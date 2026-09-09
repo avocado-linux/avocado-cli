@@ -10,8 +10,8 @@ use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
 use crate::utils::stamps::{
     compute_ext_build_input_hash, compute_ext_image_input_hash, generate_batch_read_stamps_script,
-    generate_write_stamp_script, resolve_required_stamps, validate_stamps_batch, CurrentInput,
-    Stamp, StampCommand, StampComponent, StampOutputs,
+    generate_write_stamp_script_with_digest, render_file_digest_script, resolve_required_stamps,
+    validate_stamps_batch, CurrentInput, Stamp, StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -256,6 +256,10 @@ impl ExtImageCommand {
             .unwrap_or(&rootfs_fs);
 
         // Validate stamps before proceeding (unless --no-stamps)
+        // `ext build`'s recorded output digest, read from the same batch stamp read
+        // that validates preconditions, and folded into this step's input hash at
+        // both the check and the write.
+        let mut build_content_hash: Option<String> = None;
         if !self.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config_path, config)?
                 .verbose(self.verbose)
@@ -326,6 +330,10 @@ impl ExtImageCommand {
                 self.target_board.as_deref(),
             )
             .ok();
+            build_content_hash = crate::utils::stamps::content_hash_from_batch(
+                output.as_deref().unwrap_or(""),
+                &crate::utils::stamps::StampRequirement::ext_build(&self.extension),
+            );
             let image_inputs = compute_ext_image_input_hash(
                 parsed,
                 &self.extension,
@@ -334,6 +342,7 @@ impl ExtImageCommand {
                 Some(target.as_str()),
                 self.runtime.as_deref(),
                 self.target_board.as_deref(),
+                build_content_hash.as_deref(),
             )
             .ok();
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
@@ -689,10 +698,18 @@ impl ExtImageCommand {
                     Some(target.as_str()),
                     self.runtime.as_deref(),
                     self.target_board.as_deref(),
+                    build_content_hash.as_deref(),
                 )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_image(&self.extension, &target, inputs, outputs);
-                let stamp_script = generate_write_stamp_script(&stamp)?;
+                // The image's sha256 is what `runtime build` folds for this
+                // extension — the same value the manifest records for it.
+                let stamp_script = generate_write_stamp_script_with_digest(
+                    &stamp,
+                    &render_file_digest_script(&format!(
+                        "$AVOCADO_PREFIX/output/extensions/{image_filename}"
+                    )),
+                )?;
 
                 let run_config = RunConfig {
                     container_image: container_image.to_string(),

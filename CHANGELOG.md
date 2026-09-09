@@ -23,6 +23,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
 
+### Changed
+- **Stamps now record what a step produced, and the next step's input depends
+  on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
+  built sysroot (sorted NEVRA set plus a tree hash of everything the image
+  would carry, package-manager state pruned); `ext image` records its image's
+  sha256; `rootfs install` and `initramfs install` record the digest of the
+  installed tree, overlay included. `ext image` folds the build digest into its
+  input, and `runtime build` folds every required extension's image digest into
+  its own. The effect is that a rebuild which changes no bytes — a recompile to
+  the same binary, a `touch` — stops at the first step whose output is
+  unchanged instead of cascading into a re-image, a new `image_id`, a new
+  manifest and a fresh upload. It is also the half of fingerprinting that
+  covers inputs the host cannot see: a `source: {type: git}` extension's files
+  live in the SDK volume, and its tree digest is what notices they changed.
+  The digest is computed in the container that writes the stamp; a stamp
+  whose digest is empty or not hex is refused rather than written.
+- **Stamps now hash the files a build reads, not just the paths that name
+  them.** `STAMP_VERSION` moves 2 → 3; every existing stamp reads as stale once
+  and rebuilds. Newly folded: compile-script content (`sdk.compile.<n>.compile`,
+  reached through `packages.<pkg>.compile`), `packages.<pkg>.install` scripts,
+  `kernel.install`, the `package_files` source tree of a compiled extension
+  (patterns expanded with `globstar` semantics), `version: {file}` content,
+  runtime `var_files[].source` content, `permissions` (rootfs, initramfs and
+  top-level), rootfs/initramfs `image` (kab args, dm-verity), runtime
+  `signing`, `sdk.container_args` and `src_dir`, and the extension keys the
+  build turns into unit wiring (`enable_services`, `on_merge`, `sysusers`,
+  `kernel_modules`, `users`, `groups`, …). Editing Rust source under a
+  compiled extension's `package_files` now invalidates its build; flipping
+  `rootfs.image.verity` now invalidates the runtime build.
+- **A declared script that does not exist is an error at the stamp check**,
+  not a `"missing"` sentinel. The sentinel collided — every unresolvable path
+  hashed to the same literal, so all remote extensions' `post_build` scripts
+  read as identical regardless of content. Files the host genuinely cannot see
+  (a `source: {type: git}` extension's, which live in the SDK volume) are no
+  longer hashed at all rather than hashed as missing; `source` itself still
+  is. A `source: {type: path}` extension's files are hashed under its own
+  path, not the project root.
+- **`is_current` compares `package_list_hash` strictly.** A recorded hash on
+  one side and none on the other is stale, never a match by omission.
+- An unreadable directory inside an overlay now fails the stamp check and the
+  materialization instead of being silently dropped from both.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
+
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;
   `avocado provision` builds the var image.** *(Breaking: `build` no longer
@@ -74,20 +142,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they cannot be flashed stale, and the runtime build stamp records
   `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
   manifest carries no `os_bundle`: extensions update, the OS is left alone.
-
-### Changed
-- **Runtime builds stop copying and re-hashing every image.** Per build, each
-  image was written twice into the volume — once into the runtime directory,
-  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
-  manifest step and again by the TUF hash collection; `avocado deploy` hashed
-  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
-  copy on a filesystem that refuses the link), the extension copies and the
-  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
-  and xfs, a plain copy elsewhere), and both hash collections read each
-  image's `sha256` out of the manifest — computed over the same inode — with
-  only `size` still coming from `stat`. A manifest entry whose image is absent
-  from `images/` now fails the hash collection instead of being silently
-  dropped from the published target list.
 
 ## [1.0.0-rc.3] - 2026-09-01
 

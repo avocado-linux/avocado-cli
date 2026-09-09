@@ -59,8 +59,9 @@ use crate::utils::{
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
-        compute_initramfs_input_hash, compute_rootfs_input_hash, generate_write_stamp_script,
-        Stamp, StampInputs, StampOutputs, StampRequirement, SysrootStampInputs,
+        compute_initramfs_input_hash, compute_rootfs_input_hash,
+        generate_write_stamp_script_with_digest, render_sysroot_digest_script, Stamp, StampInputs,
+        StampOutputs, StampRequirement, SysrootStampInputs,
     },
     target::validate_and_log_target,
 };
@@ -635,20 +636,31 @@ async fn write_install_stamp(
         return Ok(());
     };
 
-    let stamp = match params.sysroot_type {
-        SysrootType::Rootfs => {
-            Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
-        }
-        SysrootType::Initramfs => {
-            Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
-        }
+    // The rootfs keeps its rpmdb at /var/lib/rpm; the initramfs uses rpm's
+    // default — the same split the image build-id derivation makes.
+    let (stamp, sysroot_dir, rpm_dbpath) = match params.sysroot_type {
+        SysrootType::Rootfs => (
+            Stamp::rootfs_install(params.target, inputs, StampOutputs::default()),
+            "rootfs",
+            Some("/var/lib/rpm"),
+        ),
+        SysrootType::Initramfs => (
+            Stamp::initramfs_install(params.target, inputs, StampOutputs::default()),
+            "initramfs",
+            None,
+        ),
         _ => unreachable!("sysroot type was validated at entry"),
     };
+    // Digest the installed tree, overlay included — the image step folds this
+    // to decide whether the sysroot it would image has changed. Packages alone
+    // would miss the overlay, which this same install applied.
+    let digest =
+        render_sysroot_digest_script(&format!("$AVOCADO_PREFIX/{sysroot_dir}"), rpm_dbpath);
 
     let stamp_config = RunConfig {
         container_image: params.container_image.to_string(),
         target: params.target.to_string(),
-        command: generate_write_stamp_script(&stamp)?,
+        command: generate_write_stamp_script_with_digest(&stamp, &digest)?,
         verbose: params.verbose,
         source_environment: true,
         interactive: false,

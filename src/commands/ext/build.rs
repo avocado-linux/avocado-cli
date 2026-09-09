@@ -9,9 +9,9 @@ use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::permissions::render_users_groups_script;
 use crate::utils::stamps::{
-    compute_ext_build_input_hash, generate_batch_read_stamps_script, generate_write_stamp_script,
-    resolve_required_stamps, validate_stamps_batch, Stamp, StampCommand, StampComponent,
-    StampOutputs,
+    compute_ext_build_input_hash, generate_batch_read_stamps_script,
+    generate_write_stamp_script_with_digest, render_sysroot_digest_script, resolve_required_stamps,
+    validate_stamps_batch, Stamp, StampCommand, StampComponent, StampOutputs,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -848,7 +848,16 @@ impl ExtBuildCommand {
             )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);
-            let stamp_script = generate_write_stamp_script(&stamp)?;
+            // The digest of the built sysroot is what `ext image` folds into its
+            // own input: a rebuild that leaves the tree byte-identical (a
+            // recompile to the same binary, a `touch`) stops here.
+            let stamp_script = generate_write_stamp_script_with_digest(
+                &stamp,
+                &render_sysroot_digest_script(
+                    &format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension),
+                    Some("/var/lib/extension.d/rpm"),
+                ),
+            )?;
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
