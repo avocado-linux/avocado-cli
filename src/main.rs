@@ -279,7 +279,8 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Reinstall extensions from scratch: clear every extension's sysroot
+        /// and re-seed it.
         ///
         /// Not needed to skip dnf's prompts — installs never prompt. Forcing
         /// discards every extension's built content, so the next build has to
@@ -1656,11 +1657,11 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Install the SDK, rootfs, initramfs and target-dev sysroots in
+        /// parallel rather than one at a time.
         ///
-        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
-        /// discards every extension's built content, so the next build has to
-        /// redo all of it.
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -1734,11 +1735,11 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Run non-interactively: no live checklist, and the container is
+        /// started without a TTY.
         ///
-        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
-        /// discards every extension's built content, so the next build has to
-        /// redo all of it.
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
@@ -4452,11 +4453,12 @@ enum ExtCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Reinstall from scratch: clear this extension's sysroot and re-seed
+        /// it.
         ///
         /// Not needed to skip dnf's prompts — installs never prompt. Forcing
-        /// discards every extension's built content, so the next build has to
-        /// redo all of it.
+        /// discards the extension's built content, so the next build has to
+        /// redo it.
         #[arg(short, long)]
         force: bool,
         /// Extension name (deprecated, use positional argument)
@@ -4712,11 +4714,10 @@ enum RootfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Run non-interactively: the container is started without a TTY.
         ///
-        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
-        /// discards every extension's built content, so the next build has to
-        /// redo all of it.
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -4783,11 +4784,10 @@ enum InitramfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Reinstall from scratch: clear the sysroots and re-seed them.
+        /// Run non-interactively: the container is started without a TTY.
         ///
-        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
-        /// discards every extension's built content, so the next build has to
-        /// redo all of it.
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
