@@ -245,27 +245,30 @@ fn build_save_archive(
     }
 
     // 5. Query volume size for progress bar
-    let volume_size = Command::new(container_tool)
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{volume_name}:/data:ro"),
-            "busybox",
-            "du",
-            "-sb",
-            "/data",
-        ])
-        .output()
+    // `du` and the `tar` below share a shape, so they share one container. The
+    // SDK image is already local because every build step uses it; `busybox` is
+    // only the fallback for a project whose config names no image.
+    let volume_spec = format!("{volume_name}:/data:ro");
+    let image = Config::load(config_path)
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let out = String::from_utf8_lossy(&o.stdout);
-                out.split_whitespace().next()?.parse::<u64>().ok()
-            } else {
-                None
-            }
-        });
+        .and_then(|c| c.get_sdk_image().cloned())
+        .filter(|img| !img.contains("{{"))
+        .unwrap_or_else(|| "busybox".to_string());
+    let volume_size = crate::utils::container::SessionContainers::volume_exec(
+        container_tool,
+        &volume_spec,
+        &image,
+        &["du", "-sb", "/data"],
+    )
+    .ok()
+    .and_then(|o| {
+        if o.status.success() {
+            let out = String::from_utf8_lossy(&o.stdout);
+            out.split_whitespace().next()?.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
 
     // 6. Stream entire volume contents from container
     let pb = if let Some(total) = volume_size {
@@ -288,20 +291,13 @@ fn build_save_archive(
         pb
     };
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let session = crate::utils::container::SessionContainers::volume_container(
+        container_tool,
+        &volume_spec,
+        &image,
+    )?;
     let mut child = Command::new(container_tool)
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{volume_name}:/data:ro"),
-            "busybox",
-            "tar",
-            "cf",
-            "-",
-            "-C",
-            "/data",
-            ".",
-        ])
+        .args(["exec", &session, "tar", "cf", "-", "-C", "/data", "."])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

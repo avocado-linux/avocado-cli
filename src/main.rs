@@ -4426,6 +4426,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Remove any session container this invocation started. `--rm` covers the
+    // daemon-side reap; this covers the normal exit. A crash or a kill leaves
+    // one behind, which the next invocation sweeps by pid — see
+    // `SessionContainers::sweep_abandoned`.
+    utils::container::SessionContainers::shutdown(&utils::container::default_container_tool());
+
     result
 }
 

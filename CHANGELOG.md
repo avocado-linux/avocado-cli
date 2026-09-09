@@ -8,6 +8,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Ctrl-C removes the session containers it started.** `atexit` does not run
+  for a signal, so an interrupted run left containers parked and holding the
+  project volume until the next invocation swept them by pid. A SIGINT handler
+  now reaps them and exits 130. It is armed lazily, from the moment this process
+  first creates a session container and only then: registering a SIGINT handler
+  suppresses the default terminate-the-process disposition for the whole
+  process, and commands that never create one of these — `container dev` in
+  particular, which drives its engine shutdown off the same signal — must keep
+  the Ctrl-C behaviour they have.
+- **Session container creation no longer blocks the async runtime.** The
+  registry held one global lock across `docker ps`, `docker run -d` and the
+  mount `docker exec`. `install` runs its steps in parallel, so every step
+  waiting for a container parked a tokio worker on that lock; with enough of
+  them nothing else could be polled, including the scheduler's `select!` —
+  whose Ctrl-C branch then never fired, so the command sat there and could not
+  be interrupted. The map lock is now held only long enough to hand out a
+  per-shape slot, creation happens under that slot's own lock (so two callers
+  wanting one shape still create exactly one container, and callers wanting a
+  different shape are not blocked at all), and the blocking work runs inside
+  `block_in_place` so the worker's queue moves to another thread.
+- **Every container the CLI starts now goes through the session container, not
+  just build steps.** Eight sites started their own `docker run` outside the
+  reusable path. The worst was reading an extension's `avocado.yaml` out of the
+  SDK volume: config composition re-reads every extension discovered so far
+  after each fetch, so an `sdk install` of a project with three remote
+  extensions did that 24 times, each a ~0.52s container start for a ~5ms `cat`
+  — 12.9s of a 19s command. The registry is now synchronous, so callers that
+  run before any async context (the config reader) can reach it, and
+  `SessionContainers::volume_container` / `volume_exec` give anything that just
+  needs a volume mounted a shared container keyed on the volume spec and image.
+  Routed: the config reader, `ext checkout`'s three volume probes and its
+  `docker cp`, `profiles`' stone-manifest read, `save`'s `du` and `tar`, and
+  `host_copy`, which now `docker cp`s straight out of a running container
+  instead of creating and removing one per file. That also removes the
+  `busybox` and `alpine:latest` dependencies from those paths in favour of the
+  project's own SDK image, which is local already. `avocado load` deliberately
+  keeps `busybox`: it restores a project's config as it runs, so the SDK image
+  is not known yet and may not be pulled. On `sdk install` for a three-extension
+  project this is 31 container starts down to 6, and 23.3s down to 9.0s.
+- **Session container teardown is registered with `atexit`.** Nine call sites
+  reach `std::process::exit` directly and never return to `main`, so the
+  explicit teardown there missed them — a failed `sdk install` leaked two
+  parked containers. Rust runs `atexit` handlers for those paths and for a
+  normal return, so one registration covers every exit, including ones added
+  later. A signal that kills the process still skips it; that is what the
+  existing pid-based sweep is for.
+- **Build steps exec into a reused per-shape container instead of starting a
+  fresh one each time.** Every step was its own `docker run --rm`, and profiling
+  a no-op `avocado build` put 71% of all container time in startup alone: the
+  run itself costs ~0.52s before the command begins, against ~0.045s for an
+  `exec` into a container that is already up. Steps whose container *shape* —
+  image, platform, mounts, devices, capabilities, `container_args` — is
+  identical now share one detached session container per shape, created on
+  first use and removed when the process exits (including the `print_and_exit`
+  path, which never returns to `main`). The environment is taken from the
+  generated `run` argv rather than from the caller's `env_vars`, so an exec
+  sees exactly what the equivalent run would have; the mount block is dropped
+  from the exec's prologue because the session container already ran it, and
+  re-running bindfs would stack a second mount. Detached, interactive and named
+  steps keep their own `docker run`, as does anything under `--runs-on`, whose
+  remote path never reaches this logic. Any failure to create or reach the
+  session container falls through to the run that would have happened anyway,
+  and `AVOCADO_NO_SESSION_CONTAINER=1` disables the reuse entirely. On a no-op
+  `build` this moves 13 of 20 steps onto `exec`, cutting time spent inside the
+  container tool from 13.8s to 8.7s; wall clock goes 11.9s to 10.7s, the
+  smaller share because steps run concurrently and some of that startup was
+  already overlapped.
+- **Reading an extension's config out of the SDK volume uses the project's own
+  SDK image, not `busybox`/`alpine`.** The volume's host mountpoint is
+  unreadable under rootful Docker and inside the macOS/Windows VM, so this
+  fallback is the normal path — it ran 33 times in one `install` + `build`
+  cycle, each one a container start on a third-party image the project does not
+  control and may have to pull. The SDK image is already present because every
+  other step needs it. The busybox/alpine chain remains only for the case where
+  no config is available to name an image, and a `sdk.image` still carrying
+  `{{ … }}` is treated as unavailable rather than run as a literal.
+
 - **`runtime build` reuses the rootfs and initramfs images when nothing they
   depend on has changed.** Each image section now has a stamp whose input is
   the install step's tree digest plus the resolved image config — filesystem,
@@ -89,7 +166,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped from the published target list.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 - **Runtime builds stop copying and re-hashing every image.** Per build, each
   image was written twice into the volume — once into the runtime directory,
   once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
@@ -104,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped from the published target list.
 =======
 >>>>>>> eb01340 (fix(stamps): an empty KAB_KEYSET_FILE must not digest the filesystem root)
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
@@ -166,7 +254,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
   change now invalidates every image by itself.
 
+<<<<<<< HEAD
 >>>>>>> eb01340 (fix(stamps): an empty KAB_KEYSET_FILE must not digest the filesystem root)
+<<<<<<< HEAD
+=======
+=======
+>>>>>>> b55c437 (fix(container): correct pid liveness, lock starvation and reaper arming)
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ### Added
 - **`avocado build` produces the deployable set *and* the OTA payload;
@@ -220,6 +314,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
   manifest carries no `os_bundle`: extensions update, the OS is left alone.
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+>>>>>>> 6b48da5 (fix(container): correct pid liveness, lock starvation and reaper arming)
 
 ## [1.0.0-rc.3] - 2026-09-01
 

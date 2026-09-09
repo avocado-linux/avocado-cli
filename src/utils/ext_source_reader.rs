@@ -61,6 +61,9 @@ pub enum ExtSourceReader {
         state: VolumeState,
         target: String,
         ext_name: String,
+        /// The SDK image to read with when the mountpoint is unreadable.
+        /// `None` only when the caller has no config to take it from.
+        sdk_image: Option<String>,
     },
 }
 
@@ -93,9 +96,12 @@ impl ExtSourceReader {
         src_dir: &Path,
         target: &str,
         volume_state: Option<&VolumeState>,
+        sdk_image: Option<&str>,
         verbose: bool,
     ) -> Option<DiscoveredExt> {
-        for candidate in Self::candidates(ext_name, source, src_dir, target, volume_state) {
+        for candidate in
+            Self::candidates(ext_name, source, src_dir, target, volume_state, sdk_image)
+        {
             if verbose {
                 eprintln!(
                     "[DEBUG] Extension '{ext_name}': trying {}",
@@ -142,6 +148,7 @@ impl ExtSourceReader {
         src_dir: &Path,
         target: &str,
         volume_state: Option<&VolumeState>,
+        sdk_image: Option<&str>,
     ) -> Vec<Self> {
         if let ExtensionSource::Path { path, .. } = source {
             let resolved = if Path::new(path).is_absolute() {
@@ -163,6 +170,7 @@ impl ExtSourceReader {
                 state: state.clone(),
                 target: target.to_string(),
                 ext_name: ext_name.to_string(),
+                sdk_image: sdk_image.map(str::to_string),
             }),
             None => candidates.push(Self::dir(
                 src_dir
@@ -226,6 +234,7 @@ impl ExtSourceReader {
                 state,
                 target,
                 ext_name,
+                sdk_image,
             } => {
                 let in_volume = format!("{target}/includes/{ext_name}/{rel}");
 
@@ -238,7 +247,11 @@ impl ExtSourceReader {
                     }
                 }
 
-                read_via_container(state, &format!("/opt/_avocado/{in_volume}"))
+                read_via_container(
+                    state,
+                    sdk_image.as_deref(),
+                    &format!("/opt/_avocado/{in_volume}"),
+                )
             }
         }
     }
@@ -251,6 +264,7 @@ impl ExtSourceReader {
                 state,
                 target,
                 ext_name,
+                ..
             } => format!(
                 "SDK volume '{}' at /opt/_avocado/{target}/includes/{ext_name}",
                 state.volume_name
@@ -311,28 +325,41 @@ pub fn volume_mountpoint(state: &VolumeState) -> Result<PathBuf> {
     Ok(PathBuf::from(mountpoint))
 }
 
-/// `cat` a path out of the SDK volume using a minimal throwaway container.
+/// `cat` a path out of the SDK volume using a throwaway container.
 ///
-/// Used when the volume's host mountpoint isn't directly readable.
-fn read_via_container(state: &VolumeState, container_path: &str) -> Result<String> {
-    let images_to_try = [
-        "busybox:latest",
-        "alpine:latest",
-        "docker.io/library/busybox:latest",
-    ];
+/// Used when the volume's host mountpoint isn't directly readable — which is
+/// every rootful Docker install, and every macOS/Windows setup where the volume
+/// lives inside a VM. So this is the normal path, not the exception.
+///
+/// Runs the project's own SDK image. It is already pulled (every other step
+/// needs it), so this costs no network, and it keeps the CLI off third-party
+/// images it does not control. When the caller has no config to take the image
+/// from, fall back to the smallest images likely to be present rather than
+/// failing outright.
+fn read_via_container(
+    state: &VolumeState,
+    sdk_image: Option<&str>,
+    container_path: &str,
+) -> Result<String> {
+    let fallbacks = ["busybox:latest", "alpine:latest"];
+    let images: Vec<&str> = match sdk_image {
+        Some(img) => vec![img],
+        None => fallbacks.to_vec(),
+    };
 
-    for image in &images_to_try {
-        let output = std::process::Command::new(&state.container_tool)
-            .args([
-                "run",
-                "--rm",
-                "-v",
-                &format!("{}:/opt/_avocado:ro", state.volume_name),
-                image,
-                "cat",
-                container_path,
-            ])
-            .output();
+    let mut last_err = String::new();
+    for image in images {
+        // Routed through the session container: composition re-reads every
+        // known extension config after each fetch, so this is called O(n^2)
+        // times in an install. As a `docker run` each read cost ~0.52s of
+        // container startup for a ~5ms `cat`; as an exec into a container the
+        // first read started, it costs ~0.05s.
+        let output = crate::utils::container::SessionContainers::volume_exec(
+            &state.container_tool,
+            &format!("{}:/opt/_avocado:ro", state.volume_name),
+            image,
+            &["cat", container_path],
+        );
 
         match output {
             Ok(out) if out.status.success() => {
@@ -344,17 +371,16 @@ fn read_via_container(state: &VolumeState, container_path: &str) -> Result<Strin
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                // A missing file is conclusive — trying another image won't help.
+                // A missing file is conclusive — another image won't help.
                 if stderr.contains("No such file") || stderr.contains("not found") {
                     anyhow::bail!("{container_path} not found in volume");
                 }
+                last_err = stderr.to_string();
             }
-            // Image unavailable or the tool failed; try the next image.
-            Err(_) => {}
+            Err(e) => last_err = e.to_string(),
         }
     }
-
-    anyhow::bail!("Failed to read {container_path} via container")
+    anyhow::bail!("could not read {container_path} from the volume: {last_err}")
 }
 
 #[cfg(test)]
@@ -467,6 +493,7 @@ mod tests {
             Path::new("/projects/app"),
             "qemux86-64",
             None,
+            None,
         );
         assert_eq!(candidates.len(), 1);
         match &candidates[0] {
@@ -491,6 +518,7 @@ mod tests {
             &source,
             Path::new("/projects/app"),
             "qemux86-64",
+            None,
             None,
         );
         assert_eq!(candidates.len(), 2);
@@ -521,6 +549,7 @@ mod tests {
             Path::new("/projects/app"),
             "qemux86-64",
             Some(&state),
+            None,
         );
         assert_eq!(candidates.len(), 2);
         assert!(matches!(candidates[0], ExtSourceReader::Dir { .. }));
@@ -544,6 +573,7 @@ mod tests {
             },
             target: "qemux86-64".to_string(),
             ext_name: "my-ext".to_string(),
+            sdk_image: None,
         };
         assert_eq!(
             volume.config_path("avocado.yaml"),
