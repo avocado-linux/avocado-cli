@@ -805,6 +805,26 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         &SysrootType::TargetSysroot,
                         installed_versions,
                     );
+                    // Then where each one came from. Best effort, and separate
+                    // from the versions for a reason: `rpm` is authoritative
+                    // about what is installed and cannot say where it came
+                    // from, dnf knows the origin from the installroot's own
+                    // history. A lock records a bare version when the origin
+                    // cannot be determined, so this never fails a build.
+                    let origins = container_helper
+                        .query_installed_origins(
+                            &SysrootType::TargetSysroot,
+                            container_image,
+                            target,
+                            repo_url.map(|s| s.to_string()),
+                            repo_release.map(|s| s.to_string()),
+                            merged_container_args.cloned(),
+                            runs_on_context,
+                            self.sdk_arch.as_ref(),
+                            None,
+                        )
+                        .await;
+                    final_lock.set_sysroot_origins(target, &SysrootType::TargetSysroot, &origins);
                 }
             }
         }

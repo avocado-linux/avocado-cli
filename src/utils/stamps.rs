@@ -1635,7 +1635,7 @@ pub struct SysrootStampInputs<'a> {
     /// content.
     pub dnf_args: Option<&'a [String]>,
     /// Locked NVR pins for this sysroot, as recorded in `avocado.lock`.
-    pub locked_packages: Option<&'a std::collections::HashMap<String, String>>,
+    pub locked_packages: Option<&'a crate::utils::lockfile::PackageVersions>,
     /// The per-stage projection of the named feed set (`repos:` /
     /// `distro.feeds`) — `ResolvedFeedSet::stage_projection_json`. `None` when
     /// the project declares no feeds, which folds exactly as before. Feed
@@ -1654,11 +1654,15 @@ pub struct SysrootStampInputs<'a> {
 /// section would let a stamp written against real pins compare equal by
 /// omission. An empty set hashing to its own distinct value makes that read
 /// as stale.
-fn package_list_hash(locked: Option<&std::collections::HashMap<String, String>>) -> String {
+/// Hashes name and version only, deliberately not the recorded origin. A
+/// package's identity is its NEVRA; folding in which feed served it would move
+/// every existing stamp for a record that is provenance rather than an input —
+/// and a change of origin already moves the hash through the feed projection.
+fn package_list_hash(locked: Option<&crate::utils::lockfile::PackageVersions>) -> String {
     let mut lines: Vec<String> = locked
         .map(|pins| {
             pins.iter()
-                .map(|(name, version)| format!("{name}={version}"))
+                .map(|(name, pkg)| format!("{name}={}", pkg.version))
                 .collect()
         })
         .unwrap_or_default();
@@ -4916,16 +4920,24 @@ rootfs:
         let root = std::path::Path::new(".");
         let packages = default_rootfs_packages();
 
-        let pinned: std::collections::HashMap<String, String> =
-            std::collections::HashMap::from([(
-                "avocado-pkg-rootfs".to_string(),
-                "2026.9-r0.0".to_string(),
-            )]);
-        let repinned: std::collections::HashMap<String, String> = std::collections::HashMap::from(
-            [("avocado-pkg-rootfs".to_string(), "2026.10-r0.0".to_string())],
-        );
+        use crate::utils::lockfile::{LockedPackage, PackageVersions};
+        let pinned: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::new("2026.9-r0.0"),
+        )]);
+        let repinned: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::new("2026.10-r0.0"),
+        )]);
+        // Same version, different origin: the hash must NOT move. Provenance is a
+        // record, not an input — and a real change of origin already moves the
+        // hash through the feed projection.
+        let rehomed: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::with_repo("2026.9-r0.0", Some("other-feed".into())),
+        )]);
 
-        let inputs_for = |locked: Option<&std::collections::HashMap<String, String>>| {
+        let inputs_for = |locked: Option<&PackageVersions>| {
             compute_rootfs_input_hash(
                 &config,
                 root,
@@ -4946,6 +4958,15 @@ rootfs:
         // The config side is untouched by a re-pin; only the package list moves.
         assert_eq!(a.config_hash, b.config_hash);
         assert_ne!(a.package_list_hash, b.package_list_hash);
+        // Same version, different recorded origin: the hash must NOT move.
+        // Provenance is a record, not a build input, and folding it in would force
+        // a rebuild for every project the first time origins are captured. A real
+        // change of origin already moves the hash through the feed projection.
+        let rehomed_inputs = inputs_for(Some(&rehomed));
+        assert_eq!(
+            a.package_list_hash, rehomed_inputs.package_list_hash,
+            "recording where a package came from must not invalidate anything"
+        );
 
         // `avocado unlock` clears the section. That has to read as stale, which
         // is why an empty pin set hashes to a value rather than to None —
@@ -4966,15 +4987,17 @@ rootfs:
     fn rootfs_package_list_hash_is_order_independent() {
         // Lock pins come out of a HashMap, so iteration order varies between
         // runs. The digest must not.
-        let a = std::collections::HashMap::from([
-            ("alpha".to_string(), "1".to_string()),
-            ("beta".to_string(), "2".to_string()),
-            ("gamma".to_string(), "3".to_string()),
+        use crate::utils::lockfile::{LockedPackage, PackageVersions};
+        let p = |v: &str| LockedPackage::new(v);
+        let a = PackageVersions::from([
+            ("alpha".to_string(), p("1")),
+            ("beta".to_string(), p("2")),
+            ("gamma".to_string(), p("3")),
         ]);
-        let b = std::collections::HashMap::from([
-            ("gamma".to_string(), "3".to_string()),
-            ("alpha".to_string(), "1".to_string()),
-            ("beta".to_string(), "2".to_string()),
+        let b = PackageVersions::from([
+            ("gamma".to_string(), p("3")),
+            ("alpha".to_string(), p("1")),
+            ("beta".to_string(), p("2")),
         ]);
 
         assert_eq!(package_list_hash(Some(&a)), package_list_hash(Some(&b)));

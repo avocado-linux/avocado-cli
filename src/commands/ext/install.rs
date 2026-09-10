@@ -1192,6 +1192,25 @@ $DNF_SDK_HOST \
                         // runtime is in scope, legacy global namespace
                         // otherwise.
                         lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
+                        // And where they came from, which matters most here:
+                        // extensions are the stage most likely to draw from a
+                        // second feed. Best effort — dnf answers from the
+                        // installroot's own history, and a lock records a bare
+                        // version when it cannot.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &sysroot,
+                                container_image,
+                                target,
+                                repo_url.cloned(),
+                                repo_release.cloned(),
+                                merged_container_args.clone(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                self.runtime_env_vars(),
+                            )
+                            .await;
+                        lock_file.set_sysroot_origins(target, &sysroot, &origins);
                         if self.verbose {
                             print_info(
                                 &format!("Updated lock file with extension '{extension}' package versions."),

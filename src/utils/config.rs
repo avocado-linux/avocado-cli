@@ -4038,6 +4038,134 @@ impl Config {
     }
 }
 
+/// Write the resolved feed set into the lock, and say so when it changed.
+///
+/// Per target, because a feed's resolved URL contains `$target` and `targets:`
+/// can exclude a feed outright, so two targets in one project genuinely resolve
+/// different sets. `repo-snapshot` pins the distro feed's content; nothing
+/// equivalent exists for a third-party or on-disk feed, so without this the lock
+/// records a package's version and nothing about where it came from — and since
+/// declaration order is a strict priority override, the same name and version can
+/// be different bytes purely because the list was reordered.
+///
+/// Failures here are reported and not fatal: a build should not stop because a
+/// provenance record could not be written.
+fn record_feed_set_in_lock(
+    target: &str,
+    set: Option<&crate::utils::feeds::ResolvedFeedSet>,
+    project_root: &Path,
+) {
+    use crate::utils::lockfile::LockedFeed;
+    // `None` is the "this project declares no named feeds" path, and it has to
+    // write too: removing the last feed from a config must clear the record, or
+    // the lock keeps describing a set the build no longer uses.
+    let locked: Vec<LockedFeed> = set.map(|s| s.locked_feeds()).unwrap_or_default();
+    let mut lock = match crate::utils::lockfile::LockFile::load(project_root) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::utils::output::print_info(
+                &format!("could not read the lock to record the feed set: {e}"),
+                crate::utils::output::OutputLevel::Normal,
+            );
+            return;
+        }
+    };
+    let previous = lock.get_feeds(target);
+    let recorded = lock.has_feed_record(target);
+    // A project with no named feeds and no record should not gain an empty
+    // `feeds` key it will never use; there is nothing to clear.
+    if set.is_none() && !recorded {
+        return;
+    }
+    // And nothing to write when the lock already says exactly this. Comparing
+    // the record's presence against `set.is_some()` was wrong: `set_feeds`
+    // always writes `Some(..)`, so on the no-feeds path that test never
+    // matched and every invocation re-saved the lock.
+    if recorded && previous == locked.as_slice() {
+        return;
+    }
+    // Reported whenever a record existed before, empty or not. Gating on
+    // `!previous.is_empty()` stayed silent when a target that had resolved no
+    // feeds started resolving some — which is a change, and the message exists
+    // for exactly the changes a user would not otherwise notice.
+    if recorded {
+        // A recorded value nobody reads is only half a record. The reason to write
+        // it down is that reordering feeds silently changes which artifact a name
+        // and version resolve to, and that is the change a user would not notice.
+        //
+        // Names and order first, because that is the change worth reading. But the
+        // record also carries each feed's locator, digest and stage scope, and any
+        // of those moving is equally a change — so when the name list is identical
+        // the message has to say what actually moved, or it prints two identical
+        // lists and reads as a bug.
+        let names = |fs: &[LockedFeed]| {
+            fs.iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut message = format!(
+            "feeds for '{target}' changed since the lock was written: [{}] -> [{}]",
+            names(previous),
+            names(&locked)
+        );
+        if names(previous) == names(&locked) {
+            let fields = |a: &LockedFeed, b: &LockedFeed| {
+                [
+                    ("url", a.url != b.url),
+                    ("digest", a.digest != b.digest),
+                    ("stages", a.stages != b.stages),
+                    ("position", a.position != b.position),
+                ]
+                .into_iter()
+                .filter(|(_, moved)| *moved)
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+            };
+            let moved: Vec<String> = previous
+                .iter()
+                .zip(&locked)
+                .filter_map(|(a, b)| {
+                    let f = fields(a, b);
+                    (!f.is_empty()).then(|| format!("{} ({})", a.name, f.join(", ")))
+                })
+                .collect();
+            message = format!(
+                "feeds for '{target}' changed since the lock was written: {}",
+                moved.join("; ")
+            );
+        }
+        crate::utils::output::print_info(&message, crate::utils::output::OutputLevel::Normal);
+    }
+    lock.set_feeds(target, locked);
+    if let Err(e) = lock.save(project_root) {
+        crate::utils::output::print_info(
+            &format!("could not record the feed set in the lock: {e}"),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+}
+
+/// Targets whose feed record has already been reconciled this invocation.
+///
+/// Only the no-feeds path needs this: when feeds resolve, the per-target
+/// `OnceCell` in [`invocation_feeds`] already makes the recording happen once.
+/// Without it, every container run of a project with no named feeds would load
+/// and re-check the lock.
+static FEEDS_RECORDED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn record_empty_feed_set_once(target: &str, project_root: &Path) {
+    let seen = FEEDS_RECORDED.get_or_init(Default::default);
+    {
+        let Ok(mut guard) = seen.lock() else { return };
+        if !guard.insert(target.to_string()) {
+            return;
+        }
+    }
+    record_feed_set_in_lock(target, None, project_root);
+}
+
 /// One resolved, minted feed set per invocation, per target.
 ///
 /// Resolution is cheap and repeatable; minting is neither. A `.repo` set is
@@ -4095,7 +4223,13 @@ async fn invocation_feeds(
         // The canonical document describes the set this invocation adopted, so it
         // is written here, where that set is decided, and not by the caller.
         set.write_canonical(project_root)?;
-        // No minting here any more: it is per stage, and this cell is per target.
+        // Same for the lock, and once per target per invocation for the same
+        // reason: this is the only place that always runs when feeds resolve,
+        // whichever command is running. Doing it in each install command missed
+        // every other path, which is how the first attempt recorded nothing for a
+        // `sdk install`.
+        record_feed_set_in_lock(target, Some(&set), project_root);
+        // No minting here: it is per stage, and this cell is per target.
         let root = std::sync::Arc::new(
             tempfile::Builder::new()
                 .prefix("avocado-feeds-")
@@ -4135,11 +4269,16 @@ impl Config {
         let Some(set) =
             crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
         else {
+            // No named feeds. Still a fact worth recording, because it is the fact
+            // that removes a set the lock may still be carrying from a config that
+            // used to declare one.
+            record_empty_feed_set_once(target, &project_root);
             return Ok(None);
         };
-        // The canonical document is written inside `invocation_feeds`, before the
-        // mint, so it records what the build depended on (`connect:<org>`) and
-        // never the short-lived token or the host it was served from today.
+        // The canonical document and the lock record are both written inside
+        // `invocation_feeds`, before the mint, so they record what the build
+        // depended on (`connect:<org>`) and never the short-lived token or the
+        // host it was served from today.
         let shared = invocation_feeds(target, set, &project_root).await?;
         // Mint inside the lock: two stages starting at once must not both mint the
         // same feed, and the second must see the first one's token.
@@ -6457,6 +6596,58 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+
+    /// Recording the feed set must be a no-op when there is nothing to record.
+    ///
+    /// Two ways to get this wrong, and the first shipped: comparing the record's
+    /// *presence* against `set.is_some()` never matched on the no-feeds path,
+    /// because `set_feeds` always writes `Some(..)` — so every container run of
+    /// a project with no named feeds re-saved the lock. And a project that never
+    /// had feeds should not gain an empty `feeds` key it will never use.
+    #[test]
+    fn recording_no_feeds_writes_only_when_there_is_something_to_clear() {
+        use crate::utils::lockfile::{LockFile, LockedFeed};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Nothing recorded, nothing to record: no lock file appears.
+        super::record_feed_set_in_lock("t", None, root);
+        assert!(
+            !root.join("avocado.lock").exists(),
+            "a project with no feeds must not gain a lock just to say so"
+        );
+
+        // A recorded set is cleared, and stays cleared across a reload.
+        let mut lock = LockFile::load(root).unwrap();
+        lock.set_feeds(
+            "t",
+            vec![LockedFeed {
+                name: "vendor".into(),
+                position: 10,
+                url: "https://v".into(),
+                digest: None,
+                stages: None,
+            }],
+        );
+        lock.save(root).unwrap();
+        super::record_feed_set_in_lock("t", None, root);
+        let lock = LockFile::load(root).unwrap();
+        assert!(lock.get_feeds("t").is_empty(), "the removed feed must go");
+        assert!(lock.has_feed_record("t"), "and be recorded as none");
+
+        // Recording "none" again changes nothing, so the mtime does not move.
+        let before = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::record_feed_set_in_lock("t", None, root);
+        let after = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "a no-op must not rewrite the lock");
+    }
     #[test]
     fn fit_signing_reads_key_and_explicit_unsigned_per_runtime() {
         let yaml = r#"
