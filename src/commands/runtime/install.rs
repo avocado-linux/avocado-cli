@@ -131,7 +131,9 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Runtime, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Runtime, &self.config_path)
+            .await?;
 
         // Check if runtime section exists
         let runtime_section = match parsed.get("runtimes") {

@@ -67,12 +67,36 @@ pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 /// takes precedence over the profile store so CI runners identify without a
 /// `credentials.json`.
 pub fn user_agent() -> String {
+    user_agent_with_tier(None)
+}
+
+/// The identity header, carrying the tier Connect actually issued.
+///
+/// `tier/1` means "authenticated, tier not yet assigned": it is the floor for a
+/// logged-in client, not a claim. The edge routes rate limits on `tier/<n>`, so
+/// a client that omits it shares the anonymous bucket — and one that reports the
+/// wrong tier lands in the wrong bucket, which is why the value has to come from
+/// the mint rather than from a constant. `None` keeps the floor, for a project
+/// with no `org:` feed and therefore no minted tier.
+pub fn user_agent_with_tier(tier: Option<u32>) -> String {
+    user_agent_for(None, tier)
+}
+
+/// The identity header for a specific credential.
+///
+/// `key_id` names the credential that actually made the request. It matters when
+/// an `org:` feed resolved through a non-default Connect profile: the default
+/// profile's id would attribute those requests, in both the rate limiter and the
+/// access log, to a credential that never made them.
+pub fn user_agent_for(key_id: Option<&str>, tier: Option<u32>) -> String {
     let base = concat!("avocado-cli/", env!("CARGO_PKG_VERSION"));
-    // tier/1 = authenticated, tier not yet assigned by Connect. The edge
-    // routes on `tier/<n>`, so without it a logged-in client would share the
-    // anonymous bucket; Connect raises it once it hands the CLI a real tier.
-    match feed_key_id() {
-        Some(id) => format!("{base};key/{id};tier/1"),
+    let id = key_id.map(str::to_string).or_else(feed_key_id);
+    match id {
+        // Clamped here, at the point the header is rendered, so the floor holds
+        // whatever the tier came from. `tier/0` on an authenticated request would
+        // place it in the anonymous bucket, which is worse than an unassigned
+        // tier — and `tier/1` already means "authenticated, not yet assigned".
+        Some(id) => format!("{base};key/{id};tier/{}", tier.unwrap_or(1).max(1)),
         None => base.to_string(),
     }
 }
@@ -113,6 +137,20 @@ impl FeedStage {
     fn is_host(self) -> bool {
         matches!(self, FeedStage::Sdk)
     }
+
+    /// The stage's subdirectory under the invocation's feeds root. Stages share
+    /// one mount so every container has the same shape; this is what keeps their
+    /// `.repo` sets apart inside it, which is what makes `stages:` scoping real
+    /// rather than advisory.
+    fn dir_name(self) -> &'static str {
+        match self {
+            FeedStage::Sdk => "sdk",
+            FeedStage::Rootfs => "rootfs",
+            FeedStage::Runtime => "runtime",
+            FeedStage::Ext => "ext",
+            FeedStage::Initramfs => "initramfs",
+        }
+    }
 }
 
 impl std::fmt::Display for FeedStage {
@@ -135,6 +173,9 @@ pub enum FeedKind {
     Distro,
     Url,
     Path,
+    /// A private feed hosted by Connect, addressed by `org:`. Its URL and its
+    /// credential are both issued at materialize time, so neither is a config input.
+    Connect,
     /// A built-in repo re-scoped by name (`avocado-ext`).
     Builtin,
 }
@@ -145,6 +186,20 @@ pub enum Locality {
     Shared,
     /// Content comes from inside the project (`path:` feeds). Never cache-publishable.
     ProjectLocal,
+}
+
+/// What the feed-token mint returns. `tier` is an entitlement the server
+/// computes from the organization; the CLI mirrors it into the User-Agent and
+/// never requests one.
+#[derive(Debug, serde::Deserialize)]
+struct MintedFeedToken {
+    token: String,
+    #[serde(default)]
+    tier: Option<u32>,
+    feed_url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    expires_at: Option<i64>,
 }
 
 /// A feed after resolution: everything dnf will see, plus what the cache needs.
@@ -168,6 +223,10 @@ pub struct ResolvedFeed {
     /// raw username either, which is often an email or a token.
     pub credential_identity: String,
     pub tls_verify: bool,
+    /// The organization for an `org:` feed. Recorded because it is the stable
+    /// identity of the feed; the URL and token it resolves to are not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
     /// `path:` feeds only — the path as written in config (project-relative) and
     /// the full sha256 of its `repodata/repomd.xml`. The local analogue of the
     /// snapshot pin: a different directory or new RPMs must move the stamp hash.
@@ -236,6 +295,17 @@ pub struct ResolvedFeedSet {
     /// be renumbered above it at runtime.
     #[serde(skip)]
     distro_priority_base: Option<u32>,
+    /// Key id of the account credential the mint actually used. When an `org:`
+    /// feed resolves through a non-default profile, that is a different token
+    /// than `feed_key_id()` would find, and reporting the default profile's id
+    /// would attribute the requests to a credential that never made them.
+    #[serde(skip)]
+    minted_key_id: Option<String>,
+    /// Lowest tier the mint issued this invocation. Deliberately not serialized:
+    /// it is assigned by the server and can change between builds, so it must not
+    /// reach the canonical document or the stamp hash.
+    #[serde(skip)]
+    minted_tier: Option<u32>,
 }
 
 /// What a container run needs to see the resolved feeds. The tempdir holds
@@ -248,6 +318,12 @@ pub struct FeedMaterialization {
     pub mounts: Vec<(PathBuf, String)>,
     pub env: Vec<(String, String)>,
     pub dnf_args: Vec<String>,
+    /// The tier the mint issued, for the identity header. `None` when nothing was
+    /// minted, which keeps the authenticated floor.
+    pub tier: Option<u32>,
+    /// Key id of the credential the mint used, when it differs from the default
+    /// profile's.
+    pub key_id: Option<String>,
     /// `--add-host` entries the container needs.
     pub add_hosts: Vec<String>,
     /// SHA-256 of the stage projection this was materialized from. Lets
@@ -451,15 +527,51 @@ impl ResolvedFeedSet {
             // key at all reaches `credential` as `(user, String::new())` and writes
             // a bare `password=` into the .repo, which is the same broken auth the
             // empty check exists to prevent — just arrived at differently.
+            if def.org.is_some() && (def.username.is_some() || def.password.is_some()) {
+                // Before the generic credential rules: "remove username/password,
+                // Connect provides it" is more use than "password is missing".
+                // Minting is skipped for a feed that already has a credential, so
+                // an `org:` feed carrying one would keep its `connect://<org>/...`
+                // placeholder baseurl and dnf would fail to resolve it.
+                bail!(
+                    "repos.{name}: an `org:` feed gets its credential from Connect; \
+                     remove `username`/`password` (they are for feeds Connect knows \
+                     nothing about)"
+                );
+            }
             if def.username.is_some() && def.password.as_deref().is_none_or(str::is_empty) {
                 bail!(
                     "repos.{name}: `username` is set but `password` is empty or missing — \
                      an unset environment variable interpolates to \"\""
                 );
             }
+            // `org` is interpolated into the mint URL, into the generated baseurl,
+            // and into the .repo file. A value with a slash, whitespace or a
+            // newline could reshape the request path or inject an extra line into
+            // the .repo, so it has to be one URL-safe segment. Same rule as feed
+            // names, for the same reason.
             if def.org.is_some() {
-                // ponytail: org feeds resolve through Connect (Phase 3); parse, don't serve.
-                bail!("repos.{name}: `org:` feeds are resolved through Connect and are not yet supported");
+                // `channel` becomes the branch segment in
+                // `.../orgs/<org>/<branch>/...`, so it needs exactly the same rule
+                // as the org: a slash or a space produces a malformed path, and the
+                // server parses those segments.
+                if let Some(branch) = &def.channel {
+                    if !is_valid_feed_name(branch) {
+                        bail!(
+                            "repos.{name}: `channel: {branch}` is the branch segment of a \
+                             Connect feed path and must match [A-Za-z0-9][A-Za-z0-9._-]*"
+                        );
+                    }
+                }
+            }
+            if let Some(org) = &def.org {
+                if !is_valid_feed_name(org) {
+                    bail!(
+                        "repos.{name}: `org: {org}` must be a single path segment matching \
+                         [A-Za-z0-9][A-Za-z0-9._-]* — it is interpolated into a URL and into \
+                         the generated .repo"
+                    );
+                }
             }
             if def.password.is_some() && def.username.is_none() {
                 bail!("repos.{name}: `password` requires `username`");
@@ -519,6 +631,7 @@ impl ResolvedFeedSet {
                     locality: Locality::Shared,
                     credential_identity: "none".into(),
                     tls_verify: !config.get_repo_insecure(),
+                    org: None,
                     source: None,
                     content_digest: None,
                     credential: None,
@@ -547,12 +660,17 @@ impl ResolvedFeedSet {
                 .username
                 .as_ref()
                 .map(|u| (u.clone(), def.password.clone().unwrap_or_default()));
-            let credential_identity = match &def.username {
-                Some(u) => format!("basic:{}", short_sha256(u.as_bytes())),
-                None => "none".to_string(),
+            let credential_identity = match (&def.org, &def.username) {
+                // The org is the stable identity of a Connect feed. The token it
+                // resolves to changes every build and must never appear here: this
+                // string goes into the canonical document and the stamp hash.
+                (Some(o), _) => format!("connect:{o}"),
+                (None, Some(u)) => format!("basic:{}", short_sha256(u.as_bytes())),
+                (None, None) => "none".to_string(),
             };
             let common = |kind, baseurl, locality, mount: Option<PathBuf>, loopback_rewritten| {
                 ResolvedFeed {
+                    org: def.org.clone(),
                     source: def.path.clone(),
                     // Digest of the repodata as it stands now. Absent repodata is reported
                     // at materialize time; here it simply leaves the digest unset.
@@ -590,6 +708,29 @@ impl ResolvedFeedSet {
                     None,
                     rewritten,
                 ));
+            } else if let Some(org) = &def.org {
+                // The private tree mirrors the public one, so an org feed is just a
+                // distro-shaped feed whose releasever is `<rel>/orgs/<org>/<branch>`.
+                // That is why no new path construction is needed here.
+                let rel = def
+                    .release
+                    .clone()
+                    .or_else(|| config.get_distro_release())
+                    .unwrap_or_else(|| "2026".to_string());
+                let branch = def.channel.clone().unwrap_or_else(|| "main".to_string());
+                let path = format!("{rel}/orgs/{org}/{branch}/target/{target}");
+                // A placeholder host, replaced with the minted `feed_url` at
+                // materialize time. Recording it rather than the real URL keeps the
+                // canonical document stable across builds and keeps a server-side
+                // URL change out of the stamp hash — the org is the input, the host
+                // is a detail of how it was served today.
+                feeds.push(common(
+                    FeedKind::Connect,
+                    format!("connect://{org}/{path}"),
+                    Locality::Shared,
+                    None,
+                    false,
+                ));
             } else if let Some(p) = &def.path {
                 let host = resolve_relative(config_dir, p);
                 let in_container = format!("{CONTAINER_FEEDS_DIR}/paths/{name}");
@@ -621,6 +762,7 @@ impl ResolvedFeedSet {
                 locality: Locality::Shared,
                 credential_identity: "none".into(),
                 tls_verify: true,
+                org: None,
                 source: None,
                 content_digest: None,
                 credential: None,
@@ -631,6 +773,8 @@ impl ResolvedFeedSet {
         }
 
         Ok(Some(Self {
+            minted_tier: None,
+            minted_key_id: None,
             version: CANONICAL_VERSION,
             target: target.to_string(),
             any_project_local: feeds.iter().any(|f| f.locality == Locality::ProjectLocal),
@@ -688,6 +832,193 @@ impl ResolvedFeedSet {
         serde_json::to_string_pretty(&v).context("serializing feed projection")
     }
 
+    /// Exchange the account credential for a short-lived feed token for every
+    /// `org:` feed, and adopt the base URL the mint hands back.
+    ///
+    /// Deliberately **not** part of `resolve`. The token changes on every mint, so
+    /// letting it near the stamp hash or the canonical document would invalidate
+    /// every cached sysroot once per build. `resolve` records `connect:<org>` as
+    /// the credential identity and a `connect://` placeholder as the URL; this
+    /// fills in the real host and the secret, in memory, for the life of one
+    /// invocation. The canonical document is written before this runs.
+    ///
+    /// Runs per stage: only feeds in scope for `stage` are minted, and only when
+    /// they have no token yet.
+    ///
+    /// Returns the **lowest** tier issued, which the caller mirrors into the
+    /// User-Agent so the edge can pick a rate-limit bucket. Lowest, not highest:
+    /// dnf sends one header for every feed in a run, so claiming the best tier
+    /// would ask for a ceiling one of the feeds was never granted. The CLI never
+    /// *asks* for a tier either way — it is an entitlement the server computes.
+    pub async fn resolve_connect_credentials(&mut self, stage: FeedStage) -> Result<Option<u32>> {
+        // Only what this stage will actually use, and only once per feed. Minting
+        // every `org:` feed regardless of stage made `stages:` mean less for a
+        // private feed than for any other kind: a command whose stage excluded the
+        // feed still needed a login and a network round trip. Later stages reuse
+        // what earlier ones minted, so a feed is minted at most once per
+        // invocation, and never at all if no stage needs it.
+        if !self
+            .feeds
+            .iter()
+            .any(|f| f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none())
+        {
+            return Ok(self.minted_tier);
+        }
+        let profiles = crate::commands::connect::client::load_config()
+            .ok()
+            .flatten();
+        // No fixed User-Agent on the client: the header is set per request, from
+        // the credential that request actually uses. A client-wide `user_agent()`
+        // reads the default profile, so a mint performed with an org-specific
+        // profile would be attributed — and rate limited — as the default one.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("building the HTTP client for the feed-token mint")?;
+
+        // The lowest tier, not the highest: the tier is a claim the edge uses to
+        // pick a rate-limit bucket, and over-claiming would ask for a ceiling one
+        // of the feeds was never granted. Under-claiming only costs throughput.
+        // Seeded from whatever an earlier stage already minted, so a later stage
+        // does not forget it.
+        let mut lowest: Option<u32> = self.minted_tier;
+        let mut self_key_id: Option<String> = self.minted_key_id.clone();
+        let mut key_seen = self.minted_key_id.is_some();
+        for feed in self.feeds.iter_mut().filter(|f| {
+            f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
+        }) {
+            let org = feed.org.clone().ok_or_else(|| {
+                anyhow::anyhow!("repos.{}: a Connect feed without an org", feed.name)
+            })?;
+
+            // Env wins, so CI can authenticate without a stored profile — the same
+            // precedence the User-Agent key id already uses.
+            let env_token = std::env::var("AVOCADO_CONNECT_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty());
+            let (api_url, account_token) = match env_token {
+                Some(t) => (
+                    std::env::var("AVOCADO_CONNECT_URL")
+                        .unwrap_or_else(|_| "https://connect.peridio.com".to_string()),
+                    t,
+                ),
+                None => {
+                    let cfg = profiles.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "repos.{}: `org: {org}` is a private feed and you are not logged in.\n\
+                             Run `avocado login`, or set AVOCADO_CONNECT_TOKEN for CI.",
+                            feed.name
+                        )
+                    })?;
+                    let (_, profile) = cfg
+                        .find_profile_by_org(&org)
+                        .or_else(|| cfg.resolve_profile(None, None).ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "repos.{}: no Connect profile for org '{org}'.\n\
+                                 Run `avocado login --org {org}`.",
+                                feed.name
+                            )
+                        })?;
+                    (profile.api_url.clone(), profile.token.clone())
+                }
+            };
+
+            let url = format!(
+                "{}/api/orgs/{org}/feed-tokens",
+                api_url.trim_end_matches('/')
+            );
+            let resp = client
+                .post(&url)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    user_agent_for(Some(&short_sha256(account_token.as_bytes())), None),
+                )
+                .bearer_auth(&account_token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .with_context(|| {
+                    format!("repos.{}: requesting a feed token from {url}", feed.name)
+                })?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let hint = match status.as_u16() {
+                    401 => {
+                        " — the stored credential was rejected. Run `avocado login` to refresh it."
+                    }
+                    403 => " — this account is not entitled to that org's private feed",
+                    404 => " — this Connect deployment does not serve feed tokens yet",
+                    _ => "",
+                };
+                bail!(
+                    "repos.{}: feed-token request returned {status}{hint}",
+                    feed.name
+                );
+            }
+            let minted: MintedFeedToken = resp
+                .json()
+                .await
+                .with_context(|| format!("repos.{}: parsing the feed-token response", feed.name))?;
+
+            // `connect://<org>/<path>` -> `<feed_url>/<path>`.
+            // Fail loudly. `unwrap_or_default()` here would yield an empty path and
+            // a baseurl pointing at the feed ROOT rather than the org's subtree —
+            // dnf would then read someone else's metadata, or nothing, and report
+            // it as a broken feed. A Connect feed reaching this point without its
+            // placeholder is a logic error in resolve, not a user mistake.
+            let prefix = format!("connect://{org}/");
+            let path = feed
+                .baseurl
+                .strip_prefix(&prefix)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "repos.{}: internal error — expected the placeholder {prefix:?} but found {:?}",
+                        feed.name,
+                        feed.baseurl
+                    )
+                })?
+                .to_string();
+            // The mint hands back a host the CLI can reach; dnf reaches it from
+            // inside the container, where loopback means the container itself.
+            // `url:` feeds are rewritten at resolve time, but a Connect feed has no
+            // URL until now, so it has to happen here or a local Connect silently
+            // resolves to nothing.
+            let (baseurl, rewritten) =
+                rewrite_loopback(&format!("{}/{path}", minted.feed_url.trim_end_matches('/')));
+            feed.baseurl = baseurl;
+            feed.loopback_rewritten = rewritten;
+            // The username is for log correlation only; the verifier reads the
+            // password. Using the same key id the User-Agent carries lets an
+            // operator join a feed request to the client that made it.
+            let key_id = short_sha256(account_token.as_bytes());
+            // The identity header must name the credential that actually made the
+            // request. `feed_key_id()` reads the default profile; an `org:` feed
+            // may have resolved through a different one, and then the rate limiter
+            // and the access log would both be attributing to the wrong client.
+            //
+            // dnf sends ONE User-Agent for every feed in a run, so with two `org:`
+            // feeds minted under different credentials there is no honest single
+            // answer. Claiming the last one attributes the other's traffic to a
+            // credential that never made it, so a disagreement clears the field
+            // and the header falls back to the default profile.
+            match &self_key_id {
+                None if !key_seen => self_key_id = Some(key_id.clone()),
+                Some(seen) if seen == &key_id => {}
+                _ => self_key_id = None,
+            }
+            key_seen = true;
+            feed.credential = Some((key_id, minted.token));
+            if let Some(t) = minted.tier {
+                lowest = Some(lowest.map_or(t, |l: u32| l.min(t)));
+            }
+        }
+        self.minted_tier = lowest;
+        self.minted_key_id = self_key_id;
+        Ok(lowest)
+    }
+
     /// Write the canonical document to `<config_dir>/.avocado/feeds/<target>.json`.
     pub fn write_canonical(&self, config_dir: &Path) -> Result<PathBuf> {
         let dir = config_dir.join(".avocado").join("feeds");
@@ -712,26 +1043,54 @@ impl ResolvedFeedSet {
 
     /// Generate the per-stage `.repo` files and everything the container run
     /// needs to see them.
+    /// Materialize into a fresh throwaway root. Tests want isolation; production
+    /// deliberately shares one root per invocation (see `materialize_in`).
+    #[cfg(test)]
     pub fn materialize(&self, stage: FeedStage) -> Result<FeedMaterialization> {
-        let tempdir = tempfile::Builder::new()
-            .prefix("avocado-feeds-")
-            .tempdir()
-            .context("creating feeds tempdir")?;
+        let root = Arc::new(
+            tempfile::Builder::new()
+                .prefix("avocado-feeds-test-")
+                .tempdir()
+                .context("creating a test feeds dir")?,
+        );
+        self.materialize_in(stage, &root)
+    }
+
+    /// Write this stage's `.repo` files under `root`, and describe the mount and
+    /// environment a container needs to see them.
+    ///
+    /// `root` is one directory per **invocation**, not per step, and it is the
+    /// mount for every container the invocation starts. That matters for more
+    /// than tidiness: the mount list is part of a container's shape, so a
+    /// per-step directory would give every dnf step a unique shape and defeat
+    /// container reuse exactly where it is most valuable. Each stage gets its own
+    /// subdirectory and `AVOCADO_FEEDS_DIR` selects it, so the shape is identical
+    /// across steps while dnf still sees only the feeds scoped to its stage.
+    ///
+    /// The trade this makes, deliberately: every step in an invocation can read
+    /// every stage's credentials from the mount, where a per-step directory
+    /// showed each step only its own. For a developer building their own project
+    /// that is the same trust boundary as the source tree already being executed.
+    /// It would not be acceptable if extension builds ever run untrusted code in
+    /// that container, which is the condition that would invalidate this.
+    pub fn materialize_in(
+        &self,
+        stage: FeedStage,
+        root: &Arc<tempfile::TempDir>,
+    ) -> Result<FeedMaterialization> {
+        let root = root.clone();
+        let root_path = root.path();
+        let stage_dir = root_path.join(stage.dir_name());
         // Both scope dirs always exist: the entrypoint appends them to the dnf
         // reposdir lists unconditionally whenever AVOCADO_FEEDS_DIR is set.
         let scope = if stage.is_host() { "host" } else { "target" };
-        fs::create_dir_all(tempdir.path().join("host"))?;
-        fs::create_dir_all(tempdir.path().join("target"))?;
-        let dir = tempdir.path().join(scope);
+        fs::create_dir_all(stage_dir.join("host"))?;
+        fs::create_dir_all(stage_dir.join("target"))?;
+        let dir = stage_dir.join(scope);
 
-        let mut mounts = vec![(
-            tempdir.path().to_path_buf(),
-            CONTAINER_FEEDS_DIR.to_string(),
-        )];
-        let mut env = vec![(
-            "AVOCADO_FEEDS_DIR".to_string(),
-            CONTAINER_FEEDS_DIR.to_string(),
-        )];
+        let container_stage_dir = format!("{CONTAINER_FEEDS_DIR}/{}", stage.dir_name());
+        let mut mounts = vec![(root_path.to_path_buf(), CONTAINER_FEEDS_DIR.to_string())];
+        let mut env = vec![("AVOCADO_FEEDS_DIR".to_string(), container_stage_dir.clone())];
         let mut dnf_args = Vec::new();
         let mut add_hosts = Vec::new();
 
@@ -747,6 +1106,24 @@ impl ResolvedFeedSet {
                     }
                     continue;
                 }
+                FeedKind::Connect => {
+                    // Checked only for a feed this stage will actually write. One
+                    // scoped away from this stage is never materialized and is
+                    // deliberately never minted, so demanding a token for it would
+                    // make `stages:` weaker for a private feed than for any other.
+                    //
+                    // For a feed that IS in scope, a missing token is a bug rather
+                    // than a user error: minting runs first and fails loudly. A
+                    // .repo pointing at `connect://<org>` would simply fail to
+                    // resolve, reading as a broken feed rather than a broken CLI.
+                    if feed.applies_to(stage) && feed.credential.is_none() {
+                        bail!(
+                            "repos.{}: no feed token was issued before materialization \
+                             (internal error: resolve_connect_credentials did not run)",
+                            feed.name
+                        );
+                    }
+                }
                 FeedKind::Url | FeedKind::Path => {}
             }
             if !feed.applies_to(stage) {
@@ -758,7 +1135,7 @@ impl ResolvedFeedSet {
                     fs::copy(ca, dir.join(&fname)).with_context(|| {
                         format!("repos.{}: reading ca {}", feed.name, ca.display())
                     })?;
-                    Some(format!("{CONTAINER_FEEDS_DIR}/{scope}/{fname}"))
+                    Some(format!("{container_stage_dir}/{scope}/{fname}"))
                 }
                 None => None,
             };
@@ -781,7 +1158,10 @@ impl ResolvedFeedSet {
                 }
                 // The outer mount is read-only, so docker cannot create this
                 // mountpoint itself; it has to exist in the tempdir already.
-                fs::create_dir_all(tempdir.path().join("paths").join(&feed.name))?;
+                // At the root, not under the stage dir: a path feed's bind is the
+                // same for every stage, so keeping it out of the per-stage tree
+                // keeps the mount list identical across steps.
+                fs::create_dir_all(root_path.join("paths").join(&feed.name))?;
                 mounts.push((
                     host.clone(),
                     format!("{CONTAINER_FEEDS_DIR}/paths/{}", feed.name),
@@ -807,7 +1187,9 @@ impl ResolvedFeedSet {
             digest.iter().map(|b| format!("{b:02x}")).collect()
         };
         Ok(FeedMaterialization {
-            _tempdir: Arc::new(tempdir),
+            tier: self.minted_tier,
+            key_id: self.minted_key_id.clone(),
+            _tempdir: root,
             mounts,
             env,
             dnf_args,
@@ -976,6 +1358,184 @@ distro:
   release: 2026
   channel: next
 "#;
+
+    /// dnf sends one User-Agent for every feed in a run, so two `org:` feeds
+    /// minted under different credentials have no honest single identity, and two
+    /// different tiers have no honest single claim. The header must not attribute
+    /// one feed's traffic to the other's credential, and must not ask for a
+    /// ceiling a feed was never granted.
+    #[test]
+    fn a_single_header_never_over_claims_across_feeds() {
+        // Same credential and tier: the header can speak for both.
+        assert!(user_agent_for(Some("abc"), Some(3)).contains("tier/3"));
+        // No minted tier at all keeps the authenticated floor rather than
+        // inventing one.
+        assert!(user_agent_for(Some("abc"), None).contains("tier/1"));
+        // The identity is the credential's, not the default profile's.
+        assert!(user_agent_for(Some("abc"), Some(2)).contains("key/abc"));
+    }
+
+    /// `org` reaches a URL and the generated .repo, so it has to be one URL-safe
+    /// segment. A slash reshapes the request path; a newline injects a line into
+    /// the .repo.
+    #[test]
+    fn org_must_be_a_single_url_safe_segment() {
+        for bad in ["a/b", "a b", "a\nb", "../x", ""] {
+            let c = load(&format!(
+                "{BASE}  feeds: [f]\nrepos:\n  f:\n    org: {:?}\n",
+                bad
+            ));
+            assert!(
+                ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).is_err(),
+                "org {bad:?} should be rejected"
+            );
+        }
+    }
+
+    /// An `org:` feed resolves without contacting anything: a placeholder URL that
+    /// shows the layout, and the org as the credential identity. Both are stable
+    /// across builds, which is what keeps a per-build token out of the stamp hash.
+    #[test]
+    fn org_feed_resolves_to_a_placeholder_and_records_the_org() {
+        let c = load(&format!(
+            "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: 01a071ea\n    channel: main\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let feed = set.feeds.iter().find(|f| f.name == "acme").unwrap();
+        assert_eq!(feed.kind, FeedKind::Connect);
+        assert_eq!(feed.credential_identity, "connect:01a071ea");
+        // release before org, mirroring the public tree — see edge-contract.md S3.
+        assert_eq!(
+            feed.baseurl,
+            "connect://01a071ea/2026/orgs/01a071ea/main/target/qemux86-64"
+        );
+        assert!(feed.credential.is_none(), "no token before the mint runs");
+    }
+
+    /// The canonical document is written before the mint and must never carry a
+    /// token, a host, or anything else that changes per build.
+    #[test]
+    fn org_feed_canonical_document_carries_no_secret() {
+        let c = load(&format!(
+            "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: acme\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "qemux86-64", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let doc = set.canonical_json().unwrap();
+        assert!(
+            doc.contains("\"connect:acme\""),
+            "records the org identity: {doc}"
+        );
+        assert!(
+            doc.contains("connect://acme/"),
+            "records the placeholder: {doc}"
+        );
+        for leak in ["token", "Bearer", "password", "eyJ"] {
+            assert!(
+                !doc.contains(leak),
+                "canonical document leaked {leak:?}: {doc}"
+            );
+        }
+    }
+
+    /// Defaults: no `channel:` means the org's `main` branch, and the release
+    /// falls back to the distro's.
+    #[test]
+    fn org_feed_defaults_to_the_main_branch() {
+        let c = load(&format!("{BASE}  feeds: [a]\nrepos:\n  a:\n    org: o\n"));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let feed = set.feeds.iter().find(|f| f.name == "a").unwrap();
+        assert_eq!(feed.baseurl, "connect://o/2026/orgs/o/main/target/t");
+    }
+
+    /// An `org:` feed with its own credential would skip minting and keep the
+    /// `connect://` placeholder as its baseurl, so dnf would fail to resolve a
+    /// config that looks perfectly reasonable.
+    #[test]
+    fn an_org_feed_cannot_carry_its_own_credential() {
+        for extra in ["username: u\n    password: p", "password: p", "username: u"] {
+            let c = load(&format!(
+                "{BASE}  feeds: [p]\nrepos:\n  p:\n    org: o\n    {extra}\n"
+            ));
+            let err = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("credential from Connect"),
+                "{extra:?} should be refused: {err}"
+            );
+        }
+    }
+
+    /// `channel` is the branch segment of a Connect feed path, so it needs the
+    /// same rule as the org: a slash or a space makes a malformed path, and the
+    /// server parses those segments.
+    #[test]
+    fn an_org_feeds_branch_must_be_a_single_segment() {
+        for bad in ["a/b", "a b", "a\nb", ".."] {
+            let c = load(&format!(
+                "{BASE}  feeds: [p]\nrepos:\n  p:\n    org: o\n    channel: {:?}\n",
+                bad
+            ));
+            assert!(
+                ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).is_err(),
+                "channel {bad:?} should be rejected"
+            );
+        }
+        let ok = load(&format!(
+            "{BASE}  feeds: [p]\nrepos:\n  p:\n    org: o\n    channel: main\n"
+        ));
+        assert!(ResolvedFeedSet::resolve(&ok, "t", Path::new("."), None).is_ok());
+    }
+
+    /// `tier/1` is the authenticated floor. A mint returning 0 must not drop an
+    /// authenticated client into the anonymous bucket.
+    #[test]
+    fn the_authenticated_tier_floor_holds() {
+        assert!(user_agent_for(Some("k"), Some(0)).contains("tier/1"));
+        assert!(user_agent_for(Some("k"), None).contains("tier/1"));
+        assert!(user_agent_for(Some("k"), Some(4)).contains("tier/4"));
+    }
+
+    /// A private feed scoped away from a stage must not require a token there.
+    /// Otherwise `stages:` means less for an `org:` feed than for any other kind:
+    /// the command would demand a login and a network round trip for a feed it is
+    /// never going to write.
+    #[test]
+    fn a_connect_feed_out_of_scope_needs_no_token() {
+        let c = load(&format!(
+            "{BASE}  feeds: [priv]\nrepos:\n  priv:\n    org: o\n    stages: [ext]\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        // sdk is out of scope: materializes fine with no token at all.
+        assert!(set.materialize(FeedStage::Sdk).is_ok());
+        // ext is in scope, so a missing token there is still the internal error.
+        let err = set.materialize(FeedStage::Ext).unwrap_err().to_string();
+        assert!(err.contains("no feed token was issued"), "got: {err}");
+    }
+
+    /// Materializing a Connect feed that never got a token is an internal error,
+    /// not a silently broken `.repo`: dnf would report "no more mirrors" and the
+    /// cause would look like a broken feed rather than a CLI bug.
+    #[test]
+    fn materialize_refuses_a_connect_feed_without_a_token() {
+        let c = load(&format!("{BASE}  feeds: [a]\nrepos:\n  a:\n    org: o\n"));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let err = set.materialize(FeedStage::Sdk).unwrap_err().to_string();
+        assert!(
+            err.contains("no feed token was issued"),
+            "expected the internal-error message, got: {err}"
+        );
+    }
 
     /// A newline anywhere that reaches the generated .repo injects an INI option.
     /// The url and credential fields were checked; the release fields were not,
@@ -1195,7 +1755,10 @@ distro:
             .unwrap();
         let ext = set.materialize(FeedStage::Ext).unwrap();
         assert!(ext.dnf_args.is_empty());
-        assert!(ext.mounts[0].0.join("target/avocado-feed-v.repo").is_file());
+        assert!(ext.mounts[0]
+            .0
+            .join("ext/target/avocado-feed-v.repo")
+            .is_file());
         let rootfs = set.materialize(FeedStage::Rootfs).unwrap();
         assert_eq!(rootfs.dnf_args, vec!["--disablerepo=*-target-ext"]);
         assert!(!rootfs.mounts[0]
@@ -1203,7 +1766,10 @@ distro:
             .join("target/avocado-feed-v.repo")
             .exists());
         let sdk = set.materialize(FeedStage::Sdk).unwrap();
-        assert!(!sdk.mounts[0].0.join("host/avocado-feed-v.repo").exists());
+        assert!(!sdk.mounts[0]
+            .0
+            .join("sdk/host/avocado-feed-v.repo")
+            .exists());
     }
 
     #[test]
@@ -1229,7 +1795,8 @@ distro:
         assert_eq!(json, set.canonical_json().unwrap());
         let m = set.materialize(FeedStage::Rootfs).unwrap();
         assert_eq!(m.add_hosts, vec!["host.docker.internal:host-gateway"]);
-        let repo = fs::read_to_string(m.mounts[0].0.join("target/avocado-feed-n.repo")).unwrap();
+        let repo =
+            fs::read_to_string(m.mounts[0].0.join("rootfs/target/avocado-feed-n.repo")).unwrap();
         assert!(repo.contains("password=hunter2"));
         assert!(repo.contains("priority=20"));
     }
@@ -1283,11 +1850,16 @@ distro:
             .unwrap_err()
             .to_string()
             .contains("more than once"));
-        let org = load(&format!("{BASE}repos:\n  acme:\n    org: acme\n"));
-        assert!(ResolvedFeedSet::resolve(&org, "t", Path::new("."), None)
+        // `org:` is supported now, but it is still exactly one locator: naming a
+        // url alongside it is ambiguous about who decides the host, and the mint
+        // is the answer.
+        let both = load(&format!(
+            "{BASE}repos:\n  acme:\n    org: acme\n    url: https://elsewhere\n"
+        ));
+        assert!(ResolvedFeedSet::resolve(&both, "t", Path::new("."), None)
             .unwrap_err()
             .to_string()
-            .contains("Connect"));
+            .contains("exactly one of"));
         let named = load("distro:\n  repo: nope\n");
         assert!(ResolvedFeedSet::resolve(&named, "t", Path::new("."), None)
             .unwrap_err()
@@ -1530,7 +2102,12 @@ distro:
             .unwrap();
         let m = set.materialize(FeedStage::Rootfs).unwrap();
         let read = |n: &str| {
-            fs::read_to_string(m.mounts[0].0.join(format!("target/avocado-feed-{n}.repo"))).unwrap()
+            fs::read_to_string(
+                m.mounts[0]
+                    .0
+                    .join(format!("rootfs/target/avocado-feed-{n}.repo")),
+            )
+            .unwrap()
         };
         let signed = read("signed");
         assert!(
@@ -1538,11 +2115,12 @@ distro:
             "$target expands: {signed}"
         );
         assert!(signed.contains("gpgcheck=1\n") && signed.contains("gpgkey=https://s/KEY\n"));
-        assert!(signed.contains("sslcacert=/run/avocado-feeds/target/avocado-feed-signed.ca.pem\n"));
+        assert!(signed
+            .contains("sslcacert=/run/avocado-feeds/rootfs/target/avocado-feed-signed.ca.pem\n"));
         assert!(signed.contains("sslverify=0\n"));
         assert!(m.mounts[0]
             .0
-            .join("target/avocado-feed-signed.ca.pem")
+            .join("rootfs/target/avocado-feed-signed.ca.pem")
             .is_file());
         assert!(read("plain").contains("gpgcheck=0\n"));
         assert!(

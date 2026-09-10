@@ -4036,12 +4036,89 @@ impl Config {
         };
         self.repos.as_ref()?.get(name)
     }
+}
 
+/// One resolved, minted feed set per invocation, per target.
+///
+/// Resolution is cheap and repeatable; minting is neither. A `.repo` set is
+/// materialized once per stage, but `avocado build` runs many containers, and
+/// re-minting for each one meant five feed tokens for a single build — enough
+/// that a naive per-minute limit on the mint endpoint would refuse an ordinary
+/// build. It also gave every dnf step a different bind mount, which is part of a
+/// container's shape, so sharing a container between steps became impossible
+/// exactly where it saves the most.
+///
+/// The tempdir lives here, so it survives for the whole invocation and is removed
+/// when the process ends. Credentials therefore live as long as the invocation
+/// rather than as long as one step — see `materialize_in` for why that trade is
+/// acceptable and what would invalidate it.
+struct InvocationFeeds {
+    /// Behind a mutex because minting is now per stage: the first stage that
+    /// needs a private feed mints it and later stages reuse the token, so the set
+    /// is mutated after it is shared.
+    set: tokio::sync::Mutex<crate::utils::feeds::ResolvedFeedSet>,
+    root: std::sync::Arc<tempfile::TempDir>,
+}
+
+type FeedCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<InvocationFeeds>>>;
+
+static INVOCATION_FEEDS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedCell>>> =
+    std::sync::OnceLock::new();
+
+/// Get this invocation's feed set for `target`, resolving it once.
+///
+/// One set per target per invocation, and the first caller's set is the one that
+/// wins — every later caller gets it back rather than its own. That is what makes
+/// the invocation coherent: the canonical document, the stamp hash, the mint and
+/// the `.repo` files all describe the same set. Writing the document on every
+/// call while keeping only the first set was the incoherent version — resolution
+/// can move mid-invocation (an on-disk feed's repodata digest, an env-driven
+/// releasever) and the document would then describe a set the build was not
+/// using.
+async fn invocation_feeds(
+    target: &str,
+    set: crate::utils::feeds::ResolvedFeedSet,
+    project_root: &Path,
+) -> Result<std::sync::Arc<InvocationFeeds>> {
+    // The map lock is released before the mint starts; it is held only long enough
+    // to hand out this target's cell. The single-mint guarantee comes from the
+    // per-target `OnceCell`, not from the lock — concurrent callers for the same
+    // target await the same initialization, which matters because `sdk install`
+    // runs the rootfs and initramfs installs at once. A different target is never
+    // blocked behind someone else's network call.
+    let map = INVOCATION_FEEDS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let cell = {
+        let mut guard = map.lock().await;
+        guard.entry(target.to_string()).or_default().clone()
+    };
+    cell.get_or_try_init(|| async {
+        // The canonical document describes the set this invocation adopted, so it
+        // is written here, where that set is decided, and not by the caller.
+        set.write_canonical(project_root)?;
+        // No minting here any more: it is per stage, and this cell is per target.
+        let root = std::sync::Arc::new(
+            tempfile::Builder::new()
+                .prefix("avocado-feeds-")
+                .tempdir()
+                .context("creating the invocation's feeds directory")?,
+        );
+        Ok(std::sync::Arc::new(InvocationFeeds {
+            set: tokio::sync::Mutex::new(set),
+            root,
+        }))
+    })
+    .await
+    .cloned()
+}
+
+impl Config {
     /// Resolve, record, and materialize the named feeds for one container run.
-    /// `None` when the project declares no feeds — the zero-cost path. Writes
-    /// the canonical document to `<config_dir>/.avocado/feeds/<target>.json`
-    /// every time so the build cache always sees the current set.
-    pub fn materialize_feeds(
+    /// `None` when the project declares no feeds — the zero-cost path. The first
+    /// call for a target writes the canonical document to
+    /// `<config_dir>/.avocado/feeds/<target>.json` and pins that set for the rest
+    /// of the invocation; later calls reuse it, so the document and the build
+    /// cannot describe different sets.
+    pub async fn materialize_feeds(
         &self,
         target: &str,
         stage: crate::utils::feeds::FeedStage,
@@ -4060,8 +4137,15 @@ impl Config {
         else {
             return Ok(None);
         };
-        set.write_canonical(&project_root)?;
-        Ok(Some(set.materialize(stage)?))
+        // The canonical document is written inside `invocation_feeds`, before the
+        // mint, so it records what the build depended on (`connect:<org>`) and
+        // never the short-lived token or the host it was served from today.
+        let shared = invocation_feeds(target, set, &project_root).await?;
+        // Mint inside the lock: two stages starting at once must not both mint the
+        // same feed, and the second must see the first one's token.
+        let mut guard = shared.set.lock().await;
+        guard.resolve_connect_credentials(stage).await?;
+        Ok(Some(guard.materialize_in(stage, &shared.root)?))
     }
 
     /// Promote config-file repo TLS settings to the process env so the container
