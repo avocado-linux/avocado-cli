@@ -1,3 +1,4 @@
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -75,6 +76,7 @@ impl RuntimeDnfCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.materialize_feeds(&target, FeedStage::Runtime, &self.config_path)?;
 
         self.execute_dnf_command(
             parsed,
@@ -82,6 +84,7 @@ impl RuntimeDnfCommand {
             &target,
             repo_url.as_ref(),
             repo_release.as_ref(),
+            feeds.as_ref(),
             &merged_container_args,
         )
         .await
@@ -132,6 +135,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let container_helper = SdkContainer::new();
@@ -144,6 +148,7 @@ impl RuntimeDnfCommand {
             target,
             repo_url,
             repo_release,
+            feeds,
             merged_container_args,
         )
         .await?;
@@ -157,6 +162,7 @@ impl RuntimeDnfCommand {
             &dnf_command,
             repo_url,
             repo_release,
+            feeds,
             merged_container_args,
         )
         .await
@@ -171,6 +177,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let check_cmd = format!("test -d $AVOCADO_PREFIX/runtimes/{}", self.runtime);
@@ -183,6 +190,7 @@ impl RuntimeDnfCommand {
             source_environment: false, // don't source environment
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -198,6 +206,7 @@ impl RuntimeDnfCommand {
                 target,
                 repo_url,
                 repo_release,
+                feeds,
                 merged_container_args,
             )
             .await?;
@@ -214,6 +223,7 @@ impl RuntimeDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         let setup_cmd = format!(
@@ -229,6 +239,7 @@ impl RuntimeDnfCommand {
             source_environment: false, // don't source environment
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -264,6 +275,7 @@ impl RuntimeDnfCommand {
         dnf_command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         if self.verbose {
@@ -281,6 +293,7 @@ impl RuntimeDnfCommand {
             source_environment: true, // source environment for DNF
             interactive: true,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),

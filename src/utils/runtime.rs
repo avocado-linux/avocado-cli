@@ -218,6 +218,7 @@ mod tests {
             default_target_board: None,
             supported_targets: None,
             src_dir: None,
+            repos: None,
             distro: None,
             runtimes: None,
             default_runtime: None,

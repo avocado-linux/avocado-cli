@@ -113,8 +113,9 @@ fn releasever_is_overridden(config: &Config) -> bool {
     let distro_override = config
         .distro
         .as_ref()
-        .and_then(|d| d.repo.as_ref())
+        .and_then(|d| d.repo_inline())
         .and_then(|r| r.releasever.as_ref())
+        .or_else(|| config.distro_feed_def().and_then(|d| d.releasever.as_ref()))
         .is_some();
     let sdk_override = config
         .sdk
@@ -127,9 +128,22 @@ fn releasever_is_overridden(config: &Config) -> bool {
 /// Build an HTTP client honoring the repo's CA bundle / insecure setting,
 /// matching the TLS posture dnf uses for the same endpoint.
 fn build_client(config: &Config) -> Result<reqwest::Client> {
+    // Snapshot resolution reaches the feed on its own, not through
+    // `ResolvedFeedSet`, so the credentials-in-the-URL rule has to be enforced
+    // here too or it is enforced only on the path that happens to run first.
+    // This one persists: the resolved URL is recorded in the lock as
+    // `repo-snapshot.repo_url`, and it reaches error contexts, so a userinfo
+    // URL would put a password in a file people commit and in the output.
+    if crate::utils::feeds::url_has_userinfo(&config.effective_repo_url()) {
+        anyhow::bail!(
+            "the distro feed URL carries credentials in the URL — put them in \
+             `username`/`password` on a named feed instead. A URL is recorded in \
+             the lock's snapshot pin, the canonical document and dnf's logs."
+        );
+    }
     let mut builder = reqwest::ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent(concat!("avocado-cli/", env!("CARGO_PKG_VERSION")));
+        .user_agent(crate::utils::feeds::user_agent());
     if config.get_repo_insecure() {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -352,6 +366,26 @@ pub async fn resolve_and_apply_for(config: &Config, config_path: &str, target: &
 
 #[cfg(test)]
 mod tests {
+
+    /// Snapshot resolution reaches the feed without going through
+    /// `ResolvedFeedSet`, so it needs its own copy of the no-credentials-in-the-URL
+    /// rule. This one is the worse leak of the two: the resolved URL is written
+    /// into the lock as `repo-snapshot.repo_url`, a file people commit.
+    #[test]
+    fn the_snapshot_client_refuses_credentials_in_the_repo_url() {
+        let load =
+            |yaml: &str| -> super::Config { serde_yaml::from_str(yaml).expect("yaml parses") };
+        let with = load(
+            "distro:\n  release: 2026\n  channel: next\n  repo:\n    url: https://u:p@repo.example\n",
+        );
+        let err = super::build_client(&with).unwrap_err().to_string();
+        assert!(err.contains("credentials in the URL"), "{err}");
+
+        let without = load(
+            "distro:\n  release: 2026\n  channel: next\n  repo:\n    url: https://repo.example\n",
+        );
+        assert!(super::build_client(&without).is_ok());
+    }
     use super::*;
 
     fn snap(release: &str, channel: &str, id: &str) -> RepoSnapshot {
