@@ -291,13 +291,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typo silently dating every document to 1970 is worse than one that is honestly
   not reproducible.
 
-  The command never transmits the document. It writes the file and, with `-o`,
+  `avocado sbom` itself never transmits the document — `avocado connect
+  upload` does, see its entry below. The command writes the file and, with `-o`,
   points at <https://tools.spdx.org/app/validate/> for anyone who wants the
   reference SPDX tools' verdict, along with the reason to think first: that
   service stores every upload and serves it back without authentication for
   about ten days, and an SBOM is a component inventory of a shipped product.
   Whether a given document can be published is the operator's call, on a
   document they can read first.
+- **`avocado sbom` now emits a `software_Sbom` per runtime and per extension,
+  not only one for the whole device.** (ENG-2219) Connect needs something
+  narrower than "everything on the device" to ingest, and each SBOM now says
+  whether it describes what is running or what was built.
+
+  More elements in the one existing document rather than a file each, for the
+  same reason `avocado sbom` already writes one document: a package in both
+  `rootfs` and a runtime is one package in two places, and a scanner unioning
+  files would count it twice. A runtime's SBOM roots itself, `rootfs`,
+  `initramfs`, the shared `includes` root and every extension it carries; every
+  extension gets one of its own as well, including a legacy `ext:<name>` and a
+  remote `includes:<name>` — neither names a runtime, so no runtime's SBOM
+  claims them. A nested-layout remote extension is the other way round: it
+  installs into the shared `includes` root and keeps no database of its own, so
+  it appears under that one name or nowhere, and every runtime claims it rather
+  than none. With
+  `--include-sdk` the build-host scopes get one too, typed `build` rather than
+  `deployed`. Nothing mints new elements: the added lists only reference ids
+  the device-wide document already emits. A group whose own defining scope is
+  empty is left out, since a document named for it would name nothing.
+
+  The pre-existing device-wide `software_Sbom` is unchanged apart from the
+  same plain-language `comment`, and is still the first in `@graph`.
+- **`avocado connect upload` attaches the uploaded runtime's own SBOM to the
+  create-runtime request.** (ENG-2219) The runtime-scoped slice of the same
+  document is sent as `runtime.sbom` on `POST .../runtimes`; `RuntimeParams`
+  carries no runtime name for a server to scope an unfiltered one by. Its root
+  element is named for the runtime rather than the device, and a runtime that
+  installed no packages of its own sends no SBOM at all — the slice still holds
+  `rootfs`, so such a document would name the runtime and describe only the
+  base system.
+
+  Never allowed to fail the upload. Building it is best-effort: any error
+  warns and the field is left off, so a server that does not read it yet
+  (ENG-2284) sees today's request unchanged. If the server refuses the call
+  in a way that means this body was refused, the upload retries once without
+  it — gated on the status, via a new `HttpStatus` error type, rather than on
+  message text. That is `400` and `413`, not any 4xx: the likeliest refusal is
+  `413 Payload Too Large`, since ~400 packages of SPDX is megabytes into a body
+  that is otherwise kilobytes, while `401`, `403`, `409`, `422` and `429` are
+  ordinary outcomes of this API that a smaller body does not fix. A body
+  refused mid-write carries no status at all — a proxy over its size cap can
+  close the connection rather than answer — so a transport error on the send
+  counts too, but a decode or timeout error does not, since the runtime may
+  already exist by then. Both notices use
+  `print_warning_above`, since `print_warning` is suppressed under
+  `--output json` — the one path where a silently SBOM-less upload would go
+  unnoticed. The scan's own incomplete-read warnings take the same route, so an
+  SBOM short a package raises a `warning` event on the NDJSON stream instead of
+  only on stderr. The `--file` host path never builds one: that tarball may have
+  been built elsewhere. `AVOCADO_UPLOAD_NO_SBOM=1` skips the build.
 
 ### Changed
 - **`avocado vm update` migrates state instead of destroying it.** A version
