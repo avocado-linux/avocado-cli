@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
 
+### Added
+- **`avocado build` produces the deployable set *and* the OTA payload;
+  `avocado provision` builds the var image.** *(Breaking: `build` no longer
+  produces the var image.)* The split is by consumer: anything an OTA requires
+  is at the tail of `runtime build`, anything only provisioning consumes is at
+  the start of `provision`.
+
+  So the build tail keeps the `avocado-build-<target>` hook, `stone bundle`, the
+  `os_bundle` manifest patch and the re-sign after it. On UKI platforms that hook
+  *is* the kernel and initramfs, and `os-bundle.aos` is the OTA payload — not a
+  provisioning artifact. Verified that no provisioning script reads the bundle:
+  `avocado-provision-<target>` and the UFS flow both inject raw images.
+
+  `provision` builds the var image and primes Docker into it, which is all that
+  is genuinely provisioning-only. A pipeline that runs `avocado build` and then
+  flashes will find no var image; run `avocado provision`, which produces it.
+
+  `stone bundle` needs a var partition size because platform manifests declare
+  `var` as `expand: "true"` with no size, and it fails hard without the
+  `--partition-size` override. The var image does not exist at build time, so the
+  size is declared from the staged tree with headroom. That number reaches only
+  the bundle, an OTA never repartitions, and the partition expands at provision
+  time — but if a provision-from-bundle path is ever added it becomes real and
+  must come from the image.
+
+  The two halves live in `commands/runtime/var_image.rs` behind one context,
+  which is the set of things a portable provisioning bundle has to carry — what a
+  later `avocado provision --bundle <path>` would source from a bundle.
+
 ## [1.0.0-rc.3] - 2026-09-01
 
 ### Added
