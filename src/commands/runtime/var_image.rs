@@ -396,6 +396,35 @@ STONE_OVERLAY_FLAG=""
 # Optional: absent or a no-op on every target that needs nothing extra. Invoked
 # by absolute path with the SDK's bin on PATH because the hook shells out to
 # nativesdk tools (jq, mkbootimg) that are not otherwise on PATH here.
+# Declare the var partition for the build hook.
+#
+# The hook runs `stone validate` and `stone create` over the WHOLE manifest, and
+# every platform manifest names a `var` image -- but this PR moved the real var
+# image to `provision`, so at this point the file does not exist and validation
+# stops:
+#
+#   [ERROR] Validation failed. 1 file(s) not found:
+#     device: rootdisk, image: var
+#
+# A derived manifest with `var` removed does not work: the partition is
+# `expand: "true"` with no `size`, stone still needs a size, and the hook passes
+# no --partition-size of its own, so the layout could differ between
+# `stone create` and `stone provision`.
+#
+# A sparse placeholder at the declared size lets the hook resolve the partition
+# and set its size, while the costly work -- docker priming, subvolumes,
+# mkfs.btrfs -- stays in provision. `provision` overwrites this file with the
+# real image before stone reads it for content (see create_provision_script).
+#
+# The -f guard matters: a `provision` in the same project leaves a real var
+# image at this path, and truncating it back to sparse zeros would put an
+# unmountable /var on the device.
+STONE_VAR_PLACEHOLDER="$STONE_INPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+if [ ! -f "$STONE_VAR_PLACEHOLDER" ]; then
+    mkdir -p "$STONE_INPUT_DIR"
+    truncate -s "$STONE_VAR_SIZE" "$STONE_VAR_PLACEHOLDER"
+fi
+
 AVOCADO_BUILD_HOOK="$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH"
 if [ -x "$AVOCADO_BUILD_HOOK" ]; then
     echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$RUNTIME_NAME'."
@@ -819,6 +848,39 @@ extensions:
 
     /// Both halves must parse. Cutting one script into two is exactly how an
     /// unbalanced `if` or a stranded heredoc ships.
+    #[test]
+    fn the_ota_half_declares_a_var_placeholder_before_the_build_hook() {
+        // render_both returns (var, ota) -- the OTA tail is .1
+        let (_var, ota) = render_both("", &[]);
+
+        let placeholder = ota
+            .find("STONE_VAR_PLACEHOLDER=")
+            .expect("OTA tail must declare a var placeholder");
+        let hook = ota
+            .find("AVOCADO_BUILD_HOOK=")
+            .expect("OTA tail must invoke the platform build hook");
+
+        // Order is the point: the hook runs `stone validate` over a manifest
+        // that names `var`, so the file has to exist before it runs.
+        assert!(
+            placeholder < hook,
+            "the var placeholder must be created BEFORE the build hook"
+        );
+
+        // The path must be the one `provision` later overwrites with the real
+        // image. If these drift, the device gets a sparse file full of zeros.
+        assert!(ota.contains(
+            r#"STONE_VAR_PLACEHOLDER="$STONE_INPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs""#
+        ));
+
+        // Sparse, at the size stone bundle is already told about.
+        assert!(ota.contains(r#"truncate -s "$STONE_VAR_SIZE" "$STONE_VAR_PLACEHOLDER""#));
+
+        // Guarded on absence: a provision in the same project leaves a REAL
+        // var image here, and truncating it back would unmount /var on boot.
+        assert!(ota.contains(r#"if [ ! -f "$STONE_VAR_PLACEHOLDER" ]; then"#));
+    }
+
     #[test]
     fn both_halves_are_valid_bash() {
         let dir = TempDir::new().unwrap();
