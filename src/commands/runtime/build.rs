@@ -625,6 +625,24 @@ impl RuntimeBuildCommand {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
 
+        // Kernel command line, for the platform build hook.
+        //
+        // Exported at BUILD time, not just provision time, because a target
+        // whose boot path is a Unified Kernel Image has to bake the command
+        // line into the UKI -- and that UKI must exist before `stone bundle`
+        // if it is to be a manifest artifact, hence OTA-updatable and
+        // uploadable, rather than something only a physical reflash can
+        // change. See `effective_kernel_cmdline` for the runtime-over-
+        // top-level precedence.
+        let (kernel_cmdline, kernel_cmdline_extra) =
+            config.effective_kernel_cmdline(Some(&self.runtime_name));
+        if let Some(cmdline) = kernel_cmdline {
+            env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
+        }
+        if let Some(extra) = kernel_cmdline_extra {
+            env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
+        }
+
         // Reproducibility stamp. This run executes the rootfs and initramfs
         // image sections, so one insert covers both. Extension images are NOT
         // built here -- this run only copies their pre-built artifacts, and
