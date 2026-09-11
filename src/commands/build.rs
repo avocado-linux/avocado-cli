@@ -169,7 +169,7 @@ impl BuildCommand {
             );
         }
         let required_extensions =
-            self.find_required_extensions(config, parsed, &runtimes_to_build, &target)?;
+            self.find_required_extensions(config, parsed, &composed, &runtimes_to_build, &target)?;
 
         // Pre-flight: verify dependencies are installed before drawing the
         // task list.  This gives the user a clear "run avocado install" message
@@ -511,6 +511,7 @@ impl BuildCommand {
         &self,
         config: &Config,
         parsed: &serde_yaml::Value,
+        composed: &ComposedConfig,
         runtimes: &[String],
         target: &str,
     ) -> Result<Vec<ExtensionDependency>> {
@@ -537,6 +538,19 @@ impl BuildCommand {
             }
         }
 
+        // Expand `depends_on` once for this target. Built from the composed
+        // config, the same way runtime/build.rs builds it for AVOCADO_EXT_LIST.
+        //
+        // Without this, an extension reached only through `depends_on` gets a
+        // sysroot from `install` (which DOES walk the closure, see
+        // commands/install.rs) and then never gets an `ext build`/`ext image`
+        // task here -- so no .raw is produced, nothing names it in the runtime
+        // manifest, and it never merges on the device. Observed as a board
+        // missing its core-kit firmware while `avocado install` had plainly
+        // reported "ext install avocado-bsp-rb3gen2".
+        let dep_graph =
+            crate::utils::ext_deps::DependencyGraph::from_composed(composed, target).ok();
+
         for runtime_name in runtimes {
             // Get merged runtime config for this target
             let merged_runtime =
@@ -546,11 +560,30 @@ impl BuildCommand {
                 if let Some(extensions) =
                     merged_value.get("extensions").and_then(|e| e.as_sequence())
                 {
-                    for ext in extensions {
-                        if let Some(spec) =
-                            crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext)
+                    let authored: Vec<String> = extensions
+                        .iter()
+                        .filter_map(
+                            crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry,
+                        )
+                        .map(|spec| {
+                            crate::utils::interpolation::interpolate_name(&spec.name, target)
+                        })
+                        .collect();
+
+                    // The closure, or the authored list unchanged if the graph
+                    // could not be built -- a malformed `depends_on` is the
+                    // resolver's error to report, not a reason to build nothing.
+                    let names: Vec<String> = match dep_graph.as_ref() {
+                        Some(graph) => match graph.resolve(&authored) {
+                            Ok(closure) => closure.order,
+                            Err(_) => authored.clone(),
+                        },
+                        None => authored.clone(),
+                    };
+
+                    for ext_name in &names {
                         {
-                            let ext_name = spec.name.as_str();
+                            let ext_name = ext_name.as_str();
                             // Check if this extension has a source: field (remote extension)
                             if let Some(Some(source)) = ext_sources.get(ext_name) {
                                 // Remote extension with source field
@@ -959,5 +992,85 @@ mod tests {
         assert_eq!(cmd.target, None);
         assert_eq!(cmd.container_args, None);
         assert_eq!(cmd.dnf_args, None);
+    }
+
+    /// A `depends_on`-only extension must still get an `ext build`/`ext image`
+    /// task.
+    ///
+    /// Regression: `find_required_extensions` used to read only the runtime's
+    /// authored `extensions:` array. An extension reached solely through
+    /// `depends_on` therefore got a sysroot from `install` (which walks the
+    /// closure) but no image, so nothing named it in the runtime manifest and
+    /// it never merged on the device -- a board came up missing its core-kit
+    /// firmware while `avocado install` had reported installing it.
+    #[test]
+    fn a_depends_on_only_extension_is_still_built() {
+        use std::io::Write;
+
+        let yaml = r#"
+default_target: rb3gen2
+supported_targets:
+  - rb3gen2
+runtimes:
+  rt:
+    target-rb3gen2:
+      extensions:
+        - bsp-variant
+extensions:
+  bsp-core:
+    version: "1.0.0"
+    packages: { a: '*' }
+  bsp-variant:
+    version: "1.0.0"
+    depends_on:
+      - bsp-core
+    packages: { b: '*' }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let composed =
+            Config::load_composed_with_board(path.to_str().unwrap(), Some("rb3gen2"), None)
+                .expect("config composes");
+
+        let cmd = BuildCommand::new(
+            path.to_str().unwrap().to_string(),
+            false,
+            None,
+            None,
+            Some("rb3gen2".to_string()),
+            None,
+            None,
+        );
+
+        let found = cmd
+            .find_required_extensions(
+                &composed.config,
+                &composed.merged_value,
+                &composed,
+                &["rt".to_string()],
+                "rb3gen2",
+            )
+            .expect("resolves");
+
+        let names: Vec<&str> = found
+            .iter()
+            .map(|e| match e {
+                ExtensionDependency::Local(n) => n.as_str(),
+                ExtensionDependency::Remote { name, .. } => name.as_str(),
+            })
+            .collect();
+
+        assert!(
+            names.contains(&"bsp-variant"),
+            "the authored extension must be built: {names:?}"
+        );
+        assert!(
+            names.contains(&"bsp-core"),
+            "the depends_on-only extension must ALSO be built, or it never \
+             reaches the device: {names:?}"
+        );
     }
 }
