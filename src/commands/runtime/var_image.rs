@@ -456,6 +456,7 @@ stone bundle \
 # The btrfs image for provisioning doesn't need os_bundle — initial flash doesn't OTA.
 # Connect upload reads from var-staging directly, so it sees this update.
 python3 << 'PYEOF'
+{link_or_copy}
 import json, hashlib, uuid, os, shutil
 
 aos_path = os.environ.get("STONE_AOS_OUTPUT", "")
@@ -477,7 +478,7 @@ with open(aos_path, "rb") as f:
 aos_sha256 = aos_h.hexdigest()
 aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
 dest = os.path.join(images_dir, aos_image_id + ".raw")
-shutil.copy2(aos_path, dest)
+link_or_copy(aos_path, dest)
 print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
 
 with open(manifest_path, "r") as f:
@@ -527,6 +528,7 @@ PYEOF
 sign_amf "$AVOCADO_MANIFEST_PATH"
 "#,
         device_tree_overlay_section = r.device_tree_overlay_section,
+        link_or_copy = crate::commands::runtime::build::LINK_OR_COPY_PY,
     ))
 }
 

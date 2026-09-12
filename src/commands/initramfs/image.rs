@@ -179,7 +179,10 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     # the parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
     mkdir -p "$(dirname "$INITRAMFS_WORK")"
     rm -rf "$INITRAMFS_WORK"
-    cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
+    # --reflink=auto: a CoW clone where the filesystem supports one (btrfs, xfs),
+    # a plain copy elsewhere. The work copy is mutated below, so it must not be
+    # a hardlink; reflink gives the isolation of a copy without paying for one.
+    cp -a --reflink=auto "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
 {permissions_section}
 
 {post_install_block}

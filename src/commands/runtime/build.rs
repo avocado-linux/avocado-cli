@@ -27,6 +27,29 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Python helper spliced into the build script's manifest and os_bundle blocks:
+/// places an image under `lib/avocado/images/` by hardlink, falling back to a
+/// copy. Every image already lives on the same volume as var-staging, the
+/// destination name is content-addressed, and nothing edits these files in
+/// place, so a link is a copy that costs no I/O. Brace-free on purpose — it
+/// is interpolated into `format!` strings.
+pub(crate) const LINK_OR_COPY_PY: &str = r#"def link_or_copy(src, dst):
+    # Same name means same bytes by construction, but an interrupted earlier
+    # build can leave a short file under the right name; replace, never trust.
+    if os.path.lexists(dst):
+        os.remove(dst)
+    # Link the file, not a symlink to it. The kernel is staged as
+    # kernel/<kver>/Image -> bzImage-<kver>, a relative symlink; whether os.link
+    # follows that depends on the platform's python, and a hard link to the
+    # symlink lands in images/ as a dangling relative link. copy2 followed it;
+    # so must this.
+    real = os.path.realpath(src)
+    try:
+        os.link(real, dst)
+    except OSError:
+        shutil.copy2(real, dst)
+"#;
+
 pub struct RuntimeBuildCommand {
     runtime_name: String,
     config_path: String,
@@ -1041,20 +1064,10 @@ SIZE=$(stat -c '%s' "$MANIFEST_FILE")
 echo -n '{{"name":"manifest.json","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
 FIRST=false
 
-# Hash all image files (content-addressable by UUIDv5) — .raw and .kab
-if [ -d "$IMAGES_DIR" ]; then
-    for IMG_FILE in "$IMAGES_DIR"/*.raw "$IMAGES_DIR"/*.kab; do
-        [ -f "$IMG_FILE" ] || continue
-        BASENAME=$(basename "$IMG_FILE")
-        HASH=$(sha256sum "$IMG_FILE" | awk '{{print $1}}')
-        SIZE=$(stat -c '%s' "$IMG_FILE")
-        if [ "$FIRST" = "false" ]; then
-            echo -n ','
-        fi
-        echo -n '{{"name":"'"$BASENAME"'","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
-        FIRST=false
-    done
-fi
+# Image entries (.raw and .kab), read from the manifest rather than re-hashed —
+# see manifest_image_targets_snippet. Every entry is comma-prefixed; the
+# manifest.json entry above is always first.
+{image_targets}
 
 echo -n ']'
 
@@ -1070,6 +1083,8 @@ echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
 echo -n '}}'
 "#,
             runtime_name = self.runtime_name,
+            image_targets =
+                crate::utils::update_repo::manifest_image_targets_snippet(&["raw", "kab"]),
         )
     }
 
@@ -1502,13 +1517,13 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                         copy_commands.push(format!(
                             r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
-    cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
+    cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
     echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
     # dm-verity sidecars (image.verity: true): hash tree + root hash travel with
     # the image; stale ones from an earlier build never survive here.
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
-        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
     done
 fi"#
                         ));
@@ -1525,11 +1540,11 @@ fi"#
                     copy_commands.push(format!(
                         r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
-    cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
+    cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
     echo "  Copied: {versioned_name}.raw"
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
-        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
     done
 else
     echo "ERROR: Extension image not found: $AVOCADO_PREFIX/output/extensions/{versioned_name}.raw"
@@ -1542,11 +1557,11 @@ fi"#
 EXT_FILE=$(ls "$AVOCADO_PREFIX/output/extensions/{ext_name}"-*.raw 2>/dev/null | head -n 1)
 if [ -n "$EXT_FILE" ]; then
     EXT_BASENAME=$(basename "$EXT_FILE")
-    cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
+    cp -f --reflink=auto "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
-        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
+        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f --reflink=auto "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
     done
 fi"#
                     ));
@@ -1815,6 +1830,7 @@ SIGNEOF
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
 import json, hashlib, uuid, os, shutil, struct, sys
+{link_or_copy}
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1894,7 +1910,7 @@ for pair in ext_pairs:
     size = os.path.getsize(img_file)
     image_id = str(uuid.uuid5(namespace, sha256))
     dest = os.path.join(images_dir, image_id + ext_suffix)
-    shutil.copy2(img_file, dest)
+    link_or_copy(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
     # dm-verity, driven by the configured flag (never by sidecar presence): the
@@ -1910,7 +1926,7 @@ for pair in ext_pairs:
         if not (os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash")):
             sys.exit("ERROR: extension " + name + "-" + version + " has image.verity: true but its hash tree "
                      "(.verity/.roothash) is missing next to " + img_file + " - rebuild it with `avocado ext image`")
-        shutil.copy2(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
+        link_or_copy(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
         with open(base + ".roothash") as rf:
             entry["root_hash"] = rf.read().strip()
         print("  Verity: " + name + "-" + version + " root hash " + entry["root_hash"][:16] + "...")
@@ -1936,7 +1952,7 @@ def add_image_entry(img_path, version, image_type):
     image_id = str(uuid.uuid5(namespace, sha256))
     suffix = ".kab" if image_type == "kab" else ".raw"
     dest = os.path.join(images_dir, image_id + suffix)
-    shutil.copy2(img_path, dest)
+    link_or_copy(img_path, dest)
     print("  Image: " + os.path.basename(img_path) + " -> " + image_id + suffix)
     entry = dict(version=version, image_id=image_id, sha256=sha256)
     if image_type == "kab":
@@ -2066,6 +2082,7 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             rootfs_image_type = rootfs_image_type,
             initramfs_image_type = initramfs_image_type,
             kernel_image_type = kernel_image_type,
+            link_or_copy = LINK_OR_COPY_PY,
         );
 
         // Generate update authority (root.json) for verified updates.
@@ -3855,6 +3872,124 @@ runtimes:
         assert!(script.contains("echo \"luks2\" > \"$INITRAMFS_WORK/etc/avocado/var-encrypt\""));
         // The marker lives in the runtime's initramfs work copy, never the shared sysroot.
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
+    }
+
+    /// The staging copy into `lib/avocado/images/` is a hardlink — one inode,
+    /// no second write — and an existing file under the content-addressed
+    /// name is replaced rather than trusted, so a short file left by an
+    /// interrupted build cannot survive into the next one.
+    #[cfg(unix)]
+    #[test]
+    fn link_or_copy_hardlinks_and_replaces_a_stale_destination() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.raw");
+        let dst = dir.path().join("dst.raw");
+        std::fs::write(&src, b"image bytes").unwrap();
+        std::fs::write(&dst, b"short").unwrap(); // the interrupted-build case
+
+        let script = format!(
+            "import os, shutil, sys\n{LINK_OR_COPY_PY}\nlink_or_copy(sys.argv[1], sys.argv[2])\n"
+        );
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(&src)
+            .arg(&dst)
+            .status()
+            .expect("python3 on PATH");
+        assert!(status.success());
+
+        let (a, b) = (
+            std::fs::metadata(&src).unwrap(),
+            std::fs::metadata(&dst).unwrap(),
+        );
+        assert_eq!(a.ino(), b.ino(), "same inode: a link, not a copy");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"image bytes",
+            "stale dst replaced"
+        );
+
+        // A symlink source — the kernel's `Image -> bzImage-<kver>` — must
+        // produce a link to the target file, never a copy of the symlink: a
+        // relative link relocated into images/ dangles, and the manifest
+        // hashed the target's bytes.
+        let link = dir.path().join("Image");
+        std::os::unix::fs::symlink("src.raw", &link).unwrap();
+        let dst2 = dir.path().join("kernel.raw");
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(&link)
+            .arg(&dst2)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let m = std::fs::symlink_metadata(&dst2).unwrap();
+        assert!(
+            !m.file_type().is_symlink(),
+            "linked the target, not the symlink"
+        );
+        assert_eq!(m.ino(), a.ino(), "same inode as the real file");
+    }
+
+    /// The build script stages images by link and clones its work trees, so
+    /// no full image byte is copied that the filesystem could share instead.
+    #[test]
+    fn build_script_links_images_and_reflinks_copies() {
+        let temp_dir = TempDir::new().unwrap();
+        let content = r#"
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+"#;
+        let config_path = create_test_config_file(&temp_dir, content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &["test-ext-1.0.0".to_string()])
+            .unwrap();
+
+        // Four image stagings: three in the manifest block, one for the
+        // os_bundle. The os_bundle one is rendered in from `var_image`'s OTA
+        // half, which is part of this script — the helper is spliced into both
+        // python blocks, hence two definitions.
+        assert_eq!(
+            script.matches("link_or_copy(").count(),
+            4 + 2,
+            "3 + 1 calls, 2 defs"
+        );
+        assert!(
+            !script.contains("shutil.copy2(img_file"),
+            "no plain copy remains"
+        );
+        assert!(script.contains("cp -a --reflink=auto \"$ROOTFS_SYSROOT\""));
+        assert!(script.contains("cp -a --reflink=auto \"$INITRAMFS_SYSROOT\""));
+        assert!(script.contains("cp -f --reflink=auto \"$AVOCADO_PREFIX/output/extensions/"));
+        // The hash collection reads the manifest instead of re-hashing.
+        let hashes = cmd.create_hash_collection_script();
+        assert!(hashes.contains("TARGETS_PY"));
+        assert!(!hashes.contains("sha256sum \"$IMG_FILE\""));
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other

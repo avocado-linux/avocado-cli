@@ -333,9 +333,138 @@ pub struct HashCollectionOutput {
     pub runtime_uuid: String,
 }
 
+/// Shell that appends the image entries of a hash-collection JSON array —
+/// `,{"name":…,"sha256":…,"size":…}` per image — by reading them out of the
+/// runtime manifest instead of re-hashing every image on disk.
+///
+/// The manifest already carries a `sha256` for every image it names, computed
+/// over the same file (the build hardlinks images into `images/` by
+/// content-addressed name, so entry and file are one inode). Re-running
+/// `sha256sum` over the directory was a second full pass over every image byte
+/// for a value already in hand. `size` still comes from `stat`, since the
+/// manifest records it only for kos runtimes.
+///
+/// `suffixes` selects which image kinds to emit — `["raw"]` matches a caller
+/// that publishes only `.raw` files, `["raw", "kab"]` one that publishes both.
+/// A manifest entry whose file is absent from `images/` is an error, not a
+/// silent omission: after the build's stale-image GC the directory and the
+/// manifest agree by construction, so a mismatch is a broken build.
+///
+/// Expects `$MANIFEST_FILE` and `$IMAGES_DIR` set by the caller, and emits
+/// with a leading comma on every entry — the caller has already written the
+/// `manifest.json` entry first. Brace-free so it drops into `format!` bodies.
+pub fn manifest_image_targets_snippet(suffixes: &[&str]) -> String {
+    let suffixes = suffixes.join(",");
+    format!(
+        r#"python3 - "$MANIFEST_FILE" "$IMAGES_DIR" "{suffixes}" <<'TARGETS_PY'
+import json, os, sys
+manifest_path, images_dir, suffixes = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+m = json.load(open(manifest_path))
+out = []
+def add(entry):
+    sfx = "kab" if entry.get("image_type") == "kab" else "raw"
+    if sfx not in suffixes:
+        return
+    name = entry["image_id"] + "." + sfx
+    path = os.path.join(images_dir, name)
+    if not os.path.isfile(path):
+        sys.exit("ERROR: manifest names " + name + " but it is not present in " + images_dir)
+    out.append(dict(name=name, sha256=entry["sha256"], size=os.path.getsize(path)))
+for e in m.get("extensions", []):
+    add(e)
+for key in ("rootfs", "initramfs", "kernel", "os_bundle"):
+    if m.get(key):
+        add(m[key])
+sys.stdout.write("".join("," + json.dumps(x, separators=(",", ":")) for x in out))
+TARGETS_PY"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the snippet the way the build script does: `$MANIFEST_FILE` and
+    /// `$IMAGES_DIR` in the environment, output captured. Returns
+    /// (exit-ok, stdout, stderr).
+    #[cfg(unix)]
+    fn run_snippet(
+        dir: &std::path::Path,
+        manifest: &serde_json::Value,
+        files: &[&str],
+        suffixes: &[&str],
+    ) -> (bool, String, String) {
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        for f in files {
+            std::fs::write(images.join(f), f.as_bytes()).unwrap();
+        }
+        let manifest_path = dir.join("manifest.json");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(manifest_image_targets_snippet(suffixes))
+            .env("MANIFEST_FILE", &manifest_path)
+            .env("IMAGES_DIR", &images)
+            .output()
+            .expect("bash and python3 on PATH");
+        (
+            out.status.success(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    }
+
+    /// The manifest's own sha256 is what gets emitted — no re-hash — and the
+    /// suffix filter decides which image kinds a caller publishes.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_image_targets_read_hashes_from_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"image_id": "aaa", "sha256": "e1"},
+                {"image_id": "bbb", "sha256": "e2", "image_type": "kab"}
+            ],
+            "rootfs": {"image_id": "ccc", "sha256": "r1"},
+            "os_bundle": {"image_id": "ddd", "sha256": "o1"}
+        });
+        let files = ["aaa.raw", "bbb.kab", "ccc.raw", "ddd.raw"];
+
+        let (ok, out, err) = run_snippet(dir.path(), &manifest, &files, &["raw", "kab"]);
+        assert!(ok, "{err}");
+        // Every entry is comma-prefixed so it appends to a list already
+        // holding the manifest.json entry; wrap to parse.
+        let parsed: serde_json::Value = serde_json::from_str(&format!("[0{out}]")).unwrap();
+        let entries = &parsed.as_array().unwrap()[1..];
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["aaa.raw", "bbb.kab", "ccc.raw", "ddd.raw"]);
+        // sha256 comes straight from the manifest; size from the file.
+        assert_eq!(entries[1]["sha256"], "e2");
+        assert_eq!(entries[1]["size"], "bbb.kab".len());
+
+        // A `.raw`-only publisher never sees the kab.
+        let (ok, out, _) = run_snippet(dir.path(), &manifest, &files, &["raw"]);
+        assert!(ok);
+        assert!(out.contains("aaa.raw") && !out.contains("bbb.kab"));
+    }
+
+    /// A manifest entry with no file behind it is a broken build, and must
+    /// fail the hash collection rather than quietly publish a shorter list.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_image_targets_refuse_a_missing_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "extensions": [{"image_id": "aaa", "sha256": "e1"}]
+        });
+        let (ok, _, err) = run_snippet(dir.path(), &manifest, &[], &["raw"]);
+        assert!(!ok);
+        assert!(err.contains("aaa.raw"), "names the missing file: {err}");
+    }
     use crate::utils::update_signing::tuf_signer_from_parts;
     use ed25519_compact::{KeyPair, Seed};
 
