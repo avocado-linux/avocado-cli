@@ -279,7 +279,12 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall extensions from scratch: clear every extension's sysroot
+        /// and re-seed it.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Runtime name to install packages into (or sync when no packages given)
@@ -1652,7 +1657,11 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Install the SDK, rootfs, initramfs and target-dev sysroots in
+        /// parallel rather than one at a time.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -1726,7 +1735,11 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Run non-interactively: no live checklist, and the container is
+        /// started without a TTY.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
@@ -2250,12 +2263,12 @@ async fn main() -> Result<()> {
         } => {
             let _json_guard =
                 run_with_json_lifecycle(output, "install", target.as_deref(), runtime.as_deref());
-            // JSON output implies no human at the keyboard — auto-enable
-            // --force so dnf gets -y and container starts without -it.
-            // Without this, `docker run -it` fails ("cannot attach stdin
-            // to a TTY-enabled container") and dnf hangs waiting for
-            // confirmation.
-            let force = force || output.is_json();
+            // No JSON-implies-force coercion. Both reasons for it are gone:
+            // installs always pass `-y`, and `utils::interactivity` decides the
+            // container's stdio flags from what the environment can actually
+            // support, so `docker run -it` no longer fails without a tty. With
+            // `--force` meaning reinstall-from-scratch, keeping the coercion
+            // turned `--output json` into a full rebuild.
             if packages.is_empty() {
                 // No packages specified: sync all from config (original behavior)
                 validate_runtime_if_provided(&config, runtime.as_ref())?;
@@ -2479,9 +2492,8 @@ async fn main() -> Result<()> {
                 target.as_deref(),
                 name.as_deref().or(runtime.as_deref()),
             );
-            // JSON output implies no human at the keyboard — auto-enable
-            // --force (see `Install` arm above for rationale).
-            let force = force || output.is_json();
+            // No JSON-implies-force coercion here either (see the `Install`
+            // arm above for why both of its reasons are gone).
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -4441,7 +4453,12 @@ enum ExtCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear this extension's sysroot and re-seed
+        /// it.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards the extension's built content, so the next build has to
+        /// redo it.
         #[arg(short, long)]
         force: bool,
         /// Extension name (deprecated, use positional argument)
@@ -4697,7 +4714,10 @@ enum RootfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Run non-interactively: the container is started without a TTY.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -4764,7 +4784,10 @@ enum InitramfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Run non-interactively: the container is started without a TTY.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -5192,6 +5215,31 @@ mod tests {
     /// NOT route — routing can auto-start the VM, which is wrong for e.g.
     /// `connect auth`/`deploy`. Pins the Docker-socket fix against regressions
     /// (dropping the upload arm, or over-broadly routing all of `Connect`).
+    /// `--output json` must not imply `--force`.
+    ///
+    /// It did, for two reasons that are both gone: the TUI renderer was gated on
+    /// `--force` because dnf could prompt without it, and `docker run -it`
+    /// failed with no tty. Installs now always pass `-y`, and
+    /// `utils::interactivity` decides the container's stdio from what the
+    /// environment can actually support. With `--force` meaning
+    /// reinstall-from-scratch, the coercion turned a request for machine-readable
+    /// output into a full rebuild on every invocation.
+    ///
+    /// The needle is assembled at runtime so this assertion does not match its
+    /// own source.
+    #[test]
+    fn json_output_does_not_imply_force() {
+        let src = include_str!("main.rs");
+        let needle = format!("force {}", "|| output.is_json()");
+        for (n, line) in src.lines().enumerate() {
+            assert!(
+                !line.contains(&needle),
+                "main.rs:{} makes --output json imply --force: {line}",
+                n + 1
+            );
+        }
+    }
+
     #[test]
     fn needs_vm_routing_gates_connect_upload_only() {
         let cmd = |args: &[&str]| {

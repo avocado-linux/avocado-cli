@@ -1014,7 +1014,10 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     }
     let pkg = pkg_specs.join(" ");
 
-    let yes = if params.force { "-y" } else { "" };
+    // dnf never prompts here: this applies the package set avocado.yaml and
+    // avocado.lock already declare, so there is no decision left to make.
+    // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+    let yes = "-y";
     let dnf_args_str = if let Some(args) = &params.dnf_args {
         format!(" {} ", args.join(" "))
     } else {
@@ -1596,6 +1599,41 @@ mod tests {
 
     fn name_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Installs must never wait on a dnf prompt.
+    ///
+    /// This used to depend on `--force`, which also clears every extension
+    /// sysroot and drops its stamps — so the only way to avoid the prompt was
+    /// to pay a full rebuild, and the documented invocation (`install -f`) did
+    /// exactly that on every iteration. A prompt here also hangs CI and the
+    /// TUI, which is why the renderer was gated on `--force` too. The `yes`
+    /// argument is now a constant at all five install call sites; this pins the
+    /// step that consumes it.
+    #[test]
+    fn dnf_sync_step_passes_assume_yes() {
+        use crate::commands::rootfs::install::dnf_sync_step;
+        let step = dnf_sync_step(true, "rootfs", "", "-y", "");
+        assert!(step.contains("-y"), "expected -y in: {step}");
+        // And the sources agree, across every install site. One exact string in
+        // one file was too narrow: the coupling can come back in any of the five
+        // and can be spelled several ways, so match the shape instead — the
+        // assume-yes literal and a flag on the same line.
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains("\"-y\"") && line.contains("force")),
+                    "{name}:{} derives the assume-yes flag from a flag: {line}",
+                    n + 1
+                );
+            }
+        }
     }
 
     #[test]
