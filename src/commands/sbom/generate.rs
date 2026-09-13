@@ -304,8 +304,8 @@ enum Group<'a> {
 /// A group is skipped when its own defining scope is empty, not when every
 /// member is: `build_document` emits no element for an empty scope, so such a
 /// group would be named for something the graph never names.
-fn groups(scopes: &[Scope]) -> Vec<(Group<'_>, Vec<&Scope>)> {
-    let mut out: Vec<(Group<'_>, Vec<&Scope>)> = Vec::new();
+fn groups<'a>(scopes: &[&'a Scope]) -> Vec<(Group<'a>, Vec<&'a Scope>)> {
+    let mut out: Vec<(Group<'a>, Vec<&'a Scope>)> = Vec::new();
 
     for scope in scopes {
         let Some(runtime) = scope.name.strip_prefix("runtime:") else {
@@ -318,6 +318,7 @@ fn groups(scopes: &[Scope]) -> Vec<(Group<'_>, Vec<&Scope>)> {
         // document and this element cannot disagree.
         let members: Vec<&Scope> = scopes
             .iter()
+            .copied()
             .filter(|s| in_runtime(&s.name, runtime))
             .collect();
         out.push((Group::Runtime(runtime), members));
@@ -334,6 +335,7 @@ fn groups(scopes: &[Scope]) -> Vec<(Group<'_>, Vec<&Scope>)> {
 
     let build_host: Vec<&Scope> = scopes
         .iter()
+        .copied()
         .filter(|s| BUILD_HOST_SCOPES.contains(&s.name.as_str()) && !s.packages.is_empty())
         .collect();
     if !build_host.is_empty() {
@@ -368,15 +370,88 @@ pub(crate) fn in_runtime(scope: &str, runtime: &str) -> bool {
         || scope.starts_with(&format!("ext:{runtime}/"))
 }
 
-/// Whether `runtime` installed anything of its own in `scopes`.
-///
-/// `in_runtime` keeps `rootfs` and `initramfs` whatever the runtime is, so a
-/// filtered slice is non-empty — and builds a document — even when the runtime
-/// contributed nothing. Same condition `groups` skips a runtime on.
-pub(crate) fn runtime_has_packages(scopes: &[Scope], runtime: &str) -> bool {
-    scopes
-        .iter()
-        .any(|s| s.name == format!("runtime:{runtime}") && !s.packages.is_empty())
+/// One image's SBOM, serialized once: `digest` is the sha256 of `bytes` as
+/// they will be PUT, and Connect checks the two against each other.
+#[derive(Debug)]
+pub(crate) struct Fragment {
+    pub(crate) image_id: String,
+    pub(crate) artifact_name: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) digest: String,
+    pub(crate) package_count: usize,
+}
+
+/// The images a build manifest says get uploaded, in manifest order.
+struct ManifestImages {
+    os_bundle: Option<String>,
+    extensions: Vec<(String, String)>,
+}
+
+impl ManifestImages {
+    fn from_manifest(manifest: &serde_json::Value) -> Self {
+        let os_bundle = manifest
+            .pointer("/os_bundle/image_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let extensions = manifest
+            .get("extensions")
+            .and_then(|v| v.as_array())
+            .map(|exts| {
+                exts.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("name")?.as_str()?.to_string(),
+                            e.get("image_id")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            os_bundle,
+            extensions,
+        }
+    }
+
+    fn extension(&self, name: &str) -> Option<&str> {
+        self.extensions
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| id.as_str())
+    }
+
+    /// The uploaded image whose bytes carry `scope`'s packages, or `None`.
+    ///
+    /// `rootfs`, `initramfs` and the runtime's own sysroot are all packed into
+    /// the OS bundle; the manifest lists the first two with image ids of their
+    /// own, but those are never uploaded. A bare `includes` scope is a
+    /// nested-layout remote extension's content with no database saying which
+    /// extension, so it maps to nothing.
+    fn image_for(&self, scope: &str, runtime: &str) -> Option<&str> {
+        if scope == "rootfs" || scope == "initramfs" || scope == format!("runtime:{runtime}") {
+            return self.os_bundle.as_deref();
+        }
+        if let Some(name) = scope.strip_prefix(&format!("ext:{runtime}/")) {
+            return self.extension(name);
+        }
+        if let Some(name) = scope.strip_prefix("includes:") {
+            return self.extension(name);
+        }
+        None
+    }
+}
+
+/// What a document's root `software_Sbom` claims to cover, which decides its
+/// namespace, its name and whether the per-runtime and per-extension
+/// collections are emitted alongside it.
+#[derive(Clone, Copy)]
+enum Coverage<'a> {
+    Device,
+    Runtime(&'a str),
+    Image {
+        image_id: &'a str,
+        artifact_name: &'a str,
+    },
 }
 
 /// Finds each runtime's active manifest.json and prints it as
@@ -800,7 +875,7 @@ impl SbomCommand {
     /// Scan every sysroot and return the parsed scopes, the resolved target,
     /// and the feed snapshot they were resolved from.
     ///
-    /// Split out of `execute` so `connect upload` (ENG-2219) can build a
+    /// Split out of `execute` so `connect upload` can build a
     /// runtime-scoped document of its own without going through `execute`'s
     /// stdout — it writes the document itself and owns stdout for its
     /// `--output json` stream (`tests/no_stdout_on_the_vm_path.rs` guards this
@@ -1166,7 +1241,7 @@ impl SbomCommand {
     /// they are empty, so on a single-runtime project both would otherwise
     /// land on the same `{ns}/sbom` and `{ns}/document` IRIs while asserting
     /// different coverage.
-    fn namespace_digest(scopes: &[Scope], runtime: Option<&str>) -> String {
+    fn namespace_digest(scopes: &[&Scope], runtime: Option<&str>) -> String {
         let mut hasher = Sha256::new();
         if let Some(r) = runtime {
             hasher.update(format!("runtime\t{r}\n").as_bytes());
@@ -1205,11 +1280,125 @@ impl SbomCommand {
         runtime: Option<&str>,
         images: Option<&ImageIds>,
     ) -> serde_json::Value {
-        let ns = format!(
-            "https://avocadolinux.org/spdx/{}/{}",
-            slug_id(target),
-            Self::namespace_digest(scopes, runtime)
-        );
+        let coverage = match runtime {
+            Some(r) => Coverage::Runtime(r),
+            None => Coverage::Device,
+        };
+        let scopes: Vec<&Scope> = scopes.iter().collect();
+        self.build_graph(&scopes, target, snapshot, coverage, images)
+    }
+
+    /// One SBOM per uploaded image, from the manifest's image ids and the
+    /// scan's scope names. An image none of `scopes` maps onto gets no
+    /// fragment; a scope of this runtime that maps onto no image is named to
+    /// `warn` once and left out.
+    pub(crate) fn build_fragments(
+        &self,
+        scopes: &[Scope],
+        manifest: &serde_json::Value,
+        target: &str,
+        snapshot: Option<&RepoSnapshot>,
+        runtime: &str,
+        warn: &mut dyn FnMut(&str),
+    ) -> Vec<Fragment> {
+        let images = ManifestImages::from_manifest(manifest);
+
+        let mut by_image: BTreeMap<&str, Vec<&Scope>> = BTreeMap::new();
+        let mut unmapped: Vec<&str> = Vec::new();
+        for scope in scopes.iter().filter(|s| !s.packages.is_empty()) {
+            if !in_runtime(&scope.name, runtime) && !scope.name.starts_with("includes:") {
+                continue;
+            }
+            match images.image_for(&scope.name, runtime) {
+                Some(image_id) => by_image.entry(image_id).or_default().push(scope),
+                None => unmapped.push(&scope.name),
+            }
+        }
+        if !unmapped.is_empty() {
+            warn(&format!(
+                "{} scope(s) belong to no uploaded image and are left out of the SBOM: {}.",
+                unmapped.len(),
+                unmapped.join(", ")
+            ));
+        }
+
+        // Stamps for the scope elements; `images` above only groups scopes.
+        let ids = ImageIds::from_manifest(manifest, runtime);
+        let mut fragments = Vec::new();
+        let mut images_in_order: Vec<(&str, &str)> = Vec::new();
+        if let Some(id) = images.os_bundle.as_deref() {
+            images_in_order.push((id, "os-bundle"));
+        }
+        for (name, id) in &images.extensions {
+            images_in_order.push((id, name));
+        }
+        for (image_id, artifact_name) in images_in_order {
+            let Some(members) = by_image.get(image_id) else {
+                continue;
+            };
+            let doc = self.build_graph(
+                members,
+                target,
+                snapshot,
+                Coverage::Image {
+                    image_id,
+                    artifact_name,
+                },
+                Some(&ids),
+            );
+            let bytes = serde_json::to_vec(&doc).expect("a json! value serializes");
+            let digest = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let package_count = doc["@graph"]
+                .as_array()
+                .map(|g| {
+                    g.iter()
+                        .filter(|e| {
+                            e["type"] == "software_Package"
+                                && e.get("software_packageUrl").is_some()
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            fragments.push(Fragment {
+                image_id: image_id.to_string(),
+                artifact_name: artifact_name.to_string(),
+                bytes,
+                digest,
+                package_count,
+            });
+        }
+        fragments
+    }
+
+    fn build_graph(
+        &self,
+        scopes: &[&Scope],
+        target: &str,
+        snapshot: Option<&RepoSnapshot>,
+        coverage: Coverage<'_>,
+        images: Option<&ImageIds>,
+    ) -> serde_json::Value {
+        let runtime = match coverage {
+            Coverage::Runtime(r) => Some(r),
+            _ => None,
+        };
+        // An image's namespace is its id: the same image uploaded from two
+        // runtimes must produce the same element ids.
+        let ns = match coverage {
+            Coverage::Image { image_id, .. } => format!(
+                "https://avocadolinux.org/spdx/{}/image/{}",
+                slug_id(target),
+                slug_id(image_id)
+            ),
+            _ => format!(
+                "https://avocadolinux.org/spdx/{}/{}",
+                slug_id(target),
+                Self::namespace_digest(scopes, runtime)
+            ),
+        };
         let created = created_timestamp(std::env::var("SOURCE_DATE_EPOCH").ok().as_deref());
 
         let creation_id = format!("{ns}/creationinfo/1");
@@ -1413,32 +1602,47 @@ impl SbomCommand {
         }
 
         let sbom_id = format!("{ns}/sbom");
+        let (sbom_name, sbom_comment) = match coverage {
+            Coverage::Runtime(r) => (
+                format!("avocado {target} runtime {r} SBOM"),
+                format!(
+                    "Describes what runtime {r} installs, and so what runs on the device \
+                     under it: the transitive closure read from each of its sysroots' RPM \
+                     databases, not what avocado.yaml declares. Other runtimes in this \
+                     project are not covered."
+                ),
+            ),
+            Coverage::Device => (
+                format!("avocado {target} device SBOM"),
+                "Describes what this project installs, and so what runs on the device: the \
+                 transitive closure read from each sysroot's RPM database, not what \
+                 avocado.yaml declares."
+                    .to_string(),
+            ),
+            Coverage::Image {
+                image_id,
+                artifact_name,
+            } => (
+                format!("avocado {target} image {artifact_name} SBOM"),
+                format!(
+                    "Describes what image {image_id} ({artifact_name}) carries: the packages \
+                     read from the RPM database of each sysroot packed into it. Other images \
+                     of the same runtime are not covered."
+                ),
+            ),
+        };
         let mut sbom_element = serde_json::json!({
             "type": "software_Sbom",
             "spdxId": sbom_id,
             "creationInfo": creation_id,
-            "name": match runtime {
-                Some(r) => format!("avocado {target} runtime {r} SBOM"),
-                None => format!("avocado {target} device SBOM"),
-            },
+            "name": sbom_name,
             // "deployed", not "build". A Yocto build emits SPDX for the same
             // packages under `build`; this describes what was installed, which
             // is the whole reason the document exists.
             "software_sbomType": ["deployed"],
             // `software_sbomType` says this to a machine; this says it to a
             // person (criterion 4).
-            "comment": match runtime {
-                Some(r) => format!(
-                    "Describes what runtime {r} installs, and so what runs on the device \
-                     under it: the transitive closure read from each of its sysroots' RPM \
-                     databases, not what avocado.yaml declares. Other runtimes in this \
-                     project are not covered."
-                ),
-                None => "Describes what this project installs, and so what runs on the \
-                     device: the transitive closure read from each sysroot's RPM database, \
-                     not what avocado.yaml declares."
-                    .to_string(),
-            },
+            "comment": sbom_comment,
             "rootElement": roots,
             // Every scope belongs in `element`, roots and extensions alike. A
             // consumer that enumerates the collection through `element` — the
@@ -1505,8 +1709,13 @@ impl SbomCommand {
         // one of these can be handed over as "just this runtime".
         //
         // After the device SBOM and before `SpdxDocument`: existing tests take
-        // the first `software_Sbom` in `@graph` as the device one.
-        for (group, members) in groups(scopes) {
+        // the first `software_Sbom` in `@graph` as the device one. An image
+        // fragment is one collection by contract, so it gets none of these.
+        let group_list = match coverage {
+            Coverage::Image { .. } => Vec::new(),
+            _ => groups(scopes),
+        };
+        for (group, members) in group_list {
             if let (Group::Runtime(r), Some(scoped)) = (group, runtime) {
                 if r == scoped {
                     continue;
@@ -1583,11 +1792,17 @@ impl SbomCommand {
             }));
         }
 
+        let document_name = match coverage {
+            Coverage::Image { image_id, .. } => {
+                format!("avocado-{}-image-{}-sbom", slug(target), slug(image_id))
+            }
+            _ => format!("avocado-{}-sbom", slug(target)),
+        };
         graph.push(serde_json::json!({
             "type": "SpdxDocument",
             "spdxId": format!("{ns}/document"),
             "creationInfo": creation_id,
-            "name": format!("avocado-{}-sbom", slug(target)),
+            "name": document_name,
             "rootElement": [sbom_id],
             "profileConformance": ["core", "software", "simpleLicensing"],
             "dataLicense": data_license_id,
@@ -3417,18 +3632,415 @@ mod tests {
             .any(|e| e == includes_id));
     }
 
-    #[test]
-    fn a_runtime_that_installed_nothing_of_its_own_is_not_reported_as_scanned() {
-        // `in_runtime` keeps rootfs whatever the runtime is, so the filtered
-        // slice is non-empty and builds. Only this predicate separates a
-        // runtime that installs nothing from one that was never scanned.
-        let dump = format!(
-            "##SCOPE\trootfs\t/rootfs\n{}",
-            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+    // The manifest shape a real build writes: rootfs, initramfs and kernel
+    // carry image ids that are never uploaded, four extensions, one of them
+    // (`app`) locally built with no packages of its own, and the OS bundle.
+    const OS_BUNDLE: &str = "a21a89b3-3753-5a57-b4b0-39a15c1cd818";
+    const BSP: &str = "2098d8e0-2496-527d-a542-6524f02ab2e2";
+    const DEV: &str = "316c9c39-d425-527a-b246-95b101c37693";
+    const SSHD: &str = "bc38e32d-cf70-54b8-a293-2c365ad1bdaa";
+    const APP: &str = "c524b388-8e10-5e74-9109-b47e6dd2bff1";
+
+    fn jetson_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "manifest_version": 2,
+            "id": "6ff2890b-1a28-40ba-bb39-6642cd5f5993",
+            "runtime": { "name": "dev", "version": "6ff2890b" },
+            "rootfs": { "version": "0.0.0", "image_id": "c8cfa92f-1bf9-5194-9ef9-0db5467f2e4f" },
+            "initramfs": { "version": "0.0.0", "image_id": "ea5745f5-22eb-5c04-8d4a-493817f108e2" },
+            "kernel": { "version": "0.0.0", "image_id": "331ab5ad-0bf7-5aa0-8206-85ff61df67cf" },
+            "extensions": [
+                { "name": "avocado-ext-dev", "version": "0.1.0", "image_id": DEV },
+                { "name": "avocado-ext-sshd-dev", "version": "0.1.0", "image_id": SSHD },
+                { "name": "avocado-bsp-jetson-orin-nano-devkit", "version": "0.1.0", "image_id": BSP },
+                { "name": "app", "version": "0.1.0", "image_id": APP },
+            ],
+            "os_bundle": { "image_id": OS_BUNDLE },
+        })
+    }
+
+    /// The scan a Jetson build produces, in miniature: every scope the real
+    /// one has, with `bash` in both initramfs and the BSP extension the way
+    /// it really is, and no `ext:dev/app` at all.
+    fn jetson_dump(runtime: &str) -> String {
+        format!(
+            "##SCOPE\trootfs\t/rootfs\n{}{}\
+             ##SCOPE\tinitramfs\t/initramfs\n{}{}\
+             ##SCOPE\truntime:{runtime}\t/runtimes/{runtime}\n{}\
+             ##SCOPE\text:{runtime}/avocado-bsp-jetson-orin-nano-devkit\t/bsp\n{}{}\
+             ##SCOPE\text:{runtime}/avocado-ext-dev\t/dev\n{}\
+             ##SCOPE\text:{runtime}/avocado-ext-sshd-dev\t/sshd\n{}",
+            row_full(
+                "avocadoctl",
+                "0.10.0",
+                "r0.8",
+                "aarch64",
+                "MIT",
+                "(none)",
+                1000
+            ),
+            row_full(
+                "base-files",
+                "3.0.14",
+                "r0.1",
+                "aarch64",
+                "MIT",
+                "(none)",
+                1000
+            ),
+            row_full(
+                "avocado-tegra-init",
+                "1.0",
+                "r0.8",
+                "aarch64",
+                "MIT",
+                "(none)",
+                1100
+            ),
+            row_full("bash", "5.2.21", "r0.8", "aarch64", "GPL-3.0", "(none)", 1100),
+            row_full(
+                "avocado-runtime",
+                "0.0.0",
+                "r0.2",
+                "aarch64",
+                "MIT",
+                "(none)",
+                2000
+            ),
+            row_full(
+                "cuda-cudart",
+                "12.6.68+1",
+                "r0.0",
+                "aarch64",
+                "Proprietary",
+                "(none)",
+                3000
+            ),
+            row_full("bash", "5.2.21", "r0.8", "aarch64", "GPL-3.0", "(none)", 3000),
+            row_full("gptfdisk", "1.0.9", "r0.8", "aarch64", "GPL-2.0", "(none)", 4000),
+            row_full("openssh", "9.6p1", "r0.0", "aarch64", "BSD", "(none)", 5000),
+        )
+    }
+
+    fn fragments_for(runtime: &str) -> (Vec<Fragment>, Vec<String>) {
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&jetson_dump(runtime));
+        let mut warnings = Vec::new();
+        let fragments = c.build_fragments(
+            &scopes,
+            &jetson_manifest(),
+            "jetson-orin-nano-devkit",
+            None,
+            runtime,
+            &mut |m| warnings.push(m.to_string()),
         );
-        let scopes = cmd(false).parse_scopes(&dump);
-        assert!(!scopes.is_empty());
-        assert!(!runtime_has_packages(&scopes, "dev"));
+        (fragments, warnings)
+    }
+
+    fn purls(fragment: &Fragment) -> BTreeSet<String> {
+        let doc: serde_json::Value = serde_json::from_slice(&fragment.bytes).unwrap();
+        doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("software_packageUrl")?.as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn empty_runtime_scope_keeps_base_and_extension_fragments() {
+        let c = cmd(false);
+        let mut scopes = c.parse_scopes(&jetson_dump("dev"));
+        scopes
+            .iter_mut()
+            .filter(|s| s.name == "runtime:dev")
+            .for_each(|s| s.packages.clear());
+        let fragments = c.build_fragments(
+            &scopes,
+            &jetson_manifest(),
+            "jetson",
+            None,
+            "dev",
+            &mut |_| {},
+        );
+        assert_eq!(fragments.len(), 4);
+        assert!(
+            fragments
+                .iter()
+                .find(|f| f.artifact_name == "os-bundle")
+                .unwrap()
+                .package_count
+                > 0
+        );
+        for fragment in fragments {
+            let value: serde_json::Value = serde_json::from_slice(&fragment.bytes).unwrap();
+            assert_eq!(fragment.bytes, serde_json::to_vec(&value).unwrap());
+        }
+        assert!(c
+            .build_fragments(&[], &jetson_manifest(), "jetson", None, "dev", &mut |_| {})
+            .is_empty());
+    }
+
+    #[test]
+    fn build_fragments_stamps_scope_elements_with_manifest_image_ids() {
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&jetson_dump("dev"));
+        let mut manifest = jetson_manifest();
+        manifest["extensions"][0]["sha256"] = "img-dev-sha".into();
+        manifest["os_bundle"]["os_build_id"] = "os-build-id".into();
+        manifest["os_bundle"]["initramfs_build_id"] = "initramfs-build-id".into();
+        let fragments = c.build_fragments(&scopes, &manifest, "jetson", None, "dev", &mut |_| {});
+
+        let scope = |artifact: &str, name: &str| -> serde_json::Value {
+            let fragment = fragments
+                .iter()
+                .find(|f| f.artifact_name == artifact)
+                .unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&fragment.bytes).unwrap();
+            doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["software_primaryPurpose"] == "archive" && e["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+
+        let dev = scope("avocado-ext-dev", "ext:dev/avocado-ext-dev");
+        assert_eq!(dev["externalIdentifier"][0]["identifier"], DEV);
+        assert_eq!(
+            dev["externalIdentifier"][0]["issuingAuthority"],
+            "https://avocadolinux.org/image-id"
+        );
+        assert_eq!(dev["verifiedUsing"][0]["hashValue"], "img-dev-sha");
+
+        // No sha256 in the manifest: stamped with the id alone.
+        let sshd = scope("avocado-ext-sshd-dev", "ext:dev/avocado-ext-sshd-dev");
+        assert_eq!(sshd["externalIdentifier"][0]["identifier"], SSHD);
+        assert!(sshd.get("verifiedUsing").is_none());
+
+        for (name, id) in [
+            ("rootfs", "os-build-id"),
+            ("initramfs", "initramfs-build-id"),
+        ] {
+            let element = scope("os-bundle", name);
+            assert_eq!(element["externalIdentifier"][0]["identifier"], id);
+            assert_eq!(
+                element["externalIdentifier"][0]["issuingAuthority"],
+                "https://avocadolinux.org/os-build-id"
+            );
+            assert!(element.get("verifiedUsing").is_none());
+        }
+        assert!(scope("os-bundle", "runtime:dev")
+            .get("externalIdentifier")
+            .is_none());
+    }
+
+    #[test]
+    fn each_uploaded_image_gets_one_fragment_and_app_gets_none() {
+        let (fragments, warnings) = fragments_for("dev");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let by_image: BTreeMap<&str, &Fragment> =
+            fragments.iter().map(|f| (f.image_id.as_str(), f)).collect();
+        assert_eq!(
+            by_image.keys().copied().collect::<Vec<_>>(),
+            {
+                let mut ids = vec![OS_BUNDLE, BSP, DEV, SSHD];
+                ids.sort();
+                ids
+            },
+            "one fragment per image that has a scope; `app` has none"
+        );
+        assert!(!by_image.contains_key(APP));
+
+        let os = by_image[OS_BUNDLE];
+        assert_eq!(os.artifact_name, "os-bundle");
+        // rootfs 2 + initramfs 2 + runtime 1: `bash` is in the BSP too but
+        // that is a different image, so it is not deduplicated across.
+        assert_eq!(os.package_count, 5);
+        assert!(purls(os).iter().any(|p| p.contains("avocado-runtime")));
+        assert!(purls(os).iter().any(|p| p.contains("/bash@")));
+
+        let bsp = by_image[BSP];
+        assert_eq!(bsp.artifact_name, "avocado-bsp-jetson-orin-nano-devkit");
+        assert_eq!(bsp.package_count, 2);
+        assert!(purls(bsp).iter().any(|p| p.contains("/bash@")));
+        assert!(!purls(bsp).iter().any(|p| p.contains("avocadoctl")));
+
+        assert_eq!(by_image[DEV].package_count, 1);
+        assert_eq!(by_image[SSHD].package_count, 1);
+    }
+
+    #[test]
+    fn a_fragment_is_one_collection_rooted_at_its_scopes() {
+        let (fragments, _) = fragments_for("dev");
+        for fragment in &fragments {
+            let doc: serde_json::Value = serde_json::from_slice(&fragment.bytes).unwrap();
+            let graph = doc["@graph"].as_array().unwrap();
+
+            let sboms: Vec<&serde_json::Value> = graph
+                .iter()
+                .filter(|e| e["type"] == "software_Sbom")
+                .collect();
+            assert_eq!(sboms.len(), 1, "{}: {sboms:#?}", fragment.artifact_name);
+
+            let document = graph.iter().find(|e| e["type"] == "SpdxDocument").unwrap();
+            assert_eq!(
+                strings(&document["rootElement"]),
+                vec![sboms[0]["spdxId"].as_str().unwrap()]
+            );
+
+            // Every package is reachable from the root through a scope's
+            // `contains`, which is the walk Connect does.
+            let roots: BTreeSet<&str> = strings(&sboms[0]["rootElement"]).into_iter().collect();
+            let mut reached: BTreeSet<&str> = BTreeSet::new();
+            for rel in graph.iter().filter(|e| e["relationshipType"] == "contains") {
+                if roots.contains(rel["from"].as_str().unwrap()) {
+                    reached.extend(strings(&rel["to"]));
+                }
+            }
+            let packages: BTreeSet<&str> = graph
+                .iter()
+                .filter(|e| e.get("software_packageUrl").is_some())
+                .map(|e| e["spdxId"].as_str().unwrap())
+                .collect();
+            assert_eq!(packages, reached, "{}", fragment.artifact_name);
+            assert_eq!(packages.len(), fragment.package_count);
+        }
+    }
+
+    #[test]
+    fn a_fragments_bytes_hash_to_its_declared_digest() {
+        let (fragments, _) = fragments_for("dev");
+        assert!(!fragments.is_empty());
+        for fragment in &fragments {
+            let digest: String = Sha256::digest(&fragment.bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(fragment.digest, digest);
+            assert_eq!(fragment.digest.len(), 64);
+        }
+    }
+
+    #[test]
+    fn a_fragments_namespace_is_the_images_not_the_runtimes() {
+        let (dev, _) = fragments_for("dev");
+        let (prod, _) = fragments_for("prod");
+        let ns = |fragments: &[Fragment], image: &str| {
+            let f = fragments.iter().find(|f| f.image_id == image).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&f.bytes).unwrap();
+            let id = doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "SpdxDocument")
+                .unwrap()["spdxId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            id.strip_suffix("/document").unwrap().to_string()
+        };
+        for image in [OS_BUNDLE, BSP, DEV, SSHD] {
+            assert_eq!(ns(&dev, image), ns(&prod, image));
+            assert!(ns(&dev, image).ends_with(&format!("/image/{image}")));
+        }
+    }
+
+    #[test]
+    fn a_scope_with_no_image_is_warned_about_once_and_left_out() {
+        // A remote extension the manifest does not list, and the shared
+        // nested-layout `includes` root, both hold packages no uploaded image
+        // can be said to carry.
+        let dump = format!(
+            "{}##SCOPE\tincludes:tunnels\t/includes/tunnels\n{}\
+             ##SCOPE\tincludes\t/includes\n{}",
+            jetson_dump("dev"),
+            row_full("tunnels", "1.0", "r0.0", "aarch64", "MIT", "(none)", 6000),
+            row_full("nested", "1.0", "r0.0", "aarch64", "MIT", "(none)", 7000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let mut warnings = Vec::new();
+        let fragments = c.build_fragments(
+            &scopes,
+            &jetson_manifest(),
+            "jetson-orin-nano-devkit",
+            None,
+            "dev",
+            &mut |m| warnings.push(m.to_string()),
+        );
+
+        assert_eq!(fragments.len(), 4);
+        assert!(
+            !fragments.iter().any(|f| purls(f)
+                .iter()
+                .any(|p| p.contains("tunnels") || p.contains("nested"))),
+            "unmapped packages must not land in some other image's fragment"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("includes:tunnels") && warnings[0].contains("includes"));
+    }
+
+    #[test]
+    fn a_remote_extension_the_manifest_lists_maps_onto_its_image() {
+        let mut manifest = jetson_manifest();
+        manifest["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "tunnels", "version": "1.0", "image_id": "11111111-1111-5111-8111-111111111111",
+            }));
+        let dump = format!(
+            "{}##SCOPE\tincludes:tunnels\t/includes/tunnels\n{}",
+            jetson_dump("dev"),
+            row_full("tunnels", "1.0", "r0.0", "aarch64", "MIT", "(none)", 6000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let mut warnings = Vec::new();
+        let fragments = c.build_fragments(
+            &scopes,
+            &manifest,
+            "jetson-orin-nano-devkit",
+            None,
+            "dev",
+            &mut |m| warnings.push(m.to_string()),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let tunnels = fragments
+            .iter()
+            .find(|f| f.image_id == "11111111-1111-5111-8111-111111111111")
+            .expect("the listed remote extension got a fragment");
+        assert_eq!(tunnels.artifact_name, "tunnels");
+        assert_eq!(tunnels.package_count, 1);
+    }
+
+    #[test]
+    fn another_runtimes_scopes_stay_out_of_this_runtimes_fragments() {
+        let dump = format!(
+            "{}##SCOPE\truntime:prod\t/runtimes/prod\n{}\
+             ##SCOPE\text:prod/avocado-ext-dev\t/prod-dev\n{}",
+            jetson_dump("dev"),
+            row_full("prod-only", "1.0", "r0.0", "aarch64", "MIT", "(none)", 8000),
+            row_full("prod-ext", "1.0", "r0.0", "aarch64", "MIT", "(none)", 9000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let mut warnings = Vec::new();
+        let fragments = c.build_fragments(
+            &scopes,
+            &jetson_manifest(),
+            "jetson-orin-nano-devkit",
+            None,
+            "dev",
+            &mut |m| warnings.push(m.to_string()),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!fragments
+            .iter()
+            .any(|f| purls(f).iter().any(|p| p.contains("prod-"))));
     }
 
     #[test]
