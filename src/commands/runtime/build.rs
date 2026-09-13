@@ -4199,8 +4199,11 @@ runtimes:
             "the hook must run before stone bundle resolves its inputs"
         );
         assert!(script.contains("mkfs.btrfs"));
-        // No overlays declared: the device-tree overlay section is inert.
-        assert!(!script.contains("device-tree overlays"));
+        // No overlays declared: the section stages nothing, but it still
+        // clears the staging directory. Leaving it out entirely is what let a
+        // previous build's overlays reach an image that declares none.
+        assert!(script.contains("rm -rf \"$DTBO_STAGING\""));
+        assert!(!script.contains("avocado-dtc-overlay"));
         assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
         // No var.encrypt: the plaintext path writes no marker.
         assert!(!script.contains("/etc/avocado/var-encrypt"));

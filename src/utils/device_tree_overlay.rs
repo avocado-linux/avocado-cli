@@ -269,18 +269,34 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 /// set (they are by the time the build reaches the stone step) and leaves
 /// `$STONE_INCLUDE_FLAGS` / `$STONE_OVERLAY_FLAG` updated for the bundle call.
 pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
-    if overlays.is_empty() {
-        return Ok(String::new());
-    }
-
-    let manifest_json = build_manifest_json(overlays)?;
     let mut s = String::new();
 
+    // The staging directory describes THIS build, so it is cleared before every
+    // one -- including the build that declares no overlays at all.
+    //
+    // The clear used to live below the empty-set early return, which meant it
+    // only ran when there was something to stage. Removing the last overlay
+    // (disabling an extension, or selecting a different board) then emitted no
+    // script at all, the previous build's `apply-order` and .dtbo survived, and
+    // the platform hook merged them into the next image exactly as designed:
+    // its contract is "if apply-order exists, apply what it names", and it has
+    // no way to tell a stale record from a current one.
+    //
+    // On rb3gen2 that shipped a mezzanine overlay into a core-kit build, whose
+    // device tree enabled hardware that is not fitted. The build reported
+    // success and the resulting UKI took the board down in firmware, through
+    // both OTA and a fresh provision, because both carry the same image.
     s.push_str("# --- device-tree overlays ---\n");
     s.push_str(
         "DTBO_STAGING=\"$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/device-tree-overlays\"\n",
     );
     s.push_str("rm -rf \"$DTBO_STAGING\"\n");
+
+    if overlays.is_empty() {
+        return Ok(s);
+    }
+
+    let manifest_json = build_manifest_json(overlays)?;
     s.push_str("mkdir -p \"$DTBO_STAGING\"\n");
     s.push_str(&format!(
         "echo -e \"\\033[94m[INFO]\\033[0m Building {} device-tree overlay(s).\"\n",
@@ -492,9 +508,40 @@ extensions:
         }
     }
 
+    /// The empty set still clears the staging directory.
+    ///
+    /// This previously asserted the opposite -- that no overlays renders no
+    /// script -- which is what let a stale `apply-order` from an earlier build
+    /// survive into a build that declares nothing. The platform hook applies
+    /// whatever `apply-order` names and cannot tell a stale record from a
+    /// current one, so the next image silently carried the previous build's
+    /// overlays.
     #[test]
-    fn render_is_empty_without_overlays() {
-        assert_eq!(render_build_section(&[]).unwrap(), "");
+    fn render_clears_staging_even_with_no_overlays() {
+        let sh = render_build_section(&[]).unwrap();
+
+        assert!(
+            sh.contains("rm -rf \"$DTBO_STAGING\""),
+            "staging must be cleared when the overlay set is empty, or the \
+             previous build's overlays are applied to this one: {sh}"
+        );
+        assert!(
+            sh.contains("DTBO_STAGING=\"$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/device-tree-overlays\""),
+            "the clear needs the path it clears: {sh}"
+        );
+        // Cleared, but nothing staged and no compiler invoked.
+        assert!(!sh.contains("avocado-dtc-overlay"), "{sh}");
+        assert!(!sh.contains("mkdir -p"), "{sh}");
+    }
+
+    /// A build that DOES declare overlays must still reset first, so an
+    /// overlay dropped from the set does not linger alongside the current ones.
+    #[test]
+    fn render_clears_staging_before_staging_overlays() {
+        let sh = render_build_section(&[overlay("spi-fast", "overlays/spi-fast.dtso")]).unwrap();
+        let clear = sh.find("rm -rf \"$DTBO_STAGING\"").expect("clear present");
+        let stage = sh.find("avocado-dtc-overlay").expect("stage present");
+        assert!(clear < stage, "the clear must precede any staging: {sh}");
     }
 
     #[test]
