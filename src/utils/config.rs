@@ -1601,12 +1601,6 @@ impl Config {
         Ok(None)
     }
 
-    /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
-    /// following named refs to the top-level `kernel.<name>` map.
-    ///
-    /// Returns `None` when the runtime doesn't exist, has no `kernel:` field,
-    /// or the named ref doesn't resolve. (Phase 0e adds load-time validation
-    /// so unresolved named refs become hard errors before reaching this path.)
     /// The kernel command line this project wants, as (replace, append).
     ///
     /// Same precedence as [`Self::effective_kernel_spec`]: a runtime-level
@@ -1634,6 +1628,12 @@ impl Config {
         (None, None)
     }
 
+    /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
+    /// following named refs to the top-level `kernel.<name>` map.
+    ///
+    /// Returns `None` when the runtime doesn't exist, has no `kernel:` field,
+    /// or the named ref doesn't resolve. (Phase 0e adds load-time validation
+    /// so unresolved named refs become hard errors before reaching this path.)
     pub fn resolve_runtime_kernel(&self, runtime_name: &str) -> Option<&KernelConfig> {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.kernel.as_ref()? {
