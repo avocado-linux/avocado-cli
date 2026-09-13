@@ -432,6 +432,23 @@ fi
             }
         }
 
+        // Collect device-tree overlay sources.
+        //
+        // Not the same thing as the filesystem `overlay:` key handled above: a
+        // device-tree overlay is a .dtso compiled at build time, and the
+        // consumer resolves it out of this package. Without it here, a
+        // package-sourced extension publishes a `device_tree_overlays`
+        // declaration whose `src` is not in the payload, and the consumer's
+        // build fails with "source ... does not exist" on a declaration that
+        // is otherwise correct.
+        //
+        // Read from the RAW config so a `target-<t>:` block's overlays ship
+        // too -- the merged view only holds the target being packaged, and the
+        // published package serves every target the extension supports.
+        for cfg in [Some(ext_config), raw_ext_config].into_iter().flatten() {
+            collect_device_tree_overlay_sources(cfg, &mut seen_files, &mut default_files);
+        }
+
         // Collect compile scripts from sdk.compile sections
         if let Some(sdk_compile) = full_parsed_config
             .get("sdk")
@@ -2129,5 +2146,34 @@ extensions:
         assert!(files.contains(&"overlays/reterminal".to_string()));
         assert!(files.contains(&"overlays/reterminal-dm".to_string()));
         assert_eq!(files.len(), 3);
+    }
+}
+
+/// Pull every `device_tree_overlays[].src` out of an extension config,
+/// including any nested under `target-<t>:` blocks.
+fn collect_device_tree_overlay_sources(
+    cfg: &serde_yaml::Value,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    if let Some(list) = cfg
+        .get("device_tree_overlays")
+        .and_then(|d| d.as_sequence())
+    {
+        for entry in list {
+            if let Some(src) = entry.get("src").and_then(|v| v.as_str()) {
+                if seen.insert(src.to_string()) {
+                    out.push(src.to_string());
+                }
+            }
+        }
+    }
+    // target-<t>: blocks carry their own declarations.
+    if let Some(map) = cfg.as_mapping() {
+        for (k, v) in map {
+            if k.as_str().is_some_and(|k| k.starts_with("target-")) {
+                collect_device_tree_overlay_sources(v, seen, out);
+            }
+        }
     }
 }
