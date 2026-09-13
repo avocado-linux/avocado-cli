@@ -169,7 +169,7 @@ impl BuildCommand {
             );
         }
         let required_extensions =
-            self.find_required_extensions(config, parsed, &composed, &runtimes_to_build, &target)?;
+            self.find_required_extensions(parsed, &composed, &runtimes_to_build, &target)?;
 
         // Pre-flight: verify dependencies are installed before drawing the
         // task list.  This gives the user a clear "run avocado install" message
@@ -509,7 +509,6 @@ impl BuildCommand {
     /// Find all extensions required by the specified runtimes and target
     fn find_required_extensions(
         &self,
-        config: &Config,
         parsed: &serde_yaml::Value,
         composed: &ComposedConfig,
         runtimes: &[String],
@@ -538,66 +537,41 @@ impl BuildCommand {
             }
         }
 
-        // Expand `depends_on` once for this target. Built from the composed
-        // config, the same way runtime/build.rs builds it for AVOCADO_EXT_LIST.
-        //
-        // Without this, an extension reached only through `depends_on` gets a
-        // sysroot from `install` (which DOES walk the closure, see
-        // commands/install.rs) and then never gets an `ext build`/`ext image`
-        // task here -- so no .raw is produced, nothing names it in the runtime
-        // manifest, and it never merges on the device. Observed as a board
-        // missing its core-kit firmware while `avocado install` had plainly
-        // reported "ext install avocado-bsp-rb3gen2".
-        let dep_graph =
-            crate::utils::ext_deps::DependencyGraph::from_composed(composed, target).ok();
-
         for runtime_name in runtimes {
-            // Get merged runtime config for this target
-            let merged_runtime =
-                config.get_merged_runtime_config(runtime_name, target, &self.config_path)?;
-            if let Some(merged_value) = merged_runtime {
-                // Read extensions from the new `extensions` array format
-                if let Some(extensions) =
-                    merged_value.get("extensions").and_then(|e| e.as_sequence())
-                {
-                    let authored: Vec<String> = extensions
-                        .iter()
-                        .filter_map(
-                            crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry,
-                        )
-                        .map(|spec| {
-                            crate::utils::interpolation::interpolate_name(&spec.name, target)
-                        })
-                        .collect();
+            // The runtime's members are the `depends_on` closure, not the
+            // authored list alone.
+            //
+            // Without the expansion, an extension reached only through
+            // `depends_on` gets a sysroot from `install` (which DOES walk the
+            // closure, see commands/install.rs) and then never gets an
+            // `ext build`/`ext image` task here -- so no .raw is produced,
+            // nothing names it in the runtime manifest, and it never merges on
+            // the device. Observed as a board missing its core-kit firmware
+            // while `avocado install` had plainly reported
+            // "ext install avocado-bsp-rb3gen2".
+            //
+            // Shared with the membership check in `ext build`/`ext image`, so
+            // the set scheduled here and the set those commands consider to be
+            // in the runtime cannot drift apart.
+            let names = crate::utils::ext_deps::runtime_members(
+                composed,
+                runtime_name,
+                target,
+                &self.config_path,
+            )?;
 
-                    // The closure, or the authored list unchanged if the graph
-                    // could not be built -- a malformed `depends_on` is the
-                    // resolver's error to report, not a reason to build nothing.
-                    let names: Vec<String> = match dep_graph.as_ref() {
-                        Some(graph) => match graph.resolve(&authored) {
-                            Ok(closure) => closure.order,
-                            Err(_) => authored.clone(),
-                        },
-                        None => authored.clone(),
-                    };
-
-                    for ext_name in &names {
-                        {
-                            let ext_name = ext_name.as_str();
-                            // Check if this extension has a source: field (remote extension)
-                            if let Some(Some(source)) = ext_sources.get(ext_name) {
-                                // Remote extension with source field
-                                required_extensions.insert(ExtensionDependency::Remote {
-                                    name: ext_name.to_string(),
-                                    source: source.clone(),
-                                });
-                            } else {
-                                // Local extension (defined in ext section without source, or not in ext section)
-                                required_extensions
-                                    .insert(ExtensionDependency::Local(ext_name.to_string()));
-                            }
-                        }
-                    }
+            for ext_name in &names {
+                let ext_name = ext_name.as_str();
+                // Check if this extension has a source: field (remote extension)
+                if let Some(Some(source)) = ext_sources.get(ext_name) {
+                    // Remote extension with source field
+                    required_extensions.insert(ExtensionDependency::Remote {
+                        name: ext_name.to_string(),
+                        source: source.clone(),
+                    });
+                } else {
+                    // Local extension (defined in ext section without source, or not in ext section)
+                    required_extensions.insert(ExtensionDependency::Local(ext_name.to_string()));
                 }
             }
         }
@@ -1047,7 +1021,6 @@ extensions:
 
         let found = cmd
             .find_required_extensions(
-                &composed.config,
                 &composed.merged_value,
                 &composed,
                 &["rt".to_string()],
@@ -1071,6 +1044,24 @@ extensions:
             names.contains(&"bsp-core"),
             "the depends_on-only extension must ALSO be built, or it never \
              reaches the device: {names:?}"
+        );
+
+        // ...and having been built, it must not then be told it isn't part of
+        // the runtime. `ext build`/`ext image` answer that from this same
+        // helper, so scheduling an extension here and warning about it there
+        // cannot disagree.
+        let members = crate::utils::ext_deps::runtime_members(
+            &composed,
+            "rt",
+            "rb3gen2",
+            path.to_str().unwrap(),
+        )
+        .expect("membership resolves");
+        assert!(
+            members.iter().any(|n| n == "bsp-core"),
+            "a depends_on-only extension is a member of the runtime; reporting \
+             otherwise tells the user to add something already reached: \
+             {members:?}"
         );
     }
 }
