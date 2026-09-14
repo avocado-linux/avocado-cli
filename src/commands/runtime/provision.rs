@@ -721,6 +721,43 @@ impl RuntimeProvisionCommand {
             r#"
 {var_section}
 
+# Refresh the copy stone actually provisions from.
+#
+# Two files with this name exist under $AVOCADO_PREFIX and stone resolves
+# first-match-wins across its -i dirs, so which one reaches the device is not
+# visible from the code that flashes it:
+#
+#   $AVOCADO_PREFIX/runtimes/<rt>/...btrfs          the real image, built above
+#   $AVOCADO_PREFIX/output/runtimes/<rt>/stone/...  what stone reads
+#
+# The stone build dir was filled by `stone create` during `build`, when the only
+# var image was the sparse placeholder the OTA tail declares. Without this
+# refresh the board gets a var partition of the right size holding zeros:
+#
+#   erofs: (device mmcblk0p7): cannot find valid erofs superblock
+#   [FAILED] Failed to mount /var.  You are in emergency mode.
+#
+# Hard link because both trees are under $AVOCADO_PREFIX; copy if that crosses
+# a mount. Deliberately NOT in the var section: that half must stay portable
+# for `provision --bundle`, and a bundle carries no build tree.
+#
+# Fails closed. This shell runs without `set -e`, and every way of skipping it
+# quietly -- missing source, unwritable target -- ships a device that drops to
+# an emergency shell on first boot.
+PROVISION_VAR_SRC="$AVOCADO_PREFIX/runtimes/{name}/avocado-image-var-{target_arch}.btrfs"
+PROVISION_VAR_DST="$AVOCADO_PREFIX/output/runtimes/{name}/stone/avocado-image-var-{target_arch}.btrfs"
+if [ ! -f "$PROVISION_VAR_SRC" ]; then
+    echo -e "\033[91m[ERROR]\033[0m var image not found at $PROVISION_VAR_SRC" >&2
+    echo "        The var section above should have created it." >&2
+    exit 1
+fi
+if [ -d "$(dirname "$PROVISION_VAR_DST")" ]; then
+    rm -f "$PROVISION_VAR_DST"
+    ln "$PROVISION_VAR_SRC" "$PROVISION_VAR_DST" 2>/dev/null \
+        || cp "$PROVISION_VAR_SRC" "$PROVISION_VAR_DST" \
+        || {{ echo -e "\033[91m[ERROR]\033[0m could not refresh $PROVISION_VAR_DST" >&2; exit 1; }}
+fi
+
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{name}'."
 avocado-provision-{target_arch} {name}
 "#,
@@ -1245,6 +1282,57 @@ mod tests {
 
         assert!(script.contains("avocado-provision-x86_64 test-runtime"));
         assert!(script.contains("Running SDK lifecycle hook 'avocado-provision'"));
+    }
+
+    #[test]
+    fn the_provision_script_refreshes_the_var_image_stone_reads() {
+        let config = RuntimeProvisionConfig {
+            runtime_name: "test-runtime".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            verbose: false,
+            force: false,
+            target: Some("x86_64".to_string()),
+            target_board: None,
+            provision_profile: None,
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            state_file: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        };
+        let cmd = RuntimeProvisionCommand::new(config);
+        let script = cmd
+            .create_provision_script("x86_64", "# VAR SECTION MARKER")
+            .unwrap();
+
+        // Both paths, exactly. The bug this guards against is the two trees
+        // drifting apart: stone resolves first-match-wins and silently flashes
+        // whichever it finds first.
+        assert!(script.contains(
+            r#"PROVISION_VAR_SRC="$AVOCADO_PREFIX/runtimes/test-runtime/avocado-image-var-x86_64.btrfs""#
+        ));
+        assert!(script.contains(
+            r#"PROVISION_VAR_DST="$AVOCADO_PREFIX/output/runtimes/test-runtime/stone/avocado-image-var-x86_64.btrfs""#
+        ));
+
+        // Ordering is the whole point of the change: the real image must
+        // replace the placeholder AFTER the var section builds it and BEFORE
+        // the hook hands the tree to stone.
+        let var_section = script.find("# VAR SECTION MARKER").unwrap();
+        let refresh = script.find("PROVISION_VAR_SRC=").unwrap();
+        let hook = script.find("avocado-provision-x86_64").unwrap();
+        assert!(
+            var_section < refresh && refresh < hook,
+            "refresh must sit between the var section and the provision hook"
+        );
+
+        // Fails closed: this shell has no `set -e`, and skipping the refresh
+        // quietly ships a zero-filled /var.
+        assert!(script.contains("exit 1"));
     }
 
     // NOTE: test_collect_runtime_extensions was removed as it tested the deprecated
