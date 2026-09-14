@@ -3559,7 +3559,10 @@ async fn main() -> Result<()> {
                     None
                 } else {
                     let config = Config::load(&config_path)?;
-                    let target = crate::utils::target::validate_and_log_target(target.or(cli.target).as_deref(), &config)?;
+                    let target = crate::utils::target::validate_and_log_target(
+                        target.or(cli.target).as_deref(),
+                        &config,
+                    )?;
                     Some(commands::hitl::HitlIdentity::new(&target, &config_path))
                 };
                 commands::hitl::stop(&tool, identity.as_ref(), all)
@@ -3571,7 +3574,10 @@ async fn main() -> Result<()> {
             } => {
                 let tool = crate::utils::container::SdkContainer::new().container_tool;
                 let config = Config::load(&config_path)?;
-                let target = crate::utils::target::validate_and_log_target(target.or(cli.target).as_deref(), &config)?;
+                let target = crate::utils::target::validate_and_log_target(
+                    target.or(cli.target).as_deref(),
+                    &config,
+                )?;
                 let identity = commands::hitl::HitlIdentity::new(&target, &config_path);
                 commands::hitl::show_logs(&tool, &identity, follow)
             }

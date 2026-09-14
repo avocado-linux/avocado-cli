@@ -72,7 +72,11 @@ impl HitlIdentity {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        format!("avocado-hitl-{}-{:08x}", self.target, (h >> 32) as u32 ^ h as u32)
+        format!(
+            "avocado-hitl-{}-{:08x}",
+            self.target,
+            (h >> 32) as u32 ^ h as u32
+        )
     }
 
     pub fn labels(&self, port: u16, extensions: &[String]) -> Vec<String> {
@@ -156,7 +160,8 @@ impl HitlServerCommand {
             ),
         };
         let config = &composed.config;
-        let container_helper = SdkContainer::new().verbose(self.verbose);
+        let container_helper =
+            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
         let tool = container_helper.container_tool.clone();
         let target = validate_and_log_target(self.target.as_deref(), config)?;
 
@@ -176,6 +181,7 @@ impl HitlServerCommand {
         if self.extensions.is_empty() {
             bail!("No extensions given. Pass one or more with -e <name>; there is nothing to serve otherwise.");
         }
+        self.validate_extension_names()?;
 
         let identity = HitlIdentity::new(&target, &self.config_path);
         let name = identity.container_name();
@@ -184,13 +190,32 @@ impl HitlServerCommand {
         // One server per project+target. A running one is reported, not
         // duplicated; a dead one (crashed, or stopped without `hitl stop`) is
         // cleared so its name is free.
-        match container_state(&tool, &name) {
+        match container_state(&tool, &name)? {
             Some(state) if state == "running" => {
                 print_info(
                     &format!("HITL server '{name}' is already running."),
                     OutputLevel::Normal,
                 );
-                print_connect_hint(&tool, &name, nfs_port, &self.extensions);
+                // The hint describes the server that is running, not the
+                // options this invocation was given.
+                match running_port_and_extensions(&tool, &name) {
+                    Some((port, extensions)) => {
+                        if self.port.is_some_and(|p| p != port) || extensions != self.extensions {
+                            print_info(
+                                &format!(
+                                    "It serves {} on port {port}; `avocado hitl stop` first to change that.",
+                                    extensions.join(", ")
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                        print_connect_hint(port, &extensions);
+                    }
+                    None => print_info(
+                        "Could not read its labels; `avocado hitl status` describes it.",
+                        OutputLevel::Normal,
+                    ),
+                }
                 return Ok(());
             }
             Some(state) => {
@@ -206,18 +231,21 @@ impl HitlServerCommand {
         }
 
         if !self.no_stamps {
-            self.validate_stamps(&container_helper, &container_image, &target, &repo_url, &repo_release)
-                .await?;
+            self.validate_stamps(
+                &container_helper,
+                &container_image,
+                &target,
+                &repo_url,
+                &repo_release,
+            )
+            .await?;
         }
 
         // Network: host networking on Linux so the device reaches the port
         // directly. Docker Desktop's VM does not expose host-networked ports,
         // so publish the port there.
         let mut container_args = if is_docker_desktop() {
-            vec![
-                "-p".to_string(),
-                format!("0.0.0.0:{nfs_port}:{nfs_port}"),
-            ]
+            vec!["-p".to_string(), format!("0.0.0.0:{nfs_port}:{nfs_port}")]
         } else {
             vec!["--net=host".to_string()]
         };
@@ -242,8 +270,14 @@ impl HitlServerCommand {
 
         if self.verbose {
             print_debug(&format!("Container: {name}"), OutputLevel::Normal);
-            print_debug(&format!("Container args: {container_args:?}"), OutputLevel::Normal);
-            print_debug(&format!("Setup command: {setup_command}"), OutputLevel::Normal);
+            print_debug(
+                &format!("Container args: {container_args:?}"),
+                OutputLevel::Normal,
+            );
+            print_debug(
+                &format!("Setup command: {setup_command}"),
+                OutputLevel::Normal,
+            );
         }
 
         let run = RunConfig {
@@ -266,9 +300,15 @@ impl HitlServerCommand {
             ..Default::default()
         };
 
-        container_helper.run_in_container(run).await?;
+        let started = container_helper.run_in_container(run).await?;
         if self.foreground {
+            if !started {
+                bail!("HITL server '{name}' exited with an error.");
+            }
             return Ok(());
+        }
+        if !started {
+            bail!("Could not launch HITL server '{name}'.");
         }
 
         // The container is up; ganesha may still fail. Wait for it to say it
@@ -281,11 +321,25 @@ impl HitlServerCommand {
             ),
             OutputLevel::Normal,
         );
-        print_connect_hint(&tool, &name, nfs_port, &self.extensions);
+        print_connect_hint(nfs_port, &self.extensions);
         print_info(
             "`avocado hitl status` lists servers, `avocado hitl logs` shows this one, `avocado hitl stop` removes it.",
             OutputLevel::Normal,
         );
+        Ok(())
+    }
+
+    /// Extension names are interpolated into the container's setup shell, a
+    /// file name and ganesha's config, so they are held to the grammar the
+    /// fetch script already enforces rather than quoted at every site.
+    fn validate_extension_names(&self) -> Result<()> {
+        for ext in &self.extensions {
+            crate::utils::ext_fetch::validate_shell_safe("name", ext)?;
+            // `,` separates names in the `avocado.extensions` label.
+            if ext.contains(',') {
+                bail!("Extension name '{ext}' contains ','.");
+            }
+        }
         Ok(())
     }
 
@@ -355,7 +409,9 @@ impl HitlServerCommand {
             // ganesha refuses a symlinked export root (see module doc).
             let export = NfsExport::new(
                 export_id,
-                PathBuf::from(format!("$(readlink -f ${{AVOCADO_EXT_SYSROOTS}}/{extension})")),
+                PathBuf::from(format!(
+                    "$(readlink -f ${{AVOCADO_EXT_SYSROOTS}}/{extension})"
+                )),
                 format!("/{extension}"),
             );
             let content = Self::generate_ganesha_export_block(&export)
@@ -388,15 +444,82 @@ impl HitlServerCommand {
     }
 }
 
-/// `docker inspect` state of a container, or None if it does not exist.
-fn container_state(tool: &str, name: &str) -> Option<String> {
+/// `docker inspect` state of a container: `Ok(None)` when it does not exist,
+/// `Err` when the container tool itself failed -- a daemon that is down must
+/// not read as "no server".
+fn container_state(tool: &str, name: &str) -> Result<Option<String>> {
     let out = Command::new(tool)
-        .args(["inspect", "-f", "{{.State.Status}}", name])
+        .args(["container", "inspect", "-f", "{{.State.Status}}", name])
+        .output()
+        .with_context(|| format!("running {tool} inspect"))?;
+    if out.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ));
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if is_no_such(&err) {
+        return Ok(None);
+    }
+    bail!("{tool} inspect {name} failed: {}", err.trim())
+}
+
+/// docker says `No such object` / `No such container`, podman `no such
+/// container`: the container is absent, as opposed to the tool failing.
+fn is_no_such(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("no such")
+}
+
+/// What a running server was started with, from its labels.
+fn running_port_and_extensions(tool: &str, name: &str) -> Option<(u16, Vec<String>)> {
+    let out = Command::new(tool)
+        .args([
+            "container",
+            "inspect",
+            "-f",
+            "{{index .Config.Labels \"avocado.port\"}}\t{{index .Config.Labels \"avocado.extensions\"}}",
+            name,
+        ])
         .output()
         .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    if !out.status.success() {
+        return None;
+    }
+    parse_port_and_extensions(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `<port>\t<ext,ext,...>` as `inspect` prints the two labels.
+fn parse_port_and_extensions(text: &str) -> Option<(u16, Vec<String>)> {
+    let (port, exts) = text.trim_end_matches('\n').split_once('\t')?;
+    Some((
+        port.parse().ok()?,
+        exts.split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    ))
+}
+
+/// `docker ps -a` over every HITL server on this machine, in `format`.
+fn list_servers(tool: &str, format: &str) -> Result<String> {
+    let out = Command::new(tool)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={LABEL_ROLE}"),
+            "--format",
+            format,
+        ])
+        .output()
+        .with_context(|| format!("running {tool} ps"))?;
+    if !out.status.success() {
+        bail!(
+            "{tool} ps failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn logs(tool: &str, name: &str) -> String {
@@ -415,7 +538,12 @@ fn logs(tool: &str, name: &str) -> String {
 /// once `NFS SERVER INITIALIZED` appears with no `:CRIT :` before it; an
 /// error quoting the CRIT lines otherwise; `None` if it has said neither yet.
 pub fn judge_startup(log: &str) -> Option<Result<()>> {
-    let crits: Vec<&str> = log
+    // Only what ganesha said BEFORE declaring itself initialised counts
+    // against startup; a CRIT after that is a runtime event, not an export
+    // that failed to load.
+    const READY: &str = "NFS SERVER INITIALIZED";
+    let startup = log.split(READY).next().unwrap_or(log);
+    let crits: Vec<&str> = startup
         .lines()
         .filter(|l| l.contains(" :CRIT :") || l.contains(":FATAL :"))
         .collect();
@@ -437,7 +565,7 @@ pub fn judge_startup(log: &str) -> Option<Result<()>> {
             detail.join("\n  ")
         )));
     }
-    if log.contains("NFS SERVER INITIALIZED") {
+    if log.contains(READY) {
         return Some(Ok(()));
     }
     None
@@ -451,10 +579,14 @@ fn wait_for_ready(tool: &str, name: &str) -> Result<()> {
                 let _ = Command::new(tool).args(["stop", name]).output();
             }
             return verdict.with_context(|| {
-                format!("HITL server '{name}' failed to start; container kept for `{tool} logs {name}`")
+                format!(
+                    "HITL server '{name}' failed to start; container kept for `{tool} logs {name}`"
+                )
             });
         }
-        if let Some(state) = container_state(tool, name) {
+        // An inspect error here is "unknown": keep polling, the timeout is the
+        // backstop. Aborting would leave an unverified server holding the port.
+        if let Ok(Some(state)) = container_state(tool, name) {
             if state != "running" && state != "created" {
                 bail!(
                     "HITL server '{name}' exited during startup ({state}). Last log lines:\n{}",
@@ -463,8 +595,10 @@ fn wait_for_ready(tool: &str, name: &str) -> Result<()> {
             }
         }
         if start.elapsed() > STARTUP_TIMEOUT {
+            // An unverified server must not be left holding the port.
+            let _ = Command::new(tool).args(["stop", name]).output();
             bail!(
-                "HITL server '{name}' did not report ready within {}s. Last log lines:\n{}",
+                "HITL server '{name}' did not report ready within {}s; stopped it, container kept for `{tool} logs {name}`. Last log lines:\n{}",
                 STARTUP_TIMEOUT.as_secs(),
                 tail(&logs(tool, name), 15)
             );
@@ -499,17 +633,37 @@ fn host_addresses() -> Vec<String> {
             }
         }
     }
+    if v.is_empty() {
+        // No `ip` (macOS, Windows): the address the default route would send
+        // from. connect() on UDP sends nothing; it only picks the local end.
+        // TEST-NET-2 is unicast and never local, so the route is the default.
+        let outbound = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.connect("198.51.100.1:1").map(|_| s))
+            .and_then(|s| s.local_addr());
+        if let Ok(addr) = outbound {
+            v.push(addr.ip().to_string());
+        }
+    }
     v
 }
 
-fn print_connect_hint(_tool: &str, _name: &str, port: u16, extensions: &[String]) {
+fn print_connect_hint(port: u16, extensions: &[String]) {
     let addrs = host_addresses();
-    let ip = addrs.first().cloned().unwrap_or_else(|| "<this-host-ip>".to_string());
+    let ip = addrs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<this-host-ip>".to_string());
     let exts: Vec<String> = extensions.iter().map(|e| format!("-e {e}")).collect();
     print_info("On the device:", OutputLevel::Normal);
-    println!("    avocadoctl hitl mount -s {ip} -p {port} {}", exts.join(" "));
+    println!(
+        "    avocadoctl hitl mount -s {ip} -p {port} {}",
+        exts.join(" ")
+    );
     if addrs.len() > 1 {
-        println!("    (other addresses on this host: {})", addrs[1..].join(", "));
+        println!(
+            "    (other addresses on this host: {})",
+            addrs[1..].join(", ")
+        );
     }
 }
 
@@ -517,20 +671,15 @@ fn print_connect_hint(_tool: &str, _name: &str, port: u16, extensions: &[String]
 
 /// One line per HITL server on this machine, any project.
 pub fn status(tool: &str) -> Result<()> {
-    let out = Command::new(tool)
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label={LABEL_ROLE}"),
-            "--format",
-            "{{.Names}}\t{{.Label \"avocado.target\"}}\t{{.Label \"avocado.port\"}}\t{{.Label \"avocado.extensions\"}}\t{{.Status}}\t{{.Label \"avocado.project\"}}",
-        ])
-        .output()
-        .with_context(|| format!("running {tool} ps"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = list_servers(
+        tool,
+        "{{.Names}}\t{{.Label \"avocado.target\"}}\t{{.Label \"avocado.port\"}}\t{{.Label \"avocado.extensions\"}}\t{{.Status}}\t{{.Label \"avocado.project\"}}",
+    )?;
     if text.trim().is_empty() {
-        print_info("No HITL servers. Start one with `avocado hitl start -e <extension>`.", OutputLevel::Normal);
+        print_info(
+            "No HITL servers. Start one with `avocado hitl start -e <extension>`.",
+            OutputLevel::Normal,
+        );
         return Ok(());
     }
     println!(
@@ -552,17 +701,14 @@ pub fn status(tool: &str) -> Result<()> {
 /// Stop and remove this project's server, or every HITL server with `all`.
 pub fn stop(tool: &str, identity: Option<&HitlIdentity>, all: bool) -> Result<()> {
     let names: Vec<String> = if all {
-        let out = Command::new(tool)
-            .args(["ps", "-a", "--filter", &format!("label={LABEL_ROLE}"), "--format", "{{.Names}}"])
-            .output()?;
-        String::from_utf8_lossy(&out.stdout)
+        list_servers(tool, "{{.Names}}")?
             .lines()
             .map(str::to_string)
             .collect()
     } else {
         let id = identity.context("no project identity and --all not given")?;
         let name = id.container_name();
-        match container_state(tool, &name) {
+        match container_state(tool, &name)? {
             Some(_) => vec![name],
             None => {
                 print_info(
@@ -577,17 +723,32 @@ pub fn stop(tool: &str, identity: Option<&HitlIdentity>, all: bool) -> Result<()
         print_info("No HITL servers to stop.", OutputLevel::Normal);
         return Ok(());
     }
+    let mut failed = Vec::new();
     for name in names {
-        let ok = Command::new(tool)
+        let out = Command::new(tool)
             .args(["rm", "-f", &name])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+            .with_context(|| format!("running {tool} rm"))?;
+        // Gone between `ps` and `rm` is the state that was asked for.
+        if out.status.success() || is_no_such(&String::from_utf8_lossy(&out.stderr)) {
             print_success(&format!("Stopped and removed {name}"), OutputLevel::Normal);
         } else {
-            print_error(&format!("Could not remove {name}"), OutputLevel::Normal);
+            print_error(
+                &format!(
+                    "Could not remove {name}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                OutputLevel::Normal,
+            );
+            failed.push(name);
         }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} HITL server(s) still present: {}",
+            failed.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }
@@ -595,7 +756,7 @@ pub fn stop(tool: &str, identity: Option<&HitlIdentity>, all: bool) -> Result<()
 /// The server log, optionally followed.
 pub fn show_logs(tool: &str, identity: &HitlIdentity, follow: bool) -> Result<()> {
     let name = identity.container_name();
-    if container_state(tool, &name).is_none() {
+    if container_state(tool, &name)?.is_none() {
         bail!("No HITL server for this project and target ({name}).");
     }
     let mut args = vec!["logs"];
@@ -622,13 +783,12 @@ pub fn sync(device: &str) -> Result<()> {
     let status = Command::new("ssh")
         .args([
             "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=accept-new",
             "-o",
             "LogLevel=ERROR",
             "-o",
             "ConnectTimeout=10",
+            "--",
             device,
             "avocadoctl ext refresh",
         ])
@@ -637,7 +797,10 @@ pub fn sync(device: &str) -> Result<()> {
     if !status.success() {
         bail!("refresh on {device} failed ({status})");
     }
-    print_success(&format!("Extensions refreshed on {device}."), OutputLevel::Normal);
+    print_success(
+        &format!("Extensions refreshed on {device}."),
+        OutputLevel::Normal,
+    );
     Ok(())
 }
 
@@ -645,11 +808,10 @@ pub fn sync(device: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn export_path_is_resolved_not_symlinked() {
-        let cmd = HitlServerCommand {
+    fn cmd(extensions: &[&str]) -> HitlServerCommand {
+        HitlServerCommand {
             config_path: "avocado.yaml".into(),
-            extensions: vec!["vmm".into()],
+            extensions: extensions.iter().map(|s| s.to_string()).collect(),
             container_args: None,
             dnf_args: None,
             target: Some("rb3gen2".into()),
@@ -659,8 +821,12 @@ mod tests {
             foreground: false,
             sdk_arch: None,
             composed_config: None,
-        };
-        let sh = cmd.generate_export_setup_commands();
+        }
+    }
+
+    #[test]
+    fn export_path_is_resolved_not_symlinked() {
+        let sh = cmd(&["vmm"]).generate_export_setup_commands();
         // ganesha refuses a symlinked export root; the shell resolves it first
         assert!(sh.contains("Path = $(readlink -f ${AVOCADO_EXT_SYSROOTS}/vmm)"));
         assert!(sh.contains("Pseudo = /vmm"));
@@ -684,17 +850,69 @@ mod tests {
         assert!(err.contains("Too many levels of symbolic links"), "{err}");
     }
 
+    /// A CRIT after the ready line is a runtime event, not a failed export.
+    #[test]
+    fn a_crit_after_initialised_does_not_fail_startup() {
+        let log = "x :NFS STARTUP :EVENT :      NFS SERVER INITIALIZED\n\
+                   y :DISP :CRIT :client 10.0.0.9 went away\n";
+        assert!(judge_startup(log).unwrap().is_ok());
+    }
+
+    /// The name lands in `bash -c`, a file name and ganesha's config.
+    #[test]
+    fn extension_names_that_could_alter_the_setup_shell_are_rejected() {
+        for bad in ["vmm; rm -rf /", "$(id)", "a b", "../etc", "\"x\"", "a,b"] {
+            assert!(cmd(&[bad]).validate_extension_names().is_err(), "{bad}");
+        }
+        assert!(cmd(&["vm-alpha", "vmm"]).validate_extension_names().is_ok());
+    }
+
     #[test]
     fn startup_is_undecided_until_ganesha_speaks_and_ok_when_clean() {
-        assert!(judge_startup("nfs-ganesha-7[main] nfs_Init :NFS STARTUP :EVENT :starting").is_none());
-        assert!(judge_startup("x :NFS STARTUP :EVENT :      NFS SERVER INITIALIZED").unwrap().is_ok());
+        assert!(
+            judge_startup("nfs-ganesha-7[main] nfs_Init :NFS STARTUP :EVENT :starting").is_none()
+        );
+        assert!(
+            judge_startup("x :NFS STARTUP :EVENT :      NFS SERVER INITIALIZED")
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn inspect_stderr_distinguishes_absent_from_broken() {
+        assert!(is_no_such("Error: No such object: avocado-hitl-x\n"));
+        assert!(is_no_such("Error: no such container\n"));
+        assert!(!is_no_such(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"
+        ));
+    }
+
+    #[test]
+    fn running_server_labels_parse_back_to_what_start_was_given() {
+        assert_eq!(
+            parse_port_and_extensions("12049\tvmm,vm-alpha\n"),
+            Some((12049, vec!["vmm".to_string(), "vm-alpha".to_string()]))
+        );
+        assert_eq!(parse_port_and_extensions("2049\t\n"), Some((2049, vec![])));
+        assert_eq!(parse_port_and_extensions("\n"), None);
+        assert_eq!(parse_port_and_extensions("nope\tvmm\n"), None);
     }
 
     #[test]
     fn container_name_is_stable_per_project_and_distinct_across_them() {
-        let a = HitlIdentity { target: "rb3gen2".into(), project_dir: "/p/one".into() };
-        let b = HitlIdentity { target: "rb3gen2".into(), project_dir: "/p/two".into() };
-        let c = HitlIdentity { target: "rubikpi3".into(), project_dir: "/p/one".into() };
+        let a = HitlIdentity {
+            target: "rb3gen2".into(),
+            project_dir: "/p/one".into(),
+        };
+        let b = HitlIdentity {
+            target: "rb3gen2".into(),
+            project_dir: "/p/two".into(),
+        };
+        let c = HitlIdentity {
+            target: "rubikpi3".into(),
+            project_dir: "/p/one".into(),
+        };
         assert_eq!(a.container_name(), a.container_name());
         assert_ne!(a.container_name(), b.container_name());
         assert_ne!(a.container_name(), c.container_name());
@@ -703,8 +921,13 @@ mod tests {
 
     #[test]
     fn labels_carry_what_status_needs() {
-        let id = HitlIdentity { target: "rb3gen2".into(), project_dir: "/p".into() };
-        let l = id.labels(12049, &["vmm".into(), "vm-alpha".into()]).join(" ");
+        let id = HitlIdentity {
+            target: "rb3gen2".into(),
+            project_dir: "/p".into(),
+        };
+        let l = id
+            .labels(12049, &["vmm".into(), "vm-alpha".into()])
+            .join(" ");
         assert!(l.contains("avocado.role=hitl"));
         assert!(l.contains("avocado.target=rb3gen2"));
         assert!(l.contains("avocado.port=12049"));
