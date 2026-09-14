@@ -27,11 +27,12 @@ use std::collections::BTreeMap;
 /// Root that a [`DeviceTreeOverlay::src`] is resolved against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SrcRoot {
-    /// The project tree, bind-mounted at `/opt/src`. Extensions defined inline
-    /// or sourced from a path keep their overlays there.
+    /// The project tree, bind-mounted at `/opt/src`: an extension defined
+    /// inline, with no `source:`, keeps its overlays there.
     Project,
-    /// The extension's own unpacked directory under
-    /// `$AVOCADO_PREFIX/includes/<ext>`, for package-sourced extensions.
+    /// The extension's own directory, `$AVOCADO_PREFIX/includes/<ext>`: any
+    /// extension with a `source:`. A package source unpacks there; a path
+    /// source is bind-mounted there.
     Extension,
 }
 
@@ -45,7 +46,7 @@ pub struct DeviceTreeOverlay {
     pub src: String,
     /// Where `src` is resolved from.
     ///
-    /// A path/local extension has its files in the project tree, bind-mounted
+    /// An inline extension has its files in the project tree, bind-mounted
     /// at `/opt/src`. A PACKAGE-sourced extension does not: installing it
     /// unpacks only its `avocado.yaml` into `$AVOCADO_PREFIX/includes/<ext>/`,
     /// so a project-relative `src` names a file that is not in the container
