@@ -1195,10 +1195,28 @@ fn fold_package_scripts(
                 .and_then(|sec| sec.get("compile"))
                 .and_then(|v| v.as_str())
             {
+                // Which root this script is relative to depends on which config
+                // file declared the `sdk.compile` section, and the merge has
+                // already discarded that provenance. A path-sourced extension
+                // contributes its OWN sdk.compile, whose script sits beside its
+                // avocado.yaml -- under `content_root`, not the consuming
+                // project. Resolving against `project_root` regardless made
+                // every such extension fail its stamp AFTER building cleanly:
+                //
+                //   Config names `con-compile.sh` but it does not exist under
+                //
+                // Prefer the content root when the file is really there, and
+                // fall back to the project root so a project that declares the
+                // section itself is unaffected. When neither has it,
+                // hash_script_at still raises -- that is a real
+                // misconfiguration and we want it surfaced.
+                let root = content_root
+                    .filter(|r| r.join(script).is_file())
+                    .unwrap_or(project_root);
                 fold_file_content(
                     hash_data,
                     &format!("{prefix}.packages.{pkg}.compile_script"),
-                    project_root,
+                    root,
                     script,
                 )?;
             }
@@ -5451,6 +5469,105 @@ extensions:
         let a = ext_build_hash_at(dir.path(), yaml).unwrap();
         std::fs::write(dir.path().join("VERSION"), "1.0.1\n").unwrap();
         assert_ne!(a, ext_build_hash_at(dir.path(), yaml).unwrap());
+    }
+
+    /// A path-sourced extension's `sdk.compile` script lives beside ITS
+    /// avocado.yaml, not the consuming project's. Regression for: the stamp
+    /// resolved it against the project root and failed after a clean build
+    /// with "Config names `x-compile.sh` but it does not exist under".
+    #[test]
+    fn compile_script_resolves_under_a_path_extensions_own_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("vendored/ext")).unwrap();
+        // The script exists ONLY under the extension's path root.
+        std::fs::write(root.join("vendored/ext/x-compile.sh"), "echo build\n").unwrap();
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    source:
+      type: path
+      path: vendored/ext
+    packages:
+      my-pkg:
+        compile: my-section
+sdk:
+  compile:
+    my-section:
+      compile: x-compile.sh
+"#,
+        )
+        .unwrap();
+
+        let ext = config.get("extensions").unwrap().get("my-ext").unwrap();
+        let content_root = ext_content_root(ext, root);
+        let mut hash_data = serde_yaml::Mapping::new();
+        fold_package_scripts(
+            &mut hash_data,
+            "ext.my-ext",
+            ext.get("packages").unwrap(),
+            &config,
+            root,
+            content_root.as_deref(),
+        )
+        .expect("compile script must resolve under the extension's own root");
+
+        let v = hash_data
+            .get(serde_yaml::Value::String(
+                "ext.my-ext.packages.my-pkg.compile_script".to_string(),
+            ))
+            .expect("compile_script hashed");
+        assert_eq!(v.get("path").unwrap().as_str().unwrap(), "x-compile.sh");
+        assert!(!v
+            .get("content_sha256")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The project-root case must keep working: a project that declares the
+    /// section itself, with no path source, still resolves against its own root.
+    #[test]
+    fn compile_script_still_resolves_under_the_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("p-compile.sh"), "echo build\n").unwrap();
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    packages:
+      my-pkg:
+        compile: my-section
+sdk:
+  compile:
+    my-section:
+      compile: p-compile.sh
+"#,
+        )
+        .unwrap();
+
+        let ext = config.get("extensions").unwrap().get("my-ext").unwrap();
+        let content_root = ext_content_root(ext, root);
+        let mut hash_data = serde_yaml::Mapping::new();
+        fold_package_scripts(
+            &mut hash_data,
+            "ext.my-ext",
+            ext.get("packages").unwrap(),
+            &config,
+            root,
+            content_root.as_deref(),
+        )
+        .expect("project-root compile script must still resolve");
+        assert!(hash_data
+            .get(serde_yaml::Value::String(
+                "ext.my-ext.packages.my-pkg.compile_script".to_string()
+            ))
+            .is_some());
     }
 
     /// Where an extension's files live decides what can be hashed. A local
