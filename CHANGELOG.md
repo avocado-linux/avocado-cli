@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`avocado connect upload` sends the runtime's SBOM to object storage
+  instead of inlining it in the create-runtime body.** (ENG-2628)
+  `RuntimeParams.sbom` is now a descriptor —
+  `{sha256, size_bytes, part_size, part_checksums}` — not the document
+  itself; the document uploads the same way an artifact does, reusing the
+  multipart path's retries and presigned-URL refresh, and the same
+  empty-`parts` dedup a server that already has that hash returns for
+  artifacts. A runtime that installed no packages of its own still fails the
+  upload rather than sending a document that would name the runtime and
+  describe only the base system.
+
+  Fail-closed rather than best-effort: a build error now propagates instead
+  of warning and continuing without one, and a response missing its `sbom`
+  upload spec (when one was sent) is an error too — a runtime Connect
+  silently dropped the SBOM for is worse than an upload that fails loudly.
+  If the SBOM's own upload fails, the error propagates before `/complete`,
+  so the runtime is never completed or published without one. This replaces
+  the previous drop-and-retry fallback entirely: there is no longer a body
+  small enough to retry with, so `create_runtime_api` collapses to one call.
+
+  `AVOCADO_UPLOAD_NO_SBOM` is gone; `--no-sbom` replaces it on both upload
+  paths and prints a warning that the runtime will not be assessed. The
+  `--file` path now refuses to upload without `--no-sbom` at all — a tarball
+  built elsewhere is not something this machine can vouch for with an SBOM.
+  `connect runtimes list` gains an `SBOM`/`has_sbom` column
+  (`yes`/`no`/`?`, `?` when the server doesn't report it yet).
+
+  Built against a server contract Connect does not implement yet (ENG-2629)
+  — the CLI change lands ahead of it so the two can be reviewed separately.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated

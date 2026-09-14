@@ -754,6 +754,9 @@ enum ConnectCommands {
         /// Deploy after upload: activate immediately (skip draft)
         #[arg(long)]
         deploy_activate: bool,
+        /// Skip building and sending the runtime's SBOM (required with --file)
+        #[arg(long)]
+        no_sbom: bool,
         /// Output format (human prose or NDJSON event stream)
         #[arg(long, value_enum, default_value_t = crate::utils::output_format::OutputFormat::Human)]
         output: crate::utils::output_format::OutputFormat,
@@ -4189,6 +4192,7 @@ async fn main() -> Result<()> {
                 deploy_name,
                 deploy_tag,
                 deploy_activate,
+                no_sbom,
                 output,
             } => {
                 let profile_org = commands::connect::profile_organization_id(profile.as_deref())?;
@@ -4214,6 +4218,7 @@ async fn main() -> Result<()> {
                     deploy_name,
                     deploy_tags: deploy_tag,
                     deploy_activate,
+                    no_sbom,
                     output,
                 };
                 cmd.execute().await?;

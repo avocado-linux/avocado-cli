@@ -45,19 +45,6 @@ pub(crate) fn classify_upload_part_error(status: u16, body: &str) -> UploadPartE
     }
 }
 
-/// Lets a caller branch on a failed request's status instead of on message
-/// text, which the server is free to reword (ENG-2219).
-#[derive(Debug)]
-pub struct HttpStatus(pub reqwest::StatusCode);
-
-impl std::fmt::Display for HttpStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HTTP {}", self.0)
-    }
-}
-
-impl std::error::Error for HttpStatus {}
-
 const CONFIG_FILE: &str = "credentials.json";
 
 // ---------------------------------------------------------------------------
@@ -425,6 +412,11 @@ pub struct RuntimeListItem {
     #[serde(default)]
     pub display_version: Option<String>,
     pub status: String,
+    /// Whether Connect has an SBOM stored for this runtime (ENG-2628,
+    /// proposed — not yet implemented by Connect). `None` means the server
+    /// doesn't report it yet, and is shown as `?`, never as "no".
+    #[serde(default)]
+    pub has_sbom: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -456,15 +448,31 @@ pub struct RuntimeParams {
     pub config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lockfile: Option<serde_json::Value>,
-    /// The runtime's SPDX 3.0.1 SBOM (ENG-2219). Skipped when absent, so a
-    /// server that does not read it yet sees today's request unchanged.
+    /// A descriptor for the runtime's SBOM, not the document itself — that
+    /// goes to object storage the same way an artifact does (ENG-2628).
+    /// Skipped when absent, so a server that does not read it yet sees
+    /// today's request unchanged.
+    ///
+    /// This shape is proposed on ENG-2628; the server side is tracked on
+    /// ENG-2629 and may change it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sbom: Option<serde_json::Value>,
+    pub sbom: Option<SbomParam>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactParam {
     pub image_id: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub part_size: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub part_checksums: Vec<String>,
+}
+
+/// Same shape as `ArtifactParam`, minus `image_id` — the SBOM has no image of
+/// its own to key by until Connect hands one back (ENG-2628, proposed).
+#[derive(Debug, Clone, Serialize)]
+pub struct SbomParam {
     pub size_bytes: u64,
     pub sha256: String,
     pub part_size: u64,
@@ -507,6 +515,11 @@ pub struct RuntimeCreateData {
     pub status: String,
     #[serde(default)]
     pub artifacts: Vec<ArtifactUploadSpec>,
+    /// Upload spec for the SBOM, keyed by the document's own sha256 as
+    /// `image_id` (ENG-2628, proposed). `None` when no descriptor was sent,
+    /// or Connect doesn't implement this yet.
+    #[serde(default)]
+    pub sbom: Option<ArtifactUploadSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1220,8 +1233,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpStatus(status))
-                .context(format!("Failed to create runtime (HTTP {status}): {body}")));
+            anyhow::bail!("Failed to create runtime (HTTP {status}): {body}");
         }
 
         let resp: CreateRuntimeResponse = res.json().await?;

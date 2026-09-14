@@ -28,6 +28,7 @@ impl ConnectRuntimesListCommand {
                     "version": r.version,
                     "display_version": r.display_version,
                     "status": r.status,
+                    "has_sbom": r.has_sbom,
                 })).collect::<Vec<_>>()
             }));
             return Ok(());
@@ -45,17 +46,26 @@ impl ConnectRuntimesListCommand {
             .unwrap_or(0);
 
         println!(
-            "{:<ver_w$}  {:<10}  ID",
+            "{:<ver_w$}  {:<10}  {:<4}  ID",
             "VERSION",
             "STATUS",
+            "SBOM",
             ver_w = max_version
         );
         for rt in &runtimes {
             let ver = rt.display_version.as_deref().unwrap_or(&rt.version);
+            // `None` means the server doesn't report it yet — shown as `?`,
+            // never as "no", so an old Connect doesn't read as SBOM-less.
+            let sbom = match rt.has_sbom {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "?",
+            };
             println!(
-                "{:<ver_w$}  {:<10}  {}",
+                "{:<ver_w$}  {:<10}  {:<4}  {}",
                 ver,
                 rt.status,
+                sbom,
                 rt.id,
                 ver_w = max_version,
             );

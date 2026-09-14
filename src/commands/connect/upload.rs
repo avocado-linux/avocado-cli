@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use base64::prelude::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, HttpStatus, RuntimeParams,
+    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams, SbomParam,
     UploadPartError,
 };
 use crate::commands::sbom::generate::{in_runtime, runtime_has_packages, SbomCommand};
@@ -78,6 +79,7 @@ pub struct ConnectUploadCommand {
     pub deploy_name: Option<String>,
     pub deploy_tags: Vec<String>,
     pub deploy_activate: bool,
+    pub no_sbom: bool,
     pub output: OutputFormat,
 }
 
@@ -87,6 +89,15 @@ struct ArtifactInfo {
     size_bytes: u64,
     sha256: String,
     part_checksums: Vec<String>,
+}
+
+/// The runtime's SBOM, staged on disk and described the way `upload_artifacts`
+/// expects (ENG-2628). `_tmp` is never read directly — it exists only to keep
+/// the tempfile alive until the upload that follows.
+struct SbomUpload {
+    _tmp: tempfile::NamedTempFile,
+    info: ArtifactInfo,
+    param: SbomParam,
 }
 
 impl TaskPrerequisites for ConnectUploadCommand {
@@ -155,6 +166,17 @@ impl ConnectUploadCommand {
         connect: &ConnectClient,
         project_config: &Config,
     ) -> Result<()> {
+        // `--file` may point at a tarball built elsewhere, so this machine's
+        // sysroots would be a false claim about its SBOM — require the
+        // caller to say so explicitly, before any work, rather than
+        // silently shipping without one.
+        if !self.no_sbom {
+            anyhow::bail!(
+                "A tarball built elsewhere has no SBOM this machine can vouch for; pass --no-sbom"
+            );
+        }
+        warn_uploading_without_sbom();
+
         let (artifacts_dir, _tmp_dir) = self.get_artifacts_dir().await?;
 
         let manifest = read_manifest(&artifacts_dir)?;
@@ -224,8 +246,6 @@ impl ConnectUploadCommand {
                         &d.content_keyid,
                     )
                 }),
-                // `--file` may point at a tarball built elsewhere, so this
-                // machine's sysroots would be a false claim about it.
                 None,
             )
             .await?;
@@ -305,10 +325,14 @@ impl ConnectUploadCommand {
             None
         };
 
-        // Phase B: Create runtime via API. The SBOM (ENG-2219) is built in
-        // this phase rather than one of its own.
+        // Built and staged before the runtime exists, so its descriptor
+        // travels in the same create-runtime request (ENG-2628). Held alive
+        // (via its tempfile) until it is uploaded, right after Phase B.
+        let sbom_upload = self.prepare_sbom_upload().await?;
+
+        // Phase B: Create runtime via API. The SBOM (ENG-2628) is described
+        // in this phase rather than one of its own.
         let (runtime, num_artifacts) = run_phase(PHASE_CREATE, async {
-            let sbom = self.build_sbom().await;
             self.create_runtime_api(
                 connect,
                 version,
@@ -326,28 +350,55 @@ impl ConnectUploadCommand {
                     })
                     .collect::<Vec<_>>(),
                 delegation_refs,
-                sbom,
+                sbom_upload.as_ref().map(|s| s.param.clone()),
+            )
+            .await
+        })
+        .await?;
+
+        // Upload the SBOM's own bytes under the same upload step used for
+        // artifacts, right away and before the draft check — a runtime that
+        // already stores this hash gets empty parts back, the same dedup
+        // rule artifacts use, and `upload_artifacts` already handles that.
+        let sbom_completed = run_phase(PHASE_UPLOAD, async {
+            let Some(sbom) = &sbom_upload else {
+                return Ok(Vec::new());
+            };
+            let spec = runtime
+                .sbom
+                .as_ref()
+                .context("Connect accepted the SBOM but returned no upload spec for it")?;
+            upload_artifacts(
+                connect,
+                &self.org,
+                &self.project,
+                &runtime.id,
+                std::slice::from_ref(spec),
+                std::slice::from_ref(&sbom.info),
             )
             .await
         })
         .await?;
 
         if runtime.status == "draft" {
-            // Nothing to upload (all artifacts already present) — mark the
-            // upload/finalize steps skipped so the strip doesn't look stuck.
-            emit_step(PHASE_UPLOAD, "skipped");
-            emit_step(PHASE_FINALIZE, "skipped");
-            self.handle_draft_status(connect, &runtime, num_artifacts)
-                .await?;
-            return Ok(());
+            // Nothing else to upload (all artifacts already present).
+            // Finalize only skips if the SBOM above needed no `/complete`
+            // either — `complete_and_finalize` runs it when it did.
+            if sbom_completed.is_empty() {
+                emit_step(PHASE_FINALIZE, "skipped");
+            }
+            return self
+                .complete_and_finalize(connect, &runtime, sbom_completed, num_artifacts)
+                .await;
         }
 
         // Phase C: Stream artifacts from Docker volume and upload with progress
-        let completed_parts = run_phase(
+        let mut completed_parts = run_phase(
             PHASE_UPLOAD,
             self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
         )
         .await?;
+        completed_parts.extend(sbom_completed);
 
         // Phase D: Complete and finalize
         run_phase(
@@ -368,7 +419,7 @@ impl ConnectUploadCommand {
         manifest: &serde_json::Value,
         artifacts: &[ArtifactParam],
         delegation: Option<(&String, &String, &String)>,
-        sbom: Option<serde_json::Value>,
+        sbom: Option<SbomParam>,
     ) -> Result<(client::RuntimeCreateData, usize)> {
         progress(
             &format!("Creating runtime {version}..."),
@@ -392,26 +443,13 @@ impl ConnectUploadCommand {
             },
         };
 
-        match connect
+        let mut runtime = connect
             .create_runtime(&self.org, &self.project, &create_req)
-            .await
-        {
-            Ok(runtime) => Ok((runtime, num_artifacts)),
-            // The server rejecting the SBOM must never fail the upload.
-            Err(e) if create_req.runtime.sbom.is_some() && sbom_may_be_at_fault(&e) => {
-                print_warning_above(&format!(
-                    "Connect did not accept the runtime with an SBOM attached ({e:#}); retrying \
-                     without it."
-                ));
-                let mut retry_req = create_req;
-                retry_req.runtime.sbom = None;
-                let runtime = connect
-                    .create_runtime(&self.org, &self.project, &retry_req)
-                    .await?;
-                Ok((runtime, num_artifacts))
-            }
-            Err(e) => Err(e),
-        }
+            .await?;
+        // Fail closed: a server that dropped a sent SBOM must not finish (and
+        // possibly publish) a runtime with none (ENG-2628).
+        runtime.sbom = check_sbom_accepted(create_req.runtime.sbom.is_some(), runtime.sbom)?;
+        Ok((runtime, num_artifacts))
     }
 
     /// Read `avocado.yaml` (converted YAML→JSON) and the lock file
@@ -459,27 +497,42 @@ impl ConnectUploadCommand {
         Ok((Some(config_json), lockfile_json))
     }
 
-    /// The runtime's SBOM, or `None` on any failure — a document Connect
-    /// cannot ingest yet is worth less than the upload it would block, the
-    /// contract `read_config_and_lockfile` already has for the lockfile.
+    /// Build the runtime's SBOM and stage it on disk the way
+    /// `upload_artifacts` expects, unless `--no-sbom` was passed. The
+    /// returned `SbomUpload` keeps its tempfile alive until the caller has
+    /// uploaded it.
     ///
-    /// `AVOCADO_UPLOAD_NO_SBOM=1` skips the build outright.
-    async fn build_sbom(&self) -> Option<serde_json::Value> {
-        if std::env::var("AVOCADO_UPLOAD_NO_SBOM").as_deref() == Ok("1") {
-            return None;
+    /// Serializes the document once, so the exact bytes that get hashed are
+    /// the exact bytes that get uploaded (ENG-2628). Unlike the lockfile in
+    /// `read_config_and_lockfile`, a missing SBOM is not tolerated here: a
+    /// runtime Connect cannot assess is worse than an upload that fails
+    /// loudly, so build errors propagate instead of degrading to a warning.
+    async fn prepare_sbom_upload(&self) -> Result<Option<SbomUpload>> {
+        if self.no_sbom {
+            warn_uploading_without_sbom();
+            return Ok(None);
         }
-        match self.scan_runtime_sbom().await {
-            Ok(doc) => Some(doc),
-            Err(e) => {
-                // Not `print_warning`: that one is suppressed under
-                // `--output json`, hiding the skipped check from the reader
-                // most likely to act on it.
-                print_warning_above(&format!(
-                    "Could not build the runtime's SBOM ({e:#}); uploading without it."
-                ));
-                None
-            }
-        }
+        let doc = self.scan_runtime_sbom().await?;
+        let bytes = serde_json::to_vec(&doc).context("Failed to serialize the runtime's SBOM")?;
+        let (tmp, sha256, part_checksums) = stage_for_upload(&bytes)?;
+        let size_bytes = bytes.len() as u64;
+        let info = ArtifactInfo {
+            image_id: sha256.clone(),
+            path: tmp.path().to_path_buf(),
+            size_bytes,
+            sha256: sha256.clone(),
+            part_checksums: part_checksums.clone(),
+        };
+        Ok(Some(SbomUpload {
+            _tmp: tmp,
+            info,
+            param: SbomParam {
+                sha256,
+                size_bytes,
+                part_size: PART_SIZE,
+                part_checksums,
+            },
+        }))
     }
 
     /// `avocado sbom`'s document, filtered to this runtime by `in_runtime`.
@@ -1517,28 +1570,42 @@ fn read_delegation_info(artifacts_dir: &Path) -> Option<DelegationInfo> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Whether the SBOM in the body is a plausible cause of `e`, and so whether
-/// dropping it and retrying this non-idempotent POST is worth a second call.
-///
-/// Not any 4xx: 401, 403, 409 and 422 are ordinary outcomes of this API that
-/// a smaller body does not fix, and blaming the SBOM for them prints a
-/// misleading warning and burns a second request on the same failure — 429
-/// worst of all, retried with no backoff. 400 and 413 are the two that mean
-/// this body was refused; 413 is the likeliest, since ~400 packages of SPDX
-/// is megabytes into a body that is otherwise kilobytes.
-///
-/// A body refused mid-write has no status at all: a proxy over its size cap
-/// can close the connection instead of answering, which reqwest surfaces as
-/// a request/body error. Those count too. Decode and timeout errors do not —
-/// the server may well have created the runtime by then.
-fn sbom_may_be_at_fault(e: &anyhow::Error) -> bool {
-    match e.downcast_ref::<HttpStatus>() {
-        Some(s) => matches!(s.0.as_u16(), 400 | 413),
-        None => e
-            .chain()
-            .filter_map(|c| c.downcast_ref::<reqwest::Error>())
-            .any(|r| r.is_request() || r.is_body()),
+/// Shared wording for `--no-sbom` on both upload paths.
+fn warn_uploading_without_sbom() {
+    print_warning_above(
+        "Uploading without an SBOM (--no-sbom); this runtime will not be assessed for known \
+         vulnerabilities.",
+    );
+}
+
+/// A response with no `sbom` upload spec when one was sent means Connect
+/// accepted the runtime but silently dropped the SBOM — bail rather than
+/// finish (and possibly publish) a runtime with none (ENG-2628). Returns
+/// `response_sbom` unchanged, so callers get a spec that's already known to
+/// be valid rather than needing to trust one this function checked.
+fn check_sbom_accepted(
+    sbom_was_sent: bool,
+    response_sbom: Option<ArtifactUploadSpec>,
+) -> Result<Option<ArtifactUploadSpec>> {
+    if sbom_was_sent && response_sbom.is_none() {
+        anyhow::bail!("Connect did not accept the SBOM");
     }
+    Ok(response_sbom)
+}
+
+/// Write `bytes` to a fresh tempfile and hash it in the same pass
+/// `compute_sha256_with_parts` already does for artifacts, so the sha256 sent
+/// to Connect is computed from the exact bytes that get uploaded — no second
+/// `to_vec` in between that could serialize differently.
+fn stage_for_upload(bytes: &[u8]) -> Result<(tempfile::NamedTempFile, String, Vec<String>)> {
+    let mut tmp =
+        tempfile::NamedTempFile::new().context("Failed to create a tempfile for the SBOM")?;
+    tmp.write_all(bytes)
+        .context("Failed to write the SBOM to a tempfile")?;
+    tmp.flush()
+        .context("Failed to write the SBOM to a tempfile")?;
+    let (sha256, part_checksums) = compute_sha256_with_parts(tmp.path())?;
+    Ok((tmp, sha256, part_checksums))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1628,11 +1695,8 @@ mod tests {
         assert_eq!(parts[0], expected);
     }
 
-    #[test]
-    fn a_runtime_with_no_sbom_sends_no_sbom_key() {
-        // A server that does not read `sbom` yet must see today's request
-        // unchanged when the build produced `None`.
-        let params = RuntimeParams {
+    fn base_params(sbom: Option<SbomParam>) -> RuntimeParams {
+        RuntimeParams {
             version: "1.0.0".to_string(),
             build_id: None,
             description: None,
@@ -1643,9 +1707,15 @@ mod tests {
             content_keyid: None,
             config: None,
             lockfile: None,
-            sbom: None,
-        };
-        let value = serde_json::to_value(&params).unwrap();
+            sbom,
+        }
+    }
+
+    #[test]
+    fn a_runtime_with_no_sbom_sends_no_sbom_key() {
+        // A server that does not read `sbom` yet must see today's request
+        // unchanged when the caller sent `None` (e.g. `--no-sbom`).
+        let value = serde_json::to_value(base_params(None)).unwrap();
         assert!(
             value.as_object().unwrap().get("sbom").is_none(),
             "got: {value}"
@@ -1653,32 +1723,89 @@ mod tests {
     }
 
     #[test]
-    fn only_a_refused_body_blames_the_sbom() {
-        let with_status = |code: u16| {
-            anyhow::Error::new(HttpStatus(reqwest::StatusCode::from_u16(code).unwrap()))
-                .context("Failed to create runtime")
-        };
-        for code in [400, 413] {
-            assert!(sbom_may_be_at_fault(&with_status(code)), "{code}");
-        }
-        // Ordinary outcomes of this API: an expired token, a version already
-        // taken, a rejected field, a rate limit. A smaller body fixes none.
-        for code in [401, 403, 409, 422, 429] {
-            assert!(!sbom_may_be_at_fault(&with_status(code)), "{code}");
-        }
+    fn a_sbom_descriptor_serializes_with_no_document_inside() {
+        // The descriptor names the bytes going to object storage; it must
+        // never carry the document itself back into the create-runtime body.
+        let params = base_params(Some(SbomParam {
+            sha256: "a".repeat(64),
+            size_bytes: 1234,
+            part_size: PART_SIZE,
+            part_checksums: vec!["deadbeef==".to_string()],
+        }));
+        let value = serde_json::to_value(params).unwrap();
+        let sbom = value.get("sbom").expect("sbom key present");
+        assert_eq!(sbom["sha256"], "a".repeat(64));
+        assert_eq!(sbom["size_bytes"], 1234);
+        assert_eq!(sbom["part_size"], PART_SIZE);
+        assert_eq!(sbom["part_checksums"], serde_json::json!(["deadbeef=="]));
+        assert!(sbom.get("image_id").is_none(), "got: {sbom}");
     }
 
-    #[tokio::test]
-    async fn a_body_refused_without_a_status_still_blames_the_sbom() {
-        // A proxy over its size cap can close the connection instead of
-        // answering 413, which reaches us as a transport error carrying no
-        // HttpStatus at all.
-        let e = reqwest::Client::new()
-            .post("http://127.0.0.1:1/")
-            .send()
-            .await
-            .unwrap_err();
-        let e = anyhow::Error::new(e).context("Failed to create runtime");
-        assert!(sbom_may_be_at_fault(&e), "{e:#}");
+    #[test]
+    fn a_runtime_create_response_with_no_sbom_field_deserializes_to_none() {
+        let data: client::RuntimeCreateData = serde_json::from_value(serde_json::json!({
+            "id": "r1", "version": "1.0.0", "status": "draft", "artifacts": []
+        }))
+        .unwrap();
+        assert!(data.sbom.is_none());
+    }
+
+    #[test]
+    fn a_runtime_create_response_with_an_sbom_spec_deserializes_it() {
+        let data: client::RuntimeCreateData = serde_json::from_value(serde_json::json!({
+            "id": "r1", "version": "1.0.0", "status": "draft", "artifacts": [],
+            "sbom": { "image_id": "abc123", "upload_id": "u1", "parts": [] }
+        }))
+        .unwrap();
+        assert_eq!(data.sbom.unwrap().image_id, "abc123");
+    }
+
+    #[test]
+    fn a_runtime_list_item_with_no_has_sbom_field_deserializes_to_none() {
+        let item: client::RuntimeListItem = serde_json::from_value(serde_json::json!({
+            "id": "r1", "version": "1.0.0", "status": "draft"
+        }))
+        .unwrap();
+        assert_eq!(item.has_sbom, None);
+    }
+
+    #[test]
+    fn a_runtime_list_item_with_has_sbom_true_deserializes_it() {
+        let item: client::RuntimeListItem = serde_json::from_value(serde_json::json!({
+            "id": "r1", "version": "1.0.0", "status": "draft", "has_sbom": true
+        }))
+        .unwrap();
+        assert_eq!(item.has_sbom, Some(true));
+    }
+
+    #[test]
+    fn staged_bytes_hash_to_an_independently_computed_sha256() {
+        // Guards against re-serializing the document between hashing and
+        // upload: the hash must match the exact bytes that get staged.
+        let bytes = serde_json::to_vec(&serde_json::json!({"a": 1, "b": [1, 2, 3]})).unwrap();
+        let (_tmp, sha256, _parts) = stage_for_upload(&bytes).unwrap();
+
+        // Hash the same bytes again through a second, independent tempfile
+        // rather than re-deriving the hex loop `compute_sha256_with_parts`
+        // already covers.
+        let mut independent = NamedTempFile::new().unwrap();
+        independent.write_all(&bytes).unwrap();
+        independent.flush().unwrap();
+        let (expected, _) = compute_sha256_with_parts(independent.path()).unwrap();
+
+        assert_eq!(sha256, expected);
+    }
+
+    #[test]
+    fn a_response_missing_its_sbom_spec_is_an_error() {
+        assert!(check_sbom_accepted(true, None).is_err());
+        assert!(check_sbom_accepted(false, None).is_ok());
+        let spec = ArtifactUploadSpec {
+            image_id: "abc123".to_string(),
+            upload_id: None,
+            parts: Vec::new(),
+        };
+        let accepted = check_sbom_accepted(true, Some(spec)).unwrap();
+        assert_eq!(accepted.unwrap().image_id, "abc123");
     }
 }
