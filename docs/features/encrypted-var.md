@@ -1,4 +1,4 @@
-# Encrypted `/var` (`runtimes.<name>.var.encrypt`)
+# Encrypted `/var` (`runtimes.<name>.var`)
 
 Opt a runtime into a LUKS2-encrypted `/var` whose key is sealed to the
 target's hardware key store (the OP-TEE fTPM on Jetson). Off by default; an
@@ -10,7 +10,66 @@ runtimes:
     target: jetson-orin-nx
     var:
       encrypt: true
+      hardware: tpm2
+      recovery: var-recovery
 ```
+
+Three keys, and only the first is required:
+
+| Key | Purpose |
+| --- | --- |
+| `encrypt` | The opt-in. |
+| `hardware` | Which key engine binds the volume. Default `auto`. |
+| `recovery` | Names a registry secret held by the operator. |
+
+## `hardware`: which engine, and what happens when it is missing
+
+`auto` (the default), `caam`, `tpm2`, `none`. An unrecognised value is
+rejected when the config is parsed, which is worth knowing because `ftpm` is
+the obvious guess on Jetson and is not a valid value:
+
+```text
+runtimes.prod.var.hardware: 'ftpm' is not one of auto, caam, tpm2, none
+```
+
+`auto` uses whatever the machine ships and probes successfully, and **degrades
+to Argon2id and reports** when nothing does. The unit boots either way, so a
+fleet left on the default can be running software-derived keys while its
+operator believes the volume is hardware-bound. `tpm2` and `caam` fail closed
+instead. `none` skips the hardware slot entirely and requires `recovery`.
+
+## `recovery`: an operator-held keyslot
+
+Without it, the only way back into a unit whose hardware keyslot is lost is a
+keyslot derived from the SoC UID, which is readable on the device. `recovery`
+names an HMAC master you hold, and lets that UID-derived slot be retired.
+
+```console
+$ avocado signing-keys create var-recovery --algorithm hmac-sha256
+```
+
+Nothing derived from the master enters a build. Enrolment happens against a
+running device:
+
+```console
+$ avocado var-key enroll <runtime> --device root@<host>
+```
+
+That reads the device's SoC UID, derives
+`HMAC-SHA256(master, "avocado-var-recovery\0" || UID)`, and hands it to
+`avocadoctl var-key enroll` over the SSH session. It then re-reads the device's
+keyslots and fails unless an `avocado-recovery` token came back, so a device
+whose `avocadoctl` is too old to know `var-key` is reported rather than passed.
+
+Recovering a unit later needs only the master and the unit's UID:
+
+```console
+$ avocado var-key derive <runtime> --uid <soc-uid>
+```
+
+Hex by default; `--raw` emits the 32 bytes for `cryptsetup --key-file -`. The
+UID is read from `/sys/firmware/devicetree/base/serial-number`, falling back to
+`/sys/devices/soc0/serial_number`.
 
 ## What the cli does when it is set
 
@@ -51,6 +110,23 @@ The target's feed must declare `encrypted-var` in its
 the initrd refuses to touch the partition and `/var` fails to mount rather
 than silently staying plaintext. Jetson (orin-nano, orin-nx, agx-orin,
 agx-thor) does as of meta-avocado wrynose.
+
+That means the **2026 release, `next` channel**:
+
+```yaml
+distro:
+  release: 2026
+  channel: next
+```
+
+`cryptsetup-var` is not published in the 2024 feed at all, so a 2024 project
+that sets `encrypt: true` fails during `avocado install` while installing the
+rootfs sysroot, and the error names no missing package. An install that dies
+there right after the SDK step is the first thing to check against the release.
+
+The 2026 target names also drop the `-devkit` suffix the 2024 feed used
+(`jetson-orin-nano`, not `jetson-orin-nano-devkit`), so moving a project
+forward is a rename as well as a release bump.
 
 ## Limitations
 
