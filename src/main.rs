@@ -3492,6 +3492,33 @@ async fn main() -> Result<()> {
             },
         },
         Commands::Hitl { command } => match command {
+            HitlCommands::Start {
+                config_path,
+                extensions,
+                container_args,
+                dnf_args,
+                target,
+                verbose,
+                port,
+                no_stamps,
+                foreground,
+            } => {
+                let hitl_cmd = HitlServerCommand {
+                    config_path,
+                    extensions,
+                    container_args,
+                    dnf_args,
+                    target: target.or(cli.target),
+                    verbose,
+                    port,
+                    no_stamps: no_stamps || cli.no_stamps,
+                    foreground,
+                    sdk_arch: cli.sdk_arch.clone(),
+                    composed_config: None,
+                };
+                hitl_cmd.execute().await?;
+                Ok(())
+            }
             HitlCommands::Server {
                 config_path,
                 extensions,
@@ -3511,12 +3538,44 @@ async fn main() -> Result<()> {
                     verbose,
                     port,
                     no_stamps: no_stamps || cli.no_stamps,
+                    foreground: true,
                     sdk_arch: cli.sdk_arch.clone(),
                     composed_config: None,
                 };
                 hitl_cmd.execute().await?;
                 Ok(())
             }
+            HitlCommands::Status => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                commands::hitl::status(&tool)
+            }
+            HitlCommands::Stop {
+                config_path,
+                target,
+                all,
+            } => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                let identity = if all {
+                    None
+                } else {
+                    let config = Config::load(&config_path)?;
+                    let target = crate::utils::target::validate_and_log_target(target.or(cli.target).as_deref(), &config)?;
+                    Some(commands::hitl::HitlIdentity::new(&target, &config_path))
+                };
+                commands::hitl::stop(&tool, identity.as_ref(), all)
+            }
+            HitlCommands::Logs {
+                config_path,
+                target,
+                follow,
+            } => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                let config = Config::load(&config_path)?;
+                let target = crate::utils::target::validate_and_log_target(target.or(cli.target).as_deref(), &config)?;
+                let identity = commands::hitl::HitlIdentity::new(&target, &config_path);
+                commands::hitl::show_logs(&tool, &identity, follow)
+            }
+            HitlCommands::Sync { device } => commands::hitl::sync(&device),
         },
         Commands::Sdk { command } => match command {
             SdkCommands::Install {
@@ -5051,7 +5110,69 @@ enum VmConfigCommands {
 
 #[derive(Subcommand)]
 enum HitlCommands {
-    /// Start a HITL server container with preconfigured settings
+    /// Start a managed HITL NFS server for this project (detached; see `status`, `logs`, `stop`)
+    Start {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Extensions to serve
+        #[arg(short, long = "extension", required = true)]
+        extensions: Vec<String>,
+        /// Additional container arguments
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// NFS port number to use
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Disable stamp validation
+        #[arg(long)]
+        no_stamps: bool,
+        /// Stay attached and stream the server log instead of detaching
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// List HITL servers on this machine
+    Status,
+    /// Stop and remove this project's HITL server (or every one with --all)
+    Stop {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Stop every HITL server, not just this project's
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show this project's HITL server log
+    Logs {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Follow the log
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Re-run the extension lifecycle on a device after rebuilding what it is served
+    Sync {
+        /// Device as [user@]host, e.g. root@192.168.1.77
+        #[arg(short, long)]
+        device: String,
+    },
+    /// Start a HITL server in the foreground (alias for `start --foreground`)
     Server {
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
