@@ -262,8 +262,9 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 
 /// Render the in-container shell block that builds, stages, delivers, and
 /// validates the device-tree overlays, for injection into the runtime build
-/// script immediately before `stone bundle`. Empty string when there are no
-/// overlays, so the feature is entirely inert unless declared.
+/// script immediately before `stone bundle`. With no overlays the block only
+/// clears `$DTBO_STAGING`, so a previous build's overlays never carry into
+/// this one; nothing is compiled or staged unless declared.
 ///
 /// The block assumes `$STONE_MANIFEST` and `$STONE_INCLUDE_FLAGS` are already
 /// set (they are by the time the build reaches the stone step) and leaves
