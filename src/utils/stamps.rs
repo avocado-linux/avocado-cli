@@ -1251,15 +1251,31 @@ fn fold_package_scripts(
                 // section itself is unaffected. When neither has it,
                 // hash_script_at still raises -- that is a real
                 // misconfiguration and we want it surfaced.
-                let root = content_root
-                    .filter(|r| r.join(script).is_file())
-                    .unwrap_or(project_root);
-                fold_file_content(
-                    hash_data,
-                    &format!("{prefix}.packages.{pkg}.compile_script"),
-                    root,
-                    script,
-                )?;
+                //
+                // No content root at all is a different case, and not an error:
+                // `ext_content_root` returns None for a source the host cannot
+                // see, whose scripts are unpacked into the SDK volume rather
+                // than into any host tree. There is nothing to hash and no
+                // fallback that could find it, so skip -- as `post_build` and
+                // the `install` arm below already do. Falling back here sent
+                // that unreachable path to hash_script_at and reproduced the
+                // very failure the paragraph above describes, this time for
+                // every package-sourced extension declaring a compile script.
+                // Such an extension still invalidates by its resolved version
+                // from the lock.
+                if let Some(content_root) = content_root {
+                    let root = if content_root.join(script).is_file() {
+                        content_root
+                    } else {
+                        project_root
+                    };
+                    fold_file_content(
+                        hash_data,
+                        &format!("{prefix}.packages.{pkg}.compile_script"),
+                        root,
+                        script,
+                    )?;
+                }
             }
         }
         if let (Some(install), Some(root)) =
@@ -5774,6 +5790,61 @@ sdk:
                 "ext.my-ext.packages.my-pkg.compile_script".to_string()
             ))
             .is_some());
+    }
+
+    /// A package-sourced extension's compile script is unpacked into the SDK
+    /// volume, never into a host tree, so there is nothing to hash and no
+    /// project-root fallback that could find it. Skipping matches `post_build`
+    /// and the `install` arm, which already require a content root. Regression
+    /// for: the fallback sent that unreachable path to `hash_script_at`, which
+    /// raises, so a consumer's build failed after the extension had already
+    /// compiled and installed cleanly.
+    #[test]
+    fn compile_script_is_skipped_for_a_package_sourced_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Deliberately no script on the host: this is the normal state for a
+        // package source, not a misconfiguration.
+
+        let config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  my-ext:
+    source:
+      type: package
+      version: "*"
+    packages:
+      my-pkg:
+        compile: my-section
+sdk:
+  compile:
+    my-section:
+      compile: x-compile.sh
+"#,
+        )
+        .unwrap();
+
+        let ext = config.get("extensions").unwrap().get("my-ext").unwrap();
+        let content_root = ext_content_root(ext, root);
+        let mut hash_data = serde_yaml::Mapping::new();
+        fold_package_scripts(
+            &mut hash_data,
+            "ext.my-ext",
+            ext.get("packages").unwrap(),
+            &config,
+            root,
+            content_root.as_deref(),
+        )
+        .expect("a package source must not be reported as a missing script");
+
+        assert!(
+            hash_data
+                .get(serde_yaml::Value::String(
+                    "ext.my-ext.packages.my-pkg.compile_script".to_string()
+                ))
+                .is_none(),
+            "nothing on the host to hash, so no compile_script key"
+        );
     }
 
     /// Where an extension's files live decides what can be hashed. A local
