@@ -18,7 +18,6 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::config::Config;
 use crate::utils::output::{print_info, OutputLevel};
@@ -232,21 +231,13 @@ impl ProfilesListCommand {
              if [ -z \"$f\" ]; then echo __AVOCADO_NO_STONE__; else cat \"$f\"; fi"
         );
 
-        let out = AsyncCommand::new(container_tool)
-            .args([
-                "run",
-                "--rm",
-                "-v",
-                &format!("{volume_name}:/opt/_avocado:ro"),
-                "--entrypoint",
-                "/bin/sh",
-                sdk_image,
-                "-c",
-                &script,
-            ])
-            .output()
-            .await
-            .context("failed to spawn docker for stone manifest read")?;
+        let out = crate::utils::container::SessionContainers::volume_exec(
+            container_tool,
+            &format!("{volume_name}:/opt/_avocado:ro"),
+            sdk_image,
+            &["/bin/sh", "-c", &script],
+        )
+        .context("failed to read the stone manifest from the volume")?;
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);

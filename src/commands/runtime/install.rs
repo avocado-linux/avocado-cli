@@ -1,3 +1,4 @@
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -130,6 +131,9 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Runtime, &self.config_path)
+            .await?;
 
         // Check if runtime section exists
         let runtime_section = match parsed.get("runtimes") {
@@ -223,6 +227,7 @@ impl RuntimeInstallCommand {
                 container_image,
                 repo_url.as_ref(),
                 repo_release.as_ref(),
+                feeds.as_ref(),
                 &merged_container_args,
                 runs_on_context.as_ref(),
             )
@@ -258,6 +263,7 @@ impl RuntimeInstallCommand {
         container_image: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
@@ -297,6 +303,7 @@ impl RuntimeInstallCommand {
                     container_image,
                     repo_url,
                     repo_release,
+                    feeds,
                     merged_container_args,
                     &mut lock_file,
                     &src_dir,
@@ -332,6 +339,7 @@ impl RuntimeInstallCommand {
                         source_environment: true,
                         interactive: false,
                         repo_url: repo_url.cloned(),
+                        feeds: feeds.cloned(),
                         repo_release: repo_release.cloned(),
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
@@ -439,6 +447,7 @@ impl RuntimeInstallCommand {
         container_image: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         lock_file: &mut LockFile,
         src_dir: &Path,
@@ -476,6 +485,7 @@ impl RuntimeInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -506,6 +516,7 @@ impl RuntimeInstallCommand {
             source_environment: false,
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -525,6 +536,7 @@ impl RuntimeInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -574,6 +586,7 @@ impl RuntimeInstallCommand {
                     lock_file,
                     repo_url: repo_url.map(|s| s.as_str()),
                     repo_release: repo_release.map(|s| s.as_str()),
+                    feeds,
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     runs_on_context,
@@ -687,7 +700,10 @@ impl RuntimeInstallCommand {
                     OutputLevel::Normal,
                 );
 
-                let yes = if self.force { "-y" } else { "" };
+                // dnf never prompts here: this applies the package set avocado.yaml and
+                // avocado.lock already declare, so there is no decision left to make.
+                // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+                let yes = "-y";
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
                     format!(" {} ", args.join(" "))
                 } else {
@@ -757,8 +773,10 @@ $DNF_SDK_HOST \
                     command: dnf_command,
                     verbose: self.verbose,
                     source_environment: false, // Don't source environment - matches rootfs install behavior
-                    interactive: !self.force,
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
@@ -799,7 +817,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
-                            Some(runtime_env_vars),
+                            Some(runtime_env_vars.clone()),
                         )
                         .await?;
 
@@ -809,6 +827,24 @@ $DNF_SDK_HOST \
                             &sysroot,
                             installed_versions,
                         );
+                        // Then which feed each package came from. Best effort:
+                        // `rpm` gives the version and cannot give the origin, dnf
+                        // gives the origin from the installroot's own history, and
+                        // a lock records a bare version when it cannot be known.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &sysroot,
+                                container_image,
+                                &target_arch,
+                                repo_url.cloned(),
+                                repo_release.cloned(),
+                                merged_container_args.clone(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                Some(runtime_env_vars.clone()),
+                            )
+                            .await;
+                        lock_file.set_sysroot_origins(&target_arch, &sysroot, &origins);
                         if self.verbose {
                             print_info(
                                 &format!(

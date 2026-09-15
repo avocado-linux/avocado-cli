@@ -1,5 +1,6 @@
 //! SDK install command implementation.
 
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -203,6 +204,14 @@ impl SdkInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Sdk, &self.config_path)
+            .await?;
+        // The kernel resolver queries with the target repo conf, so it must see the
+        // feed set the rootfs install will see — not the sdk-stage (host) set.
+        let kernel_feeds = config
+            .materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)
+            .await?;
 
         // Use the container helper to run the installation
         let container_helper =
@@ -229,6 +238,7 @@ impl SdkInstallCommand {
                 &sdk_dependencies,
                 repo_url.as_deref(),
                 repo_release.as_deref(),
+                feeds.as_ref(),
                 &container_helper,
                 merged_container_args.as_ref(),
                 runs_on_context.as_ref(),
@@ -271,6 +281,7 @@ impl SdkInstallCommand {
                 lock_file: &mut bootstrap.lock_file,
                 repo_url: repo_url.as_deref(),
                 repo_release: repo_release.as_deref(),
+                feeds: kernel_feeds.as_ref(),
                 merged_container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
                 runs_on_context: runs_on_context.as_ref(),
@@ -293,6 +304,7 @@ impl SdkInstallCommand {
                 container_image,
                 repo_url.as_deref(),
                 repo_release.as_deref(),
+                feeds.as_ref(),
                 &container_helper,
                 merged_container_args.as_ref(),
                 runs_on_context.as_ref(),
@@ -328,6 +340,7 @@ impl SdkInstallCommand {
         container_image: &str,
         repo_url: Option<&str>,
         repo_release: Option<&str>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         container_helper: &SdkContainer,
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
@@ -385,7 +398,10 @@ impl SdkInstallCommand {
             all_compile_package_names.sort();
             all_compile_package_names.dedup();
 
-            let yes = if self.force { "-y" } else { "" };
+            // dnf never prompts here: this applies the package set avocado.yaml and
+            // avocado.lock already declare, so there is no decision left to make.
+            // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+            let yes = "-y";
             let dnf_args_str = if let Some(args) = &self.dnf_args {
                 format!(" {} ", args.join(" "))
             } else {
@@ -466,6 +482,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     container_image: container_image.to_string(),
                     target: target.to_string(),
                     repo_url: repo_url.map(|s| s.to_string()),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.map(|s| s.to_string()),
                     container_args: merged_container_args.cloned(),
                     sdk_arch: self.sdk_arch.clone(),
@@ -513,6 +530,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             target,
             repo_url,
             repo_release,
+            feeds,
             container_helper,
             merged_container_args,
             runs_on_context,
@@ -529,6 +547,14 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             renderer: ctx.renderer.clone(),
         });
 
+        // These two run the rootfs/initramfs dnf transactions, so they take
+        // their own stage's feeds rather than the sdk-stage set this fn holds.
+        let rootfs_feeds = config
+            .materialize_feeds(target, FeedStage::Rootfs, &self.config_path)
+            .await?;
+        let initramfs_feeds = config
+            .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
+            .await?;
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -540,10 +566,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             target_board: self.target_board.as_deref(),
             repo_url,
             repo_release,
+            feeds: rootfs_feeds.as_ref(),
             merged_container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             verbose: self.verbose,
-            force: self.force,
             runs_on_context,
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
@@ -563,10 +589,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             target_board: self.target_board.as_deref(),
             repo_url,
             repo_release,
+            feeds: initramfs_feeds.as_ref(),
             merged_container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
             verbose: self.verbose,
-            force: self.force,
             runs_on_context,
             sdk_arch: self.sdk_arch.as_ref(),
             no_stamps: self.no_stamps,
@@ -594,8 +620,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     command: cmd.clone(),
                     verbose: self.verbose,
                     source_environment: false,
-                    interactive: !self.force,
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.map(|s| s.to_string()),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.map(|s| s.to_string()),
                     container_args: merged_container_args.cloned(),
                     dnf_args: self.dnf_args.clone(),
@@ -779,6 +807,26 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         &SysrootType::TargetSysroot,
                         installed_versions,
                     );
+                    // Then where each one came from. Best effort, and separate
+                    // from the versions for a reason: `rpm` is authoritative
+                    // about what is installed and cannot say where it came
+                    // from, dnf knows the origin from the installroot's own
+                    // history. A lock records a bare version when the origin
+                    // cannot be determined, so this never fails a build.
+                    let origins = container_helper
+                        .query_installed_origins(
+                            &SysrootType::TargetSysroot,
+                            container_image,
+                            target,
+                            repo_url.map(|s| s.to_string()),
+                            repo_release.map(|s| s.to_string()),
+                            merged_container_args.cloned(),
+                            runs_on_context,
+                            self.sdk_arch.as_ref(),
+                            None,
+                        )
+                        .await;
+                    final_lock.set_sysroot_origins(target, &SysrootType::TargetSysroot, &origins);
                 }
             }
         }
@@ -831,6 +879,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
                 source_environment: true,
                 interactive: false,
                 repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.map(|s| s.to_string()),
                 container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
@@ -881,6 +930,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
                 source_environment: true,
                 interactive: false,
                 repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.map(|s| s.to_string()),
                 container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),
@@ -976,6 +1026,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
         sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
         repo_url: Option<&str>,
         repo_release: Option<&str>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         container_helper: &SdkContainer,
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
@@ -1474,6 +1525,7 @@ MACROS_EOF
             source_environment: true,
             interactive: false,
             repo_url: repo_url.map(|s| s.to_string()),
+            feeds: feeds.cloned(),
             repo_release: repo_release.map(|s| s.to_string()),
             container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
@@ -1556,6 +1608,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             source_environment: true,
             interactive: false,
             repo_url: repo_url.map(|s| s.to_string()),
+            feeds: feeds.cloned(),
             repo_release: repo_release.map(|s| s.to_string()),
             container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
@@ -1609,6 +1662,7 @@ $DNF_SDK_HOST \
             source_environment: true,
             interactive: false,
             repo_url: repo_url.map(|s| s.to_string()),
+            feeds: feeds.cloned(),
             repo_release: repo_release.map(|s| s.to_string()),
             container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
@@ -1663,6 +1717,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             source_environment: true,
             interactive: false,
             repo_url: repo_url.map(|s| s.to_string()),
+            feeds: feeds.cloned(),
             repo_release: repo_release.map(|s| s.to_string()),
             container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
@@ -1770,6 +1825,7 @@ fi
             source_environment: true,
             interactive: false,
             repo_url: repo_url.map(|s| s.to_string()),
+            feeds: feeds.cloned(),
             repo_release: repo_release.map(|s| s.to_string()),
             container_args: merged_container_args.cloned(),
             dnf_args: self.dnf_args.clone(),
@@ -1816,6 +1872,7 @@ fi
         target: &str,
         repo_url: Option<&str>,
         repo_release: Option<&str>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         container_helper: &SdkContainer,
         merged_container_args: Option<&Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
@@ -1868,7 +1925,10 @@ fi
         let mut all_sdk_package_names: Vec<String> = bootstrap_package_names.to_vec();
 
         if !sdk_packages.is_empty() {
-            let yes = if self.force { "-y" } else { "" };
+            // dnf never prompts here: this applies the package set avocado.yaml and
+            // avocado.lock already declare, so there is no decision left to make.
+            // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+            let yes = "-y";
             let dnf_args_str = if let Some(args) = &self.dnf_args {
                 format!(" {} ", args.join(" "))
             } else {
@@ -1909,8 +1969,10 @@ $DNF_SDK_HOST \
                 command,
                 verbose: self.verbose,
                 source_environment: true,
-                interactive: !self.force,
+                // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                interactive: false,
                 repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.map(|s| s.to_string()),
                 container_args: merged_container_args.cloned(),
                 dnf_args: self.dnf_args.clone(),

@@ -24,15 +24,37 @@ use anyhow::{anyhow, bail, Result};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
 
+/// Root that a [`DeviceTreeOverlay::src`] is resolved against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SrcRoot {
+    /// The project tree, bind-mounted at `/opt/src`: an extension defined
+    /// inline, with no `source:`, keeps its overlays there.
+    Project,
+    /// The extension's own directory, `$AVOCADO_PREFIX/includes/<ext>`: any
+    /// extension with a `source:`. A package source unpacks there; a path
+    /// source is bind-mounted there.
+    Extension,
+}
+
 /// One device-tree overlay declared by an extension enabled on a runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceTreeOverlay {
     /// Authoritative basename used for the .dtbo, the config.txt argument, and
     /// the u-boot entry.
     pub name: String,
-    /// Source `.dtso`/`.dts`, relative to the project root (bind-mounted at
-    /// `/opt/src` in the SDK container).
+    /// Source `.dtso`/`.dts`, relative to the root named by [`Self::src_root`].
     pub src: String,
+    /// Where `src` is resolved from.
+    ///
+    /// An inline extension has its files in the project tree, bind-mounted
+    /// at `/opt/src`. A PACKAGE-sourced extension does not: installing it
+    /// unpacks only its `avocado.yaml` into `$AVOCADO_PREFIX/includes/<ext>/`,
+    /// so a project-relative `src` names a file that is not in the container
+    /// and the build fails with "source /opt/src/... does not exist" -- while
+    /// the declaration reads as perfectly correct. Resolving against the
+    /// extension's own include dir is what lets a BSP extension ship the
+    /// overlay it declares.
+    pub src_root: SrcRoot,
     /// Optional per-overlay parameters (e.g. `dtoverlay=name,key=value`).
     pub params: BTreeMap<String, String>,
     /// The extension that declared this overlay.
@@ -82,8 +104,22 @@ pub fn collect_for_runtime(
             anyhow!("extension '{ext_name}': device_tree_overlays must be a list")
         })?;
 
+        // A package-sourced extension's files are not in the project tree.
+        // Installing one unpacks its avocado.yaml into includes/<ext>/, so the
+        // overlay it declares has to be resolved from there.
+        let src_root = match crate::utils::config::Config::parse_extension_source(
+            ext_name,
+            parsed
+                .get("extensions")
+                .and_then(|e| e.get(ext_name))
+                .unwrap_or(&Value::Null),
+        ) {
+            Ok(Some(_)) => SrcRoot::Extension,
+            _ => SrcRoot::Project,
+        };
+
         for (idx, entry) in seq.iter().enumerate() {
-            let overlay = parse_entry(entry, ext_name, idx)?;
+            let overlay = parse_entry(entry, ext_name, idx, src_root.clone())?;
             if let Some(prev) = origin.insert(overlay.name.clone(), ext_name.to_string()) {
                 bail!(
                     "device-tree overlay name '{}' is declared by both '{}' and '{}'; \
@@ -127,7 +163,12 @@ pub fn active_extensions_declaring_overlays(
     out
 }
 
-fn parse_entry(entry: &Value, ext_name: &str, idx: usize) -> Result<DeviceTreeOverlay> {
+fn parse_entry(
+    entry: &Value,
+    ext_name: &str,
+    idx: usize,
+    src_root: SrcRoot,
+) -> Result<DeviceTreeOverlay> {
     let name = entry
         .get("name")
         .and_then(|v| v.as_str())
@@ -154,6 +195,7 @@ fn parse_entry(entry: &Value, ext_name: &str, idx: usize) -> Result<DeviceTreeOv
     Ok(DeviceTreeOverlay {
         name,
         src,
+        src_root,
         params,
         ext_name: ext_name.to_string(),
     })
@@ -262,25 +304,42 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 
 /// Render the in-container shell block that builds, stages, delivers, and
 /// validates the device-tree overlays, for injection into the runtime build
-/// script immediately before `stone bundle`. Empty string when there are no
-/// overlays, so the feature is entirely inert unless declared.
+/// script immediately before `stone bundle`. With no overlays the block only
+/// clears `$DTBO_STAGING`, so a previous build's overlays never carry into
+/// this one; nothing is compiled or staged unless declared.
 ///
 /// The block assumes `$STONE_MANIFEST` and `$STONE_INCLUDE_FLAGS` are already
 /// set (they are by the time the build reaches the stone step) and leaves
 /// `$STONE_INCLUDE_FLAGS` / `$STONE_OVERLAY_FLAG` updated for the bundle call.
 pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
-    if overlays.is_empty() {
-        return Ok(String::new());
-    }
-
-    let manifest_json = build_manifest_json(overlays)?;
     let mut s = String::new();
 
+    // The staging directory describes THIS build, so it is cleared before every
+    // one -- including the build that declares no overlays at all.
+    //
+    // The clear used to live below the empty-set early return, which meant it
+    // only ran when there was something to stage. Removing the last overlay
+    // (disabling an extension, or selecting a different board) then emitted no
+    // script at all, the previous build's `apply-order` and .dtbo survived, and
+    // the platform hook merged them into the next image exactly as designed:
+    // its contract is "if apply-order exists, apply what it names", and it has
+    // no way to tell a stale record from a current one.
+    //
+    // On rb3gen2 that shipped a mezzanine overlay into a core-kit build, whose
+    // device tree enabled hardware that is not fitted. The build reported
+    // success and the resulting UKI took the board down in firmware, through
+    // both OTA and a fresh provision, because both carry the same image.
     s.push_str("# --- device-tree overlays ---\n");
     s.push_str(
         "DTBO_STAGING=\"$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/device-tree-overlays\"\n",
     );
     s.push_str("rm -rf \"$DTBO_STAGING\"\n");
+
+    if overlays.is_empty() {
+        return Ok(s);
+    }
+
+    let manifest_json = build_manifest_json(overlays)?;
     s.push_str("mkdir -p \"$DTBO_STAGING\"\n");
     s.push_str(&format!(
         "echo -e \"\\033[94m[INFO]\\033[0m Building {} device-tree overlay(s).\"\n",
@@ -289,9 +348,18 @@ pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 
     // name is a validated basename; src is user config, so double-quote it.
     for o in overlays {
+        // /opt/src is the project bind-mount; includes/<ext> is where a
+        // package-sourced extension unpacks. Getting this wrong fails with
+        // "source ... does not exist" on a declaration that is otherwise valid.
+        let src_expr = match o.src_root {
+            SrcRoot::Project => format!("/opt/src/{}", o.src),
+            SrcRoot::Extension => {
+                format!("$AVOCADO_PREFIX/includes/{}/{}", o.ext_name, o.src)
+            }
+        };
         s.push_str(&format!(
-            "avocado-dtc-overlay --name \"{}\" --src \"/opt/src/{}\" --out \"$DTBO_STAGING/{}.dtbo\"\n",
-            o.name, o.src, o.name
+            "avocado-dtc-overlay --name \"{}\" --src \"{}\" --out \"$DTBO_STAGING/{}.dtbo\"\n",
+            o.name, src_expr, o.name
         ));
     }
 
@@ -487,14 +555,46 @@ extensions:
         DeviceTreeOverlay {
             name: name.to_string(),
             src: src.to_string(),
+            src_root: SrcRoot::Project,
             params: BTreeMap::new(),
             ext_name: "board".to_string(),
         }
     }
 
+    /// The empty set still clears the staging directory.
+    ///
+    /// This previously asserted the opposite -- that no overlays renders no
+    /// script -- which is what let a stale `apply-order` from an earlier build
+    /// survive into a build that declares nothing. The platform hook applies
+    /// whatever `apply-order` names and cannot tell a stale record from a
+    /// current one, so the next image silently carried the previous build's
+    /// overlays.
     #[test]
-    fn render_is_empty_without_overlays() {
-        assert_eq!(render_build_section(&[]).unwrap(), "");
+    fn render_clears_staging_even_with_no_overlays() {
+        let sh = render_build_section(&[]).unwrap();
+
+        assert!(
+            sh.contains("rm -rf \"$DTBO_STAGING\""),
+            "staging must be cleared when the overlay set is empty, or the \
+             previous build's overlays are applied to this one: {sh}"
+        );
+        assert!(
+            sh.contains("DTBO_STAGING=\"$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/device-tree-overlays\""),
+            "the clear needs the path it clears: {sh}"
+        );
+        // Cleared, but nothing staged and no compiler invoked.
+        assert!(!sh.contains("avocado-dtc-overlay"), "{sh}");
+        assert!(!sh.contains("mkdir -p"), "{sh}");
+    }
+
+    /// A build that DOES declare overlays must still reset first, so an
+    /// overlay dropped from the set does not linger alongside the current ones.
+    #[test]
+    fn render_clears_staging_before_staging_overlays() {
+        let sh = render_build_section(&[overlay("spi-fast", "overlays/spi-fast.dtso")]).unwrap();
+        let clear = sh.find("rm -rf \"$DTBO_STAGING\"").expect("clear present");
+        let stage = sh.find("avocado-dtc-overlay").expect("stage present");
+        assert!(clear < stage, "the clear must precede any staging: {sh}");
     }
 
     #[test]
@@ -528,6 +628,7 @@ extensions:
         let overlays = vec![DeviceTreeOverlay {
             name: "spi".to_string(),
             src: "a.dtso".to_string(),
+            src_root: SrcRoot::Project,
             params,
             ext_name: "board".to_string(),
         }];
@@ -577,6 +678,69 @@ extensions:
         let active: std::collections::HashSet<String> =
             ["a"].iter().map(|s| s.to_string()).collect();
         assert!(active_extensions_declaring_overlays(&parsed, &active).is_empty());
+    }
+
+    /// A package-sourced extension's overlay resolves from its own include
+    /// dir, not the project tree.
+    ///
+    /// Regression: `src` was always rendered as `/opt/src/<src>`. Installing a
+    /// package-sourced extension unpacks only its avocado.yaml into
+    /// includes/<ext>/, so its `overlays/*.dtso` is not in the container at
+    /// all, and the build failed with
+    ///
+    ///   avocado-dtc-overlay: <name>: source /opt/src/overlays/<f>.dtso does not exist
+    ///
+    /// on a declaration that is correct. A BSP extension shipping the overlay
+    /// it declares is the whole point of the feature.
+    #[test]
+    fn a_package_sourced_extension_resolves_src_from_its_own_dir() {
+        let cfg: Value = serde_yaml::from_str(
+            r#"
+extensions:
+  local-ext:
+    device_tree_overlays:
+      - name: from-project
+        src: overlays/from-project.dtso
+  pkg-ext:
+    source:
+      type: package
+      version: "*"
+    device_tree_overlays:
+      - name: from-package
+        src: overlays/from-package.dtso
+"#,
+        )
+        .unwrap();
+        let runtime: Value = serde_yaml::from_str(
+            "extensions:
+  - local-ext
+  - pkg-ext
+",
+        )
+        .unwrap();
+
+        let overlays = collect_for_runtime(&runtime, &cfg).expect("collects");
+        assert_eq!(overlays.len(), 2, "both extensions declare one overlay");
+
+        let local = overlays.iter().find(|o| o.name == "from-project").unwrap();
+        let pkg = overlays.iter().find(|o| o.name == "from-package").unwrap();
+        assert_eq!(local.src_root, SrcRoot::Project);
+        assert_eq!(pkg.src_root, SrcRoot::Extension);
+
+        let script = render_build_section(&overlays).expect("renders");
+        assert!(
+            script.contains("--src \"/opt/src/overlays/from-project.dtso\""),
+            "a project-tree extension keeps the bind-mount path: {script}"
+        );
+        assert!(
+            script
+                .contains("--src \"$AVOCADO_PREFIX/includes/pkg-ext/overlays/from-package.dtso\""),
+            "a package-sourced extension resolves from its include dir: {script}"
+        );
+        assert!(
+            !script.contains("/opt/src/overlays/from-package.dtso"),
+            "the package extension must NOT be looked up in the project tree: {script}"
+        );
     }
 
     #[test]

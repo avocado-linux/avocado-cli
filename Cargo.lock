@@ -146,6 +146,7 @@ dependencies = [
  "ed25519-compact",
  "flate2",
  "futures-util",
+ "globset",
  "gzp",
  "indicatif",
  "libc",

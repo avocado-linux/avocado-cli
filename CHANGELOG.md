@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Installs no longer prompt, and `--force` no longer means "don't prompt".**
+  `avocado install`, `ext install`, `runtime install` and `sdk install` apply
+  the package set `avocado.yaml` and `avocado.lock` already declare, so dnf's
+  confirmation offers no decision: approving it changes nothing and declining
+  it leaves a half-configured sysroot. All four now pass `-y` unconditionally.
+
+  Previously `-y` was passed only under `--force`, which conflated two
+  unrelated things and made the documented invocation the expensive one.
+  `--force` *also* clears every extension's sysroot and drops its build and
+  image stamps, so anyone passing `-f` merely to skip the prompts — which is
+  what our own material tells people to do — discarded all built extension
+  content and paid a full rebuild on the next `avocado build`, every
+  iteration. Measured on a four-extension project: `install -f` then `build`
+  skipped 2 of 10 steps and took 10.2s; without `-f` it skips all 10 and takes
+  6.6s.
+
+  `--force` now means only what its name says: reinstall from scratch. Existing
+  scripts and docs using `-f` keep working, but should drop the flag — its help
+  text now says so. `sdk dnf`, `ext dnf` and `runtime dnf` are unchanged: they
+  pass their arguments to dnf verbatim and still prompt, which is the right
+  behaviour when a person is driving dnf directly.
+
+  No opt-out flag was added. An interactive confirmation cannot be answered
+  usefully in CI or under the TUI, and the dnf pass-through commands already
+  cover reviewing a transaction by hand.
+
+- **`--output json` no longer implies `--force`.** It did, because the TUI
+  renderer was gated on `--force` — dnf could prompt without it, and the
+  renderer made the prompt invisible — and because `docker run -it` fails
+  where no terminal is attached. Both reasons are gone: installs now always
+  pass `-y`, and `utils::interactivity` decides the container's stdio flags
+  from what the environment can actually support. With `--force` meaning
+  reinstall from scratch, keeping the coercion would have turned every request
+  for machine-readable output into a full rebuild. The renderer is no longer
+  gated on `--force` either, so an interactive `avocado install` gets the live
+  checklist without asking for a rebuild to see it.
+
+  Installs also no longer ask the container for a PTY. They used to run with
+  `-i` only; the new stdio decision granted `-i -t` to any step declaring
+  itself interactive, which put the terminal into raw mode under the TUI and,
+  on macOS through avocado-vm, failed a plain `avocado install` with
+  `unable to set IO streams as raw terminal: interrupted system call` while
+  `install -f` (which never asked) worked. With `-y` unconditional there is
+  nothing to answer, so the five install sites declare `interactive: false`.
+  `sdk dnf`, `ext dnf`, `runtime dnf` and `provision` keep their terminals.
 ### Security
 - `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption level boundaries). Lock-only; the
@@ -28,6 +74,250 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+- **`ext install` now drops the build and image stamps when it clears an
+  extension's sysroot.** A clean reinstall (`--force`, a changed dependency, a
+  re-seed) removes the sysroot, and the dnf transaction that follows restores
+  only packages — the extension-release files, unit wiring and overlay come
+  from `ext build`, whose stamp inputs a clean does not change. With the skip
+  in place that stamp read as current over a sysroot no longer holding its
+  work, so `ext build` skipped and `ext image` shipped an extension with no
+  content in it. Found by real-project dogfood.
+
+- **The sysroot digest fails closed and never writes.** A missing sysroot, an
+  unreadable file, or any failed pipeline stage now exits non-zero instead of
+  digesting nothing into an accepted hash that every downstream step would read
+  as "current". The rpm query runs only when the database directory already
+  exists — `rpm -qa` on a root without one creates it, inside the tree being
+  measured — and `ext build` queries rpm's default dbpath, where `ext install`
+  actually records packages, rather than a path that held nothing.
+- **The digest's prune list and the extension image's exclude list are one
+  list.** `var/cache/ldconfig` and rpm's newer default dbpath were pruned from
+  the digest but shipped in the image — bytes no stamp saw. Both now come from
+  `package_state_paths()`. Extension images no longer carry `var/cache/ldconfig`
+  or `usr/lib/sysimage/rpm`.
+- **`runtime build` folds each extension's build digest as well as its image
+  digest.** `var_files` are copied out of the built sysroot into the var
+  partition and never enter the image, so the image digest alone was blind to
+  them.
+- **`--no-stamps` removes the step's own stamp.** An unrecorded run no longer
+  leaves the previous run's output digest for a downstream step to trust and
+  skip over; downstream now either runs with `--no-stamps` too or fails its
+  precondition loudly.
+- **A stamp from an older format is reported as "stamp format changed
+  (vN → vM)"**, not "config hash mismatch", after a CLI upgrade. The heading is
+  now "Stale steps:" since the reason names the cause.
+- `reload_service_manager` — written into the extension release file — is folded
+  into the extension build hash.
+- The digest-bearing stamp writer anchors its substitution on the quoted JSON
+  value, so a field that happens to contain the placeholder text is untouched.
+- Removed the unused `StampOutputs.exports` field.
+- **The extension image hash chains on the build digest and folds only what the
+  imager reads** — `version`, `types`, `image`, `filesystem`, `var_files`,
+  `subvolumes`, the kab keyset when the image is kab, and the exclude list it
+  applies. Build-only inputs (`post_build`, overlay, `package_files`) reach the
+  image through the tree, and the build digest already says whether the tree
+  changed; folding them directly re-imaged on every build-input edit that left
+  the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
+  change now invalidates every image by itself.
+
+### Changed
+- **Ctrl-C removes the session containers it started.** `atexit` does not run
+  for a signal, so an interrupted run left containers parked and holding the
+  project volume until the next invocation swept them by pid. A SIGINT handler
+  now reaps them and exits 130. It is armed lazily, from the moment this process
+  first creates a session container and only then: registering a SIGINT handler
+  suppresses the default terminate-the-process disposition for the whole
+  process, and commands that never create one of these — `container dev` in
+  particular, which drives its engine shutdown off the same signal — must keep
+  the Ctrl-C behaviour they have.
+- **Session container creation no longer blocks the async runtime.** The
+  registry held one global lock across `docker ps`, `docker run -d` and the
+  mount `docker exec`. `install` runs its steps in parallel, so every step
+  waiting for a container parked a tokio worker on that lock; with enough of
+  them nothing else could be polled, including the scheduler's `select!` —
+  whose Ctrl-C branch then never fired, so the command sat there and could not
+  be interrupted. The map lock is now held only long enough to hand out a
+  per-shape slot, creation happens under that slot's own lock (so two callers
+  wanting one shape still create exactly one container, and callers wanting a
+  different shape are not blocked at all), and the blocking work runs inside
+  `block_in_place` so the worker's queue moves to another thread.
+- **Every container the CLI starts now goes through the session container, not
+  just build steps.** Eight sites started their own `docker run` outside the
+  reusable path. The worst was reading an extension's `avocado.yaml` out of the
+  SDK volume: config composition re-reads every extension discovered so far
+  after each fetch, so an `sdk install` of a project with three remote
+  extensions did that 24 times, each a ~0.52s container start for a ~5ms `cat`
+  — 12.9s of a 19s command. The registry is now synchronous, so callers that
+  run before any async context (the config reader) can reach it, and
+  `SessionContainers::volume_container` / `volume_exec` give anything that just
+  needs a volume mounted a shared container keyed on the volume spec and image.
+  Routed: the config reader, `ext checkout`'s three volume probes and its
+  `docker cp`, `profiles`' stone-manifest read, `save`'s `du` and `tar`, and
+  `host_copy`, which now `docker cp`s straight out of a running container
+  instead of creating and removing one per file. That also removes the
+  `busybox` and `alpine:latest` dependencies from those paths in favour of the
+  project's own SDK image, which is local already. `avocado load` deliberately
+  keeps `busybox`: it restores a project's config as it runs, so the SDK image
+  is not known yet and may not be pulled. On `sdk install` for a three-extension
+  project this is 31 container starts down to 6, and 23.3s down to 9.0s.
+- **Session container teardown is registered with `atexit`.** Nine call sites
+  reach `std::process::exit` directly and never return to `main`, so the
+  explicit teardown there missed them — a failed `sdk install` leaked two
+  parked containers. Rust runs `atexit` handlers for those paths and for a
+  normal return, so one registration covers every exit, including ones added
+  later. A signal that kills the process still skips it; that is what the
+  existing pid-based sweep is for.
+- **Build steps exec into a reused per-shape container instead of starting a
+  fresh one each time.** Every step was its own `docker run --rm`, and profiling
+  a no-op `avocado build` put 71% of all container time in startup alone: the
+  run itself costs ~0.52s before the command begins, against ~0.045s for an
+  `exec` into a container that is already up. Steps whose container *shape* —
+  image, platform, mounts, devices, capabilities, `container_args` — is
+  identical now share one detached session container per shape, created on
+  first use and removed when the process exits (including the `print_and_exit`
+  path, which never returns to `main`). The environment is taken from the
+  generated `run` argv rather than from the caller's `env_vars`, so an exec
+  sees exactly what the equivalent run would have; the mount block is dropped
+  from the exec's prologue because the session container already ran it, and
+  re-running bindfs would stack a second mount. Detached, interactive and named
+  steps keep their own `docker run`, as does anything under `--runs-on`, whose
+  remote path never reaches this logic. Any failure to create or reach the
+  session container falls through to the run that would have happened anyway,
+  and `AVOCADO_NO_SESSION_CONTAINER=1` disables the reuse entirely. On a no-op
+  `build` this moves 13 of 20 steps onto `exec`, cutting time spent inside the
+  container tool from 13.8s to 8.7s; wall clock goes 11.9s to 10.7s, the
+  smaller share because steps run concurrently and some of that startup was
+  already overlapped.
+- **Reading an extension's config out of the SDK volume uses the project's own
+  SDK image, not `busybox`/`alpine`.** The volume's host mountpoint is
+  unreadable under rootful Docker and inside the macOS/Windows VM, so this
+  fallback is the normal path — it ran 33 times in one `install` + `build`
+  cycle, each one a container start on a third-party image the project does not
+  control and may have to pull. The SDK image is already present because every
+  other step needs it. The busybox/alpine chain remains only for the case where
+  no config is available to name an image, and a `sdk.image` still carrying
+  `{{ … }}` is treated as unavailable rather than run as a literal.
+- **`runtime build` reuses the rootfs and initramfs images when nothing they
+  depend on has changed.** Each image section now has a stamp whose input is
+  the install step's tree digest plus the resolved image config — filesystem,
+  kab args, verity, permissions, `post_install` content, and the runtime's
+  `var`/`version`/inline `rootfs`/`initramfs` keys including per-target
+  overrides, so a per-target `var.encrypt: true` can never skip the initramfs
+  that must carry its marker. When the stamp is current and the image and its
+  `.exports` file both exist in the volume, the section is replaced by sourcing
+  the exports the last full build recorded; everything downstream sees the same
+  variables. The image digests join the runtime build's own input, so the
+  first build after upgrading re-stamps the runtime once (its inputs gained
+  the two digests); it is stable from the second build on. On the dogfood
+  project this is most of the remaining build time once extension steps skip.
+
+- **`ext build` and `ext image` skip when nothing they read has changed.** Each
+  step now reads its own stamp in the batch stamp read it already does for its
+  preconditions, and probes for its output in the same round-trip. When the
+  stamp is current for every input computed now — config, the compile and
+  install scripts' content, the `package_files` source tree, the overlay, and
+  for `ext image` the digest `ext build` recorded — and the output is present,
+  the step reports "up to date" and returns before any container work. The
+  stamp is left as it is. A source edit under a compiled extension reaches the
+  input hash and is never skipped over; a rebuild that changed no bytes stops
+  at `ext image`, which reads the same unchanged digest. `--no-stamps` disables
+  the skip along with everything else. `avocado build` on a project where one
+  extension changed now rebuilds one extension.
+- **Stamps now record what a step produced, and the next step's input depends
+  on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
+  built sysroot (sorted NEVRA set plus a tree hash of everything the image
+  would carry, package-manager state pruned); `ext image` records its image's
+  sha256; `rootfs install` and `initramfs install` record the digest of the
+  installed tree, overlay included. `ext image` folds the build digest into its
+  input, and `runtime build` folds every required extension's image digest into
+  its own. The effect is that a rebuild which changes no bytes — a recompile to
+  the same binary, a `touch` — stops at the first step whose output is
+  unchanged instead of cascading into a re-image, a new `image_id`, a new
+  manifest and a fresh upload. It is also the half of fingerprinting that
+  covers inputs the host cannot see: a `source: {type: git}` extension's files
+  live in the SDK volume, and its tree digest is what notices they changed.
+  The digest is computed in the container that writes the stamp; a stamp
+  whose digest is empty or not hex is refused rather than written.
+- **Stamps now hash the files a build reads, not just the paths that name
+  them.** `STAMP_VERSION` moves 2 → 3; every existing stamp reads as stale once
+  and rebuilds. Newly folded: compile-script content (`sdk.compile.<n>.compile`,
+  reached through `packages.<pkg>.compile`), `packages.<pkg>.install` scripts,
+  `kernel.install`, the `package_files` source tree of a compiled extension
+  (patterns expanded with `globstar` semantics), `version: {file}` content,
+  runtime `var_files[].source` content, `permissions` (rootfs, initramfs and
+  top-level), rootfs/initramfs `image` (kab args, dm-verity), runtime
+  `signing`, `sdk.container_args` and `src_dir`, and the extension keys the
+  build turns into unit wiring (`enable_services`, `on_merge`, `sysusers`,
+  `kernel_modules`, `users`, `groups`, …). Editing Rust source under a
+  compiled extension's `package_files` now invalidates its build; flipping
+  `rootfs.image.verity` now invalidates the runtime build.
+- **A declared script that does not exist is an error at the stamp check**,
+  not a `"missing"` sentinel. The sentinel collided — every unresolvable path
+  hashed to the same literal, so all remote extensions' `post_build` scripts
+  read as identical regardless of content. Files the host genuinely cannot see
+  (a `source: {type: git}` extension's, which live in the SDK volume) are no
+  longer hashed at all rather than hashed as missing; `source` itself still
+  is. A `source: {type: path}` extension's files are hashed under its own
+  path, not the project root.
+- **`is_current` compares `package_list_hash` strictly.** A recorded hash on
+  one side and none on the other is stale, never a match by omission.
+- An unreadable directory inside an overlay now fails the stamp check and the
+  materialization instead of being silently dropped from both.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
+
+- **Runtime builds stop copying and re-hashing every image.** Per build, each
+  image was written twice into the volume — once into the runtime directory,
+  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
+  manifest step and again by the TUF hash collection; `avocado deploy` hashed
+  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
+  copy on a filesystem that refuses the link), the extension copies and the
+  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
+  and xfs, a plain copy elsewhere), and both hash collections read each
+  image's `sha256` out of the manifest — computed over the same inode — with
+  only `size` still coming from `stat`. A manifest entry whose image is absent
+  from `images/` now fails the hash collection instead of being silently
+  dropped from the published target list.
+
+### Added
+- **`avocado build` produces the deployable set *and* the OTA payload;
+  `avocado provision` builds the var image.** *(Breaking: `build` no longer
+  produces the var image.)* The split is by consumer: anything an OTA requires
+  is at the tail of `runtime build`, anything only provisioning consumes is at
+  the start of `provision`.
+
+  So the build tail keeps the `avocado-build-<target>` hook, `stone bundle`, the
+  `os_bundle` manifest patch and the re-sign after it. On UKI platforms that hook
+  *is* the kernel and initramfs, and `os-bundle.aos` is the OTA payload — not a
+  provisioning artifact. Verified that no provisioning script reads the bundle:
+  `avocado-provision-<target>` and the UFS flow both inject raw images.
+
+  `provision` builds the var image and primes Docker into it, which is all that
+  is genuinely provisioning-only. A pipeline that runs `avocado build` and then
+  flashes will find no var image; run `avocado provision`, which produces it.
+
+  `stone bundle` needs a var partition size because platform manifests declare
+  `var` as `expand: "true"` with no size, and it fails hard without the
+  `--partition-size` override. The var image does not exist at build time, so the
+  size is declared from the staged tree with headroom. That number reaches only
+  the bundle, an OTA never repartitions, and the partition expands at provision
+  time — but if a provision-from-bundle path is ever added it becomes real and
+  must come from the image.
+
+  The two halves live in `commands/runtime/var_image.rs` behind one context,
+  which is the set of things a portable provisioning bundle has to carry — what a
+  later `avocado provision --bundle <path>` would source from a bundle.
 
 ## [1.0.0-rc.3] - 2026-09-01
 

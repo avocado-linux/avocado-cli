@@ -2,40 +2,27 @@
 //!
 //! The SDK volume (e.g. `avocado-<target>`) is mounted at `/opt/_avocado`
 //! inside the container; anything written under `$AVOCADO_PREFIX/...`
-//! during a build survives container exit. To make those files visible
-//! on the host we spin up a one-shot busybox container that mounts the
-//! volume read-only and `docker cp` the file out.
+//! during a build survives container exit. To make those files visible on the
+//! host we `docker cp` out of a container that has the volume mounted.
+//!
+//! That container is the session container, not a fresh one: `docker cp` works
+//! against a running container, so a copy costs one `cp` instead of the
+//! `create` + `cp` + `rm` — on a third-party `busybox` image — that it used to.
 
 use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command;
 
-async fn create_temp_container(container_tool: &str, volume_name: &str) -> Result<String> {
-    let output = Command::new(container_tool)
-        .args([
-            "create",
-            "--rm",
-            "-v",
-            &format!("{volume_name}:/opt/_avocado"),
-            "busybox",
-            "true",
-        ])
-        .output()
-        .await
-        .context("Failed to create temp container for volume cp")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to create temp container: {stderr}");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Copy `<container_path>` from the SDK volume to `<host_path>`. Creates
-/// the host path's parent if missing. The temp container is always
-/// `<container_tool> rm -f`'d, even on failure.
+/// Copy `<container_path>` from the SDK volume to `<host_path>`. Creates the
+/// host path's parent if missing.
+///
+/// `image` is the project's SDK image. It is only used if this is the first
+/// caller to need a container for this volume; after that the existing one is
+/// reused and the image is irrelevant.
 pub async fn copy_volume_path_to_host(
     container_tool: &str,
     volume_name: &str,
+    image: &str,
     container_path: &str,
     host_path: &Path,
 ) -> Result<()> {
@@ -43,7 +30,11 @@ pub async fn copy_volume_path_to_host(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("copy_volume_path_to_host: mkdir -p {}", parent.display()))?;
     }
-    let cid = create_temp_container(container_tool, volume_name).await?;
+    let cid = crate::utils::container::SessionContainers::volume_container(
+        container_tool,
+        &format!("{volume_name}:/opt/_avocado:ro"),
+        image,
+    )?;
     let result = Command::new(container_tool)
         .args([
             "cp",
@@ -55,10 +46,6 @@ pub async fn copy_volume_path_to_host(
         .output()
         .await
         .context("Failed to run docker cp")?;
-    let _ = Command::new(container_tool)
-        .args(["rm", "-f", &cid])
-        .output()
-        .await;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         anyhow::bail!("docker cp failed: {stderr}");

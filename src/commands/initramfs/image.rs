@@ -179,7 +179,10 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     # the parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
     mkdir -p "$(dirname "$INITRAMFS_WORK")"
     rm -rf "$INITRAMFS_WORK"
-    cp -a "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
+    # --reflink=auto: a CoW clone where the filesystem supports one (btrfs, xfs),
+    # a plain copy elsewhere. The work copy is mutated below, so it must not be
+    # a hardlink; reflink gives the isolation of a copy without paying for one.
+    cp -a --reflink=auto "$INITRAMFS_SYSROOT" "$INITRAMFS_WORK"
 {permissions_section}
 
 {post_install_block}
@@ -275,6 +278,7 @@ if [ -d "$INITRAMFS_SYSROOT/usr" ]; then
     export AVOCADO_INITRAMFS_IMAGE="$INITRAMFS_OUTPUT"
     export AVOCADO_INITRAMFS_FILESYSTEM="$INITRAMFS_FS"
     export AVOCADO_INITRAMFS_BUILD_ID="$INITRAMFS_BUILD_ID"
+{exports_file}
     echo "Built initramfs: $INITRAMFS_OUTPUT"
 else
     echo "No initramfs sysroot found — skipping initramfs image build."
@@ -283,6 +287,14 @@ fi"#,
         post_install_block = post_install_block,
         permissions_section = permissions_section,
         var_encrypt_block = var_encrypt_block,
+        exports_file = crate::commands::rootfs::image::render_exports_file(
+            "$INITRAMFS_OUTPUT",
+            &[
+                "AVOCADO_INITRAMFS_IMAGE",
+                "AVOCADO_INITRAMFS_FILESYSTEM",
+                "AVOCADO_INITRAMFS_BUILD_ID",
+            ],
+        ),
         purge_paths = render_build_state_purge("INITRAMFS_WORK"),
         identity_injection = render_identity_injection("INITRAMFS_WORK", "INITRAMFS_BUILD_ID"),
         build_id_block = render_build_id_block(&BuildIdSpec {
@@ -572,6 +584,7 @@ export AVOCADO_OS_VERSION_ID
             copy_volume_path_to_host(
                 &container_helper.container_tool,
                 volume_name,
+                container_image,
                 &container_path,
                 &host_dir.join(&host_filename),
             )

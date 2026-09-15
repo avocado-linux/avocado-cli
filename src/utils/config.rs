@@ -163,7 +163,21 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["package", "version", "compile", "install", "image"],
+        // Every field of KernelConfig must appear here: this list is what
+        // distinguishes `kernel: {<field>: ...}` (one anonymous block) from
+        // `kernel: {<name>: {...}}` (a map of named kernels). Omitting a field
+        // makes a block that sets only that field parse as a kernel *named*
+        // after it, failing with "invalid type: string, expected struct
+        // KernelConfig".
+        &[
+            "package",
+            "version",
+            "compile",
+            "install",
+            "image",
+            "cmdline",
+            "cmdline_extra",
+        ],
         "kernel",
     )
 }
@@ -624,12 +638,24 @@ pub struct KernelConfig {
     /// lands in the manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<serde_yaml::Value>,
+    /// Complete kernel command line, replacing whatever the platform would
+    /// otherwise boot with. Mutually exclusive with `cmdline_extra`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    /// Kernel command line arguments appended to the platform's own line.
+    ///
+    /// The common case: a project wants `isolcpus=`/`nohz_full=` or an
+    /// `earlycon` without restating the board-specific `root=`/`console=` that
+    /// only the BSP knows. Mutually exclusive with `cmdline`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline_extra: Option<String>,
 }
 
 impl KernelConfig {
     /// Validate that the kernel config is well-formed:
     /// - `package` and `compile` are mutually exclusive
     /// - `compile` requires `install`
+    /// - `cmdline` and `cmdline_extra` are mutually exclusive
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.package.is_some() && self.compile.is_some() {
             return Err(ConfigError::ValidationError(
@@ -641,7 +667,20 @@ impl KernelConfig {
                 "kernel config: 'compile' requires 'install' to be set".to_string(),
             ));
         }
-        if self.package.is_none() && self.compile.is_none() {
+        if self.cmdline.is_some() && self.cmdline_extra.is_some() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'cmdline' and 'cmdline_extra' are mutually exclusive; \
+                 'cmdline' replaces the platform's line, 'cmdline_extra' appends to it"
+                    .to_string(),
+            ));
+        }
+        // A block that only sets command line arguments is legitimate: the
+        // kernel itself still comes from the resolver (or from the platform),
+        // and the project is only amending how it boots. Requiring `package`
+        // or `compile` here would force every project that wants an extra
+        // kernel argument to also restate where its kernel comes from.
+        let only_cmdline = self.cmdline.is_some() || self.cmdline_extra.is_some();
+        if self.package.is_none() && self.compile.is_none() && !only_cmdline {
             return Err(ConfigError::ValidationError(
                 "kernel config: either 'package' or 'compile' must be set".to_string(),
             ));
@@ -899,8 +938,34 @@ pub struct DistroConfig {
         deserialize_with = "deserialize_string_or_int"
     )]
     pub release: Option<String>,
+    /// The distro feed: either an inline `{url, releasever, ca, tls_verify}`
+    /// block (today's grammar) or the name of a feed defined under `repos:`.
     #[serde(default)]
-    pub repo: Option<DistroRepoConfig>,
+    pub repo: Option<DistroRepoRef>,
+    /// Ordered list of enabled feed names; position is dnf priority (first
+    /// wins). The distro feed is implicitly first unless listed explicitly.
+    /// Absent with `repos:` present means only the distro feed is enabled.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+}
+
+impl DistroConfig {
+    /// The inline repo block, when `distro.repo` is not a name reference.
+    pub fn repo_inline(&self) -> Option<&DistroRepoConfig> {
+        match self.repo.as_ref()? {
+            DistroRepoRef::Inline(c) => Some(c),
+            DistroRepoRef::Named(_) => None,
+        }
+    }
+}
+
+/// `distro.repo`: a feed name or an inline repo block. Untagged so a bare
+/// string and a mapping both parse.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DistroRepoRef {
+    Named(String),
+    Inline(DistroRepoConfig),
 }
 
 /// Deserialize a value that may be a string or integer into Option<String>
@@ -954,6 +1019,37 @@ pub struct DistroRepoConfig {
     pub ca: Option<String>,
     /// TLS verification toggle for the repo endpoint. Set false to skip verification
     /// (testing only). Env override: AVOCADO_REPO_INSECURE=1. Default: verify.
+    pub tls_verify: Option<bool>,
+}
+
+/// A named package feed under `repos:`. Exactly one locator — `url`, `org`,
+/// or `path` — selects the kind; `release`/`channel` present makes it
+/// distro-shaped. Config names a credential and never holds one: `username`
+/// and `password` are meant to be `{{ env.X }}` references. See
+/// `utils::feeds` for resolution.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct RepoDef {
+    /// Remote feed. `$releasever` and `$target` are expanded CLI-side.
+    pub url: Option<String>,
+    /// Connect-hosted private feed, resolved through the logged-in profile.
+    pub org: Option<String>,
+    /// Directory of RPMs (with `repodata/`) on disk, relative to the config
+    /// file; bind-mounted into the container.
+    pub path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_int")]
+    pub release: Option<String>,
+    pub channel: Option<String>,
+    pub releasever: Option<String>,
+    pub gpgkey: Option<String>,
+    /// Defaults to true when `gpgkey` is set, false otherwise.
+    pub gpgcheck: Option<bool>,
+    /// Only enable for these targets.
+    pub targets: Option<Vec<String>>,
+    /// Only enable during these stages; absent = all.
+    pub stages: Option<Vec<crate::utils::feeds::FeedStage>>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ca: Option<String>,
     pub tls_verify: Option<bool>,
 }
 
@@ -1465,6 +1561,10 @@ pub struct Config {
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
     pub distro: Option<DistroConfig>,
+    /// Named package feeds. Definitions only — `distro.feeds` orders and
+    /// enables them. A map so composed/board configs merge by name.
+    #[serde(default)]
+    pub repos: Option<HashMap<String, RepoDef>>,
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     /// Default runtime name for commands that scope by runtime. Mirrors
@@ -1560,6 +1660,33 @@ impl Config {
         }
 
         Ok(None)
+    }
+
+    /// The kernel command line this project wants, as (replace, append).
+    ///
+    /// Same precedence as [`Self::effective_kernel_spec`]: a runtime-level
+    /// `kernel:` wins over the top-level one, so one project can boot two
+    /// runtimes with different arguments off the same kernel. Returns the
+    /// pair rather than a merged string because the two mean different things
+    /// to the platform hook -- `cmdline` replaces the board's line outright,
+    /// `cmdline_extra` is appended to it -- and only the hook knows the base.
+    pub fn effective_kernel_cmdline(
+        &self,
+        runtime_name: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        if let Some(name) = runtime_name {
+            if let Some(kc) = self.resolve_runtime_kernel(name) {
+                if kc.cmdline.is_some() || kc.cmdline_extra.is_some() {
+                    return (kc.cmdline.clone(), kc.cmdline_extra.clone());
+                }
+            }
+        }
+        if let Some(top) = self.kernel_default() {
+            if top.cmdline.is_some() || top.cmdline_extra.is_some() {
+                return (top.cmdline.clone(), top.cmdline_extra.clone());
+            }
+        }
+        (None, None)
     }
 
     /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
@@ -2103,6 +2230,7 @@ impl Config {
                 supported_targets: None,
                 src_dir: None,
                 distro: None,
+                repos: None,
                 runtimes: None,
                 default_runtime: None,
                 sdk: None,
@@ -2184,12 +2312,21 @@ impl Config {
             queue.iter().map(|(n, _)| n.clone()).collect();
 
         while let Some((ext_name, source)) = queue.pop_front() {
+            // The SDK image to read the extension's config with. Skipped when it
+            // still carries `{{ ... }}`: this runs mid-composition, so the value
+            // may not be interpolated yet, and a literal template is not a
+            // runnable image. The reader falls back in that case.
+            let sdk_image = temp_config
+                .get_sdk_image()
+                .map(String::as_str)
+                .filter(|img| !img.contains("{{"));
             let Some(discovered) = ExtSourceReader::discover(
                 &ext_name,
                 &source,
                 &src_dir,
                 &resolved_target,
                 volume_state.as_ref(),
+                sdk_image,
                 verbose,
             ) else {
                 // Not fetched yet (or unreadable). Skip it — the missing
@@ -3911,9 +4048,12 @@ impl Config {
         if let Some(url) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.url.as_ref())
         {
+            return Some(url.clone());
+        }
+        if let Some(url) = self.distro_feed_def().and_then(|d| d.url.as_ref()) {
             return Some(url.clone());
         }
         // Legacy fallback: sdk.repo_url
@@ -3939,8 +4079,9 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.ca.as_ref())
+            .or_else(|| self.distro_feed_def().and_then(|d| d.ca.as_ref()))
             .cloned()
     }
 
@@ -3952,10 +4093,273 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.tls_verify)
+            .or_else(|| self.distro_feed_def().and_then(|d| d.tls_verify))
             .map(|verify| !verify)
             .unwrap_or(false)
+    }
+
+    /// The `repos:` definition `distro.repo` names, when it is a name reference.
+    pub(crate) fn distro_feed_def(&self) -> Option<&RepoDef> {
+        // No `distro.repo` at all means the default name: `repos.avocado` is the
+        // distro feed, exactly as if `distro.repo: avocado` had been written.
+        let name = match self.distro.as_ref().and_then(|d| d.repo.as_ref()) {
+            Some(DistroRepoRef::Named(n)) => n.as_str(),
+            Some(DistroRepoRef::Inline(_)) => return None,
+            None => crate::utils::feeds::DEFAULT_DISTRO_FEED_NAME,
+        };
+        self.repos.as_ref()?.get(name)
+    }
+}
+
+/// Write the resolved feed set into the lock, and say so when it changed.
+///
+/// Per target, because a feed's resolved URL contains `$target` and `targets:`
+/// can exclude a feed outright, so two targets in one project genuinely resolve
+/// different sets. `repo-snapshot` pins the distro feed's content; nothing
+/// equivalent exists for a third-party or on-disk feed, so without this the lock
+/// records a package's version and nothing about where it came from — and since
+/// declaration order is a strict priority override, the same name and version can
+/// be different bytes purely because the list was reordered.
+///
+/// Failures here are reported and not fatal: a build should not stop because a
+/// provenance record could not be written.
+fn record_feed_set_in_lock(
+    target: &str,
+    set: Option<&crate::utils::feeds::ResolvedFeedSet>,
+    project_root: &Path,
+) {
+    use crate::utils::lockfile::LockedFeed;
+    // `None` is the "this project declares no named feeds" path, and it has to
+    // write too: removing the last feed from a config must clear the record, or
+    // the lock keeps describing a set the build no longer uses.
+    let locked: Vec<LockedFeed> = set.map(|s| s.locked_feeds()).unwrap_or_default();
+    let mut lock = match crate::utils::lockfile::LockFile::load(project_root) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::utils::output::print_info(
+                &format!("could not read the lock to record the feed set: {e}"),
+                crate::utils::output::OutputLevel::Normal,
+            );
+            return;
+        }
+    };
+    let previous = lock.get_feeds(target);
+    let recorded = lock.has_feed_record(target);
+    // A project with no named feeds and no record should not gain an empty
+    // `feeds` key it will never use; there is nothing to clear.
+    if set.is_none() && !recorded {
+        return;
+    }
+    // And nothing to write when the lock already says exactly this. Comparing
+    // the record's presence against `set.is_some()` was wrong: `set_feeds`
+    // always writes `Some(..)`, so on the no-feeds path that test never
+    // matched and every invocation re-saved the lock.
+    if recorded && previous == locked.as_slice() {
+        return;
+    }
+    // Reported whenever a record existed before, empty or not. Gating on
+    // `!previous.is_empty()` stayed silent when a target that had resolved no
+    // feeds started resolving some — which is a change, and the message exists
+    // for exactly the changes a user would not otherwise notice.
+    if recorded {
+        // A recorded value nobody reads is only half a record. The reason to write
+        // it down is that reordering feeds silently changes which artifact a name
+        // and version resolve to, and that is the change a user would not notice.
+        //
+        // Names and order first, because that is the change worth reading. But the
+        // record also carries each feed's locator, digest and stage scope, and any
+        // of those moving is equally a change — so when the name list is identical
+        // the message has to say what actually moved, or it prints two identical
+        // lists and reads as a bug.
+        let names = |fs: &[LockedFeed]| {
+            fs.iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut message = format!(
+            "feeds for '{target}' changed since the lock was written: [{}] -> [{}]",
+            names(previous),
+            names(&locked)
+        );
+        if names(previous) == names(&locked) {
+            let fields = |a: &LockedFeed, b: &LockedFeed| {
+                [
+                    ("url", a.url != b.url),
+                    ("digest", a.digest != b.digest),
+                    ("stages", a.stages != b.stages),
+                    ("position", a.position != b.position),
+                ]
+                .into_iter()
+                .filter(|(_, moved)| *moved)
+                .map(|(f, _)| f)
+                .collect::<Vec<_>>()
+            };
+            let moved: Vec<String> = previous
+                .iter()
+                .zip(&locked)
+                .filter_map(|(a, b)| {
+                    let f = fields(a, b);
+                    (!f.is_empty()).then(|| format!("{} ({})", a.name, f.join(", ")))
+                })
+                .collect();
+            message = format!(
+                "feeds for '{target}' changed since the lock was written: {}",
+                moved.join("; ")
+            );
+        }
+        crate::utils::output::print_info(&message, crate::utils::output::OutputLevel::Normal);
+    }
+    lock.set_feeds(target, locked);
+    if let Err(e) = lock.save(project_root) {
+        crate::utils::output::print_info(
+            &format!("could not record the feed set in the lock: {e}"),
+            crate::utils::output::OutputLevel::Normal,
+        );
+    }
+}
+
+/// Targets whose feed record has already been reconciled this invocation.
+///
+/// Only the no-feeds path needs this: when feeds resolve, the per-target
+/// `OnceCell` in [`invocation_feeds`] already makes the recording happen once.
+/// Without it, every container run of a project with no named feeds would load
+/// and re-check the lock.
+static FEEDS_RECORDED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn record_empty_feed_set_once(target: &str, project_root: &Path) {
+    let seen = FEEDS_RECORDED.get_or_init(Default::default);
+    {
+        let Ok(mut guard) = seen.lock() else { return };
+        if !guard.insert(target.to_string()) {
+            return;
+        }
+    }
+    record_feed_set_in_lock(target, None, project_root);
+}
+
+/// One resolved, minted feed set per invocation, per target.
+///
+/// Resolution is cheap and repeatable; minting is neither. A `.repo` set is
+/// materialized once per stage, but `avocado build` runs many containers, and
+/// re-minting for each one meant five feed tokens for a single build — enough
+/// that a naive per-minute limit on the mint endpoint would refuse an ordinary
+/// build. It also gave every dnf step a different bind mount, which is part of a
+/// container's shape, so sharing a container between steps became impossible
+/// exactly where it saves the most.
+///
+/// The tempdir lives here, so it survives for the whole invocation and is removed
+/// when the process ends. Credentials therefore live as long as the invocation
+/// rather than as long as one step — see `materialize_in` for why that trade is
+/// acceptable and what would invalidate it.
+struct InvocationFeeds {
+    /// Behind a mutex because minting is now per stage: the first stage that
+    /// needs a private feed mints it and later stages reuse the token, so the set
+    /// is mutated after it is shared.
+    set: tokio::sync::Mutex<crate::utils::feeds::ResolvedFeedSet>,
+    root: std::sync::Arc<tempfile::TempDir>,
+}
+
+type FeedCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<InvocationFeeds>>>;
+
+static INVOCATION_FEEDS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedCell>>> =
+    std::sync::OnceLock::new();
+
+/// Get this invocation's feed set for `target`, resolving it once.
+///
+/// One set per target per invocation, and the first caller's set is the one that
+/// wins — every later caller gets it back rather than its own. That is what makes
+/// the invocation coherent: the canonical document, the stamp hash, the mint and
+/// the `.repo` files all describe the same set. Writing the document on every
+/// call while keeping only the first set was the incoherent version — resolution
+/// can move mid-invocation (an on-disk feed's repodata digest, an env-driven
+/// releasever) and the document would then describe a set the build was not
+/// using.
+async fn invocation_feeds(
+    target: &str,
+    set: crate::utils::feeds::ResolvedFeedSet,
+    project_root: &Path,
+) -> Result<std::sync::Arc<InvocationFeeds>> {
+    // The map lock is released before the mint starts; it is held only long enough
+    // to hand out this target's cell. The single-mint guarantee comes from the
+    // per-target `OnceCell`, not from the lock — concurrent callers for the same
+    // target await the same initialization, which matters because `sdk install`
+    // runs the rootfs and initramfs installs at once. A different target is never
+    // blocked behind someone else's network call.
+    let map = INVOCATION_FEEDS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let cell = {
+        let mut guard = map.lock().await;
+        guard.entry(target.to_string()).or_default().clone()
+    };
+    cell.get_or_try_init(|| async {
+        // The canonical document describes the set this invocation adopted, so it
+        // is written here, where that set is decided, and not by the caller.
+        set.write_canonical(project_root)?;
+        // Same for the lock, and once per target per invocation for the same
+        // reason: this is the only place that always runs when feeds resolve,
+        // whichever command is running. Doing it in each install command missed
+        // every other path, which is how the first attempt recorded nothing for a
+        // `sdk install`.
+        record_feed_set_in_lock(target, Some(&set), project_root);
+        // No minting here: it is per stage, and this cell is per target.
+        let root = std::sync::Arc::new(
+            tempfile::Builder::new()
+                .prefix("avocado-feeds-")
+                .tempdir()
+                .context("creating the invocation's feeds directory")?,
+        );
+        Ok(std::sync::Arc::new(InvocationFeeds {
+            set: tokio::sync::Mutex::new(set),
+            root,
+        }))
+    })
+    .await
+    .cloned()
+}
+
+impl Config {
+    /// Resolve, record, and materialize the named feeds for one container run.
+    /// `None` when the project declares no feeds — the zero-cost path. The first
+    /// call for a target writes the canonical document to
+    /// `<config_dir>/.avocado/feeds/<target>.json` and pins that set for the rest
+    /// of the invocation; later calls reuse it, so the document and the build
+    /// cannot describe different sets.
+    pub async fn materialize_feeds(
+        &self,
+        target: &str,
+        stage: crate::utils::feeds::FeedStage,
+        config_path: &str,
+    ) -> Result<Option<crate::utils::feeds::FeedMaterialization>> {
+        // `path:` feeds resolve against project_root, like every other relative
+        // path in the config; the canonical document goes under <config_dir>/.avocado/.
+        // Both the resolved feeds and the canonical document key off project_root,
+        // not the config file's directory. `avocado.lock` lives at the top of
+        // `src_dir` and the legacy `.avocado/lock.json` did too, so a project that
+        // sets `src_dir` would otherwise get its feed document beside the config
+        // file while the rest of its build state sits somewhere else.
+        let project_root = self.project_root(config_path);
+        let Some(set) =
+            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
+        else {
+            // No named feeds. Still a fact worth recording, because it is the fact
+            // that removes a set the lock may still be carrying from a config that
+            // used to declare one.
+            record_empty_feed_set_once(target, &project_root);
+            return Ok(None);
+        };
+        // The canonical document and the lock record are both written inside
+        // `invocation_feeds`, before the mint, so they record what the build
+        // depended on (`connect:<org>`) and never the short-lived token or the
+        // host it was served from today.
+        let shared = invocation_feeds(target, set, &project_root).await?;
+        // Mint inside the lock: two stages starting at once must not both mint the
+        // same feed, and the second must see the first one's token.
+        let mut guard = shared.set.lock().await;
+        guard.resolve_connect_credentials(stage).await?;
+        Ok(Some(guard.materialize_in(stage, &shared.root)?))
     }
 
     /// Promote config-file repo TLS settings to the process env so the container
@@ -3988,10 +4392,18 @@ impl Config {
         if let Some(rv) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.releasever.as_ref())
         {
             return Some(rv.clone());
+        }
+        if let Some(d) = self.distro_feed_def() {
+            if let Some(rv) = &d.releasever {
+                return Some(rv.clone());
+            }
+            if let (Some(r), Some(c)) = (&d.release, &d.channel) {
+                return Some(format!("{r}/{c}"));
+            }
         }
         // Legacy fallback: sdk.repo_release
         if let Some(rv) = self.sdk.as_ref().and_then(|s| s.repo_release.as_ref()) {
@@ -6259,6 +6671,58 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+
+    /// Recording the feed set must be a no-op when there is nothing to record.
+    ///
+    /// Two ways to get this wrong, and the first shipped: comparing the record's
+    /// *presence* against `set.is_some()` never matched on the no-feeds path,
+    /// because `set_feeds` always writes `Some(..)` — so every container run of
+    /// a project with no named feeds re-saved the lock. And a project that never
+    /// had feeds should not gain an empty `feeds` key it will never use.
+    #[test]
+    fn recording_no_feeds_writes_only_when_there_is_something_to_clear() {
+        use crate::utils::lockfile::{LockFile, LockedFeed};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Nothing recorded, nothing to record: no lock file appears.
+        super::record_feed_set_in_lock("t", None, root);
+        assert!(
+            !root.join("avocado.lock").exists(),
+            "a project with no feeds must not gain a lock just to say so"
+        );
+
+        // A recorded set is cleared, and stays cleared across a reload.
+        let mut lock = LockFile::load(root).unwrap();
+        lock.set_feeds(
+            "t",
+            vec![LockedFeed {
+                name: "vendor".into(),
+                position: 10,
+                url: "https://v".into(),
+                digest: None,
+                stages: None,
+            }],
+        );
+        lock.save(root).unwrap();
+        super::record_feed_set_in_lock("t", None, root);
+        let lock = LockFile::load(root).unwrap();
+        assert!(lock.get_feeds("t").is_empty(), "the removed feed must go");
+        assert!(lock.has_feed_record("t"), "and be recorded as none");
+
+        // Recording "none" again changes nothing, so the mtime does not move.
+        let before = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::record_feed_set_in_lock("t", None, root);
+        let after = std::fs::metadata(root.join("avocado.lock"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "a no-op must not rewrite the lock");
+    }
     #[test]
     fn fit_signing_reads_key_and_explicit_unsigned_per_runtime() {
         let yaml = r#"
@@ -11398,6 +11862,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11410,6 +11876,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11422,6 +11890,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_err());
     }
@@ -11434,6 +11904,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("'compile' requires 'install'"));
@@ -11447,6 +11919,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("either 'package' or 'compile'"));
@@ -13125,6 +13599,8 @@ runtimes:
                 compile: None,
                 install: None,
                 image: None,
+                cmdline: None,
+                cmdline_extra: None,
             },
         );
         let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
@@ -13865,5 +14341,76 @@ extensions:
             }
             other => panic!("expected Git source, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_cmdline_tests {
+    use super::*;
+
+    fn cfg(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("config parses")
+    }
+
+    /// A `kernel:` block that only amends the command line is valid. Requiring
+    /// `package`/`compile` here would force every project that wants one extra
+    /// kernel argument to also restate where its kernel comes from.
+    #[test]
+    fn cmdline_only_block_is_valid() {
+        let k = KernelConfig {
+            package: None,
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: None,
+            cmdline_extra: Some("isolcpus=4-6".to_string()),
+        };
+        assert!(k.validate().is_ok());
+    }
+
+    /// Replacing and appending are different operations; asking for both is a
+    /// mistake the platform hook cannot resolve.
+    #[test]
+    fn cmdline_and_cmdline_extra_conflict() {
+        let k = KernelConfig {
+            package: Some("kernel-image".to_string()),
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: Some("root=/dev/x".to_string()),
+            cmdline_extra: Some("earlycon".to_string()),
+        };
+        assert!(k.validate().is_err());
+    }
+
+    #[test]
+    fn top_level_cmdline_extra_is_used_when_no_runtime_override() {
+        let c = cfg("kernel:\n  cmdline_extra: \"earlycon\"\n");
+        let (replace, extra) = c.effective_kernel_cmdline(Some("prod"));
+        assert_eq!(replace, None);
+        assert_eq!(extra.as_deref(), Some("earlycon"));
+    }
+
+    /// Two runtimes off one kernel can boot with different arguments -- the
+    /// reason this resolves per-runtime rather than once per project.
+    #[test]
+    fn runtime_level_cmdline_overrides_top_level() {
+        let c = cfg(concat!(
+            "kernel:\n  cmdline_extra: \"earlycon\"\n",
+            "runtimes:\n  rt:\n    kernel:\n      cmdline_extra: \"isolcpus=4-6 nohz_full=4-6\"\n",
+        ));
+        let (_, extra) = c.effective_kernel_cmdline(Some("rt"));
+        assert_eq!(extra.as_deref(), Some("isolcpus=4-6 nohz_full=4-6"));
+        // a runtime with no kernel block of its own still sees the top level
+        let (_, other) = c.effective_kernel_cmdline(Some("nonexistent"));
+        assert_eq!(other.as_deref(), Some("earlycon"));
+    }
+
+    #[test]
+    fn absent_kernel_block_yields_nothing() {
+        let c = cfg("default_target: qemuarm64\n");
+        assert_eq!(c.effective_kernel_cmdline(Some("rt")), (None, None));
     }
 }

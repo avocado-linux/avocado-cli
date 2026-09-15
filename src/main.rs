@@ -279,7 +279,12 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall extensions from scratch: clear every extension's sysroot
+        /// and re-seed it.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards every extension's built content, so the next build has to
+        /// redo all of it.
         #[arg(short, long)]
         force: bool,
         /// Runtime name to install packages into (or sync when no packages given)
@@ -626,6 +631,11 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
     },
+    /// Log in to Connect (shortcut for `connect auth login`)
+    ///
+    /// Your builds then identify themselves to the package feeds, which raises
+    /// your rate limit and gives access to private feeds.
+    Login(LoginArgs),
     /// Avocado Connect platform commands (auth, upload)
     Connect {
         #[command(subcommand)]
@@ -1410,27 +1420,39 @@ enum ConfigCommands {
     },
 }
 
+/// Arguments shared by `avocado login` and `avocado connect auth login`.
+#[derive(clap::Args)]
+struct LoginArgs {
+    /// API URL (defaults to https://connect.peridio.com or AVOCADO_CONNECT_URL env var)
+    #[arg(long)]
+    url: Option<String>,
+    /// Profile name (defaults to "default")
+    #[arg(long)]
+    profile: Option<String>,
+    /// Use an existing API token instead of browser login
+    #[arg(long)]
+    token: Option<String>,
+    /// Organization id (UUID) to scope the new token to. Required for
+    /// non-interactive multi-org logins; ignored when --token is set.
+    #[arg(long)]
+    org: Option<String>,
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    output: OutputFormat,
+}
+
+impl LoginArgs {
+    async fn run(self) -> Result<()> {
+        ConnectAuthLoginCommand::new(self.url, self.profile, self.token, self.org, self.output)
+            .execute()
+            .await
+    }
+}
+
 #[derive(Subcommand)]
 enum ConnectAuthCommands {
     /// Login to the Connect platform
-    Login {
-        /// API URL (defaults to https://connect.peridio.com or AVOCADO_CONNECT_URL env var)
-        #[arg(long)]
-        url: Option<String>,
-        /// Profile name (defaults to "default")
-        #[arg(long)]
-        profile: Option<String>,
-        /// Use an existing API token instead of browser login
-        #[arg(long)]
-        token: Option<String>,
-        /// Organization id (UUID) to scope the new token to. Required for
-        /// non-interactive multi-org logins; ignored when --token is set.
-        #[arg(long)]
-        org: Option<String>,
-        /// Output format
-        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
-        output: OutputFormat,
-    },
+    Login(LoginArgs),
     /// Logout from the Connect platform
     Logout {
         /// Profile name (defaults to the active default profile)
@@ -1652,7 +1674,11 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Install the SDK, rootfs, initramfs and target-dev sysroots in
+        /// parallel rather than one at a time.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -1726,7 +1752,10 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Run without the live checklist.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
@@ -2250,12 +2279,12 @@ async fn main() -> Result<()> {
         } => {
             let _json_guard =
                 run_with_json_lifecycle(output, "install", target.as_deref(), runtime.as_deref());
-            // JSON output implies no human at the keyboard — auto-enable
-            // --force so dnf gets -y and container starts without -it.
-            // Without this, `docker run -it` fails ("cannot attach stdin
-            // to a TTY-enabled container") and dnf hangs waiting for
-            // confirmation.
-            let force = force || output.is_json();
+            // No JSON-implies-force coercion. Both reasons for it are gone:
+            // installs always pass `-y`, and `utils::interactivity` decides the
+            // container's stdio flags from what the environment can actually
+            // support, so `docker run -it` no longer fails without a tty. With
+            // `--force` meaning reinstall-from-scratch, keeping the coercion
+            // turned `--output json` into a full rebuild.
             if packages.is_empty() {
                 // No packages specified: sync all from config (original behavior)
                 validate_runtime_if_provided(&config, runtime.as_ref())?;
@@ -2479,9 +2508,8 @@ async fn main() -> Result<()> {
                 target.as_deref(),
                 name.as_deref().or(runtime.as_deref()),
             );
-            // JSON output implies no human at the keyboard — auto-enable
-            // --force (see `Install` arm above for rationale).
-            let force = force || output.is_json();
+            // No JSON-implies-force coercion here either (see the `Install`
+            // arm above for why both of its reasons are gone).
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -3492,6 +3520,33 @@ async fn main() -> Result<()> {
             },
         },
         Commands::Hitl { command } => match command {
+            HitlCommands::Start {
+                config_path,
+                extensions,
+                container_args,
+                dnf_args,
+                target,
+                verbose,
+                port,
+                no_stamps,
+                foreground,
+            } => {
+                let hitl_cmd = HitlServerCommand {
+                    config_path,
+                    extensions,
+                    container_args,
+                    dnf_args,
+                    target: target.or(cli.target),
+                    verbose,
+                    port,
+                    no_stamps: no_stamps || cli.no_stamps,
+                    foreground,
+                    sdk_arch: cli.sdk_arch.clone(),
+                    composed_config: None,
+                };
+                hitl_cmd.execute().await?;
+                Ok(())
+            }
             HitlCommands::Server {
                 config_path,
                 extensions,
@@ -3511,12 +3566,50 @@ async fn main() -> Result<()> {
                     verbose,
                     port,
                     no_stamps: no_stamps || cli.no_stamps,
+                    foreground: true,
                     sdk_arch: cli.sdk_arch.clone(),
                     composed_config: None,
                 };
                 hitl_cmd.execute().await?;
                 Ok(())
             }
+            HitlCommands::Status => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                commands::hitl::status(&tool)
+            }
+            HitlCommands::Stop {
+                config_path,
+                target,
+                all,
+            } => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                let identity = if all {
+                    None
+                } else {
+                    let config = Config::load(&config_path)?;
+                    let target = crate::utils::target::validate_and_log_target(
+                        target.or(cli.target).as_deref(),
+                        &config,
+                    )?;
+                    Some(commands::hitl::HitlIdentity::new(&target, &config_path))
+                };
+                commands::hitl::stop(&tool, identity.as_ref(), all)
+            }
+            HitlCommands::Logs {
+                config_path,
+                target,
+                follow,
+            } => {
+                let tool = crate::utils::container::SdkContainer::new().container_tool;
+                let config = Config::load(&config_path)?;
+                let target = crate::utils::target::validate_and_log_target(
+                    target.or(cli.target).as_deref(),
+                    &config,
+                )?;
+                let identity = commands::hitl::HitlIdentity::new(&target, &config_path);
+                commands::hitl::show_logs(&tool, &identity, follow)
+            }
+            HitlCommands::Sync { device } => commands::hitl::sync(&device),
         },
         Commands::Sdk { command } => match command {
             SdkCommands::Install {
@@ -3683,19 +3776,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Login(args) => args.run().await,
         Commands::Connect { command } => match command {
             ConnectCommands::Auth { command } => match command {
-                ConnectAuthCommands::Login {
-                    url,
-                    profile,
-                    token,
-                    org,
-                    output,
-                } => {
-                    let cmd = ConnectAuthLoginCommand::new(url, profile, token, org, output);
-                    cmd.execute().await?;
-                    Ok(())
-                }
+                ConnectAuthCommands::Login(args) => args.run().await,
                 ConnectAuthCommands::Logout { profile, output } => {
                     let cmd = ConnectAuthLogoutCommand { profile, output };
                     cmd.execute().await?;
@@ -4426,6 +4510,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Remove any session container this invocation started. `--rm` covers the
+    // daemon-side reap; this covers the normal exit. A crash or a kill leaves
+    // one behind, which the next invocation sweeps by pid — see
+    // `SessionContainers::sweep_abandoned`.
+    utils::container::SessionContainers::shutdown(&utils::container::default_container_tool());
+
     result
 }
 
@@ -4441,7 +4531,12 @@ enum ExtCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Reinstall from scratch: clear this extension's sysroot and re-seed
+        /// it.
+        ///
+        /// Not needed to skip dnf's prompts — installs never prompt. Forcing
+        /// discards the extension's built content, so the next build has to
+        /// redo it.
         #[arg(short, long)]
         force: bool,
         /// Extension name (deprecated, use positional argument)
@@ -4697,7 +4792,10 @@ enum RootfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Accepted for compatibility with older scripts; has no effect.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -4764,7 +4862,10 @@ enum InitramfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Accepted for compatibility with older scripts; has no effect.
+        ///
+        /// Clears nothing. Not needed to skip dnf's prompts — installs never
+        /// prompt.
         #[arg(short, long)]
         force: bool,
         /// Target architecture
@@ -5051,7 +5152,69 @@ enum VmConfigCommands {
 
 #[derive(Subcommand)]
 enum HitlCommands {
-    /// Start a HITL server container with preconfigured settings
+    /// Start a managed HITL NFS server for this project (detached; see `status`, `logs`, `stop`)
+    Start {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Extensions to serve
+        #[arg(short, long = "extension", required = true)]
+        extensions: Vec<String>,
+        /// Additional container arguments
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        container_args: Option<Vec<String>>,
+        /// Additional arguments to pass to DNF commands
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        dnf_args: Option<Vec<String>>,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        /// NFS port number to use
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Disable stamp validation
+        #[arg(long)]
+        no_stamps: bool,
+        /// Stay attached and stream the server log instead of detaching
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// List HITL servers on this machine
+    Status,
+    /// Stop and remove this project's HITL server (or every one with --all)
+    Stop {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Stop every HITL server, not just this project's
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show this project's HITL server log
+    Logs {
+        /// Path to avocado.yaml configuration file
+        #[arg(short = 'C', long, default_value = "avocado.yaml")]
+        config_path: String,
+        /// Target
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Follow the log
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Re-run the extension lifecycle on a device after rebuilding what it is served
+    Sync {
+        /// Device as [user@]host, e.g. root@192.168.1.77
+        #[arg(short, long)]
+        device: String,
+    },
+    /// Start a HITL server in the foreground (alias for `start --foreground`)
     Server {
         /// Path to avocado.yaml configuration file
         #[arg(short = 'C', long, default_value = "avocado.yaml")]
@@ -5192,6 +5355,31 @@ mod tests {
     /// NOT route — routing can auto-start the VM, which is wrong for e.g.
     /// `connect auth`/`deploy`. Pins the Docker-socket fix against regressions
     /// (dropping the upload arm, or over-broadly routing all of `Connect`).
+    /// `--output json` must not imply `--force`.
+    ///
+    /// It did, for two reasons that are both gone: the TUI renderer was gated on
+    /// `--force` because dnf could prompt without it, and `docker run -it`
+    /// failed with no tty. Installs now always pass `-y`, and
+    /// `utils::interactivity` decides the container's stdio from what the
+    /// environment can actually support. With `--force` meaning
+    /// reinstall-from-scratch, the coercion turned a request for machine-readable
+    /// output into a full rebuild on every invocation.
+    ///
+    /// The needle is assembled at runtime so this assertion does not match its
+    /// own source.
+    #[test]
+    fn json_output_does_not_imply_force() {
+        let src = include_str!("main.rs");
+        let needle = format!("force {}", "|| output.is_json()");
+        for (n, line) in src.lines().enumerate() {
+            assert!(
+                !line.contains(&needle),
+                "main.rs:{} makes --output json imply --force: {line}",
+                n + 1
+            );
+        }
+    }
+
     #[test]
     fn needs_vm_routing_gates_connect_upload_only() {
         let cmd = |args: &[&str]| {
@@ -5229,6 +5417,72 @@ mod tests {
             "--target",
             "qemux86-64",
         ])));
+    }
+
+    /// `avocado login` is a shortcut for `connect auth login`: one argument
+    /// struct, one command. Both are pure Connect-API calls and must not route
+    /// to the VM, which could auto-start it for a login.
+    #[test]
+    fn login_is_a_shortcut_for_connect_auth_login() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        };
+        let short = parse(&[
+            "avocado",
+            "login",
+            "--token",
+            "t",
+            "--profile",
+            "p",
+            "--org",
+            "o",
+            "--url",
+            "https://connect.example",
+            "--output",
+            "json",
+        ]);
+        let long = parse(&[
+            "avocado",
+            "connect",
+            "auth",
+            "login",
+            "--token",
+            "t",
+            "--profile",
+            "p",
+            "--org",
+            "o",
+            "--url",
+            "https://connect.example",
+            "--output",
+            "json",
+        ]);
+        let Commands::Login(a) = &short else {
+            panic!("`avocado login` must parse to Commands::Login");
+        };
+        let Commands::Connect {
+            command:
+                ConnectCommands::Auth {
+                    command: ConnectAuthCommands::Login(b),
+                },
+        } = &long
+        else {
+            panic!("`connect auth login` must parse to ConnectAuthCommands::Login");
+        };
+        // Every shared field, not a sample. The point of the shared struct is that
+        // the two spellings cannot diverge; a test covering three of five fields
+        // would not notice the other two diverging.
+        for args in [a, b] {
+            assert_eq!(args.token.as_deref(), Some("t"));
+            assert_eq!(args.profile.as_deref(), Some("p"));
+            assert_eq!(args.org.as_deref(), Some("o"));
+            assert_eq!(args.url.as_deref(), Some("https://connect.example"));
+            assert!(matches!(args.output, OutputFormat::Json));
+        }
+        assert!(!needs_vm_routing(&short));
+        assert!(!needs_vm_routing(&long));
     }
 
     /// The engine-driving `container dev` subcommands must route, or

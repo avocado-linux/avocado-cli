@@ -1,5 +1,6 @@
 //! Rootfs sysroot install command and shared install logic for rootfs/initramfs.
 
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -59,8 +60,9 @@ use crate::utils::{
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
-        compute_initramfs_input_hash, compute_rootfs_input_hash, generate_write_stamp_script,
-        Stamp, StampInputs, StampOutputs, StampRequirement, SysrootStampInputs,
+        compute_initramfs_input_hash, compute_rootfs_input_hash,
+        generate_write_stamp_script_with_digest, render_sysroot_digest_script, Stamp, StampInputs,
+        StampOutputs, StampRequirement, SysrootStampInputs,
     },
     target::validate_and_log_target,
 };
@@ -80,10 +82,10 @@ pub struct SysrootInstallParams<'a> {
     pub target_board: Option<&'a str>,
     pub repo_url: Option<&'a str>,
     pub repo_release: Option<&'a str>,
+    pub feeds: Option<&'a crate::utils::feeds::FeedMaterialization>,
     pub merged_container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub verbose: bool,
-    pub force: bool,
     pub runs_on_context: Option<&'a RunsOnContext>,
     pub sdk_arch: Option<&'a String>,
     /// Skip stamp reading and writing when true — the escape hatch that
@@ -175,6 +177,7 @@ async fn stage_kernel_sysroot_from_rootfs(
     lock_file: &mut LockFile,
     repo_url: Option<&str>,
     repo_release: Option<&str>,
+    feeds: Option<&crate::utils::feeds::FeedMaterialization>,
     merged_container_args: Option<Vec<String>>,
     runs_on_context: Option<&RunsOnContext>,
     sdk_arch: Option<&String>,
@@ -239,6 +242,7 @@ fi
         source_environment: true,
         interactive: false,
         repo_url: repo_url.map(|s| s.to_string()),
+        feeds: feeds.cloned(),
         repo_release: repo_release.map(|s| s.to_string()),
         container_args: merged_container_args.clone(),
         sdk_arch: sdk_arch.cloned(),
@@ -418,6 +422,7 @@ async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) -> 
         source_environment: true,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         sdk_arch: params.sdk_arch.cloned(),
@@ -491,6 +496,24 @@ pub fn compute_sysroot_install_inputs(
     ctx: &SysrootStampContext<'_>,
     packages: &HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<StampInputs>> {
+    let stage = match ctx.sysroot_type {
+        SysrootType::Rootfs => crate::utils::feeds::FeedStage::Rootfs,
+        SysrootType::Initramfs => crate::utils::feeds::FeedStage::Initramfs,
+        _ => return Ok(None),
+    };
+    // Resolved in-process rather than read back from .avocado/feeds/<target>.json:
+    // that file is rewritten on every resolution, so a hash taken from it could
+    // key on the previous config's feed set and skip a stale sysroot. The
+    // releasever comes from ctx — pin-aware on both the install and the build
+    // side — never from env, which only install exports the pin into.
+    let feed_projection = crate::utils::feeds::ResolvedFeedSet::resolve(
+        ctx.config,
+        ctx.target,
+        ctx.src_dir,
+        ctx.repo_release,
+    )?
+    .map(|set| set.stage_projection_json(stage))
+    .transpose()?;
     let resolved = SysrootStampInputs {
         packages,
         repo_url: ctx.repo_url,
@@ -500,6 +523,7 @@ pub fn compute_sysroot_install_inputs(
         locked_packages: ctx
             .lock_file
             .get_sysroot_versions(ctx.target, ctx.sysroot_type),
+        feed_projection: feed_projection.as_deref(),
     };
 
     let inputs = match ctx.sysroot_type {
@@ -585,6 +609,7 @@ async fn package_exists_in_target_repo(
         source_environment: false,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
@@ -635,24 +660,37 @@ async fn write_install_stamp(
         return Ok(());
     };
 
-    let stamp = match params.sysroot_type {
-        SysrootType::Rootfs => {
-            Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
-        }
-        SysrootType::Initramfs => {
-            Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
-        }
+    // The rootfs keeps its rpmdb at /var/lib/rpm; the initramfs uses rpm's
+    // default — the same split the image build-id derivation makes.
+    let (stamp, sysroot_dir, rpm_dbpath) = match params.sysroot_type {
+        SysrootType::Rootfs => (
+            Stamp::rootfs_install(params.target, inputs, StampOutputs::default()),
+            "rootfs",
+            Some("/var/lib/rpm"),
+        ),
+        SysrootType::Initramfs => (
+            Stamp::initramfs_install(params.target, inputs, StampOutputs::default()),
+            "initramfs",
+            None,
+        ),
         _ => unreachable!("sysroot type was validated at entry"),
     };
+    // Digest the installed tree, overlay included. This is the chain link the
+    // image step's input hash folds (once that step checks its own stamp), so
+    // it must cover the overlay, which this same install applied — packages
+    // alone would miss it.
+    let digest =
+        render_sysroot_digest_script(&format!("$AVOCADO_PREFIX/{sysroot_dir}"), rpm_dbpath);
 
     let stamp_config = RunConfig {
         container_image: params.container_image.to_string(),
         target: params.target.to_string(),
-        command: generate_write_stamp_script(&stamp)?,
+        command: generate_write_stamp_script_with_digest(&stamp, &digest)?,
         verbose: params.verbose,
         source_environment: true,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         sdk_arch: params.sdk_arch.cloned(),
@@ -756,6 +794,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             lock_file: params.lock_file,
             repo_url: params.repo_url,
             repo_release: params.repo_release,
+            feeds: params.feeds,
             merged_container_args: params.merged_container_args.clone(),
             dnf_args: params.dnf_args.clone(),
             runs_on_context: params.runs_on_context,
@@ -1014,7 +1053,10 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     }
     let pkg = pkg_specs.join(" ");
 
-    let yes = if params.force { "-y" } else { "" };
+    // dnf never prompts here: this applies the package set avocado.yaml and
+    // avocado.lock already declare, so there is no decision left to make.
+    // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+    let yes = "-y";
     let dnf_args_str = if let Some(args) = &params.dnf_args {
         format!(" {} ", args.join(" "))
     } else {
@@ -1111,7 +1153,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
-    let command = format!(
+    let mut command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
 # resolve /lib/modules, /sbin, /bin paths within the sysroot
@@ -1130,6 +1172,19 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {sync_snippet}{overlay_snippet}"#
     );
+    if params.no_stamps {
+        // See remove_own_stamp_line: an unrecorded install must not leave the
+        // previous stamp's digest for the image step to trust.
+        let own = match params.sysroot_type {
+            SysrootType::Rootfs => crate::utils::stamps::StampRequirement::rootfs_install(),
+            SysrootType::Initramfs => crate::utils::stamps::StampRequirement::initramfs_install(),
+            _ => unreachable!("sysroot type was validated at entry"),
+        };
+        command = format!(
+            "{}{command}",
+            crate::utils::stamps::remove_own_stamp_line(&own)
+        );
+    }
 
     let mut run_config = RunConfig {
         container_image: params.container_image.to_string(),
@@ -1137,8 +1192,10 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         command,
         verbose: params.verbose,
         source_environment: false,
-        interactive: !params.force,
+        // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+        interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
@@ -1201,6 +1258,28 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 &params.sysroot_type,
                 installed_versions,
             );
+            // Then where each one came from. Best effort and deliberately not
+            // gated on `versions_recorded` being true for the origins as well: a
+            // lock that records a version without an origin is the normal case
+            // for a single-feed project, and a build must never fail because
+            // provenance could not be determined.
+            let origins = params
+                .container_helper
+                .query_installed_origins(
+                    &params.sysroot_type,
+                    params.container_image,
+                    params.target,
+                    params.repo_url.map(|s| s.to_string()),
+                    params.repo_release.map(|s| s.to_string()),
+                    params.merged_container_args.clone(),
+                    params.runs_on_context,
+                    params.sdk_arch,
+                    None,
+                )
+                .await;
+            params
+                .lock_file
+                .set_sysroot_origins(params.target, &params.sysroot_type, &origins);
             if params.verbose {
                 print_info(
                     &format!("Updated lock file with {label} package versions."),
@@ -1241,6 +1320,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     params.lock_file,
                     params.repo_url,
                     params.repo_release,
+                    params.feeds,
                     params.merged_container_args.clone(),
                     params.runs_on_context,
                     params.sdk_arch,
@@ -1313,6 +1393,9 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
 pub struct RootfsInstallCommand {
     config_path: String,
     verbose: bool,
+    /// Accepted for compatibility with scripts that pass `-f`; nothing reads it
+    /// any more: installs never prompt, and this command clears nothing.
+    #[allow(dead_code)]
     force: bool,
     target: Option<String>,
     target_board: Option<String>,
@@ -1404,6 +1487,9 @@ impl RootfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)
+            .await?;
 
         let container_helper = SdkContainer::from_config(&self.config_path, config)?
             .verbose(self.verbose)
@@ -1430,6 +1516,7 @@ impl RootfsInstallCommand {
                 container_image: container_image.to_string(),
                 target: target.to_string(),
                 repo_url: repo_url.clone(),
+                feeds: feeds.clone(),
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
@@ -1457,10 +1544,10 @@ impl RootfsInstallCommand {
                     target_board: self.target_board.as_deref(),
                     repo_url: repo_url.as_deref(),
                     repo_release: repo_release.as_deref(),
+                    feeds: feeds.as_ref(),
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     verbose: self.verbose,
-                    force: self.force,
                     runs_on_context: runs_on_context.as_ref(),
                     sdk_arch: self.sdk_arch.as_ref(),
                     no_stamps: self.no_stamps,
@@ -1596,6 +1683,74 @@ mod tests {
 
     fn name_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Installs must never wait on a dnf prompt.
+    ///
+    /// This used to depend on `--force`, which also clears every extension
+    /// sysroot and drops its stamps — so the only way to avoid the prompt was
+    /// to pay a full rebuild, and the documented invocation (`install -f`) did
+    /// exactly that on every iteration. A prompt here also hangs CI and the
+    /// TUI, which is why the renderer was gated on `--force` too. The `yes`
+    /// argument is now a constant at all five install call sites; this pins the
+    /// step that consumes it.
+    #[test]
+    fn dnf_sync_step_passes_assume_yes() {
+        use crate::commands::rootfs::install::dnf_sync_step;
+        let step = dnf_sync_step(true, "rootfs", "", "-y", "");
+        assert!(step.contains("-y"), "expected -y in: {step}");
+        // And the sources agree, across every install site. One exact string in
+        // one file was too narrow: the coupling can come back in any of the five
+        // and can be spelled several ways, so match the shape instead — the
+        // assume-yes literal and a flag on the same line.
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains("\"-y\"") && line.contains("force")),
+                    "{name}:{} derives the assume-yes flag from a flag: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// With `-y` unconditional there is nothing in an install a person could
+    /// answer, so no install step may ask the container for a PTY. Asking is
+    /// not harmless: `docker run -t` puts the caller's terminal into raw mode,
+    /// which the TUI already owns, and on macOS through avocado-vm that setup
+    /// fails with "unable to set IO streams as raw terminal: interrupted system
+    /// call" on a plain `avocado install`, while `install -f` -- which never
+    /// asked -- works. Before this branch installs ran with `-i` only; the
+    /// stdio decision in `utils::interactivity` grants `-i -t` to any step that
+    /// declares itself interactive, so the declaration has to go, not the
+    /// decision. Provision is deliberately not scanned: flashing tools do talk
+    /// to a person. The needle is assembled at runtime so this test cannot
+    /// match its own source.
+    #[test]
+    fn no_install_step_ties_the_container_pty_to_a_flag() {
+        let key = ["inter", "active:"].concat();
+        let flag = ["for", "ce"].concat();
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains(&key) && line.contains(&flag)),
+                    "{name}:{} ties the container PTY to a flag: {line}",
+                    n + 1
+                );
+            }
+        }
     }
 
     #[test]
