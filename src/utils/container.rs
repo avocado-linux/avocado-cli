@@ -2451,9 +2451,10 @@ if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
 else
     REPO_RELEASE="https://repo.avocadolinux.org"
 
-    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
+    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found.
+    # os-release may repeat a key; take the last, as os-release(5) prescribes.
     if [ -f /etc/os-release ]; then
-        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1 | cut -d= -f2 | tr -d '"')
     fi
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
@@ -2710,9 +2711,10 @@ if [ -n "$AVOCADO_SDK_REPO_RELEASE" ]; then
 else
     REPO_RELEASE="https://repo.avocadolinux.org"
 
-    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found
+    # Read VERSION_CODENAME from os-release, defaulting to "dev" if not found.
+    # os-release may repeat a key; take the last, as os-release(5) prescribes.
     if [ -f /etc/os-release ]; then
-        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+        REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1 | cut -d= -f2 | tr -d '"')
     fi
     REPO_RELEASE=${{REPO_RELEASE:-dev}}
 fi
@@ -3848,5 +3850,94 @@ extensions:
         // Should return the host platform
         assert!(result.starts_with("linux/"));
         assert_eq!(result, get_host_platform());
+    }
+
+    /// `/etc/os-release` is a key=value file, not a map, and nothing stops a
+    /// key appearing twice. Both published SDK images do exactly that: as of
+    /// 2026-09-04 `avocadolinux/sdk:2024-edge` and `:2026-edge` each carry two
+    /// identical `VERSION_CODENAME` lines.
+    ///
+    /// An unanchored read then yields a TWO-LINE value, and the resulting
+    /// `dnf --releasever=<value>` puts the second line where dnf expects a
+    /// subcommand: `No such command: 2024/edge`. Every dnf call in the SDK
+    /// fails, and because the callers route repoquery through
+    /// `2>/dev/null || true`, it surfaces as an empty result rather than an
+    /// error - "no kernel versions found in the repository to choose from"
+    /// against a repository that has them.
+    ///
+    /// The two lines below carry DIFFERENT values, which the images' do not,
+    /// so this pins which line is taken rather than only that one line is.
+    /// `os-release(5)` settles that: "readers should pick the entries later in
+    /// the file in case of repeats, similarly to how a shell sourcing the file
+    /// would". Collapsing to the first would disagree with `. /etc/os-release`,
+    /// with systemd's own parser, and with
+    /// `platform.freedesktop_os_release()`.
+    ///
+    /// Executed rather than pattern-matched: the defect is in what the shell
+    /// does with the pipeline, so asserting on the script text would pass
+    /// against any spelling that still returns two lines.
+    #[test]
+    fn a_duplicated_version_codename_yields_a_single_line_release() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let os_release = dir.path().join("os-release");
+        let mut f = std::fs::File::create(&os_release).unwrap();
+        writeln!(f, "ID=avocado").unwrap();
+        writeln!(f, "VERSION_CODENAME=\"2024/edge\"").unwrap();
+        writeln!(f, "VERSION_CODENAME=\"2026/edge\"").unwrap();
+        drop(f);
+
+        // Lift the pipeline out of the production source rather than
+        // restating it, so this test exercises what the script actually emits.
+        // An inlined copy would pass against a fix that never shipped.
+        let src = include_str!("container.rs");
+        let marker = r#"REPO_RELEASE=$(grep "^VERSION_CODENAME=" /etc/os-release"#;
+        let start = src
+            .find(marker)
+            .expect("os-release read not found in source");
+        let line = &src[start..src[start..].find('\n').unwrap() + start];
+        let snippet = format!(
+            "{}\nprintf '%s' \"$REPO_RELEASE\"",
+            line.replace("/etc/os-release", &os_release.display().to_string())
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .output()
+            .expect("sh");
+        let value = String::from_utf8_lossy(&out.stdout).to_string();
+
+        assert_eq!(
+            value, "2026/edge",
+            "a duplicated key must collapse to the LAST entry, on one line"
+        );
+        assert!(
+            !value.contains('\n'),
+            "releasever must be one line, got {value:?}"
+        );
+    }
+
+    /// The generated scripts must actually carry the anchoring. Cheap guard so
+    /// the fix cannot be dropped from one of the two emission sites while the
+    /// executing test above keeps passing against its own inline copy.
+    #[test]
+    fn every_os_release_read_is_anchored_to_one_line() {
+        // Only the production half: this module's own test literals contain
+        // the same strings, and counting them made the guard compare its own
+        // source against itself.
+        let whole = include_str!("container.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").expect("test module marker")];
+        let reads = src
+            .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release"#)
+            .count();
+        assert!(reads >= 2, "expected the two emission sites, found {reads}");
+        let anchored = src
+            .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release | tail -n 1"#)
+            .count();
+        assert_eq!(
+            reads, anchored,
+            "every os-release read must pipe through `tail -n 1`"
+        );
     }
 }
