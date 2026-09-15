@@ -49,7 +49,7 @@ pub struct PackageFetchEntry {
 /// `includes/`, so none of those characters is ever legitimate — a value
 /// carrying one is a config error worth reporting, not something to quote and
 /// pass through.
-fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_shell_safe(field: &str, value: &str) -> Result<()> {
     validate_shell_safe_chars(field, value, false)
 }
 
