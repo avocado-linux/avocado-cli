@@ -1028,6 +1028,48 @@ impl DependencyGraph {
     }
 }
 
+/// Every extension a runtime actually contains: its authored
+/// `runtimes.<name>.extensions` entries plus everything reached through
+/// `depends_on`.
+///
+/// [`Config::get_runtime_extension_dependencies_detailed`] answers the
+/// narrower question — the authored entries alone. That is the right input
+/// for ordering and for choosing which stamps to require, but it is the wrong
+/// answer to "is this extension part of the runtime?". `install` walks the
+/// closure, and so does `build`, so an extension reached only through
+/// `depends_on` is as much a member as one typed into the list. Asking the
+/// authored list produces a warning telling the user to add something that is
+/// already there.
+///
+/// Names come back interpolated against `target`, matching the graph and the
+/// task names `build` schedules.
+///
+/// Falls back to the authored list when the graph cannot be built or
+/// resolved. A malformed `depends_on` is the build path's error to report
+/// with its own diagnostics — an advisory membership check is not the place
+/// to surface it, and must not fail the command over it.
+pub fn runtime_members(
+    composed: &ComposedConfig,
+    runtime_name: &str,
+    target: &str,
+    config_path: &str,
+) -> Result<Vec<String>> {
+    let authored: Vec<String> = composed
+        .config
+        .get_runtime_extension_dependencies_detailed(runtime_name, target, config_path)?
+        .iter()
+        .map(|dep| interpolate_name(dep.name(), target))
+        .collect();
+
+    let Ok(graph) = DependencyGraph::from_composed(composed, target) else {
+        return Ok(authored);
+    };
+    match graph.resolve(&authored) {
+        Ok(closure) => Ok(closure.order),
+        Err(_) => Ok(authored),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
     /// Open on the DFS stack — reaching it again is a back-edge.

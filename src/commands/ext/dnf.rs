@@ -1,3 +1,4 @@
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,6 +93,7 @@ impl ExtDnfCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.materialize_feeds(&target, FeedStage::Ext, &self.config_path)?;
 
         self.execute_dnf_command(
             parsed,
@@ -99,6 +101,7 @@ impl ExtDnfCommand {
             &target,
             repo_url.as_ref(),
             repo_release.as_ref(),
+            feeds.as_ref(),
             &merged_container_args,
             &extension_location,
         )
@@ -167,6 +170,7 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         extension_location: &ExtensionLocation,
     ) -> Result<()> {
@@ -180,6 +184,7 @@ impl ExtDnfCommand {
             target,
             repo_url,
             repo_release,
+            feeds,
             merged_container_args,
             extension_location,
         )
@@ -194,6 +199,7 @@ impl ExtDnfCommand {
             &dnf_command,
             repo_url,
             repo_release,
+            feeds,
             merged_container_args,
         )
         .await
@@ -208,6 +214,7 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         extension_location: &ExtensionLocation,
     ) -> Result<()> {
@@ -225,6 +232,7 @@ impl ExtDnfCommand {
             source_environment: false, // don't source environment
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -242,6 +250,7 @@ impl ExtDnfCommand {
                 target,
                 repo_url,
                 repo_release,
+                feeds,
                 merged_container_args,
                 extension_location,
             )
@@ -259,6 +268,7 @@ impl ExtDnfCommand {
         target: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         extension_location: &ExtensionLocation,
     ) -> Result<()> {
@@ -278,6 +288,7 @@ impl ExtDnfCommand {
             source_environment: false, // don't source environment
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -314,6 +325,7 @@ impl ExtDnfCommand {
         dnf_command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
     ) -> Result<()> {
         if self.verbose {
@@ -331,6 +343,7 @@ impl ExtDnfCommand {
             source_environment: false, // don't source environment
             interactive: true,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),

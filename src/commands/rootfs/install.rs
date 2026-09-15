@@ -1,5 +1,6 @@
 //! Rootfs sysroot install command and shared install logic for rootfs/initramfs.
 
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -59,8 +60,9 @@ use crate::utils::{
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
-        compute_initramfs_input_hash, compute_rootfs_input_hash, generate_write_stamp_script,
-        Stamp, StampInputs, StampOutputs, StampRequirement, SysrootStampInputs,
+        compute_initramfs_input_hash, compute_rootfs_input_hash,
+        generate_write_stamp_script_with_digest, render_sysroot_digest_script, Stamp, StampInputs,
+        StampOutputs, StampRequirement, SysrootStampInputs,
     },
     target::validate_and_log_target,
 };
@@ -80,6 +82,7 @@ pub struct SysrootInstallParams<'a> {
     pub target_board: Option<&'a str>,
     pub repo_url: Option<&'a str>,
     pub repo_release: Option<&'a str>,
+    pub feeds: Option<&'a crate::utils::feeds::FeedMaterialization>,
     pub merged_container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub verbose: bool,
@@ -175,6 +178,7 @@ async fn stage_kernel_sysroot_from_rootfs(
     lock_file: &mut LockFile,
     repo_url: Option<&str>,
     repo_release: Option<&str>,
+    feeds: Option<&crate::utils::feeds::FeedMaterialization>,
     merged_container_args: Option<Vec<String>>,
     runs_on_context: Option<&RunsOnContext>,
     sdk_arch: Option<&String>,
@@ -239,6 +243,7 @@ fi
         source_environment: true,
         interactive: false,
         repo_url: repo_url.map(|s| s.to_string()),
+        feeds: feeds.cloned(),
         repo_release: repo_release.map(|s| s.to_string()),
         container_args: merged_container_args.clone(),
         sdk_arch: sdk_arch.cloned(),
@@ -418,6 +423,7 @@ async fn clean_sysroot(params: &SysrootInstallParams<'_>, sysroot_dir: &str) -> 
         source_environment: true,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         sdk_arch: params.sdk_arch.cloned(),
@@ -491,6 +497,24 @@ pub fn compute_sysroot_install_inputs(
     ctx: &SysrootStampContext<'_>,
     packages: &HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<StampInputs>> {
+    let stage = match ctx.sysroot_type {
+        SysrootType::Rootfs => crate::utils::feeds::FeedStage::Rootfs,
+        SysrootType::Initramfs => crate::utils::feeds::FeedStage::Initramfs,
+        _ => return Ok(None),
+    };
+    // Resolved in-process rather than read back from .avocado/feeds/<target>.json:
+    // that file is rewritten on every resolution, so a hash taken from it could
+    // key on the previous config's feed set and skip a stale sysroot. The
+    // releasever comes from ctx — pin-aware on both the install and the build
+    // side — never from env, which only install exports the pin into.
+    let feed_projection = crate::utils::feeds::ResolvedFeedSet::resolve(
+        ctx.config,
+        ctx.target,
+        ctx.src_dir,
+        ctx.repo_release,
+    )?
+    .map(|set| set.stage_projection_json(stage))
+    .transpose()?;
     let resolved = SysrootStampInputs {
         packages,
         repo_url: ctx.repo_url,
@@ -500,6 +524,7 @@ pub fn compute_sysroot_install_inputs(
         locked_packages: ctx
             .lock_file
             .get_sysroot_versions(ctx.target, ctx.sysroot_type),
+        feed_projection: feed_projection.as_deref(),
     };
 
     let inputs = match ctx.sysroot_type {
@@ -585,6 +610,7 @@ async fn package_exists_in_target_repo(
         source_environment: false,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
@@ -635,24 +661,37 @@ async fn write_install_stamp(
         return Ok(());
     };
 
-    let stamp = match params.sysroot_type {
-        SysrootType::Rootfs => {
-            Stamp::rootfs_install(params.target, inputs, StampOutputs::default())
-        }
-        SysrootType::Initramfs => {
-            Stamp::initramfs_install(params.target, inputs, StampOutputs::default())
-        }
+    // The rootfs keeps its rpmdb at /var/lib/rpm; the initramfs uses rpm's
+    // default — the same split the image build-id derivation makes.
+    let (stamp, sysroot_dir, rpm_dbpath) = match params.sysroot_type {
+        SysrootType::Rootfs => (
+            Stamp::rootfs_install(params.target, inputs, StampOutputs::default()),
+            "rootfs",
+            Some("/var/lib/rpm"),
+        ),
+        SysrootType::Initramfs => (
+            Stamp::initramfs_install(params.target, inputs, StampOutputs::default()),
+            "initramfs",
+            None,
+        ),
         _ => unreachable!("sysroot type was validated at entry"),
     };
+    // Digest the installed tree, overlay included. This is the chain link the
+    // image step's input hash folds (once that step checks its own stamp), so
+    // it must cover the overlay, which this same install applied — packages
+    // alone would miss it.
+    let digest =
+        render_sysroot_digest_script(&format!("$AVOCADO_PREFIX/{sysroot_dir}"), rpm_dbpath);
 
     let stamp_config = RunConfig {
         container_image: params.container_image.to_string(),
         target: params.target.to_string(),
-        command: generate_write_stamp_script(&stamp)?,
+        command: generate_write_stamp_script_with_digest(&stamp, &digest)?,
         verbose: params.verbose,
         source_environment: true,
         interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         sdk_arch: params.sdk_arch.cloned(),
@@ -756,6 +795,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
             lock_file: params.lock_file,
             repo_url: params.repo_url,
             repo_release: params.repo_release,
+            feeds: params.feeds,
             merged_container_args: params.merged_container_args.clone(),
             dnf_args: params.dnf_args.clone(),
             runs_on_context: params.runs_on_context,
@@ -1111,7 +1151,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
-    let command = format!(
+    let mut command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
 # resolve /lib/modules, /sbin, /bin paths within the sysroot
@@ -1130,6 +1170,19 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
 {sync_snippet}{overlay_snippet}"#
     );
+    if params.no_stamps {
+        // See remove_own_stamp_line: an unrecorded install must not leave the
+        // previous stamp's digest for the image step to trust.
+        let own = match params.sysroot_type {
+            SysrootType::Rootfs => crate::utils::stamps::StampRequirement::rootfs_install(),
+            SysrootType::Initramfs => crate::utils::stamps::StampRequirement::initramfs_install(),
+            _ => unreachable!("sysroot type was validated at entry"),
+        };
+        command = format!(
+            "{}{command}",
+            crate::utils::stamps::remove_own_stamp_line(&own)
+        );
+    }
 
     let mut run_config = RunConfig {
         container_image: params.container_image.to_string(),
@@ -1139,6 +1192,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         source_environment: false,
         interactive: !params.force,
         repo_url: params.repo_url.map(|s| s.to_string()),
+        feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
         container_args: params.merged_container_args.clone(),
         dnf_args: params.dnf_args.clone(),
@@ -1241,6 +1295,7 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                     params.lock_file,
                     params.repo_url,
                     params.repo_release,
+                    params.feeds,
                     params.merged_container_args.clone(),
                     params.runs_on_context,
                     params.sdk_arch,
@@ -1404,6 +1459,7 @@ impl RootfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)?;
 
         let container_helper = SdkContainer::from_config(&self.config_path, config)?
             .verbose(self.verbose)
@@ -1430,6 +1486,7 @@ impl RootfsInstallCommand {
                 container_image: container_image.to_string(),
                 target: target.to_string(),
                 repo_url: repo_url.clone(),
+                feeds: feeds.clone(),
                 repo_release: repo_release.clone(),
                 container_args: merged_container_args.clone(),
                 sdk_arch: self.sdk_arch.clone(),
@@ -1457,6 +1514,7 @@ impl RootfsInstallCommand {
                     target_board: self.target_board.as_deref(),
                     repo_url: repo_url.as_deref(),
                     repo_release: repo_release.as_deref(),
+                    feeds: feeds.as_ref(),
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     verbose: self.verbose,
