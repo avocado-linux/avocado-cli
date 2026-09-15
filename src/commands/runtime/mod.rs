@@ -7,6 +7,7 @@ pub mod install;
 pub mod list;
 pub mod provision;
 pub mod sign;
+pub mod var_image;
 
 pub use build::RuntimeBuildCommand;
 #[allow(unused_imports)]
