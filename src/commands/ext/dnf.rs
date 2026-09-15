@@ -93,7 +93,9 @@ impl ExtDnfCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Ext, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Ext, &self.config_path)
+            .await?;
 
         self.execute_dnf_command(
             parsed,

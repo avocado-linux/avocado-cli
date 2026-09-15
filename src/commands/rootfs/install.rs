@@ -1258,6 +1258,28 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
                 &params.sysroot_type,
                 installed_versions,
             );
+            // Then where each one came from. Best effort and deliberately not
+            // gated on `versions_recorded` being true for the origins as well: a
+            // lock that records a version without an origin is the normal case
+            // for a single-feed project, and a build must never fail because
+            // provenance could not be determined.
+            let origins = params
+                .container_helper
+                .query_installed_origins(
+                    &params.sysroot_type,
+                    params.container_image,
+                    params.target,
+                    params.repo_url.map(|s| s.to_string()),
+                    params.repo_release.map(|s| s.to_string()),
+                    params.merged_container_args.clone(),
+                    params.runs_on_context,
+                    params.sdk_arch,
+                    None,
+                )
+                .await;
+            params
+                .lock_file
+                .set_sysroot_origins(params.target, &params.sysroot_type, &origins);
             if params.verbose {
                 print_info(
                     &format!("Updated lock file with {label} package versions."),
@@ -1465,7 +1487,9 @@ impl RootfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)
+            .await?;
 
         let container_helper = SdkContainer::from_config(&self.config_path, config)?
             .verbose(self.verbose)

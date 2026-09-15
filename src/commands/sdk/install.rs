@@ -204,11 +204,14 @@ impl SdkInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Sdk, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Sdk, &self.config_path)
+            .await?;
         // The kernel resolver queries with the target repo conf, so it must see the
         // feed set the rootfs install will see — not the sdk-stage (host) set.
-        let kernel_feeds =
-            config.materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)?;
+        let kernel_feeds = config
+            .materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)
+            .await?;
 
         // Use the container helper to run the installation
         let container_helper =
@@ -546,10 +549,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
         // These two run the rootfs/initramfs dnf transactions, so they take
         // their own stage's feeds rather than the sdk-stage set this fn holds.
-        let rootfs_feeds =
-            config.materialize_feeds(target, FeedStage::Rootfs, &self.config_path)?;
-        let initramfs_feeds =
-            config.materialize_feeds(target, FeedStage::Initramfs, &self.config_path)?;
+        let rootfs_feeds = config
+            .materialize_feeds(target, FeedStage::Rootfs, &self.config_path)
+            .await?;
+        let initramfs_feeds = config
+            .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
+            .await?;
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -802,6 +807,26 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         &SysrootType::TargetSysroot,
                         installed_versions,
                     );
+                    // Then where each one came from. Best effort, and separate
+                    // from the versions for a reason: `rpm` is authoritative
+                    // about what is installed and cannot say where it came
+                    // from, dnf knows the origin from the installroot's own
+                    // history. A lock records a bare version when the origin
+                    // cannot be determined, so this never fails a build.
+                    let origins = container_helper
+                        .query_installed_origins(
+                            &SysrootType::TargetSysroot,
+                            container_image,
+                            target,
+                            repo_url.map(|s| s.to_string()),
+                            repo_release.map(|s| s.to_string()),
+                            merged_container_args.cloned(),
+                            runs_on_context,
+                            self.sdk_arch.as_ref(),
+                            None,
+                        )
+                        .await;
+                    final_lock.set_sysroot_origins(target, &SysrootType::TargetSysroot, &origins);
                 }
             }
         }

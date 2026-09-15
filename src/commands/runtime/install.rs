@@ -131,7 +131,9 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Runtime, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Runtime, &self.config_path)
+            .await?;
 
         // Check if runtime section exists
         let runtime_section = match parsed.get("runtimes") {
@@ -815,7 +817,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
-                            Some(runtime_env_vars),
+                            Some(runtime_env_vars.clone()),
                         )
                         .await?;
 
@@ -825,6 +827,24 @@ $DNF_SDK_HOST \
                             &sysroot,
                             installed_versions,
                         );
+                        // Then which feed each package came from. Best effort:
+                        // `rpm` gives the version and cannot give the origin, dnf
+                        // gives the origin from the installroot's own history, and
+                        // a lock records a bare version when it cannot be known.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &sysroot,
+                                container_image,
+                                &target_arch,
+                                repo_url.cloned(),
+                                repo_release.cloned(),
+                                merged_container_args.clone(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                Some(runtime_env_vars.clone()),
+                            )
+                            .await;
+                        lock_file.set_sysroot_origins(&target_arch, &sysroot, &origins);
                         if self.verbose {
                             print_info(
                                 &format!(

@@ -575,10 +575,16 @@ pub fn inject_feed_env(
     env_vars: &mut std::collections::HashMap<String, String>,
     feeds: Option<&crate::utils::feeds::FeedMaterialization>,
 ) {
-    // Identity rides on every run, named feeds or not.
+    // Identity rides on every run, named feeds or not. The tier comes from the
+    // mint when there was one: a hard-coded tier/1 put every authenticated client
+    // in the same rate-limit bucket regardless of what Connect actually issued,
+    // which made the tier in the mint response decorative.
     env_vars.insert(
         "AVOCADO_FEED_UA".to_string(),
-        crate::utils::feeds::user_agent(),
+        crate::utils::feeds::user_agent_for(
+            feeds.and_then(|f| f.key_id.as_deref()),
+            feeds.and_then(|f| f.tier),
+        ),
     );
     let Some(feeds) = feeds else { return };
     for (k, v) in &feeds.env {
@@ -2510,6 +2516,62 @@ impl SdkContainer {
                 Ok(std::collections::HashMap::new())
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Which repository each installed package came from, best effort.
+    ///
+    /// Companion to [`Self::query_installed_packages`] rather than a replacement:
+    /// versions come from `rpm`, which is authoritative and needs no repository
+    /// configuration, and origins come from dnf, which is the only one that knows.
+    /// An empty map means "unknown", never an error — a lock records provenance
+    /// where it can and a bare version where it cannot, so a failure here costs a
+    /// detail and never a build.
+    pub async fn query_installed_origins(
+        &self,
+        sysroot: &crate::utils::lockfile::SysrootType,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<String>,
+        repo_release: Option<String>,
+        container_args: Option<Vec<String>>,
+        runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
+        sdk_arch: Option<&String>,
+        env_vars: Option<std::collections::HashMap<String, String>>,
+    ) -> std::collections::HashMap<String, String> {
+        let Some(query) = sysroot.get_rpm_query_config().build_origin_query_command() else {
+            return std::collections::HashMap::new();
+        };
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: query,
+            verbose: self.verbose,
+            source_environment: false,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url,
+            repo_release,
+            container_args,
+            sdk_arch: sdk_arch.cloned(),
+            env_vars,
+            ..Default::default()
+        };
+        let output = match runs_on_context {
+            Some(ctx) => self
+                .run_in_container_with_output_remote(&run_config, ctx)
+                .await
+                .ok()
+                .flatten(),
+            None => self
+                .run_in_container_with_output(run_config)
+                .await
+                .ok()
+                .flatten(),
+        };
+        output
+            .map(|o| crate::utils::lockfile::parse_origin_query_output(&o))
+            .unwrap_or_default()
     }
 
     /// Run a command in a remote container and capture its output
