@@ -583,8 +583,19 @@ impl ExtInstallCommand {
                         )
                     })
                     .collect();
-                let inputs =
-                    compute_ext_install_input_hash_with_deps(parsed, ext_name, &dep_state)?;
+                // Resolved kernel pin for this extension's sysroot — set by
+                // `resolve_and_pin_kernel_version` during the install above.
+                // Folding it in means `avocado update` clearing the pin (or a
+                // range spec resolving to a new version) invalidates the stamp.
+                let resolved_kernel = lock_file
+                    .get_kernel_version(target, &self.extension_sysroot(ext_name))
+                    .cloned();
+                let inputs = compute_ext_install_input_hash_with_deps(
+                    parsed,
+                    ext_name,
+                    &dep_state,
+                    resolved_kernel.as_deref(),
+                )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;

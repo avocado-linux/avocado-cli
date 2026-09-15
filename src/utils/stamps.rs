@@ -1404,6 +1404,7 @@ pub fn compute_ext_install_input_hash_with_deps(
     config: &serde_yaml::Value,
     ext_name: &str,
     dep_state: &[(String, String)],
+    resolved_kernel: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
 
@@ -1462,15 +1463,29 @@ pub fn compute_ext_install_input_hash_with_deps(
 
     // The effective kernel version is substituted into package names
     // (`{{ avocado.kernel.version }}`) and is a dnf resolution input, so a
-    // kernel change installs a different module set. The declared `kernel`
-    // config is what selects that version; fold it in — mirroring the
-    // rootfs/initramfs sysroot hashes, which already do — so a kernel bump
-    // invalidates every extension's stamp (feed-driven "latest" moves go
-    // through `avocado update`, which clears the pins the reader also checks).
+    // kernel change installs a different module set. Two inputs move the hash
+    // on a kernel change:
+    //
+    // 1. The declared `kernel` config — mirroring the rootfs/initramfs sysroot
+    //    hashes, which already fold it. Catches an edited `kernel.version`
+    //    even before a reinstall repins.
+    // 2. The extension's resolved kernel pin. A range/`*` spec resolves to a
+    //    concrete version whose value the declared config does not carry;
+    //    `avocado update` clears that pin (without touching the stamp), so a
+    //    reader that folds it goes stale exactly when the pin is cleared or
+    //    changed. `None` (no kernel-family packages, or a cleared pin) folds
+    //    to nothing, so a stamp written with a pin no longer matches once it
+    //    is gone — the correct, over-invalidating direction.
     if let Some(kernel) = config.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String("kernel".to_string()),
             narrow_kernel_for_hash(kernel),
+        );
+    }
+    if let Some(kver) = resolved_kernel {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.resolved_kernel")),
+            serde_yaml::Value::String(kver.to_string()),
         );
     }
 
@@ -1590,6 +1605,7 @@ pub fn compute_ext_install_input_hash_current(
     ext_name: &str,
     target: &str,
     lock_src_dir: &Path,
+    runtime: Option<&str>,
 ) -> Result<StampInputs> {
     let dep_names: Vec<String> =
         match crate::utils::ext_deps::DependencyGraph::from_composed(composed, target) {
@@ -1600,19 +1616,36 @@ pub fn compute_ext_install_input_hash_current(
             Err(_) => Vec::new(),
         };
 
+    // Load the lock once for both the dependency fingerprints and this
+    // extension's resolved kernel pin. The pin is keyed by the extension's
+    // sysroot the same way `ext install` writes it (runtime-scoped when a
+    // runtime is in scope), so the reader must build the same key.
+    let lock_file = crate::utils::lockfile::LockFile::load(lock_src_dir).ok();
+    let sysroot = match runtime {
+        Some(rt) => crate::utils::lockfile::SysrootType::RuntimeExtension {
+            runtime: rt.to_string(),
+            extension: ext_name.to_string(),
+        },
+        None => crate::utils::lockfile::SysrootType::Extension(ext_name.to_string()),
+    };
+    let resolved_kernel = lock_file
+        .as_ref()
+        .and_then(|lf| lf.get_kernel_version(target, &sysroot))
+        .cloned();
+
     let dep_state: Vec<(String, String)> = if dep_names.is_empty() {
         Vec::new()
     } else {
         match (
-            crate::utils::lockfile::LockFile::load(lock_src_dir),
+            lock_file.as_ref(),
             crate::utils::ext_deps::DependencyGraph::from_composed(composed, target),
         ) {
-            (Ok(lock_file), Ok(graph)) => dep_names
+            (Some(lock_file), Ok(graph)) => dep_names
                 .iter()
                 .map(|dep| {
                     (
                         dep.clone(),
-                        ext_dep_fingerprint(&lock_file, target, &graph, dep),
+                        ext_dep_fingerprint(lock_file, target, &graph, dep),
                     )
                 })
                 .collect(),
@@ -1620,7 +1653,12 @@ pub fn compute_ext_install_input_hash_current(
         }
     };
 
-    compute_ext_install_input_hash_with_deps(&composed.merged_value, ext_name, &dep_state)
+    compute_ext_install_input_hash_with_deps(
+        &composed.merged_value,
+        ext_name,
+        &dep_state,
+        resolved_kernel.as_deref(),
+    )
 }
 
 /// Compute input hash for **extension build**.
@@ -4852,13 +4890,19 @@ extensions:
     }
 
     fn ext_install_hash(value: &serde_yaml::Value) -> String {
-        compute_ext_install_input_hash_with_deps(value, "my-ext", &[])
+        compute_ext_install_input_hash_with_deps(value, "my-ext", &[], None)
             .unwrap()
             .config_hash
     }
 
     fn ext_install_hash_with_deps(value: &serde_yaml::Value, deps: &[(String, String)]) -> String {
-        compute_ext_install_input_hash_with_deps(value, "my-ext", deps)
+        compute_ext_install_input_hash_with_deps(value, "my-ext", deps, None)
+            .unwrap()
+            .config_hash
+    }
+
+    fn ext_install_hash_with_kernel(value: &serde_yaml::Value, kver: Option<&str>) -> String {
+        compute_ext_install_input_hash_with_deps(value, "my-ext", &[], kver)
             .unwrap()
             .config_hash
     }
@@ -4902,6 +4946,28 @@ extensions:
             k665,
             ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.5\"\n"))
         );
+    }
+
+    /// A range/`*` spec keeps the declared config byte-identical while the
+    /// *resolved* kernel changes. `avocado update` clears the extension's
+    /// kernel pin; folding the resolved pin means the reader (build/image,
+    /// and the install fast path) that now sees no pin — or a different one —
+    /// no longer matches a stamp written with the old pin. Without this, a
+    /// dependency-free extension under `version: "*"` validates its stale
+    /// sysroot as current.
+    #[test]
+    fn resolved_kernel_pin_change_invalidates_ext_install_hash() {
+        let cfg = ext_with_extras("kernel:\n  version: \"*\"\n");
+        let pinned = ext_install_hash_with_kernel(&cfg, Some("6.6.5"));
+        let bumped = ext_install_hash_with_kernel(&cfg, Some("6.6.6"));
+        let cleared = ext_install_hash_with_kernel(&cfg, None);
+        assert_ne!(pinned, bumped, "a resolved pin bump must move the hash");
+        assert_ne!(
+            pinned, cleared,
+            "clearing the pin (avocado update) must move the hash"
+        );
+        // Same pin, recomputed: stable.
+        assert_eq!(pinned, ext_install_hash_with_kernel(&cfg, Some("6.6.5")));
     }
 
     /// `app -> mid -> base`: a change in base's lock state must move MID's
