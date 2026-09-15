@@ -826,7 +826,12 @@ runtimes:
     #[test]
     fn device_tree_overlays_reach_stone() {
         let none = ota_half(BASE);
-        assert!(!none.contains("device-tree overlays"));
+        // No overlays declared: the section still clears the staging directory
+        // (a previous build's overlays must not reach this image) but stages,
+        // compiles and delivers nothing.
+        assert!(none.contains("rm -rf \"$DTBO_STAGING\""));
+        assert!(!none.contains("avocado-dtc-overlay"));
+        assert!(!none.contains("device-tree-overlay-deliver"));
         assert!(none.contains("STONE_OVERLAY_FLAG=\"\""));
 
         let with = BASE.to_string()

@@ -3982,6 +3982,12 @@ runtimes:
             script.find("Patched manifest with os_bundle").unwrap() < resign,
             "the re-sign must follow the os_bundle patch it exists for"
         );
+        // No overlays declared: the section stages nothing, but it still
+        // clears the staging directory. Leaving it out entirely is what let a
+        // previous build's overlays reach an image that declares none.
+        assert!(script.contains("rm -rf \"$DTBO_STAGING\""));
+        assert!(!script.contains("avocado-dtc-overlay"));
+        assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
         // No var.encrypt: the plaintext path writes no marker.
         assert!(!script.contains("/etc/avocado/var-encrypt"));
         // A previous build's re-keyed bootloader is removed before stone can
