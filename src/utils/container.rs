@@ -1885,6 +1885,62 @@ impl SdkContainer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Which repository each installed package came from, best effort.
+    ///
+    /// Companion to [`Self::query_installed_packages`] rather than a replacement:
+    /// versions come from `rpm`, which is authoritative and needs no repository
+    /// configuration, and origins come from dnf, which is the only one that knows.
+    /// An empty map means "unknown", never an error — a lock records provenance
+    /// where it can and a bare version where it cannot, so a failure here costs a
+    /// detail and never a build.
+    pub async fn query_installed_origins(
+        &self,
+        sysroot: &crate::utils::lockfile::SysrootType,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<String>,
+        repo_release: Option<String>,
+        container_args: Option<Vec<String>>,
+        runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
+        sdk_arch: Option<&String>,
+        env_vars: Option<std::collections::HashMap<String, String>>,
+    ) -> std::collections::HashMap<String, String> {
+        let Some(query) = sysroot.get_rpm_query_config().build_origin_query_command() else {
+            return std::collections::HashMap::new();
+        };
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: query,
+            verbose: self.verbose,
+            source_environment: false,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url,
+            repo_release,
+            container_args,
+            sdk_arch: sdk_arch.cloned(),
+            env_vars,
+            ..Default::default()
+        };
+        let output = match runs_on_context {
+            Some(ctx) => self
+                .run_in_container_with_output_remote(&run_config, ctx)
+                .await
+                .ok()
+                .flatten(),
+            None => self
+                .run_in_container_with_output(run_config)
+                .await
+                .ok()
+                .flatten(),
+        };
+        output
+            .map(|o| crate::utils::lockfile::parse_origin_query_output(&o))
+            .unwrap_or_default()
+    }
+
     /// Run a command in a remote container and capture its output
     ///
     /// This is similar to `run_in_container_with_output` but uses the provided
