@@ -94,7 +94,12 @@ repos:
 
 runtimes:
   dev:
-    packages: {}
+    packages:
+      # From `local-build`, so the lock's recorded origin has something to be
+      # right or wrong about. With every package coming from the baked distro
+      # repo, "provenance works" is indistinguishable from "provenance is a
+      # constant".
+      hello-feed: "*"
 
 extensions:
   app:
@@ -174,5 +179,30 @@ pass "stage scoping: runtime stage sees local-build only"
   || { cat ext.err >&2; fail "ext dnf repoquery failed"; }
 grep -q '@vendor' ext.out || { cat ext.out; fail "vendor feed missing at ext stage"; }
 pass "stage scoping: ext stage sees vendor"
+
+# 8. The lock records WHICH feed each package came from, per target.
+#    `rpm` cannot answer this; dnf can, from the installroot's own history. The
+#    interesting assertion is not that a repo is recorded but that it is the
+#    NAMED feed rather than the baked distro one — otherwise the test passes for
+#    a constant.
+"$AVOCADO" --no-tui install --force > install-runtime.out 2>&1 || {
+  tail -20 install-runtime.out >&2; fail "runtime install"; }
+python3 - <<'PYEOF' || fail "lock provenance"
+import json, sys
+lock = json.load(open("avocado.lock"))
+targets = lock.get("targets", {})
+found = {}
+for t, tv in targets.items():
+    for rt in (tv.get("runtimes") or {}).values():
+        for name, rec in (rt.get("packages") or {}).items():
+            if isinstance(rec, dict):
+                found[name] = rec.get("repo")
+if found.get("hello-feed") != "local-build":
+    print(f"  hello-feed origin = {found.get('hello-feed')!r}, expected 'local-build'")
+    print(f"  recorded: {found}")
+    sys.exit(1)
+print(f"     hello-feed recorded as coming from {found['hello-feed']!r}")
+PYEOF
+pass "lock records the feed each package came from"
 
 echo "ALL PASSED  (workdir: $WORK)"

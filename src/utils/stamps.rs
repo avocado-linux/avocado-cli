@@ -364,6 +364,32 @@ impl Stamp {
         )
     }
 
+    /// Create rootfs image stamp
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rootfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Rootfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
+    /// Create initramfs image stamp
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn initramfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Initramfs,
+            None,
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
     ///
     /// For SDK stamps, the path includes the target architecture (which represents
@@ -519,6 +545,18 @@ impl StampRequirement {
     /// Initramfs install requirement
     pub fn initramfs_install() -> Self {
         Self::new(StampCommand::Install, StampComponent::Initramfs, None)
+    }
+
+    /// Rootfs image requirement
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rootfs_image() -> Self {
+        Self::new(StampCommand::Image, StampComponent::Rootfs, None)
+    }
+
+    /// Initramfs image requirement
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn initramfs_image() -> Self {
+        Self::new(StampCommand::Image, StampComponent::Initramfs, None)
     }
 
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
@@ -876,6 +914,13 @@ impl StampValidationError {
             renderer.shutdown();
         }
 
+        // Same reason as the renderer above: `process::exit` below skips main's
+        // cleanup, so a session container started for this invocation would be
+        // left parked until the next run swept it.
+        crate::utils::container::SessionContainers::shutdown(
+            &crate::utils::container::default_container_tool(),
+        );
+
         if crate::utils::output_format::is_json_output_active() {
             crate::utils::output_format::emit_json_event(&self.json_error_event());
         }
@@ -896,7 +941,7 @@ impl StampValidationError {
         }
 
         if !self.stale.is_empty() {
-            print_warning("Stale steps (config changed):", OutputLevel::Normal);
+            print_warning("Stale steps:", OutputLevel::Normal);
             for (req, reason) in &self.stale {
                 print_warning(
                     &format!(
@@ -954,7 +999,7 @@ impl fmt::Display for StampValidationError {
         }
 
         if !self.stale.is_empty() {
-            writeln!(f, "  Stale steps (config changed):")?;
+            writeln!(f, "  Stale steps:")?;
             for (req, reason) in &self.stale {
                 writeln!(
                     f,
@@ -1712,68 +1757,214 @@ pub fn compute_ext_build_input_hash(
 
 /// Compute input hash for **extension image**.
 ///
-/// Includes the build inputs plus image-only inputs: `var_files`,
-/// `subvolumes`, and the resolved `filesystem` format.
-// The interpolation trio (target, runtime, cli_target_board) mirrors
-// `fold_overlay_content_hash`; the upstream digest is the eighth. Same cleanup
-// applies: a context struct once a fourth CLI override lands.
+/// The image step reads the built sysroot and a handful of image-only config
+/// keys. The sysroot enters as `ext build`'s recorded output digest — the chain
+/// link — and nothing the *build* read (overlay, `post_build`, compile scripts,
+/// `package_files`) is folded here: those reach the image only through the tree,
+/// and the digest already says whether the tree changed. Folding them directly
+/// would make the image re-run for a build input edit that left the tree
+/// byte-identical, which is exactly the cascade the digest exists to stop.
+///
+/// The exclude list the imager applies is folded too, so a change to
+/// `package_state_paths()` invalidates every image by itself.
+// The interpolation trio (target, runtime, cli_target_board) is kept for
+// signature stability with the build hash; the image itself does not
+// interpolate. A context struct once a fourth CLI override lands.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_ext_image_input_hash(
     config: &serde_yaml::Value,
     ext_name: &str,
     filesystem: Option<&str>,
-    project_root: &Path,
-    target: Option<&str>,
-    runtime: Option<&str>,
-    cli_target_board: Option<&str>,
+    _project_root: &Path,
+    _target: Option<&str>,
+    _runtime: Option<&str>,
+    _cli_target_board: Option<&str>,
     build_content_hash: Option<&str>,
 ) -> Result<StampInputs> {
-    let mut hash_data = ext_build_hash_data(
-        config,
-        ext_name,
-        project_root,
-        target,
-        runtime,
-        cli_target_board,
-    )?;
-    // What `ext build` actually produced. This is the link that lets a
-    // rebuild which changed no bytes stop before re-imaging — and it covers
-    // inputs the host never sees, such as a git-fetched extension's files.
-    if let Some(h) = build_content_hash {
-        hash_data.insert(
-            serde_yaml::Value::String(format!("ext.{ext_name}.build_content_hash")),
-            serde_yaml::Value::String(h.to_string()),
-        );
-    }
+    let mut hash_data = serde_yaml::Mapping::new();
+    let key = |k: &str| serde_yaml::Value::String(format!("ext.{ext_name}.{k}"));
+
+    // What `ext build` actually produced. Strict: an absent digest is folded
+    // as such, so a stamp written with one never matches a run without one.
+    hash_data.insert(
+        key("build_content_hash"),
+        serde_yaml::Value::String(build_content_hash.unwrap_or("<none>").to_string()),
+    );
 
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
-        if let Some(var_files) = ext.get("var_files") {
-            hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{ext_name}.var_files")),
-                var_files.clone(),
-            );
+        // `version` names the image file; `types` decides what is imaged;
+        // `image` carries type/args/verity; `var_files` are excluded from the
+        // image; `subvolumes` shape the var partition it feeds.
+        for k in ["version", "types", "image", "var_files", "subvolumes"] {
+            if let Some(v) = ext.get(k) {
+                hash_data.insert(key(k), v.clone());
+            }
         }
-        if let Some(subvolumes) = ext.get("subvolumes") {
-            hash_data.insert(
-                serde_yaml::Value::String(format!("ext.{ext_name}.subvolumes")),
-                subvolumes.clone(),
-            );
+        // A kab-wrapped image is signed with the keyset; a rotated key must
+        // re-wrap. Only when the image is kab — a stray env var must not churn
+        // raw images. Set but unreadable is an error, like a missing script.
+        let is_kab = ext
+            .get("image")
+            .and_then(|i| i.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("kab");
+        if is_kab {
+            if let Ok(keyset) = std::env::var("KAB_KEYSET_FILE") {
+                // Empty is an error, not "unset". `path_content_digest` would be
+                // handed an empty relative path and digest `/` itself, so the
+                // stamp would silently depend on the whole filesystem and read as
+                // a rotated key on any unrelated change. Same treatment as a
+                // declared file that does not exist.
+                let rel = keyset.trim().trim_start_matches('/');
+                if rel.is_empty() {
+                    anyhow::bail!(
+                        "KAB_KEYSET_FILE is set but empty — unset it, or point it at the keyset file"
+                    );
+                }
+                let digest =
+                    crate::utils::overlay_preprocess::path_content_digest(Path::new("/"), rel)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("KAB_KEYSET_FILE is set but `{keyset}` does not exist")
+                        })?;
+                hash_data.insert(key("kab_keyset"), serde_yaml::Value::String(digest));
+            }
         }
     }
     if let Some(fs) = filesystem {
-        hash_data.insert(
-            serde_yaml::Value::String(format!("ext.{ext_name}.filesystem")),
-            serde_yaml::Value::String(fs.to_string()),
-        );
+        hash_data.insert(key("filesystem"), serde_yaml::Value::String(fs.to_string()));
     }
-
+    hash_data.insert(
+        key("image_excludes"),
+        serde_yaml::Value::Sequence(
+            package_state_paths()
+                .into_iter()
+                .map(|p| serde_yaml::Value::String(p.to_string()))
+                .collect(),
+        ),
+    );
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
 
-/// Shared mapping construction for `ext build` (and the subset used by
-/// `ext image`). Keeping both steps' shared inputs in one place avoids
-/// drift between the two hash functions.
+/// Compute input hash for **rootfs image** / **initramfs image**.
+///
+/// `section` is `"rootfs"` / `"initramfs"`; `resolved_section` is what
+/// `Config::resolve_image_section` returns for the build target — never the
+/// raw node, so a `target-<name>:` override reaches the hash. `config` is the
+/// merged config the build reads (`parsed`); `runtime_name` is set on the
+/// `runtime build` path, which inlines both image steps. Folded:
+///
+/// - `<section>.install.content_hash` — the install stamp's digest. What the
+///   step images is the sysroot, which the host cannot see; this chains the
+///   two stamps, overlay and all.
+/// - `<section>.image_section` — the whole resolved section, not a picked
+///   subset, so an image-side key this module has not heard of still
+///   invalidates (over-invalidation is the safe side).
+/// - `<section>.post_install` — by content, so an in-place edit invalidates.
+///   Absent folds nothing, as the install hash does.
+/// - `permissions` — the bodies behind `<section>.permissions: <name>` refs.
+/// - `source_date_epoch` — `mkfs.erofs -T` and the cpio mtime normalization.
+/// - `sdk.image` — the container whose mkfs/cpio/zstd produce the bytes.
+/// - `runtimes.<rt>.{var,version,rootfs,initramfs}`, and the same four under
+///   each `runtimes.<rt>.target-*:` block since the build resolves those
+///   overrides for its target: `var` drives the initramfs encrypt marker,
+///   `version` rides the kab `-v`, `rootfs`/`initramfs` carry inline
+///   per-runtime permissions. Deliberately NOT the whole `runtimes.<rt>` node
+///   — it holds `extensions` and `packages`, and re-imaging the rootfs
+///   because an extension was added is exactly the inner loop this stamp
+///   exists to protect.
+/// - `<section>.kab_keyset` — the keyset file's digest, only when
+///   `image.type` is `kab` and `KAB_KEYSET_FILE` is set: a rotated key must
+///   invalidate and the path alone cannot show it. Set but unreadable is an
+///   error, like a declared script that is missing. Nothing is folded for a
+///   non-kab image, so a stray env var cannot churn it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn compute_sysroot_image_input_hash(
+    section: &str,
+    resolved_section: &serde_yaml::Value,
+    install_content_hash: &str,
+    config: &serde_yaml::Value,
+    runtime_name: Option<&str>,
+    project_root: &Path,
+) -> Result<StampInputs> {
+    let mut hash_data = serde_yaml::Mapping::new();
+    hash_data.insert(
+        serde_yaml::Value::String(format!("{section}.install.content_hash")),
+        serde_yaml::Value::String(install_content_hash.to_string()),
+    );
+    hash_data.insert(
+        serde_yaml::Value::String(format!("{section}.image_section")),
+        resolved_section.clone(),
+    );
+    if let Some(post_install) = resolved_section
+        .get("post_install")
+        .and_then(|v| v.as_str())
+    {
+        fold_file_content(
+            &mut hash_data,
+            &format!("{section}.post_install"),
+            project_root,
+            post_install,
+        )?;
+    }
+    for (key, value) in [
+        ("permissions", config.get("permissions")),
+        ("source_date_epoch", config.get("source_date_epoch")),
+        ("sdk.image", config.get("sdk").and_then(|s| s.get("image"))),
+    ] {
+        if let Some(v) = value {
+            hash_data.insert(serde_yaml::Value::String(key.to_string()), v.clone());
+        }
+    }
+    let runtime = runtime_name.and_then(|rt| Some((rt, config.get("runtimes")?.get(rt)?)));
+    if let Some((rt, runtime)) = runtime {
+        // The base block plus every `target-*:` override block: the build
+        // resolves those for its target, and folding all of them
+        // over-invalidates across targets rather than missing an opt-in.
+        let overrides = runtime
+            .as_mapping()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                let k = k.as_str()?;
+                k.starts_with("target-")
+                    .then(|| (format!("runtimes.{rt}.{k}"), v))
+            });
+        for (prefix, node) in std::iter::once((format!("runtimes.{rt}"), runtime)).chain(overrides)
+        {
+            for k in ["var", "version", "rootfs", "initramfs"] {
+                if let Some(v) = node.get(k) {
+                    hash_data.insert(
+                        serde_yaml::Value::String(format!("{prefix}.{k}")),
+                        v.clone(),
+                    );
+                }
+            }
+        }
+    }
+    let is_kab = resolved_section
+        .get("image")
+        .and_then(|i| i.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("kab");
+    if let Some(keyset) = std::env::var("KAB_KEYSET_FILE").ok().filter(|_| is_kab) {
+        // Against the cwd, which is how the build's own existence check
+        // resolves it.
+        let digest = crate::utils::overlay_preprocess::path_content_digest(Path::new(""), &keyset)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("KAB_KEYSET_FILE points to '{keyset}' but the file does not exist.")
+            })?;
+        hash_data.insert(
+            serde_yaml::Value::String(format!("{section}.kab_keyset")),
+            serde_yaml::Value::String(digest),
+        );
+    }
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Mapping construction for `ext build`'s input hash: everything the build
+/// reads, by content where it is a file.
 fn ext_build_hash_data(
     config: &serde_yaml::Value,
     ext_name: &str,
@@ -1817,6 +2008,7 @@ fn ext_build_hash_data(
             "kernel_modules",
             "ld_so_conf_d",
             "scopes",
+            "reload_service_manager",
             "users",
             "groups",
         ] {
@@ -1995,7 +2187,7 @@ pub struct SysrootStampInputs<'a> {
     /// content.
     pub dnf_args: Option<&'a [String]>,
     /// Locked NVR pins for this sysroot, as recorded in `avocado.lock`.
-    pub locked_packages: Option<&'a std::collections::HashMap<String, String>>,
+    pub locked_packages: Option<&'a crate::utils::lockfile::PackageVersions>,
     /// The per-stage projection of the named feed set (`repos:` /
     /// `distro.feeds`) — `ResolvedFeedSet::stage_projection_json`. `None` when
     /// the project declares no feeds, which folds exactly as before. Feed
@@ -2014,11 +2206,15 @@ pub struct SysrootStampInputs<'a> {
 /// section would let a stamp written against real pins compare equal by
 /// omission. An empty set hashing to its own distinct value makes that read
 /// as stale.
-fn package_list_hash(locked: Option<&std::collections::HashMap<String, String>>) -> String {
+/// Hashes name and version only, deliberately not the recorded origin. A
+/// package's identity is its NEVRA; folding in which feed served it would move
+/// every existing stamp for a record that is provenance rather than an input —
+/// and a change of origin already moves the hash through the feed projection.
+fn package_list_hash(locked: Option<&crate::utils::lockfile::PackageVersions>) -> String {
     let mut lines: Vec<String> = locked
         .map(|pins| {
             pins.iter()
-                .map(|(name, version)| format!("{name}={version}"))
+                .map(|(name, pkg)| format!("{name}={}", pkg.version))
                 .collect()
         })
         .unwrap_or_default();
@@ -2261,11 +2457,11 @@ pub fn compute_runtime_build_input_hash(
     let mut hash_data = serde_yaml::Mapping::new();
 
     // What the steps this build consumes actually produced — each required
-    // extension's image digest, keyed by extension name. An extension whose
-    // rebuild left its image byte-identical does not move this.
-    for (name, digest) in upstream_content_hashes {
+    // extension's image and build digests, keyed `<name>.image` / `<name>.build`.
+    // An extension whose rebuild left both byte-identical does not move this.
+    for (key, digest) in upstream_content_hashes {
         hash_data.insert(
-            serde_yaml::Value::String(format!("ext.{name}.image_content_hash")),
+            serde_yaml::Value::String(format!("ext.{key}.content_hash")),
             serde_yaml::Value::String(digest.clone()),
         );
     }
@@ -2485,26 +2681,35 @@ pub fn content_hash_from_batch(batch_output: &str, req: &StampRequirement) -> Op
         .and_then(|stamp| stamp.outputs.content_hash)
 }
 
-/// The image digests of every extension in `ext_names`, read from one batch
-/// stamp read. Extensions whose image stamp is absent or carries no digest are
-/// simply not present in the map — their absence is itself part of the input.
-pub fn ext_image_content_hashes_from_batch(
+/// The output digests of every extension in `ext_names` that `runtime build`
+/// consumes, read from one batch stamp read, keyed `<name>.image` and
+/// `<name>.build`. Both matter: the image is what ships, but `var_files` are
+/// copied out of the built sysroot into the var partition and never enter the
+/// image, so the image digest alone is blind to them. Extensions whose stamp is
+/// absent or carries no digest are simply not present — their absence is itself
+/// part of the input.
+pub fn ext_content_hashes_from_batch(
     batch_output: &str,
     ext_names: impl IntoIterator<Item = String>,
 ) -> std::collections::BTreeMap<String, String> {
     let parsed = parse_batch_stamps_output(batch_output);
-    ext_names
-        .into_iter()
-        .filter_map(|name| {
-            let req = StampRequirement::ext_image(&name);
-            parsed
-                .get(&req.relative_path())
-                .and_then(|json| json.as_deref())
-                .and_then(|json| Stamp::from_json(json).ok())
-                .and_then(|stamp| stamp.outputs.content_hash)
-                .map(|h| (name, h))
-        })
-        .collect()
+    let digest_of = |req: StampRequirement| {
+        parsed
+            .get(&req.relative_path())
+            .and_then(|json| json.as_deref())
+            .and_then(|json| Stamp::from_json(json).ok())
+            .and_then(|stamp| stamp.outputs.content_hash)
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for name in ext_names {
+        if let Some(h) = digest_of(StampRequirement::ext_image(&name)) {
+            out.insert(format!("{name}.image"), h);
+        }
+        if let Some(h) = digest_of(StampRequirement::ext_build(&name)) {
+            out.insert(format!("{name}.build"), h);
+        }
+    }
+    out
 }
 
 /// Placeholder the digest-bearing stamp writer substitutes in the container.
@@ -2555,39 +2760,61 @@ sed -i 's|"content_hash": "{placeholder}"|"content_hash": "sha256:'"$AVOCADO_CON
     ))
 }
 
+/// Paths a sysroot digest ignores, and an extension image must exclude: the
+/// package-manager state. rpmdb bytes embed install timestamps and dnf caches
+/// churn on every transaction; a digest that followed them would move on every
+/// install that changed nothing, and an image that shipped them would carry
+/// bytes the digest never saw. The two lists are the same list on purpose —
+/// [`BUILD_STATE_PATHS`] plus rpm's newer default dbpath — so the digest and
+/// the image agree about what is in the image.
+///
+/// [`BUILD_STATE_PATHS`]: crate::commands::rootfs::image::BUILD_STATE_PATHS
+pub fn package_state_paths() -> Vec<&'static str> {
+    crate::commands::rootfs::image::BUILD_STATE_PATHS
+        .iter()
+        .copied()
+        .chain(std::iter::once("usr/lib/sysimage/rpm"))
+        .collect()
+}
+
 /// Shell that sets `AVOCADO_CONTENT_HASH` to a digest of a sysroot directory:
 /// the sorted NEVRA set from its rpmdb, plus a tree hash of everything the
 /// image would carry. Same recipe as the rootfs/initramfs build id
 /// ([`crate::commands::rootfs::image::render_build_id_block`]) — path, type,
-/// mode, ownership, symlink target, file content — with the package-manager
-/// state pruned, since rpmdb bytes embed install timestamps and would move the
-/// digest on every install that changed nothing. Ownership is hashed: for a
-/// format that flattens it (erofs) that over-invalidates one step, and the
-/// image's own digest stops the cascade there.
+/// mode, ownership, symlink target, file content — with [`package_state_paths`]
+/// pruned. Ownership is hashed: for a format that flattens it (erofs) that
+/// over-invalidates one step, and the image's own digest stops the cascade
+/// there.
+///
+/// Fails closed. A missing sysroot, an unreadable file, or any failed pipeline
+/// stage exits non-zero instead of yielding a digest of nothing — a stamp
+/// carrying an accepted hash over a broken tree would read as "current" to
+/// every downstream step. And it never writes: the rpm query runs only when
+/// the database directory already exists, because `rpm -qa` on a root without
+/// one creates it, inside the tree being measured.
 ///
 /// `sysroot` is a shell expression for the directory; `rpm_dbpath` the rpmdb's
-/// location inside it (`None` for rpm's default).
+/// location inside it (`None` for rpm's default, `/var/lib/rpm`).
 pub fn render_sysroot_digest_script(sysroot: &str, rpm_dbpath: Option<&str>) -> String {
-    let mut prune: Vec<String> = crate::commands::rootfs::image::BUILD_STATE_PATHS
-        .iter()
-        // rpm's default dbpath on newer distributions. The query below must not
-        // be able to perturb the tree it measures: on a root with no database
-        // there, `rpm -qa` creates one.
-        .chain(std::iter::once(&"usr/lib/sysimage/rpm"))
+    let dbpath = rpm_dbpath.unwrap_or("/var/lib/rpm");
+    let mut prune: Vec<String> = package_state_paths()
+        .into_iter()
         .map(|p| format!("-path ./{p}"))
         .collect();
-    if let Some(db) = rpm_dbpath {
-        prune.push(format!("-path ./{}", db.trim_start_matches('/')));
+    let db_rel = dbpath.trim_start_matches('/');
+    if !package_state_paths().contains(&db_rel) {
+        prune.push(format!("-path ./{db_rel}"));
     }
     let prune = prune.join(" -o ");
-    let dbpath = rpm_dbpath
-        .map(|p| format!("--dbpath {p} "))
-        .unwrap_or_default();
     format!(
         r#"_avocado_sysroot="{sysroot}"
-_avocado_pkgs=$(rpm {dbpath}-qa --queryformat '%{{NEVRA}}\n' --root "$_avocado_sysroot" 2>/dev/null | LC_ALL=C sort | sha256sum | awk '{{print $1}}')
-_avocado_meta=$(cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -printf '%y %m %U %G %P\t%l\n' | LC_ALL=C sort)
-_avocado_content=$(cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+[ -d "$_avocado_sysroot" ] || {{ echo "ERROR: sysroot to digest does not exist: $_avocado_sysroot" >&2; exit 1; }}
+_avocado_pkgs=""
+if [ -d "$_avocado_sysroot{dbpath}" ]; then
+    _avocado_pkgs=$(set -o pipefail; rpm --dbpath {dbpath} -qa --queryformat '%{{NEVRA}}\n' --root "$_avocado_sysroot" | LC_ALL=C sort | sha256sum | awk '{{print $1}}') || exit 1
+fi
+_avocado_meta=$(set -o pipefail; cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -printf '%y %m %U %G %P\t%l\n' | LC_ALL=C sort) || exit 1
+_avocado_content=$(set -o pipefail; cd "$_avocado_sysroot" && find . \( {prune} \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) || exit 1
 AVOCADO_CONTENT_HASH=$(printf '%s\n%s\n%s\n' "$_avocado_pkgs" "$_avocado_meta" "$_avocado_content" | sha256sum | awk '{{print $1}}')"#
     )
 }
@@ -2657,6 +2884,57 @@ pub fn generate_batch_read_stamps_script(requirements: &[StampRequirement]) -> S
     }
 
     script_parts.join("\n")
+}
+
+/// One shell line that removes a step's own stamp. Prepended to the step's
+/// build script under `--no-stamps`: a step that redoes its work without
+/// recording it must not leave last time's stamp — and last time's output
+/// digest — for a downstream step to trust. With the stamp gone, downstream
+/// either runs with `--no-stamps` too or fails its precondition loudly;
+/// neither silently skips over stale bytes.
+pub fn remove_own_stamp_line(req: &StampRequirement) -> String {
+    format!(
+        "rm -f \"$AVOCADO_PREFIX/.stamps/{}\"\n",
+        req.relative_path()
+    )
+}
+
+/// Key under which [`generate_output_listing_probe`] reports in a batch read.
+pub const OUTPUT_LISTING_KEY: &str = "__outputs__";
+
+/// One more line for a batch stamp-read script: the basenames of the entries
+/// (files or directories) matching `glob_expr` (a shell glob, quoted as the caller wants it expanded),
+/// space-separated, under [`OUTPUT_LISTING_KEY`]. Lets a step learn whether its
+/// output exists in the same container round-trip that reads its stamps —
+/// the second half of "may I skip": a current stamp whose output is gone must
+/// still rebuild.
+pub fn generate_output_listing_probe(glob_expr: &str) -> String {
+    format!(
+        r#"echo -n "{OUTPUT_LISTING_KEY}:::"; for _f in {glob_expr}; do [ -e "$_f" ] && printf '%s ' "$(basename "$_f")"; done; echo"#
+    )
+}
+
+/// The basenames reported by [`generate_output_listing_probe`].
+pub fn output_listing_from_batch(batch_output: &str) -> Vec<String> {
+    parse_batch_stamps_output(batch_output)
+        .get(OUTPUT_LISTING_KEY)
+        .and_then(|v| v.as_deref())
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the stamp at `req` in a batch read exists and is current for
+/// `inputs`. The self-check a step makes before doing its work.
+pub fn own_stamp_is_current(
+    batch_output: &str,
+    req: &StampRequirement,
+    inputs: &StampInputs,
+) -> bool {
+    parse_batch_stamps_output(batch_output)
+        .get(&req.relative_path())
+        .and_then(|json| json.as_deref())
+        .and_then(|json| Stamp::from_json(json).ok())
+        .is_some_and(|stamp| stamp.is_current(inputs))
 }
 
 /// Parse the output from `generate_batch_read_stamps_script` into a map of path -> JSON content
@@ -2942,10 +3220,19 @@ pub fn validate_stamp(
                         if stamp.is_current(inputs) {
                             StampStatus::Current(stamp)
                         } else {
-                            StampStatus::Stale {
-                                stamp,
-                                reason: "config hash mismatch".to_string(),
-                            }
+                            // Name the real cause. After a CLI upgrade every
+                            // stamp fails the version check with the config
+                            // untouched; telling the user their config changed
+                            // sends them to the wrong place.
+                            let reason = if stamp.version != STAMP_VERSION {
+                                format!(
+                                    "stamp format changed (v{} → v{STAMP_VERSION}); re-run the step to refresh it",
+                                    stamp.version
+                                )
+                            } else {
+                                "config hash mismatch".to_string()
+                            };
+                            StampStatus::Stale { stamp, reason }
                         }
                     } else {
                         // No inputs to check, assume current
@@ -5608,7 +5895,13 @@ extensions:
     #[test]
     fn digest_stamp_writer_substitutes_only_the_digest() {
         let dir = tempfile::tempdir().unwrap();
-        let inputs = StampInputs::new("c$HOME`whoami`".to_string()); // hostile-looking, must survive
+        // Hostile-looking, must survive unexpanded; and the placeholder text as
+        // *data* must survive the substitution, which is anchored on the quoted
+        // JSON value, not the bare string.
+        let inputs = StampInputs::with_package_list(
+            "c$HOME`whoami`".to_string(),
+            format!("x{CONTENT_HASH_PLACEHOLDER}y"),
+        );
         let stamp = Stamp::ext_build("e", "qemux86-64", inputs, StampOutputs::default());
 
         let ok_script =
@@ -5625,10 +5918,11 @@ extensions:
             written.inputs.config_hash, "c$HOME`whoami`",
             "no shell expansion"
         );
-        assert!(!written
-            .to_json()
-            .unwrap()
-            .contains(CONTENT_HASH_PLACEHOLDER));
+        assert_eq!(
+            written.inputs.package_list_hash.as_deref(),
+            Some(format!("x{CONTENT_HASH_PLACEHOLDER}y").as_str()),
+            "placeholder as data is untouched"
+        );
 
         for bad in [
             "AVOCADO_CONTENT_HASH=",
@@ -5732,6 +6026,182 @@ extensions:
         assert_ne!(d2, digest(None), "new file");
     }
 
+    /// The digest fails closed and never writes. A missing sysroot exits
+    /// non-zero rather than digesting nothing into an accepted hash, and a tree
+    /// with no rpmdb comes out of the run without one — `rpm -qa` would have
+    /// created it inside the tree being measured.
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_digest_fails_closed_and_never_creates_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |root: &Path| {
+            let script = format!(
+                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                render_sysroot_digest_script(&root.display().to_string(), None)
+            );
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .stderr(std::process::Stdio::null())
+                .output()
+                .expect("bash on PATH")
+        };
+        let missing = run(&dir.path().join("nope"));
+        assert!(
+            !missing.status.success(),
+            "missing sysroot must fail, not digest nothing"
+        );
+        assert!(String::from_utf8(missing.stdout).unwrap().trim().is_empty());
+
+        let root = dir.path().join("sysroot");
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/app"), "x").unwrap();
+        let ok = run(&root);
+        assert!(ok.status.success());
+        assert_eq!(String::from_utf8(ok.stdout).unwrap().trim().len(), 64);
+        assert!(
+            !root.join("var/lib/rpm").exists(),
+            "the query must not create an rpmdb"
+        );
+        assert!(!root.join("usr/lib/sysimage").exists());
+
+        // And through the writer: a failing digest writes no stamp.
+        let stamp = Stamp::ext_build(
+            "e",
+            "qemux86-64",
+            StampInputs::new("c".into()),
+            StampOutputs::default(),
+        );
+        let script = generate_write_stamp_script_with_digest(
+            &stamp,
+            &render_sysroot_digest_script(&dir.path().join("nope").display().to_string(), None),
+        )
+        .unwrap();
+        let (ok, written) = run_stamp_script(dir.path(), &script);
+        assert!(!ok && written.is_none());
+    }
+
+    /// `--no-stamps` prepends removal of the step's own stamp to its script,
+    /// so an unrecorded run leaves no digest for a downstream step to trust.
+    #[test]
+    fn remove_own_stamp_line_names_the_stamp() {
+        let line = remove_own_stamp_line(&StampRequirement::ext_build("app"));
+        assert_eq!(
+            line,
+            "rm -f \"$AVOCADO_PREFIX/.stamps/ext/app/build.stamp\"\n"
+        );
+    }
+
+    /// A stamp from an older format is reported as such, not as a config change.
+    #[test]
+    fn stale_reason_names_a_format_change() {
+        let inputs = StampInputs::new("c".into());
+        let mut old =
+            Stamp::ext_install("app", "qemux86-64", inputs.clone(), StampOutputs::default());
+        old.version = STAMP_VERSION - 1;
+        match validate_stamp(
+            &StampRequirement::ext_install("app"),
+            Some(&old.to_json().unwrap()),
+            Some(&inputs),
+        ) {
+            StampStatus::Stale { reason, .. } => {
+                assert!(reason.contains("stamp format changed"), "{reason}");
+                assert!(
+                    reason.contains(&format!("v{}", STAMP_VERSION - 1)),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+        let current =
+            Stamp::ext_install("app", "qemux86-64", inputs.clone(), StampOutputs::default());
+        match validate_stamp(
+            &StampRequirement::ext_install("app"),
+            Some(&current.to_json().unwrap()),
+            Some(&StampInputs::new("d".into())),
+        ) {
+            StampStatus::Stale { reason, .. } => assert_eq!(reason, "config hash mismatch"),
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    /// The image hash chains on the build's output digest and folds only what
+    /// the imager itself reads. A build-only input — `post_build`, an overlay —
+    /// must NOT move it: it reaches the image through the tree, and the digest
+    /// says whether the tree changed. That is what lets a rebuild with identical
+    /// bytes stop before re-imaging.
+    #[test]
+    fn ext_image_hash_chains_on_the_build_digest_not_build_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("post.sh"), "a").unwrap();
+        let img = |yaml: &str, digest: Option<&str>| {
+            let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            compute_ext_image_input_hash(
+                &v,
+                "my-ext",
+                Some("erofs"),
+                dir.path(),
+                None,
+                None,
+                None,
+                digest,
+            )
+            .unwrap()
+            .config_hash
+        };
+        let base = "extensions:\n  my-ext:\n    version: '1.0.0'\n    post_build: post.sh\n";
+        let a = img(base, Some("sha256:t1"));
+
+        // Build-only inputs: no effect on the image hash.
+        std::fs::write(dir.path().join("post.sh"), "b").unwrap();
+        assert_eq!(a, img(base, Some("sha256:t1")), "post_build content");
+        assert_eq!(
+            a,
+            img(
+                &base.replace(
+                    "post_build: post.sh",
+                    "post_build: other.sh\n    overlay: ov"
+                ),
+                Some("sha256:t1")
+            ),
+            "post_build path / overlay"
+        );
+
+        // The tree digest and the image's own inputs: effect.
+        assert_ne!(a, img(base, Some("sha256:t2")), "build digest");
+        assert_ne!(a, img(base, None), "absent digest is not a match");
+        assert_ne!(
+            a,
+            img(&base.replace("1.0.0", "1.0.1"), Some("sha256:t1")),
+            "version"
+        );
+        assert_ne!(
+            a,
+            img(
+                &(base.to_string() + "    image:\n      verity: true\n"),
+                Some("sha256:t1")
+            ),
+            "image.verity"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(base).unwrap();
+        assert_ne!(
+            a,
+            compute_ext_image_input_hash(
+                &v,
+                "my-ext",
+                Some("squashfs"),
+                dir.path(),
+                None,
+                None,
+                None,
+                Some("sha256:t1")
+            )
+            .unwrap()
+            .config_hash,
+            "filesystem"
+        );
+    }
+
     /// Batch-read output is `path:::json` per line, `null` for a missing stamp.
     fn batch_line(req: &StampRequirement, stamp: Option<&Stamp>) -> String {
         let body = stamp
@@ -5802,9 +6272,12 @@ extensions:
             &StampRequirement::ext_image("app"),
             Some(&image_stamp("sha256:22")),
         );
-        let map_a = ext_image_content_hashes_from_batch(&batch_a, ["app".to_string()]);
-        let map_b = ext_image_content_hashes_from_batch(&batch_b, ["app".to_string()]);
-        assert_eq!(map_a.get("app").map(String::as_str), Some("sha256:11"));
+        let map_a = ext_content_hashes_from_batch(&batch_a, ["app".to_string()]);
+        let map_b = ext_content_hashes_from_batch(&batch_b, ["app".to_string()]);
+        assert_eq!(
+            map_a.get("app.image").map(String::as_str),
+            Some("sha256:11")
+        );
         let rt: serde_yaml::Value = serde_yaml::from_str("packages:\n  a: '*'\n").unwrap();
         let empty = serde_yaml::Value::Mapping(Default::default());
         let rb = |m: &std::collections::BTreeMap<String, String>| {
@@ -5814,6 +6287,67 @@ extensions:
         };
         assert_ne!(rb(&map_a), rb(&map_b));
         assert_ne!(rb(&map_a), rb(&Default::default()));
+    }
+
+    /// The output probe rides in the batch read and reports what exists —
+    /// files and directories both — so a step can refuse to skip over a
+    /// current stamp whose output is gone.
+    #[cfg(unix)]
+    #[test]
+    fn output_listing_probe_reports_existing_files_and_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output/extensions");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("app-1.0.0.raw"), "x").unwrap();
+        std::fs::write(out.join("app-1.0.0.kab"), "x").unwrap();
+        std::fs::write(out.join("other-2.0.0.raw"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("sysroots/app")).unwrap();
+
+        let run = |glob: &str| {
+            let script = generate_output_listing_probe(glob);
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .env("AVOCADO_PREFIX", dir.path())
+                .output()
+                .unwrap();
+            let mut names = output_listing_from_batch(&String::from_utf8(o.stdout).unwrap());
+            names.sort();
+            names
+        };
+        assert_eq!(
+            run(
+                r#""$AVOCADO_PREFIX/output/extensions/app-"*.raw "$AVOCADO_PREFIX/output/extensions/app-"*.kab"#
+            ),
+            ["app-1.0.0.kab", "app-1.0.0.raw"]
+        );
+        assert_eq!(
+            run(r#""$AVOCADO_PREFIX/sysroots/app""#),
+            ["app"],
+            "a directory counts"
+        );
+        assert!(run(r#""$AVOCADO_PREFIX/sysroots/missing""#).is_empty());
+        assert!(run(r#""$AVOCADO_PREFIX/output/extensions/nope-"*.raw"#).is_empty());
+    }
+
+    /// The self-check: current only when the stamp is present AND its inputs
+    /// match — a stale or absent own stamp never permits a skip.
+    #[test]
+    fn own_stamp_is_current_requires_presence_and_matching_inputs() {
+        let req = StampRequirement::ext_image("app");
+        let inputs = StampInputs::new("h1".into());
+        let stamp = Stamp::ext_image("app", "qemux86-64", inputs.clone(), StampOutputs::default());
+        let batch = batch_line(&req, Some(&stamp));
+        assert!(own_stamp_is_current(&batch, &req, &inputs));
+        assert!(
+            !own_stamp_is_current(&batch, &req, &StampInputs::new("h2".into())),
+            "stale"
+        );
+        assert!(
+            !own_stamp_is_current(&batch_line(&req, None), &req, &inputs),
+            "absent"
+        );
+        assert!(!own_stamp_is_current("", &req, &inputs), "no batch");
     }
 
     /// `is_current` compares `package_list_hash` strictly. A recorded `None`
@@ -6383,16 +6917,24 @@ rootfs:
         let root = std::path::Path::new(".");
         let packages = default_rootfs_packages();
 
-        let pinned: std::collections::HashMap<String, String> =
-            std::collections::HashMap::from([(
-                "avocado-pkg-rootfs".to_string(),
-                "2026.9-r0.0".to_string(),
-            )]);
-        let repinned: std::collections::HashMap<String, String> = std::collections::HashMap::from(
-            [("avocado-pkg-rootfs".to_string(), "2026.10-r0.0".to_string())],
-        );
+        use crate::utils::lockfile::{LockedPackage, PackageVersions};
+        let pinned: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::new("2026.9-r0.0"),
+        )]);
+        let repinned: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::new("2026.10-r0.0"),
+        )]);
+        // Same version, different origin: the hash must NOT move. Provenance is a
+        // record, not an input — and a real change of origin already moves the
+        // hash through the feed projection.
+        let rehomed: PackageVersions = PackageVersions::from([(
+            "avocado-pkg-rootfs".to_string(),
+            LockedPackage::with_repo("2026.9-r0.0", Some("other-feed".into())),
+        )]);
 
-        let inputs_for = |locked: Option<&std::collections::HashMap<String, String>>| {
+        let inputs_for = |locked: Option<&PackageVersions>| {
             compute_rootfs_input_hash(
                 &config,
                 root,
@@ -6413,6 +6955,15 @@ rootfs:
         // The config side is untouched by a re-pin; only the package list moves.
         assert_eq!(a.config_hash, b.config_hash);
         assert_ne!(a.package_list_hash, b.package_list_hash);
+        // Same version, different recorded origin: the hash must NOT move.
+        // Provenance is a record, not a build input, and folding it in would force
+        // a rebuild for every project the first time origins are captured. A real
+        // change of origin already moves the hash through the feed projection.
+        let rehomed_inputs = inputs_for(Some(&rehomed));
+        assert_eq!(
+            a.package_list_hash, rehomed_inputs.package_list_hash,
+            "recording where a package came from must not invalidate anything"
+        );
 
         // `avocado unlock` clears the section. That has to read as stale, which
         // is why an empty pin set hashes to a value rather than to None —
@@ -6433,15 +6984,17 @@ rootfs:
     fn rootfs_package_list_hash_is_order_independent() {
         // Lock pins come out of a HashMap, so iteration order varies between
         // runs. The digest must not.
-        let a = std::collections::HashMap::from([
-            ("alpha".to_string(), "1".to_string()),
-            ("beta".to_string(), "2".to_string()),
-            ("gamma".to_string(), "3".to_string()),
+        use crate::utils::lockfile::{LockedPackage, PackageVersions};
+        let p = |v: &str| LockedPackage::new(v);
+        let a = PackageVersions::from([
+            ("alpha".to_string(), p("1")),
+            ("beta".to_string(), p("2")),
+            ("gamma".to_string(), p("3")),
         ]);
-        let b = std::collections::HashMap::from([
-            ("gamma".to_string(), "3".to_string()),
-            ("alpha".to_string(), "1".to_string()),
-            ("beta".to_string(), "2".to_string()),
+        let b = PackageVersions::from([
+            ("gamma".to_string(), p("3")),
+            ("alpha".to_string(), p("1")),
+            ("beta".to_string(), p("2")),
         ]);
 
         assert_eq!(package_list_hash(Some(&a)), package_list_hash(Some(&b)));
@@ -6691,5 +7244,282 @@ rootfs:
             !stamp.is_current(&inputs),
             "older stamp version should be reported as stale"
         );
+    }
+
+    /// `compute_sysroot_image_input_hash`'s config hash over a YAML section
+    /// body against config `cfg`, with a fixed upstream digest; `rt` selects
+    /// the runtime-build path.
+    fn image_hash_in(
+        section: &str,
+        yaml: &str,
+        cfg: &str,
+        rt: Option<&str>,
+        root: &Path,
+    ) -> Result<String> {
+        let node: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cfg: serde_yaml::Value = serde_yaml::from_str(cfg).unwrap();
+        Ok(
+            compute_sysroot_image_input_hash(section, &node, "sha256:aa", &cfg, rt, root)?
+                .config_hash,
+        )
+    }
+
+    /// The standalone-command shape: empty config, no runtime.
+    fn image_hash(section: &str, yaml: &str, root: &Path) -> Result<String> {
+        image_hash_in(section, yaml, "{}", None, root)
+    }
+
+    #[test]
+    fn sysroot_image_hash_is_deterministic() {
+        let yaml = "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n";
+        let root = Path::new(".");
+        assert_eq!(
+            image_hash("rootfs", yaml, root).unwrap(),
+            image_hash("rootfs", yaml, root).unwrap()
+        );
+    }
+
+    /// The chain edge: the image step's real input is the sysroot, and the
+    /// install stamp's digest is how it reaches the hash.
+    #[test]
+    fn sysroot_image_hash_chains_install_content_hash() {
+        let node: serde_yaml::Value = serde_yaml::from_str("filesystem: erofs\n").unwrap();
+        let empty = serde_yaml::Value::Mapping(Default::default());
+        let hash = |up: &str| {
+            compute_sysroot_image_input_hash("rootfs", &node, up, &empty, None, Path::new("."))
+                .unwrap()
+                .config_hash
+        };
+        assert_ne!(hash("sha256:aa"), hash("sha256:bb"));
+    }
+
+    #[test]
+    fn sysroot_image_hash_tracks_filesystem_image_and_permissions() {
+        let root = Path::new(".");
+        let base = image_hash("rootfs", "filesystem: erofs\n", root).unwrap();
+        for (label, yaml) in [
+            ("filesystem", "filesystem: erofs-lz4\n"),
+            (
+                "image.verity",
+                "filesystem: erofs\nimage:\n  verity: true\n",
+            ),
+            (
+                "image arg",
+                "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n",
+            ),
+            (
+                "permissions",
+                "filesystem: erofs\npermissions:\n  users: [{name: app}]\n",
+            ),
+            // Not a key this module picks — the whole resolved section is
+            // folded so an unforeseen image-side key still invalidates.
+            (
+                "unpicked section key",
+                "filesystem: erofs\nfuture_knob: 1\n",
+            ),
+            (
+                "unpicked image key",
+                "filesystem: erofs\nimage:\n  compression: zstd\n",
+            ),
+        ] {
+            assert_ne!(base, image_hash("rootfs", yaml, root).unwrap(), "{label}");
+        }
+    }
+
+    #[test]
+    fn sysroot_image_hash_tracks_post_install_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("post.sh");
+        let yaml = "post_install: post.sh\n";
+
+        std::fs::write(&script, b"echo v1\n").unwrap();
+        let h1 = image_hash("rootfs", yaml, tmp.path()).unwrap();
+        std::fs::write(&script, b"echo v2\n").unwrap();
+        let h2 = image_hash("rootfs", yaml, tmp.path()).unwrap();
+        assert_ne!(h1, h2, "same path, edited content must invalidate");
+
+        std::fs::remove_file(&script).unwrap();
+        assert!(
+            image_hash("rootfs", yaml, tmp.path()).is_err(),
+            "a declared but missing post_install is an error, not a sentinel"
+        );
+    }
+
+    #[test]
+    fn rootfs_and_initramfs_image_hashes_differ_for_identical_inputs() {
+        let yaml = "filesystem: erofs\n";
+        let root = Path::new(".");
+        assert_ne!(
+            image_hash("rootfs", yaml, root).unwrap(),
+            image_hash("initramfs", yaml, root).unwrap()
+        );
+    }
+
+    /// The hash is computed over `Config::resolve_image_section`'s output, so
+    /// a `target-<name>:` override reaches it — the raw node would read the
+    /// same for every target.
+    #[test]
+    fn sysroot_image_hash_sees_target_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("foo.sh"), b"echo foo\n").unwrap();
+        let yaml = "rootfs:\n  filesystem: erofs\n  target-foo:\n    post_install: foo.sh\n";
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hash = |target: &str| {
+            let section = config
+                .resolve_image_section(&parsed, "rootfs", target)
+                .unwrap();
+            compute_sysroot_image_input_hash(
+                "rootfs",
+                &section,
+                "sha256:aa",
+                &parsed,
+                None,
+                tmp.path(),
+            )
+            .unwrap()
+            .config_hash
+        };
+        assert_ne!(hash("foo"), hash("bar"));
+    }
+
+    /// The inputs the image step reads from outside its own section, each
+    /// moving the hash on its own.
+    #[test]
+    fn sysroot_image_hash_tracks_config_and_runtime_inputs() {
+        let root = Path::new(".");
+        let hash = |cfg: &str| {
+            image_hash_in(
+                "initramfs",
+                "filesystem: cpio.zst\n",
+                cfg,
+                Some("dev"),
+                root,
+            )
+            .unwrap()
+        };
+        let dev = "runtimes:\n  dev:\n    version: '1'\n";
+        let base = hash(dev);
+        for (label, extra) in [
+            ("var.encrypt", "    var:\n      encrypt: true\n"),
+            ("var.hardware", "    var:\n      hardware: caam\n"),
+            // The build resolves `target-<x>:` overrides inside the runtime
+            // block; a per-target opt-in must not be invisible here.
+            (
+                "target-scoped var.encrypt",
+                "    target-foo:\n      var:\n        encrypt: true\n",
+            ),
+            (
+                "inline runtime rootfs permissions",
+                "    rootfs:\n      permissions:\n        users: [{name: app}]\n",
+            ),
+            (
+                "inline runtime initramfs permissions",
+                "    initramfs:\n      permissions:\n        users: [{name: app}]\n",
+            ),
+            ("source_date_epoch", "source_date_epoch: 1700000000\n"),
+            ("sdk.image", "sdk:\n  image: other\n"),
+        ] {
+            assert_ne!(base, hash(&format!("{dev}{extra}")), "{label}");
+        }
+        assert_ne!(
+            base,
+            hash("runtimes:\n  dev:\n    version: '2'\n"),
+            "runtime version"
+        );
+    }
+
+    /// `<section>.permissions: <name>` is only a ref; the body it names lives
+    /// in top-level `permissions:` and an edit there has to invalidate.
+    #[test]
+    fn sysroot_image_hash_tracks_named_permissions_body() {
+        let root = Path::new(".");
+        let hash =
+            |cfg: &str| image_hash_in("rootfs", "permissions: p\n", cfg, None, root).unwrap();
+        assert_ne!(
+            hash("permissions:\n  p:\n    users: [{name: app}]\n"),
+            hash("permissions:\n  p:\n    users: [{name: app, uid: 1001}]\n")
+        );
+    }
+
+    /// `runtimes.<rt>` is folded narrowly. Adding an extension or a package
+    /// to the runtime must not re-image the rootfs — that inner loop is what
+    /// this stamp exists to protect — and the standalone path ignores the
+    /// runtimes block entirely.
+    #[test]
+    fn sysroot_image_hash_ignores_runtime_extensions_and_packages() {
+        let root = Path::new(".");
+        let hash = |cfg: &str, rt: Option<&str>| {
+            image_hash_in("rootfs", "filesystem: erofs\n", cfg, rt, root).unwrap()
+        };
+        let a = "runtimes:\n  dev:\n    version: '1'\n    var:\n      encrypt: true\n";
+        let b = format!(
+            "{a}    extensions:\n      app: {{version: '1'}}\n    packages:\n      vim: '*'\n"
+        );
+        assert_eq!(hash(a, Some("dev")), hash(&b, Some("dev")));
+        assert_eq!(
+            hash(a, None),
+            hash("{}", None),
+            "standalone ignores runtimes"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sysroot_image_hash_tracks_kab_keyset_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let keyset = tmp.path().join("kab.keyset");
+        let root = Path::new(".");
+        let kab = "image:\n  type: kab\n  args: -v 1\n";
+        let raw = "image:\n  type: raw\n";
+
+        std::env::set_var("KAB_KEYSET_FILE", &keyset);
+        std::fs::write(&keyset, b"key-v1").unwrap();
+        let h1 = image_hash("rootfs", kab, root).unwrap();
+        std::fs::write(&keyset, b"key-v2").unwrap();
+        assert_ne!(
+            h1,
+            image_hash("rootfs", kab, root).unwrap(),
+            "a rotated keyset must invalidate"
+        );
+        let h_raw = image_hash("rootfs", raw, root).unwrap();
+
+        std::env::set_var("KAB_KEYSET_FILE", tmp.path().join("missing"));
+        assert!(
+            image_hash("rootfs", kab, root).is_err(),
+            "set but unreadable is an error, not a sentinel"
+        );
+        assert_eq!(
+            h_raw,
+            image_hash("rootfs", raw, root).unwrap(),
+            "a non-kab image never reads the keyset"
+        );
+
+        std::env::remove_var("KAB_KEYSET_FILE");
+        assert_eq!(
+            h_raw,
+            image_hash("rootfs", raw, root).unwrap(),
+            "a stray KAB_KEYSET_FILE must not churn non-kab images"
+        );
+    }
+
+    #[test]
+    fn sysroot_image_stamp_paths_and_requirements() {
+        let inputs = StampInputs::new("sha256:abc".to_string());
+        let stamp = Stamp::rootfs_image("qemux86-64", inputs.clone(), StampOutputs::default());
+        assert_eq!(stamp.command, StampCommand::Image);
+        assert_eq!(stamp.component, StampComponent::Rootfs);
+        assert_eq!(stamp.relative_path(), "rootfs/image.stamp");
+        let stamp = Stamp::initramfs_image("qemux86-64", inputs, StampOutputs::default());
+        assert_eq!(stamp.relative_path(), "initramfs/image.stamp");
+
+        let req = StampRequirement::rootfs_image();
+        assert_eq!(req.relative_path(), "rootfs/image.stamp");
+        assert_eq!(req.description(), "rootfs image");
+        assert_eq!(req.fix_command(), "avocado rootfs image");
+        let req = StampRequirement::initramfs_image();
+        assert_eq!(req.relative_path(), "initramfs/image.stamp");
+        assert_eq!(req.description(), "initramfs image");
+        assert_eq!(req.fix_command(), "avocado initramfs image");
     }
 }

@@ -16,10 +16,48 @@ use crate::utils::output::{
 };
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
-    compute_ext_install_input_hash_with_deps, generate_write_stamp_script, Stamp, StampOutputs,
+    compute_ext_install_input_hash_with_deps, ext_dep_fingerprint,
+    generate_batch_read_stamps_script, generate_write_stamp_script, parse_batch_stamps_output,
+    validate_stamp, Stamp, StampOutputs, StampRequirement, StampStatus,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
+
+/// Whether an extension name is safe to interpolate raw into the fast-path
+/// batch shell script (stamp path + sysroot probe). Names come from composed
+/// YAML keys, which are not constrained to shell-safe characters, so a name
+/// with quotes or `$(...)` could break the batch protocol or run commands in
+/// the SDK container. The fast path only skips names that pass this allowlist;
+/// anything else falls through to a normal install.
+fn ext_name_stamp_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Shell that clears an extension's sysroot and drops the stamps that vouch for
+/// what was in it.
+///
+/// `ext build`'s output — the extension-release files, unit wiring, the applied
+/// overlay — lives in this sysroot and is *not* restored by the dnf transaction
+/// that follows a clean; only `ext build` puts it back. Its stamp's inputs are
+/// unchanged by a clean, so a surviving stamp would let `ext build` report "up
+/// to date" over a sysroot that no longer holds its work, and `ext image` would
+/// then image an empty extension. Same rule as `--no-stamps`: a step that
+/// destroys an output invalidates the stamp claiming it exists.
+fn clean_ext_sysroot_command(extension: &str) -> String {
+    format!(
+        r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}"
+{build_stamp}{image_stamp}"#,
+        build_stamp = crate::utils::stamps::remove_own_stamp_line(
+            &crate::utils::stamps::StampRequirement::ext_build(extension)
+        ),
+        image_stamp = crate::utils::stamps::remove_own_stamp_line(
+            &crate::utils::stamps::StampRequirement::ext_image(extension)
+        ),
+    )
+}
 
 pub struct ExtInstallCommand {
     extension: Option<String>,
@@ -521,6 +559,66 @@ impl ExtInstallCommand {
             );
         }
 
+        // Batch-read existing extension install stamps in one container call so we
+        // can skip extensions whose inputs are unchanged, instead of re-running
+        // the dnf transaction (and, for depends_on extensions, the sysroot
+        // rebuild) on every install. Skipped under --force, --no-stamps, or
+        // --runs-on; any read failure leaves the map empty and we install
+        // everything.
+        // The stamp only fingerprints extension config, not per-invocation install
+        // options: `--dnf-args` and the weak-dependency setting change the
+        // transaction but not the stamp, so disable the fast path when either is
+        // in play rather than skip a differently-configured install. Also off for
+        // --force, --no-stamps, and --runs-on.
+        let fast_path = !self.force
+            && !self.no_stamps
+            && runs_on_context.is_none()
+            && self.dnf_args.as_ref().is_none_or(|a| a.is_empty())
+            && !config.get_sdk_disable_weak_dependencies();
+        // Only fast-path shell-safe names (see `ext_name_stamp_safe`); the rest
+        // fall through to a normal install rather than being skipped.
+        let stamp_safe = ext_name_stamp_safe;
+        let stamp_reads: std::collections::HashMap<String, Option<String>> = if !fast_path {
+            std::collections::HashMap::new()
+        } else {
+            let reqs: Vec<StampRequirement> = extensions_to_install
+                .iter()
+                .filter(|(name, _)| stamp_safe(name))
+                .map(|(name, _)| StampRequirement::ext_install(name))
+                .collect();
+            // Read the stamps AND probe each sysroot's existence in the same
+            // call, so a surviving stamp over a manually-removed sysroot does
+            // not skip a needed reinstall.
+            let mut command = generate_batch_read_stamps_script(&reqs);
+            for (name, _) in extensions_to_install.iter().filter(|(n, _)| stamp_safe(n)) {
+                command.push_str(&format!(
+                        "\nprintf 'sysroot:{name}:::%s\\n' \"$([ -d \"$AVOCADO_EXT_SYSROOTS/{name}\" ] && echo yes || echo no)\""
+                    ));
+            }
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command,
+                verbose: false,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                env_vars: self.runtime_env_vars(),
+                ..Default::default()
+            };
+            match container_helper
+                .run_in_container_with_output(run_config)
+                .await
+            {
+                Ok(output) => parse_batch_stamps_output(output.as_deref().unwrap_or("")),
+                Err(_) => std::collections::HashMap::new(),
+            }
+        };
+
         // Install each extension
         for (index, (ext_name, ext_location)) in extensions_to_install.iter().enumerate() {
             if self.verbose {
@@ -529,6 +627,66 @@ impl ExtInstallCommand {
                     OutputLevel::Normal,
                 );
             }
+
+            // Is this extension already up to date? Compute its current input
+            // hash the same way the stamp writer does -- folding in its direct
+            // dependencies' current fingerprints (deps are installed earlier in
+            // this topologically-ordered loop, so the lockfile is current here) --
+            // and compare against the stamp read above.
+            let ext_up_to_date = if !fast_path || !stamp_safe(ext_name) {
+                false
+            } else {
+                let sysroot_present = stamp_reads
+                    .get(&format!("sysroot:{ext_name}"))
+                    .and_then(|v| v.as_deref())
+                    == Some("yes");
+                // `avocado update` clears the lock's package pins to force
+                // re-resolution against the new snapshot; a dependency-free
+                // extension would otherwise keep a matching config hash,
+                // sysroot, and stamp and skip without re-locking. Only accept
+                // the stamp when the extension still has resolved package pins.
+                let has_pins = lock_file
+                    .get_extension_packages_any_scope(target, ext_name)
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false);
+                let dep_state: Vec<(String, String)> = direct_deps
+                    .get(ext_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|dep| {
+                        (
+                            dep.clone(),
+                            ext_dep_fingerprint(&lock_file, target, graph, dep),
+                        )
+                    })
+                    .collect();
+                // The pin the writer folded is the one on disk for this sysroot;
+                // read the same key so the fast path compares like with like.
+                let resolved_kernel = lock_file
+                    .get_kernel_version(target, &self.extension_sysroot(ext_name))
+                    .cloned();
+                match compute_ext_install_input_hash_with_deps(
+                    parsed,
+                    ext_name,
+                    &dep_state,
+                    resolved_kernel.as_deref(),
+                ) {
+                    Ok(inputs) => {
+                        let req = StampRequirement::ext_install(ext_name);
+                        let json = stamp_reads
+                            .get(&req.relative_path())
+                            .and_then(|v| v.as_deref());
+                        sysroot_present
+                            && has_pins
+                            && matches!(
+                                validate_stamp(&req, json, Some(&inputs)),
+                                StampStatus::Current(_)
+                            )
+                    }
+                    Err(_) => false,
+                }
+            };
 
             if !self
                 .install_single_extension(
@@ -549,14 +707,51 @@ impl ExtInstallCommand {
                     runs_on_context,
                     effective_tui_context,
                     direct_deps.get(ext_name).map(Vec::as_slice).unwrap_or(&[]),
+                    ext_up_to_date,
                 )
                 .await?
             {
                 return Err(anyhow::anyhow!("Failed to install extension '{ext_name}'"));
             }
 
-            // Write extension install stamp (unless --no-stamps)
-            if !self.no_stamps {
+            // The config-only stamp fingerprints extension config, not the
+            // per-invocation transaction: `--dnf-args` and a disabled
+            // weak-dependency setting install a different package set than the
+            // stamp records. Writing a clean stamp after such a transaction
+            // would let a later plain install skip a sysroot missing those
+            // packages, so instead drop any existing stamp and force the next
+            // install to re-resolve.
+            let transaction_is_standard = self.dnf_args.as_ref().is_none_or(|a| a.is_empty())
+                && !config.get_sdk_disable_weak_dependencies();
+            if !self.no_stamps
+                && !ext_up_to_date
+                && !transaction_is_standard
+                && stamp_safe(ext_name)
+            {
+                let req = StampRequirement::ext_install(ext_name);
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.to_string(),
+                    command: format!("rm -f \"$AVOCADO_PREFIX/.stamps/{}\"", req.relative_path()),
+                    verbose: self.verbose,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    tui_context: effective_tui_context.clone(),
+                    env_vars: self.runtime_env_vars(),
+                    ..Default::default()
+                };
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+            }
+
+            // Write extension install stamp (unless --no-stamps, it was already
+            // up to date -- the stamp is already current -- or the transaction
+            // was non-standard, handled above).
+            if !self.no_stamps && !ext_up_to_date && transaction_is_standard {
                 // Update peek line so it doesn't stay on "Complete!" during stamp write
                 if let Some(ref ctx) = effective_tui_context {
                     ctx.renderer
@@ -735,6 +930,7 @@ impl ExtInstallCommand {
         runs_on_context: Option<&RunsOnContext>,
         effective_tui_context: &Option<TuiContext>,
         direct_deps: &[String],
+        up_to_date: bool,
     ) -> Result<bool> {
         let sysroot = self.extension_sysroot(extension);
 
@@ -751,6 +947,18 @@ impl ExtInstallCommand {
             lock_file.save(src_dir).with_context(|| {
                 format!("Failed to record membership for extension '{extension}' in runtime '{rt}'")
             })?;
+        }
+
+        // Already up to date (install stamp matches current inputs): the sysroot
+        // is built and its packages are present, so skip the dnf transaction and
+        // sysroot work. Membership above is still recorded for lockfile
+        // consistency.
+        if up_to_date {
+            print_success(
+                &format!("Extension '{extension}' is up to date."),
+                OutputLevel::Normal,
+            );
+            return Ok(true);
         }
 
         // Snapshot the previously-pinned kernel BEFORE the resolver runs: it
@@ -872,8 +1080,17 @@ impl ExtInstallCommand {
         // steady state.
         let reseed_required = !direct_deps.is_empty();
         if needs_clean_reinstall || self.force || reseed_required || kernel_pin_change.is_some() {
-            // Clean the sysroot so it will be recreated fresh below
-            let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
+            // Clean the sysroot so it will be recreated fresh below, and drop
+            // the stamps that vouch for what was in it. `ext build`'s output —
+            // the extension-release files, unit wiring, the overlay — lives in
+            // this sysroot and is not reinstalled by the dnf transaction that
+            // follows; only `ext build` puts it back. Its stamp's inputs are
+            // unchanged by a clean, so leaving the stamp behind lets `ext build`
+            // report "up to date" over a sysroot that no longer holds its work,
+            // and `ext image` then images an empty extension. Same rule as
+            // `--no-stamps`: a step that destroys an output invalidates the
+            // stamp that claims it exists.
+            let clean_command = clean_ext_sysroot_command(extension);
 
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -1146,7 +1363,10 @@ impl ExtInstallCommand {
 
             if !packages.is_empty() {
                 // Build DNF install command
-                let yes = if self.force { "-y" } else { "" };
+                // dnf never prompts here: this applies the package set avocado.yaml and
+                // avocado.lock already declare, so there is no decision left to make.
+                // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+                let yes = "-y";
                 let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension}");
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
                     format!(" {} ", args.join(" "))
@@ -1195,7 +1415,8 @@ $DNF_SDK_HOST \
                     command,
                     verbose: self.verbose,
                     source_environment: false, // don't source environment
-                    interactive: !self.force,  // interactive if not forced
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
                     feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
@@ -1242,6 +1463,25 @@ $DNF_SDK_HOST \
                         // runtime is in scope, legacy global namespace
                         // otherwise.
                         lock_file.update_sysroot_versions(target, &sysroot, installed_versions);
+                        // And where they came from, which matters most here:
+                        // extensions are the stage most likely to draw from a
+                        // second feed. Best effort — dnf answers from the
+                        // installroot's own history, and a lock records a bare
+                        // version when it cannot.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &sysroot,
+                                container_image,
+                                target,
+                                repo_url.cloned(),
+                                repo_release.cloned(),
+                                merged_container_args.clone(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                self.runtime_env_vars(),
+                            )
+                            .await;
+                        lock_file.set_sysroot_origins(target, &sysroot, &origins);
                         if self.verbose {
                             print_info(
                                 &format!("Updated lock file with extension '{extension}' package versions."),
@@ -1304,7 +1544,44 @@ async fn run_container_command(
 
 #[cfg(test)]
 mod tests {
-    use super::ExtInstallCommand as C;
+    use super::*;
+
+    #[test]
+    fn fast_path_only_accepts_shell_safe_extension_names() {
+        // Ordinary names the fast path may interpolate directly.
+        for ok in ["foo", "my-ext", "my_ext", "ext.v2", "avocado-dev", "a1"] {
+            assert!(ext_name_stamp_safe(ok), "{ok} should be accepted");
+        }
+        // Injection / protocol-breaking names must fall through to a normal
+        // install instead of being skipped via the batch script.
+        for bad in [
+            "",
+            "ext name",          // splits the printf/path
+            "ext\"; rm -rf /\"", // quote break + command
+            "$(reboot)",         // command substitution
+            "`id`",              // backtick substitution
+            "a/b",               // path traversal into the stamp path
+            "ext\nrm",           // newline breaks the line protocol
+            "ext:::x",           // collides with the ':::' delimiter
+        ] {
+            assert!(!ext_name_stamp_safe(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// Clearing the sysroot must take the build and image stamps with it.
+    /// Without this, `install --force` leaves a sysroot holding only package
+    /// state while `ext build`'s stamp still reads current — the skip then
+    /// fires and `ext image` ships an extension with no content in it.
+    #[test]
+    fn clean_ext_sysroot_drops_the_stamps_that_vouch_for_its_contents() {
+        let cmd = clean_ext_sysroot_command("app");
+        assert!(cmd.contains(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/app""#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/build.stamp""#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/image.stamp""#));
+        // The install stamp is rewritten by the install that follows; removing
+        // it here would be harmless but is not this function's job.
+        assert!(!cmd.contains("install.stamp"));
+    }
 
     /// Only a change between two known pins cleans the sysroot: the first pin
     /// has nothing stale to remove, and an extension that resolves no kernel
@@ -1312,11 +1589,20 @@ mod tests {
     #[test]
     fn a_kernel_pin_change_is_only_a_change_between_two_pins() {
         assert_eq!(
-            C::kernel_pin_change(Some("6.6.5"), Some("6.6.6")),
+            ExtInstallCommand::kernel_pin_change(Some("6.6.5"), Some("6.6.6")),
             Some(("6.6.5".to_string(), "6.6.6".to_string()))
         );
-        assert_eq!(C::kernel_pin_change(Some("6.6.5"), Some("6.6.5")), None);
-        assert_eq!(C::kernel_pin_change(None, Some("6.6.5")), None);
-        assert_eq!(C::kernel_pin_change(Some("6.6.5"), None), None);
+        assert_eq!(
+            ExtInstallCommand::kernel_pin_change(Some("6.6.5"), Some("6.6.5")),
+            None
+        );
+        assert_eq!(
+            ExtInstallCommand::kernel_pin_change(None, Some("6.6.5")),
+            None
+        );
+        assert_eq!(
+            ExtInstallCommand::kernel_pin_change(Some("6.6.5"), None),
+            None
+        );
     }
 }

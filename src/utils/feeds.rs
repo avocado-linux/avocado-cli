@@ -248,6 +248,15 @@ pub struct ResolvedFeed {
     pub mount: Option<PathBuf>,
     #[serde(skip)]
     loopback_rewritten: bool,
+    /// The locator as configured, for the lock: a `url:` with `$releasever` and
+    /// `$target` expanded but WITHOUT the loopback rewrite, or a `path:` exactly
+    /// as written. `baseurl` is the container's view — `host.docker.internal` on
+    /// an ephemeral port, or a `file://` path inside the mount — which is
+    /// plumbing, not provenance, and would make the lock churn on every run.
+    /// `#[serde(skip)]`: the canonical document records `baseurl` and feeds the
+    /// stamp hash, so adding a field there would move every hash.
+    #[serde(skip)]
+    configured_locator: String,
 }
 
 impl ResolvedFeed {
@@ -618,6 +627,10 @@ impl ResolvedFeedSet {
                     distro_priority_base = Some(priority);
                 }
                 feeds.push(ResolvedFeed {
+                    configured_locator: match &distro_releasever {
+                        Some(rv) => format!("{}/{rv}", repo_url.trim_end_matches('/')),
+                        None => repo_url.clone(),
+                    },
                     name: name.clone(),
                     kind: FeedKind::Distro,
                     baseurl: match &distro_releasever {
@@ -668,8 +681,14 @@ impl ResolvedFeedSet {
                 (None, Some(u)) => format!("basic:{}", short_sha256(u.as_bytes())),
                 (None, None) => "none".to_string(),
             };
-            let common = |kind, baseurl, locality, mount: Option<PathBuf>, loopback_rewritten| {
+            let common = |kind,
+                          baseurl,
+                          locality,
+                          mount: Option<PathBuf>,
+                          loopback_rewritten,
+                          configured_locator: String| {
                 ResolvedFeed {
+                    configured_locator,
                     org: def.org.clone(),
                     source: def.path.clone(),
                     // Digest of the repodata as it stands now. Absent repodata is reported
@@ -700,6 +719,10 @@ impl ResolvedFeedSet {
                 if let Some(rv) = &feed_releasever {
                     expanded = expanded.replace("$releasever", rv);
                 }
+                // The pre-rewrite form is what the lock records: the rewrite is
+                // container reachability, and on an ephemeral port it would make
+                // the lock churn every run.
+                let configured = expanded.clone();
                 let (expanded, rewritten) = rewrite_loopback(&expanded);
                 feeds.push(common(
                     FeedKind::Url,
@@ -707,6 +730,7 @@ impl ResolvedFeedSet {
                     Locality::Shared,
                     None,
                     rewritten,
+                    configured,
                 ));
             } else if let Some(org) = &def.org {
                 // The private tree mirrors the public one, so an org feed is just a
@@ -724,12 +748,14 @@ impl ResolvedFeedSet {
                 // canonical document stable across builds and keeps a server-side
                 // URL change out of the stamp hash — the org is the input, the host
                 // is a detail of how it was served today.
+                let placeholder = format!("connect://{org}/{path}");
                 feeds.push(common(
                     FeedKind::Connect,
-                    format!("connect://{org}/{path}"),
+                    placeholder.clone(),
                     Locality::Shared,
                     None,
                     false,
+                    placeholder,
                 ));
             } else if let Some(p) = &def.path {
                 let host = resolve_relative(config_dir, p);
@@ -740,6 +766,8 @@ impl ResolvedFeedSet {
                     Locality::ProjectLocal,
                     Some(host),
                     false,
+                    // As written in the config, not the in-container mount path.
+                    p.clone(),
                 ));
             }
         }
@@ -752,6 +780,7 @@ impl ResolvedFeedSet {
                 .map(|f| f.priority)
                 .unwrap_or(PRIORITY_STEP);
             feeds.push(ResolvedFeed {
+                configured_locator: BUILTIN_EXT_REPO_GLOB.into(),
                 name: BUILTIN_EXT_FEED.into(),
                 kind: FeedKind::Builtin,
                 baseurl: BUILTIN_EXT_REPO_GLOB.into(),
@@ -1017,6 +1046,34 @@ impl ResolvedFeedSet {
         self.minted_tier = lowest;
         self.minted_key_id = self_key_id;
         Ok(lowest)
+    }
+
+    /// The feed set as a lockfile record, in priority order.
+    ///
+    /// The whole set, not the stage-filtered view: `stages:` decides which feeds a
+    /// given step sees, but the lock answers "what was this target resolved
+    /// against", so each feed carries its own stage list instead.
+    ///
+    /// Built-in re-scopes are left out. They are served by the `.repo` files baked
+    /// into the SDK image and have a repoid glob rather than a URL, so recording
+    /// one as a source would describe something that is not one. Their effect on
+    /// resolution is already in the stamp projection.
+    pub fn locked_feeds(&self) -> Vec<crate::utils::lockfile::LockedFeed> {
+        self.feeds
+            .iter()
+            .filter(|f| f.kind != FeedKind::Builtin)
+            .map(|f| crate::utils::lockfile::LockedFeed {
+                name: f.name.clone(),
+                position: f.priority,
+                url: f.configured_locator.clone(),
+                digest: f.content_digest.clone(),
+                stages: if f.stages.is_empty() {
+                    None
+                } else {
+                    Some(f.stages.iter().map(|s| s.to_string()).collect())
+                },
+            })
+            .collect()
     }
 
     /// Write the canonical document to `<config_dir>/.avocado/feeds/<target>.json`.
@@ -1500,6 +1557,46 @@ distro:
         assert!(user_agent_for(Some("k"), Some(0)).contains("tier/1"));
         assert!(user_agent_for(Some("k"), None).contains("tier/1"));
         assert!(user_agent_for(Some("k"), Some(4)).contains("tier/4"));
+    }
+
+    /// The lock records the source as configured, not the container's view of it.
+    /// A loopback URL is rewritten to `host.docker.internal` for reachability and
+    /// a `path:` feed becomes a `file://` path inside the mount — both are
+    /// plumbing. Recording those would put an ephemeral port and an internal
+    /// mount path into a file people commit and diff.
+    #[test]
+    fn the_lock_records_the_configured_source_not_the_container_view() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
+        std::fs::write(dir.path().join("feed/repodata/repomd.xml"), b"x").unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [ondisk, local]\nrepos:\n  ondisk:\n    path: ./feed\n  local:\n    url: http://localhost:8080\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        let locked = set.locked_feeds();
+        let by = |n: &str| locked.iter().find(|f| f.name == n).unwrap();
+
+        assert_eq!(by("ondisk").url, "./feed", "as written, not the mount path");
+        assert!(
+            by("ondisk").digest.is_some(),
+            "an on-disk feed is the one case content can be pinned"
+        );
+        assert_eq!(
+            by("local").url,
+            "http://localhost:8080",
+            "the user's URL, not the loopback rewrite"
+        );
+        // The container still sees the rewritten form — the two views differ, and
+        // that is the point.
+        let feed = set.feeds.iter().find(|f| f.name == "local").unwrap();
+        assert!(feed.baseurl.contains("host.docker.internal"));
+
+        // Order is recorded, because order is a strict priority override.
+        assert!(by("ondisk").position < by("local").position);
+        // Built-ins are not sources and are left out.
+        assert!(!locked.iter().any(|f| f.name == BUILTIN_EXT_FEED));
     }
 
     /// A private feed scoped away from a stage must not require a token there.

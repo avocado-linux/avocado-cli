@@ -700,7 +700,10 @@ impl RuntimeInstallCommand {
                     OutputLevel::Normal,
                 );
 
-                let yes = if self.force { "-y" } else { "" };
+                // dnf never prompts here: this applies the package set avocado.yaml and
+                // avocado.lock already declare, so there is no decision left to make.
+                // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+                let yes = "-y";
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
                     format!(" {} ", args.join(" "))
                 } else {
@@ -770,7 +773,8 @@ $DNF_SDK_HOST \
                     command: dnf_command,
                     verbose: self.verbose,
                     source_environment: false, // Don't source environment - matches rootfs install behavior
-                    interactive: !self.force,
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
                     feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
@@ -813,7 +817,7 @@ $DNF_SDK_HOST \
                             merged_container_args.clone(),
                             runs_on_context,
                             self.sdk_arch.as_ref(),
-                            Some(runtime_env_vars),
+                            Some(runtime_env_vars.clone()),
                         )
                         .await?;
 
@@ -823,6 +827,24 @@ $DNF_SDK_HOST \
                             &sysroot,
                             installed_versions,
                         );
+                        // Then which feed each package came from. Best effort:
+                        // `rpm` gives the version and cannot give the origin, dnf
+                        // gives the origin from the installroot's own history, and
+                        // a lock records a bare version when it cannot be known.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &sysroot,
+                                container_image,
+                                &target_arch,
+                                repo_url.cloned(),
+                                repo_release.cloned(),
+                                merged_container_args.clone(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                Some(runtime_env_vars.clone()),
+                            )
+                            .await;
+                        lock_file.set_sysroot_origins(&target_arch, &sysroot, &origins);
                         if self.verbose {
                             print_info(
                                 &format!(

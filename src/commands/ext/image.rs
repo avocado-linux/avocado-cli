@@ -266,6 +266,12 @@ impl ExtImageCommand {
         // that validates preconditions, and folded into this step's input hash at
         // both the check and the write.
         let mut build_content_hash: Option<String> = None;
+        // The skip's two facts, from the same batch read: is this step's own
+        // stamp current for the inputs computed now, and which of this
+        // extension's images already exist. Both stay at their defaults under
+        // `--no-stamps`, so nothing skips.
+        let mut own_stamp_current = false;
+        let mut existing_outputs: Vec<String> = Vec::new();
         if !self.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config_path, config)?
                 .verbose(self.verbose)
@@ -279,8 +285,21 @@ impl ExtImageCommand {
                 &[], // No extension dependencies for ext image
             );
 
-            // Batch all stamp reads into a single container invocation for performance
-            let batch_script = generate_batch_read_stamps_script(&required);
+            // Batch all stamp reads into a single container invocation for performance.
+            // The same round-trip also reads this step's OWN stamp and lists the
+            // images already in output/extensions/ for this extension — the two
+            // facts the skip below needs. The version is not known yet here, so
+            // the listing is matched against the exact filename once it is.
+            let own_req = crate::utils::stamps::StampRequirement::ext_image(&self.extension);
+            let batch_script = format!(
+                "{}\n{}\n{}",
+                generate_batch_read_stamps_script(&required),
+                generate_batch_read_stamps_script(std::slice::from_ref(&own_req)),
+                crate::utils::stamps::generate_output_listing_probe(&format!(
+                    "\"$AVOCADO_PREFIX/output/extensions/{n}-\"*.raw \"$AVOCADO_PREFIX/output/extensions/{n}-\"*.kab",
+                    n = self.extension
+                )),
+            );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target.clone(),
@@ -352,6 +371,12 @@ impl ExtImageCommand {
                 build_content_hash.as_deref(),
             )
             .ok();
+            let batch = output.as_deref().unwrap_or("");
+            if let Some(ref i) = image_inputs {
+                own_stamp_current = crate::utils::stamps::own_stamp_is_current(batch, &own_req, i);
+            }
+            existing_outputs = crate::utils::stamps::output_listing_from_batch(batch);
+
             let mut current_inputs: Vec<CurrentInput<'_>> = Vec::new();
             if let Some(ref i) = install_inputs {
                 current_inputs.push((StampComponent::Extension, StampCommand::Install, i));
@@ -630,30 +655,48 @@ impl ExtImageCommand {
             kab_env_vars = Some(env);
         }
 
-        let result = self
-            .create_image(
-                &container_helper,
-                container_image,
-                &target_arch,
-                &ext_version,
-                &ext_types.join(","), // Pass types for potential future use
-                repo_url.as_ref(),
-                repo_release.as_ref(),
-                &kab_container_args,
-                source_date_epoch,
-                filesystem,
-                &var_files,
-                &effective_tui_context,
-                &image_type,
-                image_args.as_deref(),
-                verity,
-                &kab_env_vars,
-            )
-            .await?;
+        let image_ext = if image_type == "kab" { "kab" } else { "raw" };
+        let image_filename = format!("{}-{}.{}", self.extension, ext_version, image_ext);
+
+        // Skip: the stamp this step wrote last time is current for every input
+        // computed above — config, on-disk content, and `ext build`'s output
+        // digest — and the image it wrote is still there. Nothing this step
+        // would do could produce different bytes. `--out` still delivers the
+        // existing file below; the stamp is left as it is.
+        let up_to_date = own_stamp_current && existing_outputs.iter().any(|f| f == &image_filename);
+        if up_to_date {
+            print_success(
+                &format!(
+                    "Image for extension '{}-{}' is up to date.",
+                    self.extension, ext_version
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
+        let result = up_to_date
+            || self
+                .create_image(
+                    &container_helper,
+                    container_image,
+                    &target_arch,
+                    &ext_version,
+                    &ext_types.join(","), // Pass types for potential future use
+                    repo_url.as_ref(),
+                    repo_release.as_ref(),
+                    &kab_container_args,
+                    source_date_epoch,
+                    filesystem,
+                    &var_files,
+                    &effective_tui_context,
+                    &image_type,
+                    image_args.as_deref(),
+                    verity,
+                    &kab_env_vars,
+                )
+                .await?;
 
         if result {
-            let image_ext = if image_type == "kab" { "kab" } else { "raw" };
-            let image_filename = format!("{}-{}.{}", self.extension, ext_version, image_ext);
             let container_image_path =
                 format!("/opt/_avocado/{target_arch}/output/extensions/{image_filename}");
 
@@ -676,14 +719,21 @@ impl ExtImageCommand {
                 .await?;
                 print_success(
                     &format!(
-                        "Successfully created image for extension '{}-{}': {}",
+                        "{} image for extension '{}-{}': {}",
+                        if up_to_date {
+                            "Delivered up-to-date"
+                        } else {
+                            "Successfully created"
+                        },
                         self.extension,
                         ext_version,
                         PathBuf::from(output_dir).join(&image_filename).display()
                     ),
                     OutputLevel::Normal,
                 );
-            } else {
+            } else if !up_to_date {
+                // The skip already reported "up to date"; don't follow it with
+                // a summary claiming the image was created.
                 print_success(
                     &format!(
                         "Successfully created image for extension '{}-{}' (types: {}).",
@@ -695,8 +745,9 @@ impl ExtImageCommand {
                 );
             }
 
-            // Write extension image stamp (unless --no-stamps)
-            if !self.no_stamps {
+            // Write extension image stamp (unless --no-stamps). A skipped run
+            // leaves the stamp that justified the skip.
+            if !self.no_stamps && !up_to_date {
                 let inputs = compute_ext_image_input_hash(
                     parsed,
                     &self.extension,
@@ -858,7 +909,7 @@ impl ExtImageCommand {
         extra_env_vars: &Option<std::collections::HashMap<String, String>>,
     ) -> Result<bool> {
         // Create the build script
-        let build_script = self.create_build_script(
+        let mut build_script = self.create_build_script(
             ext_version,
             extension_type,
             source_date_epoch,
@@ -868,6 +919,14 @@ impl ExtImageCommand {
             image_args,
             verity,
         );
+        if self.no_stamps {
+            build_script = format!(
+                "{}{build_script}",
+                crate::utils::stamps::remove_own_stamp_line(
+                    &crate::utils::stamps::StampRequirement::ext_image(&self.extension)
+                )
+            );
+        }
 
         // Execute the build script in the SDK container
         if self.verbose {
@@ -935,9 +994,12 @@ impl ExtImageCommand {
         // mkfs directly against the live sysroot (no work copy, unlike the
         // rootfs and initramfs paths) and later `ext dnf` / `ext install` calls
         // still resolve against that rpmdb.
-        let excludes: Vec<String> = ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"]
-            .iter()
-            .map(|s| (*s).to_string())
+        // The same list the sysroot digest prunes, so the digest and the image
+        // agree about what the image carries — a path pruned from one but
+        // shipped by the other is content no stamp ever sees.
+        let excludes: Vec<String> = crate::utils::stamps::package_state_paths()
+            .into_iter()
+            .map(str::to_string)
             .chain(var_excludes)
             .collect();
 
@@ -1445,10 +1507,17 @@ mod tests {
         let script =
             cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
 
+        let expected = crate::utils::stamps::package_state_paths();
         assert_eq!(
             script.matches("-e \"").count(),
-            3,
-            "only the three package-manager paths should be excluded"
+            expected.len(),
+            "only the package-state paths should be excluded"
         );
+        for path in expected {
+            assert!(
+                script.contains(&format!("-e \"{path}\"")),
+                "excludes {path}"
+            );
+        }
     }
 }
