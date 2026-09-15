@@ -4381,6 +4381,10 @@ extensions:
                     "x86_64",
                     false,
                     false,
+                    // include_mounts: the production call sites pass true, and
+                    // the reposdir expansion this test asserts lives in the
+                    // entrypoint body rather than the mount block.
+                    true,
                 ),
                 container.create_entrypoint_script_for_remote(
                     source_env,
