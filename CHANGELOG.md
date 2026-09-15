@@ -7,6 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] - 2026-09-15
+
+### Added
+- **Named package feeds: `repos:` and `distro.feeds`.** A project can pull from
+  any mix of the public feed, a mirror, a third-party RPM repository and a
+  directory of RPMs on disk. `repos:` defines feeds; `distro.feeds` orders and
+  enables them, and position is the dnf priority, a strict override, so a local
+  build placed ahead of the distro feed shadows it. `stages:` scopes a feed to
+  `sdk`, `rootfs`, `runtime`, `ext` or `initramfs`; `path:` feeds are
+  bind-mounted read-only and loopback URLs are rewritten so a locally hosted
+  feed is reachable from inside the container; credentials come from
+  `{{ env.X }}` references and are refused inside a URL; TLS settings are per
+  feed. The CLI identifies itself to feeds through the dnf User-Agent as
+  `avocado-cli/<version>;key/<id>;tier/<n>`. The resolved feed set is written
+  to `.avocado/feeds/<target>.json` and folded into the build stamps, so
+  changing a feed invalidates the sysroots built from it. (#241)
+- **Private organization feeds (`org:`), materialized once per invocation.**
+  `repos: { acme: { org: acme } }` has the CLI exchange its Connect credential
+  for a short-lived feed token and inject it into the generated repository
+  file; the token is never a build input, only the organization and a
+  `connect://<org>/<path>` locator are recorded. Errors name the remedy: not
+  logged in points at `avocado login`, a 403 means the account is not entitled,
+  a 404 means the deployment does not serve feed tokens yet. Feeds are resolved
+  and minted once per invocation rather than once per container, so a build
+  mints one token instead of five and every step shares one container shape.
+  Until the server side ships, `org:` fails closed with a clear message. (#243)
+- **The lock records the feed set per target, and each package's origin.**
+  `targets.<t>.feeds` lists the feeds a target resolved against, in priority
+  order, with the source as configured rather than as the container saw it and
+  a content digest for on-disk feeds; each locked package carries the repository
+  it came from. The set is replaced, not merged, so a dropped feed leaves the
+  lock, and a changed order is reported with the old and new sequence. Built-in
+  repositories are excluded. (#244)
+- **`avocado login`**, a top-level shortcut for `avocado connect auth login`.
+  Both spellings share one argument set and neither routes through the
+  avocado-vm. Logging in is what raises the feed rate limit and unlocks private
+  feeds. (#242)
+- **`kernel.cmdline` and `kernel.cmdline_extra` in project config.** `cmdline`
+  replaces the board's kernel command line outright; `cmdline_extra` appends to
+  it. Both resolve per runtime with a top-level fallback and reach the build and
+  provision hooks as `AVOCADO_KERNEL_CMDLINE` / `AVOCADO_KERNEL_CMDLINE_EXTRA`,
+  so `isolcpus` or `earlycon` no longer need a Yocto rebuild. (#252)
+- **`avocado hitl` is a managed NFS server: `start`, `status`, `stop`, `logs`,
+  `sync`.** `start` runs a detached, named, labelled container
+  (`avocado-hitl-<target>-<project hash>`), resolves the export root through
+  `readlink -f` because ganesha refuses a symlinked export, waits for ganesha to
+  report initialised, and fails, quoting the CRIT lines and stopping the
+  container, when an export did not load; a second `start` reports the running
+  server and its connect hint instead of duplicating it. `status` lists every
+  server on the machine, `stop` removes this project's or all of them, `logs`
+  shows the server log on demand, and `sync` re-runs the extension lifecycle on
+  a device after a rebuild. The old foreground behaviour remains as
+  `hitl server` / `start --foreground`. (#258)
+- **`avocado install` skips extensions that are already up to date.** Every
+  extension install stamp is read in one container call before installing; an
+  extension whose stamp matches the current input hash, whose sysroot is present
+  and whose lock pins exist is skipped without a dnf transaction. Only shell-safe
+  extension names take the fast path; anything else installs normally. A second
+  `install` with nothing changed is a no-op instead of ~26 s of redundant
+  transactions. (#260)
+- **`avocado sbom` now emits a `software_Sbom` per runtime and per extension,
+  not only one for the whole device.** (ENG-2219) Connect needs something
+  narrower than "everything on the device" to ingest, and each SBOM now says
+  whether it describes what is running or what was built.
+
+  More elements in the one existing document rather than a file each, for the
+  same reason `avocado sbom` already writes one document: a package in both
+  `rootfs` and a runtime is one package in two places, and a scanner unioning
+  files would count it twice. A runtime's SBOM roots itself, `rootfs`,
+  `initramfs`, the shared `includes` root and every extension it carries; every
+  extension gets one of its own as well, including a legacy `ext:<name>` and a
+  remote `includes:<name>` — neither names a runtime, so no runtime's SBOM
+  claims them. A nested-layout remote extension is the other way round: it
+  installs into the shared `includes` root and keeps no database of its own, so
+  it appears under that one name or nowhere, and every runtime claims it rather
+  than none. With
+  `--include-sdk` the build-host scopes get one too, typed `build` rather than
+  `deployed`. Nothing mints new elements: the added lists only reference ids
+  the device-wide document already emits. A group whose own defining scope is
+  empty is left out, since a document named for it would name nothing.
+
+  The pre-existing device-wide `software_Sbom` is unchanged apart from the
+  same plain-language `comment`, and is still the first in `@graph`.
+- **`avocado build` produces the deployable set *and* the OTA payload;
+  `avocado provision` builds the var image.** *(Breaking: `build` no longer
+  produces the var image.)* The split is by consumer: anything an OTA requires
+  is at the tail of `runtime build`, anything only provisioning consumes is at
+  the start of `provision`.
+
+  So the build tail keeps the `avocado-build-<target>` hook, `stone bundle`, the
+  `os_bundle` manifest patch and the re-sign after it. On UKI platforms that hook
+  *is* the kernel and initramfs, and `os-bundle.aos` is the OTA payload — not a
+  provisioning artifact. Verified that no provisioning script reads the bundle:
+  `avocado-provision-<target>` and the UFS flow both inject raw images.
+
+  `provision` builds the var image and primes Docker into it, which is all that
+  is genuinely provisioning-only. A pipeline that runs `avocado build` and then
+  flashes will find no var image; run `avocado provision`, which produces it.
+
+  `stone bundle` needs a var partition size because platform manifests declare
+  `var` as `expand: "true"` with no size, and it fails hard without the
+  `--partition-size` override. The var image does not exist at build time, so the
+  size is declared from the staged tree with headroom. That number reaches only
+  the bundle, an OTA never repartitions, and the partition expands at provision
+  time — but if a provision-from-bundle path is ever added it becomes real and
+  must come from the image.
+
+  The two halves live in `commands/runtime/var_image.rs` behind one context,
+  which is the set of things a portable provisioning bundle has to carry — what a
+  later `avocado provision --bundle <path>` would source from a bundle.
+
 ### Changed
 - **Installs no longer prompt, and `--force` no longer means "don't prompt".**
   `avocado install`, `ext install`, `runtime install` and `sdk install` apply
@@ -33,7 +144,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   No opt-out flag was added. An interactive confirmation cannot be answered
   usefully in CI or under the TUI, and the dnf pass-through commands already
   cover reviewing a transaction by hand.
-
 - **`--output json` no longer implies `--force`.** It did, because the TUI
   renderer was gated on `--force` — dnf could prompt without it, and the
   renderer made the prompt invisible — and because `docker run -it` fails
@@ -53,74 +163,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `install -f` (which never asked) worked. With `-y` unconditional there is
   nothing to answer, so the five install sites declare `interactive: false`.
   `sdk dnf`, `ext dnf`, `runtime dnf` and `provision` keep their terminals.
-### Security
-- `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
-  messages accepted across encryption level boundaries). Lock-only; the
-  fix version pulls `aws-lc-rs` 1.16.3 -> 1.18.1 and `aws-lc-sys` 0.40.0 ->
-  0.45.0 with it.
-
-### Fixed
-- `avocado signing-keys create` no longer generates a key before discovering
-  the name is taken. A duplicate name is rejected up front, so a repeated
-  `create <name> --algorithm rsa2048` no longer leaves an orphaned
-  `.key`/`.crt` pair behind, and `--pkcs11-device --generate` no longer
-  consumes a slot on the token before failing.
-- An extension with a `source: { type: path }` now mounts over an
-  `includes/<ext>` left populated by an earlier `package` or `git` fetch of the
-  same extension. bindfs on libfuse2 refused the non-empty mountpoint
-  (`fuse: mountpoint is not empty`), which made `avocado clean` the only way
-  forward.
-- A `type: path` source that cannot be resolved now reports the absolute path
-  it resolved to, the directory it was resolved against, and the config that
-  declared it — and names the directory when it exists one level off, e.g.
-  `extensions/foo` for a top-level `foo`.
-- **`ext install` now drops the build and image stamps when it clears an
-  extension's sysroot.** A clean reinstall (`--force`, a changed dependency, a
-  re-seed) removes the sysroot, and the dnf transaction that follows restores
-  only packages — the extension-release files, unit wiring and overlay come
-  from `ext build`, whose stamp inputs a clean does not change. With the skip
-  in place that stamp read as current over a sysroot no longer holding its
-  work, so `ext build` skipped and `ext image` shipped an extension with no
-  content in it. Found by real-project dogfood.
-
-- **The sysroot digest fails closed and never writes.** A missing sysroot, an
-  unreadable file, or any failed pipeline stage now exits non-zero instead of
-  digesting nothing into an accepted hash that every downstream step would read
-  as "current". The rpm query runs only when the database directory already
-  exists — `rpm -qa` on a root without one creates it, inside the tree being
-  measured — and `ext build` queries rpm's default dbpath, where `ext install`
-  actually records packages, rather than a path that held nothing.
-- **The digest's prune list and the extension image's exclude list are one
-  list.** `var/cache/ldconfig` and rpm's newer default dbpath were pruned from
-  the digest but shipped in the image — bytes no stamp saw. Both now come from
-  `package_state_paths()`. Extension images no longer carry `var/cache/ldconfig`
-  or `usr/lib/sysimage/rpm`.
-- **`runtime build` folds each extension's build digest as well as its image
-  digest.** `var_files` are copied out of the built sysroot into the var
-  partition and never enter the image, so the image digest alone was blind to
-  them.
-- **`--no-stamps` removes the step's own stamp.** An unrecorded run no longer
-  leaves the previous run's output digest for a downstream step to trust and
-  skip over; downstream now either runs with `--no-stamps` too or fails its
-  precondition loudly.
-- **A stamp from an older format is reported as "stamp format changed
-  (vN → vM)"**, not "config hash mismatch", after a CLI upgrade. The heading is
-  now "Stale steps:" since the reason names the cause.
-- `reload_service_manager` — written into the extension release file — is folded
-  into the extension build hash.
-- The digest-bearing stamp writer anchors its substitution on the quoted JSON
-  value, so a field that happens to contain the placeholder text is untouched.
-- Removed the unused `StampOutputs.exports` field.
-- **The extension image hash chains on the build digest and folds only what the
-  imager reads** — `version`, `types`, `image`, `filesystem`, `var_files`,
-  `subvolumes`, the kab keyset when the image is kab, and the exclude list it
-  applies. Build-only inputs (`post_build`, overlay, `package_files`) reach the
-  image through the tree, and the build digest already says whether the tree
-  changed; folding them directly re-imaged on every build-input edit that left
-  the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
-  change now invalidates every image by itself.
-
-### Changed
 - **Ctrl-C removes the session containers it started.** `atexit` does not run
   for a signal, so an interrupted run left containers parked and holding the
   project volume until the next invocation swept them by pid. A SIGINT handler
@@ -210,7 +252,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first build after upgrading re-stamps the runtime once (its inputs gained
   the two digests); it is stable from the second build on. On the dogfood
   project this is most of the remaining build time once extension steps skip.
-
 - **`ext build` and `ext image` skip when nothing they read has changed.** Each
   step now reads its own stamp in the batch stamp read it already does for its
   preconditions, and probes for its output in the same round-trip. When the
@@ -263,7 +304,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one side and none on the other is stale, never a match by omission.
 - An unreadable directory inside an overlay now fails the stamp check and the
   materialization instead of being silently dropped from both.
-
 - **Runtime builds stop copying and re-hashing every image.** Per build, each
   image was written twice into the volume — once into the runtime directory,
   once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
@@ -277,47 +317,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `images/` now fails the hash collection instead of being silently
   dropped from the published target list.
 
-- **Runtime builds stop copying and re-hashing every image.** Per build, each
-  image was written twice into the volume — once into the runtime directory,
-  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
-  manifest step and again by the TUF hash collection; `avocado deploy` hashed
-  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
-  copy on a filesystem that refuses the link), the extension copies and the
-  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
-  and xfs, a plain copy elsewhere), and both hash collections read each
-  image's `sha256` out of the manifest — computed over the same inode — with
-  only `size` still coming from `stat`. A manifest entry whose image is absent
-  from `images/` now fails the hash collection instead of being silently
-  dropped from the published target list.
+### Fixed
+- **`avocado build` builds the `depends_on` closure, not just the authored
+  list.** An extension reached only through `depends_on` was installed but
+  never built or imaged, so it never reached the device: a board came up without
+  its core-kit firmware while `install` had reported success. The build
+  scheduler and the `ext build` / `ext image` membership checks now share one
+  closure, so the set that is built and the set those commands consider part of
+  the runtime cannot drift apart. (#253)
+- **A package-sourced extension can ship the device-tree overlay it
+  declares.** Overlay `src` paths of an extension with a `source:` resolve from
+  `$AVOCADO_PREFIX/includes/<ext>` instead of the project bind-mount, and
+  `.dtso` sources are collected into the extension package, including those
+  declared under `target-<t>:` blocks. Either fix alone still failed: the first
+  named a file that was never shipped, the second shipped a file nothing looked
+  for. (#254)
+- **`runtime build` clears the device-tree overlay staging directory on every
+  build.** The clear only ran when at least one overlay was declared, so
+  dropping the last overlay left the previous build's `apply-order` and `.dtbo`
+  in place and the platform hook merged them into the next image; a core-kit
+  build inherited a mezzanine's overlay and the resulting image faulted the
+  board in firmware. (#255)
+- **The SDK entrypoint reads one `VERSION_CODENAME` line from os-release.** Both
+  published SDK images repeat the key, so an unanchored read handed dnf two
+  lines and every dnf call failed with `No such command: 2024/edge` whenever
+  `AVOCADO_SDK_REPO_RELEASE` was unset. (#240)
+- **A kernel version change invalidates every extension's install stamp, and a
+  changed kernel pin cleans the sysroot before the reinstall.** The extension
+  install hash omitted the kernel, so a validator accepted a stamp written
+  against the old kernel and skipped a sysroot that now resolves a different
+  module set. The declared `kernel` config and the extension's resolved pin are
+  both folded, and the pin is read across lock scopes so `ext install`,
+  `ext build` and `ext image` agree on it whichever side resolved a runtime. As
+  rootfs and initramfs already did, a changed pin wipes the sysroot so the old
+  kernel's module packages cannot linger beside the new ones; a first pin over a
+  sysroot that already exists counts as a change, which is the state
+  `avocado update` and `avocado clean --unlock` leave behind. The wipe also
+  drops the extension's package pins, a failed wipe fails the install instead
+  of being stamped over, and the lock is saved once, after the install
+  succeeds. `narrow_kernel_for_hash` now resolves the named-map `kernel:` form
+  (`default`, or the sole entry) instead of hashing an empty map, which also
+  moves the rootfs, initramfs and runtime-build hashes for projects that declare
+  their kernel that way. `STAMP_VERSION` moves 4 → 5. (#267)
+- **Stamp errors now name the target, docker volume and daemon they searched.**
+  Stamps live at `/opt/_avocado/<target>/.stamps` inside the project's docker
+  volume, on whichever daemon the process routed to, so a step reported missing
+  is usually one of those three differing from the command that wrote it: a
+  different `--target`, a different project directory and therefore a different
+  volume, or the host's docker rather than the avocado-vm's. The error named
+  none of them. Under `--runs-on` the line also notes that the volume stays
+  local and is exported over NFS. A stamp that exists but whose JSON does not
+  parse is also no longer reported as simply missing: it gets its own section
+  with the parse error, rather than being indistinguishable from an absent file.
+- `avocado signing-keys create` no longer generates a key before discovering
+  the name is taken. A duplicate name is rejected up front, so a repeated
+  `create <name> --algorithm rsa2048` no longer leaves an orphaned
+  `.key`/`.crt` pair behind, and `--pkcs11-device --generate` no longer
+  consumes a slot on the token before failing.
+- An extension with a `source: { type: path }` now mounts over an
+  `includes/<ext>` left populated by an earlier `package` or `git` fetch of the
+  same extension. bindfs on libfuse2 refused the non-empty mountpoint
+  (`fuse: mountpoint is not empty`), which made `avocado clean` the only way
+  forward.
+- A `type: path` source that cannot be resolved now reports the absolute path
+  it resolved to, the directory it was resolved against, and the config that
+  declared it — and names the directory when it exists one level off, e.g.
+  `extensions/foo` for a top-level `foo`.
+- **`ext install` now drops the build and image stamps when it clears an
+  extension's sysroot.** A clean reinstall (`--force`, a changed dependency, a
+  re-seed) removes the sysroot, and the dnf transaction that follows restores
+  only packages — the extension-release files, unit wiring and overlay come
+  from `ext build`, whose stamp inputs a clean does not change. With the skip
+  in place that stamp read as current over a sysroot no longer holding its
+  work, so `ext build` skipped and `ext image` shipped an extension with no
+  content in it. Found by real-project dogfood.
+- **The sysroot digest fails closed and never writes.** A missing sysroot, an
+  unreadable file, or any failed pipeline stage now exits non-zero instead of
+  digesting nothing into an accepted hash that every downstream step would read
+  as "current". The rpm query runs only when the database directory already
+  exists — `rpm -qa` on a root without one creates it, inside the tree being
+  measured — and `ext build` queries rpm's default dbpath, where `ext install`
+  actually records packages, rather than a path that held nothing.
+- **The digest's prune list and the extension image's exclude list are one
+  list.** `var/cache/ldconfig` and rpm's newer default dbpath were pruned from
+  the digest but shipped in the image — bytes no stamp saw. Both now come from
+  `package_state_paths()`. Extension images no longer carry `var/cache/ldconfig`
+  or `usr/lib/sysimage/rpm`.
+- **`runtime build` folds each extension's build digest as well as its image
+  digest.** `var_files` are copied out of the built sysroot into the var
+  partition and never enter the image, so the image digest alone was blind to
+  them.
+- **`--no-stamps` removes the step's own stamp.** An unrecorded run no longer
+  leaves the previous run's output digest for a downstream step to trust and
+  skip over; downstream now either runs with `--no-stamps` too or fails its
+  precondition loudly.
+- **A stamp from an older format is reported as "stamp format changed
+  (vN → vM)"**, not "config hash mismatch", after a CLI upgrade. The heading is
+  now "Stale steps:" since the reason names the cause.
+- `reload_service_manager` — written into the extension release file — is folded
+  into the extension build hash.
+- The digest-bearing stamp writer anchors its substitution on the quoted JSON
+  value, so a field that happens to contain the placeholder text is untouched.
+- Removed the unused `StampOutputs.exports` field.
+- **The extension image hash chains on the build digest and folds only what the
+  imager reads** — `version`, `types`, `image`, `filesystem`, `var_files`,
+  `subvolumes`, the kab keyset when the image is kab, and the exclude list it
+  applies. Build-only inputs (`post_build`, overlay, `package_files`) reach the
+  image through the tree, and the build digest already says whether the tree
+  changed; folding them directly re-imaged on every build-input edit that left
+  the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
+  change now invalidates every image by itself.
 
-### Added
-- **`avocado build` produces the deployable set *and* the OTA payload;
-  `avocado provision` builds the var image.** *(Breaking: `build` no longer
-  produces the var image.)* The split is by consumer: anything an OTA requires
-  is at the tail of `runtime build`, anything only provisioning consumes is at
-  the start of `provision`.
-
-  So the build tail keeps the `avocado-build-<target>` hook, `stone bundle`, the
-  `os_bundle` manifest patch and the re-sign after it. On UKI platforms that hook
-  *is* the kernel and initramfs, and `os-bundle.aos` is the OTA payload — not a
-  provisioning artifact. Verified that no provisioning script reads the bundle:
-  `avocado-provision-<target>` and the UFS flow both inject raw images.
-
-  `provision` builds the var image and primes Docker into it, which is all that
-  is genuinely provisioning-only. A pipeline that runs `avocado build` and then
-  flashes will find no var image; run `avocado provision`, which produces it.
-
-  `stone bundle` needs a var partition size because platform manifests declare
-  `var` as `expand: "true"` with no size, and it fails hard without the
-  `--partition-size` override. The var image does not exist at build time, so the
-  size is declared from the staged tree with headroom. That number reaches only
-  the bundle, an OTA never repartitions, and the partition expands at provision
-  time — but if a provision-from-bundle path is ever added it becomes real and
-  must come from the image.
-
-  The two halves live in `commands/runtime/var_image.rs` behind one context,
-  which is the set of things a portable provisioning bundle has to carry — what a
-  later `avocado provision --bundle <path>` would source from a bundle.
+### Security
+- `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption level boundaries). Lock-only; the
+  fix version pulls `aws-lc-rs` 1.16.3 -> 1.18.1 and `aws-lc-sys` 0.40.0 ->
+  0.45.0 with it.
 
 ## [1.0.0-rc.3] - 2026-09-01
 
@@ -595,29 +710,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about ten days, and an SBOM is a component inventory of a shipped product.
   Whether a given document can be published is the operator's call, on a
   document they can read first.
-- **`avocado sbom` now emits a `software_Sbom` per runtime and per extension,
-  not only one for the whole device.** (ENG-2219) Connect needs something
-  narrower than "everything on the device" to ingest, and each SBOM now says
-  whether it describes what is running or what was built.
-
-  More elements in the one existing document rather than a file each, for the
-  same reason `avocado sbom` already writes one document: a package in both
-  `rootfs` and a runtime is one package in two places, and a scanner unioning
-  files would count it twice. A runtime's SBOM roots itself, `rootfs`,
-  `initramfs`, the shared `includes` root and every extension it carries; every
-  extension gets one of its own as well, including a legacy `ext:<name>` and a
-  remote `includes:<name>` — neither names a runtime, so no runtime's SBOM
-  claims them. A nested-layout remote extension is the other way round: it
-  installs into the shared `includes` root and keeps no database of its own, so
-  it appears under that one name or nowhere, and every runtime claims it rather
-  than none. With
-  `--include-sdk` the build-host scopes get one too, typed `build` rather than
-  `deployed`. Nothing mints new elements: the added lists only reference ids
-  the device-wide document already emits. A group whose own defining scope is
-  empty is left out, since a document named for it would name nothing.
-
-  The pre-existing device-wide `software_Sbom` is unchanged apart from the
-  same plain-language `comment`, and is still the first in `@graph`.
 - **`avocado connect upload` attaches the uploaded runtime's own SBOM to the
   create-runtime request.** (ENG-2219) The runtime-scoped slice of the same
   document is sent as `runtime.sbom` on `POST .../runtimes`; `RuntimeParams`
@@ -917,6 +1009,7 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.0.0-rc.4]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.1
