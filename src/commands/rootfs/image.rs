@@ -249,6 +249,53 @@ pub fn render_build_id_block(spec: &BuildIdSpec) -> String {
     )
 }
 
+/// Shell that records the listed variables — those that are set — as
+/// `export NAME=value` lines in `<output_expr>.exports`, next to the image they
+/// describe. A later build that finds the image current sources this file
+/// instead of rebuilding, so everything downstream of the image section sees
+/// the same variables it would have after a real build. Unset variables are
+/// omitted (a rootfs without verity has no root hash), so consumers that test
+/// with `-n` behave identically on both paths.
+pub fn render_exports_file(output_expr: &str, vars: &[&str]) -> String {
+    let list = vars.join(" ");
+    format!(
+        r#"    : > "{output_expr}.exports"
+    for _v in {list}; do
+        if [ -n "${{!_v+x}}" ]; then printf 'export %s=%q\n' "$_v" "${{!_v}}" >> "{output_expr}.exports"; fi
+    done"#
+    )
+}
+
+/// Wrap an image build section in a reuse gate. When `reuse` is true — the
+/// host found the section's stamp current for every input, including the
+/// install step's content digest — and both the image and its `.exports` file
+/// exist, the section is replaced by sourcing the exports; otherwise the full
+/// section runs. The existence checks are in the container, where the files
+/// are: a current stamp whose image is gone must still rebuild.
+///
+/// `var` names the gate variable (`ROOTFS_IMAGE_REUSE`), bound rather than
+/// inlined so the rendered text cannot collide with other `if [ "0" = "1" ]`
+/// gates the script already carries.
+pub fn gate_image_section(
+    section: &str,
+    output_expr: &str,
+    var: &str,
+    label: &str,
+    reuse: bool,
+) -> String {
+    let flag = if reuse { "1" } else { "0" };
+    format!(
+        r#"
+{var}="{flag}"
+if [ "${var}" = "1" ] && [ -f "{output_expr}" ] && [ -f "{output_expr}.exports" ]; then
+    echo "{label} image is up to date; reusing {output_expr}"
+    . "{output_expr}.exports"
+else
+{section}
+fi"#
+    )
+}
+
 /// Generate the shell script fragment that builds a rootfs image from the shared sysroot.
 ///
 /// The generated script expects these shell variables to be set:
@@ -446,6 +493,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     export AVOCADO_ROOTFS_IMAGE="$ROOTFS_OUTPUT"
 {verity_step}    export AVOCADO_ROOTFS_FILESYSTEM="$ROOTFS_FS"
     export AVOCADO_OS_BUILD_ID="$OS_BUILD_ID"
+{exports_file}
     echo "Built rootfs: $ROOTFS_OUTPUT (AVOCADO_OS_BUILD_ID=$OS_BUILD_ID)"
 else
     echo "No rootfs sysroot found — skipping rootfs image build."
@@ -453,6 +501,16 @@ fi"#,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
         verity_step = verity_step,
+        exports_file = render_exports_file(
+            "$ROOTFS_OUTPUT",
+            &[
+                "AVOCADO_ROOTFS_IMAGE",
+                "AVOCADO_ROOTFS_FILESYSTEM",
+                "AVOCADO_OS_BUILD_ID",
+                "AVOCADO_ROOTFS_ROOTHASH",
+                "AVOCADO_ROOTFS_VERITY",
+            ],
+        ),
         permissions_section = permissions_section,
         purge_paths = render_build_state_purge("ROOTFS_WORK"),
         build_id_block = render_build_id_block(&BuildIdSpec {
@@ -774,6 +832,95 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `.exports` records exactly the variables that are set, as sourceable
+    /// `export` lines, so a reused image replays what a full build exported
+    /// and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn exports_file_records_set_variables_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image.erofs");
+        let script = format!(
+            "A_IMG=/x/y.erofs; A_HASH='with space'; unset A_ROOTHASH\n{}\n",
+            render_exports_file(
+                &out.display().to_string(),
+                &["A_IMG", "A_HASH", "A_ROOTHASH"]
+            )
+        );
+        assert!(std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap()
+            .success());
+        let exports = std::fs::read_to_string(format!("{}.exports", out.display())).unwrap();
+        assert!(exports.contains("export A_IMG=/x/y.erofs\n"));
+        assert!(
+            exports.contains("export A_HASH=with\\ space\n"),
+            "{exports}"
+        );
+        assert!(!exports.contains("A_ROOTHASH"), "unset var omitted");
+        // Round-trips through `source`.
+        let back = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". \"{}.exports\"; printf '%s|%s' \"$A_IMG\" \"$A_HASH\"",
+                out.display()
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(back.stdout).unwrap(),
+            "/x/y.erofs|with space"
+        );
+    }
+
+    /// The gate replaces the section only when armed AND the image and its
+    /// exports both exist; any other state runs the full section. Exercised
+    /// under bash so the shell shape is what's tested.
+    #[cfg(unix)]
+    #[test]
+    fn image_gate_reuses_only_with_image_and_exports_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("img.erofs");
+        let run = |reuse: bool| {
+            let script = gate_image_section(
+                "    echo FULL-SECTION",
+                &out.display().to_string(),
+                "ROOTFS_IMAGE_REUSE",
+                "rootfs",
+                reuse,
+            );
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert!(
+            run(true).contains("FULL-SECTION"),
+            "no image yet: full build"
+        );
+        std::fs::write(&out, "x").unwrap();
+        assert!(
+            run(true).contains("FULL-SECTION"),
+            "image but no exports: full build"
+        );
+        std::fs::write(format!("{}.exports", out.display()), "export Y=1\n").unwrap();
+        let reused = run(true);
+        assert!(reused.contains("up to date; reusing") && !reused.contains("FULL-SECTION"));
+        assert!(run(false).contains("FULL-SECTION"), "not armed: full build");
+
+        // Text shape: a bound variable, never a bare literal that could collide
+        // with the script's other `if [ "0" = "1" ]` gates.
+        let s = gate_image_section("x", "/o", "ROOTFS_IMAGE_REUSE", "rootfs", true);
+        assert!(
+            s.contains("ROOTFS_IMAGE_REUSE=\"1\"")
+                && s.contains("if [ \"$ROOTFS_IMAGE_REUSE\" = \"1\" ]")
+        );
+    }
 
     #[test]
     fn test_rootfs_verity_step_is_opt_in_and_exports_root_hash() {

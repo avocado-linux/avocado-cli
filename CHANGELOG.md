@@ -28,8 +28,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it resolved to, the directory it was resolved against, and the config that
   declared it — and names the directory when it exists one level off, e.g.
   `extensions/foo` for a top-level `foo`.
+- **`ext install` now drops the build and image stamps when it clears an
+  extension's sysroot.** A clean reinstall (`--force`, a changed dependency, a
+  re-seed) removes the sysroot, and the dnf transaction that follows restores
+  only packages — the extension-release files, unit wiring and overlay come
+  from `ext build`, whose stamp inputs a clean does not change. With the skip
+  in place that stamp read as current over a sysroot no longer holding its
+  work, so `ext build` skipped and `ext image` shipped an extension with no
+  content in it. Found by real-project dogfood.
+
+- **The sysroot digest fails closed and never writes.** A missing sysroot, an
+  unreadable file, or any failed pipeline stage now exits non-zero instead of
+  digesting nothing into an accepted hash that every downstream step would read
+  as "current". The rpm query runs only when the database directory already
+  exists — `rpm -qa` on a root without one creates it, inside the tree being
+  measured — and `ext build` queries rpm's default dbpath, where `ext install`
+  actually records packages, rather than a path that held nothing.
+- **The digest's prune list and the extension image's exclude list are one
+  list.** `var/cache/ldconfig` and rpm's newer default dbpath were pruned from
+  the digest but shipped in the image — bytes no stamp saw. Both now come from
+  `package_state_paths()`. Extension images no longer carry `var/cache/ldconfig`
+  or `usr/lib/sysimage/rpm`.
+- **`runtime build` folds each extension's build digest as well as its image
+  digest.** `var_files` are copied out of the built sysroot into the var
+  partition and never enter the image, so the image digest alone was blind to
+  them.
+- **`--no-stamps` removes the step's own stamp.** An unrecorded run no longer
+  leaves the previous run's output digest for a downstream step to trust and
+  skip over; downstream now either runs with `--no-stamps` too or fails its
+  precondition loudly.
+- **A stamp from an older format is reported as "stamp format changed
+  (vN → vM)"**, not "config hash mismatch", after a CLI upgrade. The heading is
+  now "Stale steps:" since the reason names the cause.
+- `reload_service_manager` — written into the extension release file — is folded
+  into the extension build hash.
+- The digest-bearing stamp writer anchors its substitution on the quoted JSON
+  value, so a field that happens to contain the placeholder text is untouched.
+- Removed the unused `StampOutputs.exports` field.
+- **The extension image hash chains on the build digest and folds only what the
+  imager reads** — `version`, `types`, `image`, `filesystem`, `var_files`,
+  `subvolumes`, the kab keyset when the image is kab, and the exclude list it
+  applies. Build-only inputs (`post_build`, overlay, `package_files`) reach the
+  image through the tree, and the build digest already says whether the tree
+  changed; folding them directly re-imaged on every build-input edit that left
+  the tree byte-identical, defeating the cascade stop. A `package_state_paths()`
+  change now invalidates every image by itself.
 
 ### Changed
+- **`runtime build` reuses the rootfs and initramfs images when nothing they
+  depend on has changed.** Each image section now has a stamp whose input is
+  the install step's tree digest plus the resolved image config — filesystem,
+  kab args, verity, permissions, `post_install` content, and the runtime's
+  `var`/`version`/inline `rootfs`/`initramfs` keys including per-target
+  overrides, so a per-target `var.encrypt: true` can never skip the initramfs
+  that must carry its marker. When the stamp is current and the image and its
+  `.exports` file both exist in the volume, the section is replaced by sourcing
+  the exports the last full build recorded; everything downstream sees the same
+  variables. The image digests join the runtime build's own input, so the
+  first build after upgrading re-stamps the runtime once (its inputs gained
+  the two digests); it is stable from the second build on. On the dogfood
+  project this is most of the remaining build time once extension steps skip.
+
+- **`ext build` and `ext image` skip when nothing they read has changed.** Each
+  step now reads its own stamp in the batch stamp read it already does for its
+  preconditions, and probes for its output in the same round-trip. When the
+  stamp is current for every input computed now — config, the compile and
+  install scripts' content, the `package_files` source tree, the overlay, and
+  for `ext image` the digest `ext build` recorded — and the output is present,
+  the step reports "up to date" and returns before any container work. The
+  stamp is left as it is. A source edit under a compiled extension reaches the
+  input hash and is never skipped over; a rebuild that changed no bytes stops
+  at `ext image`, which reads the same unchanged digest. `--no-stamps` disables
+  the skip along with everything else. `avocado build` on a project where one
+  extension changed now rebuilds one extension.
 - **Stamps now record what a step produced, and the next step's input depends
   on it.** `STAMP_VERSION` moves 3 → 4. `ext build` records a digest of the
   built sysroot (sorted NEVRA set plus a tree hash of everything the image
@@ -125,20 +196,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two halves live in `commands/runtime/var_image.rs` behind one context,
   which is the set of things a portable provisioning bundle has to carry — what a
   later `avocado provision --bundle <path>` would source from a bundle.
-
-### Changed
-- **Runtime builds stop copying and re-hashing every image.** Per build, each
-  image was written twice into the volume — once into the runtime directory,
-  once into `var-staging/lib/avocado/images/` — and sha256'd twice, by the
-  manifest step and again by the TUF hash collection; `avocado deploy` hashed
-  them a third time. Images now land in `lib/avocado/images/` by hardlink (a
-  copy on a filesystem that refuses the link), the extension copies and the
-  rootfs/initramfs work trees use `cp --reflink=auto` (a CoW clone on btrfs
-  and xfs, a plain copy elsewhere), and both hash collections read each
-  image's `sha256` out of the manifest — computed over the same inode — with
-  only `size` still coming from `stat`. A manifest entry whose image is absent
-  from `images/` now fails the hash collection instead of being silently
-  dropped from the published target list.
 
 ## [1.0.0-rc.3] - 2026-09-01
 
