@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption level boundaries). Lock-only; the
+  fix version pulls `aws-lc-rs` 1.16.3 -> 1.18.1 and `aws-lc-sys` 0.40.0 ->
+  0.45.0 with it.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated
