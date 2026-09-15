@@ -340,7 +340,6 @@ impl ExtBuildCommand {
                 &self.extension,
                 &target,
                 &lock_src_dir,
-                self.runtime.as_deref(),
             )
             .ok();
             let build_inputs = compute_ext_build_input_hash(

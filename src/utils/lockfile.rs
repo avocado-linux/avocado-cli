@@ -1380,6 +1380,82 @@ impl LockFile {
         }
     }
 
+    /// The package map of a sysroot, created empty if the lock has no entry yet.
+    fn sysroot_packages_mut(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+    ) -> &mut PackageVersions {
+        let target_locks = self.targets.entry(target.to_string()).or_default();
+        match sysroot {
+            SysrootType::Sdk(arch) => target_locks.sdk.entry(arch.clone()).or_default(),
+            SysrootType::Rootfs => &mut target_locks.rootfs,
+            SysrootType::Initramfs => &mut target_locks.initramfs,
+            SysrootType::TargetSysroot => &mut target_locks.target_sysroot,
+            SysrootType::Extension(name) => {
+                &mut target_locks
+                    .extensions
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
+            }
+            SysrootType::Runtime(name) => {
+                &mut target_locks
+                    .runtimes
+                    .entry(name.clone())
+                    .or_default()
+                    .packages
+            }
+            SysrootType::Kernel(version) => {
+                target_locks.kernels.entry(version.clone()).or_default()
+            }
+            SysrootType::RuntimeExtension { runtime, extension } => {
+                &mut target_locks
+                    .runtimes
+                    .entry(runtime.clone())
+                    .or_default()
+                    .extensions
+                    .entry(extension.clone())
+                    .or_default()
+                    .packages
+            }
+        }
+    }
+
+    /// Forget every package pin of one sysroot, keeping its kernel pin and the
+    /// rest of the lock. Rootfs and initramfs do this (`clear_rootfs`,
+    /// `clear_initramfs`) when a kernel pin change wipes the sysroot: a stale
+    /// package map over an empty sysroot would ask dnf for exact old versions a
+    /// rolling feed may no longer carry.
+    pub fn clear_sysroot_packages(&mut self, target: &str, sysroot: &SysrootType) {
+        self.sysroot_packages_mut(target, sysroot).clear();
+    }
+
+    /// The kernel pin recorded for an extension under whichever scope holds
+    /// one: the legacy `extensions/<ext>` key first, then each runtime's
+    /// `runtimes/<rt>/extensions/<ext>` in name order -- the same walk as
+    /// [`Self::get_extension_packages_any_scope`]. `ext install` pins under the
+    /// scope it installs into while `ext build`/`ext image` resolve a runtime
+    /// on their own, so a scope-specific read on either side makes the two
+    /// disagree; both fold this instead.
+    pub fn get_kernel_version_any_scope(&self, target: &str, ext_name: &str) -> Option<&String> {
+        let tl = self.targets.get(target)?;
+        let legacy = SysrootType::Extension(ext_name.to_string()).lock_key();
+        if let Some(k) = tl.kernel_versions.get(&legacy) {
+            return Some(k);
+        }
+        // Pins are a flat map keyed by lock key, so the runtime scopes are
+        // found on the keys themselves rather than under `runtimes`.
+        let suffix = format!("/extensions/{ext_name}");
+        let mut runtime_keys: Vec<&String> = tl
+            .kernel_versions
+            .keys()
+            .filter(|k| k.starts_with("runtimes/") && k.ends_with(&suffix))
+            .collect();
+        runtime_keys.sort();
+        runtime_keys.first().map(|k| &tl.kernel_versions[*k])
+    }
+
     /// Get the pinned KERNEL_VERSION for a specific target and sysroot, if any.
     pub fn get_kernel_version(&self, target: &str, sysroot: &SysrootType) -> Option<&String> {
         self.targets
@@ -3922,6 +3998,67 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let recorded = lock.get_boot_record("icam-540");
         assert_eq!(recorded.kernel_version.as_deref(), Some("5.15.185-l4t"));
         assert_eq!(recorded.active_runtime.as_deref(), Some("dev-l4t"));
+    }
+
+    /// The writer pins under the scope it installs into and the readers
+    /// resolve a runtime of their own; both must land on the same pin, so the
+    /// lookup walks scopes the way the package lookup does.
+    #[test]
+    fn kernel_pin_any_scope_walks_legacy_then_runtimes() {
+        let mut lock = LockFile::new();
+        assert!(lock.get_kernel_version_any_scope("t", "foo").is_none());
+        let rt = SysrootType::RuntimeExtension {
+            runtime: "dev".to_string(),
+            extension: "foo".to_string(),
+        };
+        lock.set_kernel_version("t", &rt, "6.6.6");
+        assert_eq!(
+            lock.get_kernel_version_any_scope("t", "foo")
+                .map(String::as_str),
+            Some("6.6.6")
+        );
+        // The legacy global scope wins when both are present, as for packages.
+        lock.set_kernel_version("t", &SysrootType::Extension("foo".to_string()), "6.6.5");
+        assert_eq!(
+            lock.get_kernel_version_any_scope("t", "foo")
+                .map(String::as_str),
+            Some("6.6.5")
+        );
+        // Another extension's pin is not this extension's.
+        assert!(lock.get_kernel_version_any_scope("t", "bar").is_none());
+    }
+
+    /// A kernel pin change wipes the sysroot; the package pins must go with it
+    /// while the kernel pin and everything else stays.
+    #[test]
+    fn clear_sysroot_packages_drops_pins_but_not_the_kernel() {
+        let mut lock = LockFile::new();
+        let rt = SysrootType::RuntimeExtension {
+            runtime: "dev".to_string(),
+            extension: "foo".to_string(),
+        };
+        lock.update_sysroot_versions(
+            "t",
+            &rt,
+            HashMap::from([("pkg".to_string(), "1.0-r0".to_string())]),
+        );
+        lock.set_kernel_version("t", &rt, "6.6.6");
+        lock.update_sysroot_versions(
+            "t",
+            &SysrootType::Rootfs,
+            HashMap::from([("base".to_string(), "2.0-r0".to_string())]),
+        );
+
+        lock.clear_sysroot_packages("t", &rt);
+
+        assert!(lock.get_locked_version("t", &rt, "pkg").is_none());
+        assert_eq!(
+            lock.get_kernel_version("t", &rt).map(String::as_str),
+            Some("6.6.6")
+        );
+        assert!(lock
+            .get_locked_version("t", &SysrootType::Rootfs, "base")
+            .is_some());
     }
 
     #[test]
