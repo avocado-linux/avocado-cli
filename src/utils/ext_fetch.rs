@@ -299,6 +299,9 @@ pub struct ExtensionFetcher {
     sdk_arch: Option<String>,
     /// Source directory for resolving relative extension paths
     src_dir: Option<PathBuf>,
+    /// Named feeds (`repos:` / `distro.feeds`) for the ext stage, so an
+    /// extension package that lives only in a local or vendor feed is fetchable.
+    feeds: Option<crate::utils::feeds::FeedMaterialization>,
 }
 
 impl ExtensionFetcher {
@@ -319,7 +322,14 @@ impl ExtensionFetcher {
             container_args: None,
             sdk_arch: None,
             src_dir: None,
+            feeds: None,
         }
+    }
+
+    /// Set the named feeds materialized for the ext stage
+    pub fn with_feeds(mut self, feeds: Option<crate::utils::feeds::FeedMaterialization>) -> Self {
+        self.feeds = feeds;
+        self
     }
 
     /// Set repository URL
@@ -621,6 +631,7 @@ echo "{INSTALLED_REPORT_END}"
             source_environment: true,
             interactive: false,
             repo_url: self.repo_url.clone(),
+            feeds: self.feeds.clone(),
             repo_release: self.repo_release.clone(),
             container_args: self.container_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
@@ -764,6 +775,7 @@ echo "Successfully installed extension '{ext_name}' (package: {package_spec}) to
             source_environment: true,
             interactive: false,
             repo_url: self.repo_url.clone(),
+            feeds: self.feeds.clone(),
             repo_release: self.repo_release.clone(),
             container_args: self.container_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
@@ -850,6 +862,7 @@ echo "Successfully fetched extension '{ext_name}' from git"
             source_environment: true,
             interactive: false,
             repo_url: self.repo_url.clone(),
+            feeds: self.feeds.clone(),
             repo_release: self.repo_release.clone(),
             container_args: self.container_args.clone(),
             sdk_arch: self.sdk_arch.clone(),
