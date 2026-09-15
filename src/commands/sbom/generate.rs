@@ -1,14 +1,15 @@
 //! `avocado sbom` — emit an SPDX 3.0.1 SBOM of what this project installed.
 //!
 //! Asks RPM what is in every sysroot (the walk lives in `utils::sysroot_scan`)
-//! and writes one `software_Sbom` of type `deployed`.
+//! and writes a device-wide `software_Sbom` of type `deployed`, plus one more
+//! `software_Sbom` per runtime, per extension, and (with `--include-sdk`) one
+//! for the build host — see `groups` (ENG-2219).
 //!
-//! One document with one root per scope, rather than one document per scope,
-//! for a reason that is about correctness rather than tidiness: a package
-//! present in both `rootfs` and `initramfs` is one package in two places. Split
-//! across files it becomes two SPDX elements, and a scanner counting packages
-//! or matching CVEs counts the same exposure twice. Here it is one element with
-//! two `contains` relationships.
+//! One document rather than one per scope, for correctness rather than
+//! tidiness: a package in both `rootfs` and `initramfs` is one package in two
+//! places. Split across files it becomes two elements, and a scanner counting
+//! packages or matching CVEs counts the same exposure twice. Here it is one
+//! element every `software_Sbom` references by id.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -142,8 +143,8 @@ impl Package {
 
 /// A sysroot and the packages it holds that are its own.
 #[derive(Debug)]
-struct Scope {
-    name: String,
+pub(crate) struct Scope {
+    pub(crate) name: String,
     root: String,
     packages: Vec<Package>,
     failed: bool,
@@ -159,6 +160,99 @@ struct Scope {
 /// as its own content. See `parse_scopes` for what the seed is and why.
 fn is_seeded_scope(name: &str) -> bool {
     name.starts_with("ext:") || name.starts_with("runtime:")
+}
+
+/// One unit that gets a `software_Sbom` of its own (ENG-2219).
+#[derive(Clone, Copy)]
+enum Group<'a> {
+    Runtime(&'a str),
+    Extension(&'a str),
+    BuildHost,
+}
+
+/// Group the scan's scopes, keyed on the names `sysroot_scan.rs` produces.
+///
+/// `rootfs`/`initramfs` repeat into every runtime's group so each group's
+/// `element` list stands alone; they are id references, so the file holds one
+/// copy. An extension also gets a group of its own — criterion 2 says *each*
+/// extension.
+///
+/// A group is skipped when its own defining scope is empty, not when every
+/// member is: `build_document` emits no element for an empty scope, so such a
+/// group would be named for something the graph never names.
+fn groups(scopes: &[Scope]) -> Vec<(Group<'_>, Vec<&Scope>)> {
+    let mut out: Vec<(Group<'_>, Vec<&Scope>)> = Vec::new();
+
+    for scope in scopes {
+        let Some(runtime) = scope.name.strip_prefix("runtime:") else {
+            continue;
+        };
+        if scope.packages.is_empty() {
+            continue;
+        }
+        // Same predicate `connect upload` filters with, so the attached
+        // document and this element cannot disagree.
+        let members: Vec<&Scope> = scopes
+            .iter()
+            .filter(|s| in_runtime(&s.name, runtime))
+            .collect();
+        out.push((Group::Runtime(runtime), members));
+    }
+
+    for scope in scopes {
+        // `includes:<n>` is a remote extension, not a project include.
+        if (scope.name.starts_with("ext:") || scope.name.starts_with("includes:"))
+            && !scope.packages.is_empty()
+        {
+            out.push((Group::Extension(&scope.name), vec![scope]));
+        }
+    }
+
+    let build_host: Vec<&Scope> = scopes
+        .iter()
+        .filter(|s| BUILD_HOST_SCOPES.contains(&s.name.as_str()) && !s.packages.is_empty())
+        .collect();
+    if !build_host.is_empty() {
+        out.push((Group::BuildHost, build_host));
+    }
+
+    // ponytail: `includes:<n>` and legacy `ext:<n>` name no runtime, so they
+    // get a group of their own and no runtime group claims them, while the
+    // shared `includes` root is claimed by all of them. Upgrade path is
+    // `with_composed_config`, which carries the declared composition to
+    // attribute both by.
+
+    out
+}
+
+/// Whether `scope` belongs to `runtime`: itself, `rootfs`, `initramfs`, the
+/// shared `includes` root, and its own extensions. `connect upload` filters a
+/// scan with this — `RuntimeParams` carries no runtime name, so an unfiltered
+/// document would give the server nothing to scope by.
+///
+/// A nested-layout remote extension installs into the shared `includes` root
+/// and keeps no database of its own (`utils/ext_fetch.rs`), so its packages
+/// exist under that one name or nowhere. Counted into every runtime, like
+/// `rootfs`: which runtimes actually carry it needs the declared composition,
+/// and naming it in one too many is recoverable where dropping it from all of
+/// them is not.
+pub(crate) fn in_runtime(scope: &str, runtime: &str) -> bool {
+    scope == "rootfs"
+        || scope == "initramfs"
+        || scope == "includes"
+        || scope == format!("runtime:{runtime}")
+        || scope.starts_with(&format!("ext:{runtime}/"))
+}
+
+/// Whether `runtime` installed anything of its own in `scopes`.
+///
+/// `in_runtime` keeps `rootfs` and `initramfs` whatever the runtime is, so a
+/// filtered slice is non-empty — and builds a document — even when the runtime
+/// contributed nothing. Same condition `groups` skips a runtime on.
+pub(crate) fn runtime_has_packages(scopes: &[Scope], runtime: &str) -> bool {
+    scopes
+        .iter()
+        .any(|s| s.name == format!("runtime:{runtime}") && !s.packages.is_empty())
 }
 
 /// Tripwires on the seeded-scope subtraction, which is a heuristic and has been
@@ -191,7 +285,7 @@ fn seeding_warnings(scopes: &[Scope]) -> Vec<String> {
     // longer has. Said separately for that reason.
     if base_count == 0 && !seeded.is_empty() {
         warnings.push(format!(
-            "[WARN] The rootfs contributed no packages, so nothing was subtracted from the {} \
+            "The rootfs contributed no packages, so nothing was subtracted from the {} \
              seeded scope(s): {}. Their installroots are seeded with a copy of the rootfs RPM \
              database, so what they report is the base system plus their own content, not what \
              the extension ships.",
@@ -210,7 +304,7 @@ fn seeding_warnings(scopes: &[Scope]) -> Vec<String> {
             .collect();
         if !suspect.is_empty() {
             warnings.push(format!(
-                "[WARN] {} scope(s) report at least as many packages as the rootfs ({}): {}. \
+                "{} scope(s) report at least as many packages as the rootfs ({}): {}. \
                  Either they really do install that much, or the rootfs database they were seeded \
                  from could not be told apart from what they installed themselves — check before \
                  treating their contents as shipped by the extension.",
@@ -499,6 +593,43 @@ impl SbomCommand {
 
         let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
 
+        let (scopes, target, snapshot) = self.scan(|m| eprintln!("[WARN] {m}")).await?;
+        let doc = self.build_document(&scopes, &target, snapshot.as_ref(), None);
+
+        match &self.output_path {
+            Some(path) => {
+                std::fs::write(path, serde_json::to_string_pretty(&doc)?)
+                    .with_context(|| format!("Failed to write SBOM to '{path}'"))?;
+                self.print_summary(&scopes, Some(path));
+            }
+            None if self.output.is_json() => emit_json_object(&doc),
+            None => {
+                println!("{}", serde_json::to_string_pretty(&doc)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scan every sysroot and return the parsed scopes, the resolved target,
+    /// and the feed snapshot they were resolved from.
+    ///
+    /// Split out of `execute` so `connect upload` (ENG-2219) can build a
+    /// runtime-scoped document of its own without going through `execute`'s
+    /// stdout — it writes the document itself and owns stdout for its
+    /// `--output json` stream (`tests/no_stdout_on_the_vm_path.rs` guards this
+    /// class of bug).
+    ///
+    /// Carries the failed-scope bail, the unreadable-row warning and
+    /// `seeding_warnings` — a caller that skips those ships a complete-looking,
+    /// incomplete SBOM. Those warnings go through `warn` rather than a fixed
+    /// `eprintln!`: `execute` owns stdout for the document, while `connect
+    /// upload` owns it for its NDJSON stream and needs a `warning` event on it
+    /// or a consumer reading only that stream sees an unqualified green run.
+    pub(crate) async fn scan(
+        &self,
+        warn: fn(&str),
+    ) -> Result<(Vec<Scope>, String, Option<RepoSnapshot>)> {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
             None => Arc::new(
@@ -569,15 +700,15 @@ impl SbomCommand {
                 .map(|s| format!("{} ({})", s.name, s.unreadable))
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!(
-                "[WARN] {unreadable} package row(s) could not be read and are missing from the \
-                 SBOM: {where_}. A tab inside an rpm tag shifts every field after it, so the row \
-                 is dropped rather than mapped onto the wrong columns."
-            );
+            warn(&format!(
+                "{unreadable} package row(s) could not be read and are missing from the SBOM: \
+                 {where_}. A tab inside an rpm tag shifts every field after it, so the row is \
+                 dropped rather than mapped onto the wrong columns."
+            ));
         }
 
         for warning in seeding_warnings(&scopes) {
-            eprintln!("{warning}");
+            warn(&warning);
         }
 
         if scopes.iter().all(|s| s.packages.is_empty()) {
@@ -604,21 +735,7 @@ impl SbomCommand {
             .ok()
             .and_then(|lock| lock.get_repo_snapshot(&target).cloned());
 
-        let doc = self.build_document(&scopes, &target, snapshot.as_ref());
-
-        match &self.output_path {
-            Some(path) => {
-                std::fs::write(path, serde_json::to_string_pretty(&doc)?)
-                    .with_context(|| format!("Failed to write SBOM to '{path}'"))?;
-                self.print_summary(&scopes, Some(path));
-            }
-            None if self.output.is_json() => emit_json_object(&doc),
-            None => {
-                println!("{}", serde_json::to_string_pretty(&doc)?);
-            }
-        }
-
-        Ok(())
+        Ok((scopes, target, snapshot))
     }
 
     /// Map the raw dump onto packages, dropping what a scope only sees because
@@ -775,8 +892,17 @@ impl SbomCommand {
     /// running, or a consumer diffing two SBOMs sees churn that is not there.
     /// Two devices holding genuinely identical software share a namespace,
     /// which is correct — the documents are then identical too.
-    fn namespace_digest(scopes: &[Scope]) -> String {
+    ///
+    /// `runtime` is folded in for the same reason: a runtime-scoped document
+    /// and the device-wide one differ only by scopes the digest skips when
+    /// they are empty, so on a single-runtime project both would otherwise
+    /// land on the same `{ns}/sbom` and `{ns}/document` IRIs while asserting
+    /// different coverage.
+    fn namespace_digest(scopes: &[Scope], runtime: Option<&str>) -> String {
         let mut hasher = Sha256::new();
+        if let Some(r) = runtime {
+            hasher.update(format!("runtime\t{r}\n").as_bytes());
+        }
         // Sorted, so the digest does not depend on the order the sysroots were
         // discovered in.
         let mut lines: Vec<String> = Vec::new();
@@ -799,16 +925,21 @@ impl SbomCommand {
         digest[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn build_document(
+    /// `runtime` names the runtime `scopes` was filtered to, if any. The
+    /// top-level element is the document's `rootElement`, so a consumer reads
+    /// its name as the document's coverage — calling a one-runtime slice the
+    /// device SBOM would under-report every package the other runtimes install.
+    pub(crate) fn build_document(
         &self,
         scopes: &[Scope],
         target: &str,
         snapshot: Option<&RepoSnapshot>,
+        runtime: Option<&str>,
     ) -> serde_json::Value {
         let ns = format!(
             "https://avocadolinux.org/spdx/{}/{}",
             slug_id(target),
-            Self::namespace_digest(scopes)
+            Self::namespace_digest(scopes, runtime)
         );
         let created = created_timestamp(std::env::var("SOURCE_DATE_EPOCH").ok().as_deref());
 
@@ -988,11 +1119,28 @@ impl SbomCommand {
             "type": "software_Sbom",
             "spdxId": sbom_id,
             "creationInfo": creation_id,
-            "name": format!("avocado {target} device SBOM"),
+            "name": match runtime {
+                Some(r) => format!("avocado {target} runtime {r} SBOM"),
+                None => format!("avocado {target} device SBOM"),
+            },
             // "deployed", not "build". A Yocto build emits SPDX for the same
             // packages under `build`; this describes what was installed, which
             // is the whole reason the document exists.
             "software_sbomType": ["deployed"],
+            // `software_sbomType` says this to a machine; this says it to a
+            // person (criterion 4).
+            "comment": match runtime {
+                Some(r) => format!(
+                    "Describes what runtime {r} installs, and so what runs on the device \
+                     under it: the transitive closure read from each of its sysroots' RPM \
+                     databases, not what avocado.yaml declares. Other runtimes in this \
+                     project are not covered."
+                ),
+                None => "Describes what this project installs, and so what runs on the \
+                     device: the transitive closure read from each sysroot's RPM database, \
+                     not what avocado.yaml declares."
+                    .to_string(),
+            },
             "rootElement": roots,
             // Every scope belongs in `element`, roots and extensions alike. A
             // consumer that enumerates the collection through `element` — the
@@ -1054,6 +1202,88 @@ impl SbomCommand {
             }
         }
         graph.push(sbom_element);
+
+        // Mints no new element — only id lists drawn from the loops above, so
+        // one of these can be handed over as "just this runtime".
+        //
+        // After the device SBOM and before `SpdxDocument`: existing tests take
+        // the first `software_Sbom` in `@graph` as the device one.
+        for (group, members) in groups(scopes) {
+            if let (Group::Runtime(r), Some(scoped)) = (group, runtime) {
+                if r == scoped {
+                    continue;
+                }
+            }
+            let (key, name, sbom_type, comment, ext_prefix) = match group {
+                Group::Runtime(r) => (
+                    format!("runtime:{r}"),
+                    format!("avocado {target} runtime {r} SBOM"),
+                    "deployed",
+                    "Describes what this runtime installs, and so what runs on the device: the \
+                     transitive closure read from each sysroot's RPM database, not what \
+                     avocado.yaml declares.",
+                    // Its extensions are members but not roots, as `parent_of`
+                    // has it for the device SBOM.
+                    Some(format!("ext:{r}/")),
+                ),
+                Group::Extension(full) => (
+                    full.to_string(),
+                    format!("avocado {target} extension {full} SBOM"),
+                    "deployed",
+                    "Describes what this extension adds on top of the rootfs it was seeded \
+                     from, and so what it contributes to whatever runs on the device.",
+                    None,
+                ),
+                Group::BuildHost => (
+                    "build-host".to_string(),
+                    format!("avocado {target} build host SBOM"),
+                    "build",
+                    "Describes the build host's own sysroots — what produced the image, not \
+                     what runs on the device.",
+                    None,
+                ),
+            };
+
+            let mut element_ids: BTreeSet<String> = BTreeSet::new();
+            for scope in &members {
+                if let Some(id) = by_name.get(scope.name.as_str()) {
+                    element_ids.insert((*id).to_string());
+                }
+                for pkg in &scope.packages {
+                    let (pn, epoch, version, release, arch) = pkg.key();
+                    let pkg_key = (
+                        pn.to_string(),
+                        epoch.to_string(),
+                        version.to_string(),
+                        release.to_string(),
+                        arch.to_string(),
+                    );
+                    if let Some(id) = emitted.get(&pkg_key) {
+                        element_ids.insert(id.clone());
+                    }
+                }
+            }
+
+            let mut root_ids: Vec<String> = members
+                .iter()
+                .filter(|s| !ext_prefix.as_deref().is_some_and(|p| s.name.starts_with(p)))
+                .filter_map(|s| by_name.get(s.name.as_str()).map(|id| (*id).to_string()))
+                .collect();
+            root_ids.sort();
+
+            graph.push(serde_json::json!({
+                "type": "software_Sbom",
+                "spdxId": format!("{ns}/sbom/{}", slug_id(&key)),
+                "creationInfo": creation_id,
+                "name": name,
+                "software_sbomType": [sbom_type],
+                // Not `description`: the snapshot provenance block above uses
+                // that key.
+                "comment": comment,
+                "rootElement": root_ids,
+                "element": element_ids.into_iter().collect::<Vec<_>>(),
+            }));
+        }
 
         graph.push(serde_json::json!({
             "type": "SpdxDocument",
@@ -1544,7 +1774,7 @@ mod tests {
         let mut scopes = c.parse_scopes(&dump);
         scopes[0].packages[0].sourcerpm = "(none)".to_string();
 
-        let doc = c.build_document(&scopes, "qemuarm64", None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None);
         let pkg = doc["@graph"]
             .as_array()
             .unwrap()
@@ -1611,7 +1841,7 @@ mod tests {
         let scopes = c.parse_scopes(&dump);
         assert_eq!(scopes.len(), 2);
 
-        let doc = c.build_document(&scopes, "qemuarm64", None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let packages: Vec<&str> = graph
@@ -1689,7 +1919,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let runtime = ids_named(graph, "runtime:dev").remove(0);
@@ -1730,7 +1960,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
         let graph = doc["@graph"].as_array().unwrap();
         let ext = ids_named(graph, "ext:app").remove(0);
 
@@ -1755,7 +1985,7 @@ mod tests {
             created: Some("2026-07-08T02:17:53Z".into()),
         };
 
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", Some(&snap));
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", Some(&snap), None);
         let graph = doc["@graph"].as_array().unwrap();
         let sbom = graph.iter().find(|e| e["type"] == "software_Sbom").unwrap();
 
@@ -1772,7 +2002,7 @@ mod tests {
         // Unpinned, the document says nothing rather than repeating the
         // release and channel the config asked for: the channel head moves, so
         // that would be provenance the document cannot stand behind.
-        let bare = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let bare = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
         let bare = bare["@graph"]
             .as_array()
             .unwrap()
@@ -1798,7 +2028,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let spdx_doc = graph.iter().find(|e| e["type"] == "SpdxDocument").unwrap();
@@ -1907,7 +2137,7 @@ mod tests {
         let scopes = c.parse_scopes(&dump);
         assert_eq!(scopes.len(), 2, "still scanned, and still summarised");
 
-        let doc = c.build_document(&scopes, "qemuarm64", None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None);
         let graph = doc["@graph"].as_array().unwrap();
         assert!(!graph.iter().any(|e| e["name"] == "includes:etc"));
         assert!(graph.iter().all(
@@ -1969,8 +2199,8 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc_a = c.build_document(&c.parse_scopes(&a), "qemuarm64", None);
-        let doc_b = c.build_document(&c.parse_scopes(&b), "qemuarm64", None);
+        let doc_a = c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None);
+        let doc_b = c.build_document(&c.parse_scopes(&b), "qemuarm64", None, None);
 
         let id = |d: &serde_json::Value| {
             d["@graph"]
@@ -1989,7 +2219,7 @@ mod tests {
         // the namespace becoming content-derived.
         assert_eq!(
             id(&doc_a),
-            id(&c.build_document(&c.parse_scopes(&a), "qemuarm64", None))
+            id(&c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None))
         );
     }
 
@@ -2091,7 +2321,7 @@ mod tests {
         assert!(ext.packages.is_empty(), "the known limitation");
 
         // Still in the inventory, under the rootfs.
-        let doc = c.build_document(&scopes, "qemuarm64", None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None);
         assert!(doc["@graph"]
             .as_array()
             .unwrap()
@@ -2251,7 +2481,7 @@ mod tests {
             row("libc6", "2.39", "r0.2", "cortexa57", "MIT")
         );
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
         let sbom = doc["@graph"]
             .as_array()
             .unwrap()
@@ -2284,7 +2514,7 @@ mod tests {
                 .replace("Avocado Developers <info@avocadolinux.org>", "avocado")
         );
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
 
         let mut ids: Vec<&str> = doc["@graph"]
             .as_array()
@@ -2369,8 +2599,8 @@ mod tests {
             )
         };
         assert_eq!(
-            strip(c.build_document(&scopes, "qemuarm64", None)),
-            strip(c.build_document(&scopes, "qemuarm64", None))
+            strip(c.build_document(&scopes, "qemuarm64", None, None)),
+            strip(c.build_document(&scopes, "qemuarm64", None, None))
         );
     }
 
@@ -2501,5 +2731,405 @@ mod tests {
             slug("GPL-2.0-only AND LicenseRef-PD"),
             "GPL-2.0-only-AND-LicenseRef-PD"
         );
+    }
+
+    #[test]
+    fn a_remote_or_legacy_extension_gets_a_document_but_joins_no_runtime() {
+        // `includes:<n>` (remote) and `ext:<n>` (legacy) name no runtime, so
+        // no runtime claims them — but each is still an extension.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\tincludes:remote\t/includes/remote\n{}\
+             ##SCOPE\text:legacy\t/extensions/legacy\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "avocado-runtime",
+                "0.0.0",
+                "r0.0",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                2000
+            ),
+            row_full(
+                "nginx",
+                "1.25.4",
+                "r0.2",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                3000
+            ),
+            row_full(
+                "dropbear",
+                "2024.84",
+                "r0.1",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                4000
+            ),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let names: Vec<&str> = graph
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"avocado qemuarm64 extension includes:remote SBOM"),
+            "a remote extension is an extension; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"avocado qemuarm64 extension ext:legacy SBOM"),
+            "so is a legacy-layout one; got: {names:?}"
+        );
+
+        let runtime_sbom = graph
+            .iter()
+            .find(|e| e["name"] == "avocado qemuarm64 runtime dev SBOM")
+            .expect("the runtime got one");
+        let elements = strings(&runtime_sbom["element"]);
+        let remote_pkg = ids_named(graph, "nginx").remove(0);
+        let legacy_pkg = ids_named(graph, "dropbear").remove(0);
+        assert!(
+            !elements.contains(&remote_pkg.as_str()) && !elements.contains(&legacy_pkg.as_str()),
+            "got: {elements:?}"
+        );
+        assert!(!in_runtime("includes:remote", "dev"));
+        assert!(!in_runtime("ext:legacy", "dev"));
+        assert!(in_runtime("ext:dev/app", "dev"));
+        assert!(in_runtime("rootfs", "dev") && in_runtime("runtime:dev", "dev"));
+    }
+
+    #[test]
+    fn a_group_whose_own_scope_is_empty_gets_no_document() {
+        // No scope element, so a document named for it would name nothing.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:bare\t/runtimes/bare\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            // Same package and transaction id: pure seed, subtracted away.
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let names: Vec<&str> = graph
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["avocado qemuarm64 device SBOM"],
+            "the device SBOM still covers the rootfs; the empty runtime gets none"
+        );
+    }
+
+    #[test]
+    fn each_runtime_and_extension_gets_an_sbom_of_its_own() {
+        // Criteria 1 and 2: a runtime's SBOM lists what it installs, and each
+        // extension gets one narrow enough to hand over alone.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "avocado-runtime",
+                "0.0.0",
+                "r0.0",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                2000
+            ),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 3000),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let sboms: Vec<&serde_json::Value> = graph
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .collect();
+        assert_eq!(
+            sboms.len(),
+            3,
+            "device + one runtime + one extension; got: {sboms:#?}"
+        );
+
+        let rootfs_pkg = ids_named(graph, "libc6").remove(0);
+        let rootfs_scope = ids_named(graph, "rootfs").remove(0);
+        let ext_scope = ids_named(graph, "ext:dev/app").remove(0);
+        let ext_pkg = ids_named(graph, "curl").remove(0);
+
+        let runtime_sbom = sboms
+            .iter()
+            .find(|s| s["name"] == "avocado qemuarm64 runtime dev SBOM")
+            .expect("the runtime got a software_Sbom of its own");
+        let runtime_elements = strings(&runtime_sbom["element"]);
+        assert!(
+            runtime_elements.contains(&rootfs_pkg.as_str()),
+            "the runtime's slice includes what rootfs installs too; got: {runtime_elements:?}"
+        );
+        assert!(
+            runtime_elements.contains(&ext_scope.as_str()),
+            "and its own extension's scope; got: {runtime_elements:?}"
+        );
+
+        let ext_sbom = sboms
+            .iter()
+            .find(|s| s["name"] == "avocado qemuarm64 extension ext:dev/app SBOM")
+            .expect("the extension got a software_Sbom of its own");
+        let ext_elements = strings(&ext_sbom["element"]);
+        assert!(
+            ext_elements.contains(&ext_pkg.as_str()),
+            "got: {ext_elements:?}"
+        );
+        assert!(
+            !ext_elements.contains(&rootfs_pkg.as_str())
+                && !ext_elements.contains(&rootfs_scope.as_str()),
+            "an extension's own SBOM must not carry the rootfs's package or scope; got: \
+             {ext_elements:?}"
+        );
+    }
+
+    #[test]
+    fn an_sbom_says_whether_it_describes_what_is_running_or_what_was_built() {
+        // Criterion 4: an SBOM has to say, in the open, whether it describes
+        // what runs on the device or what produced it — not leave a reader to
+        // infer that from `software_sbomType` alone.
+        let dump = format!(
+            "##SCOPE\tsdk\t/opt/_avocado/sdk\n{}\
+             ##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}",
+            row_full(
+                "nativesdk-curl",
+                "8.7",
+                "r0.0",
+                "x86_64",
+                "MIT",
+                "(none)",
+                1000
+            ),
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+            row_full(
+                "avocado-runtime",
+                "0.0.0",
+                "r0.0",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                3000
+            ),
+        );
+
+        // include_sdk=true so the build-host group is in the slice at all.
+        let c = cmd(true);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let runtime_sbom = graph
+            .iter()
+            .find(|e| {
+                e["type"] == "software_Sbom" && e["name"] == "avocado qemuarm64 runtime dev SBOM"
+            })
+            .unwrap();
+        assert_eq!(runtime_sbom["software_sbomType"][0], "deployed");
+        assert!(runtime_sbom["comment"].as_str().unwrap().contains("device"));
+
+        let build_host_sbom = graph
+            .iter()
+            .find(|e| {
+                e["type"] == "software_Sbom" && e["name"] == "avocado qemuarm64 build host SBOM"
+            })
+            .expect("--include-sdk puts the build-host scopes in the slice");
+        assert_eq!(build_host_sbom["software_sbomType"][0], "build");
+        assert!(build_host_sbom["comment"]
+            .as_str()
+            .unwrap()
+            .contains("build host"));
+
+        // The device-level SBOM states it too. Criterion 4 is about the
+        // document, and this is the element a reader reaches first.
+        let device_sbom = graph.iter().find(|e| e["type"] == "software_Sbom").unwrap();
+        assert_eq!(device_sbom["software_sbomType"][0], "deployed");
+        assert!(device_sbom["comment"].as_str().unwrap().contains("device"));
+    }
+
+    #[test]
+    fn the_device_sbom_is_the_first_one_in_the_graph() {
+        // Seven existing tests do `graph.iter().find(|e| e["type"] ==
+        // "software_Sbom")` and take the first match as the device SBOM. The
+        // per-runtime/per-extension elements this ticket adds must come after
+        // it, never before.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "avocado-runtime",
+                "0.0.0",
+                "r0.0",
+                "cortexa57",
+                "MIT",
+                "(none)",
+                2000
+            ),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 3000),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let sbom_positions: Vec<usize> = graph
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["type"] == "software_Sbom")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            sbom_positions.len() > 1,
+            "need more than one software_Sbom to pin an order"
+        );
+        assert_eq!(
+            graph[sbom_positions[0]]["name"], "avocado qemuarm64 device SBOM",
+            "the device SBOM must be the first software_Sbom pushed"
+        );
+    }
+
+    #[test]
+    fn a_runtime_scoped_document_does_not_call_itself_the_device_sbom() {
+        // What `connect upload` attaches. Its root element is what a consumer
+        // reads the document's coverage off, so a one-runtime slice calling
+        // itself the device SBOM under-reports every other runtime.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, Some("dev"));
+        let names: Vec<&str> = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["avocado qemuarm64 runtime dev SBOM"],
+            "one element, named for the runtime: the top-level one is already \
+             the runtime's, so the group loop must not repeat it"
+        );
+    }
+
+    #[test]
+    fn a_runtime_scoped_document_does_not_reuse_the_device_documents_ids() {
+        // Same scopes, two documents: `avocado sbom` writes the device-wide
+        // one, `connect upload` attaches the runtime-scoped one. On a
+        // single-runtime project the scope sets differ only by scopes the
+        // digest skips when empty, so both used to land on `{ns}/sbom` and
+        // `{ns}/document` while asserting different coverage — and collapse
+        // into one element when ingested together.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+        );
+
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let device = c.build_document(&scopes, "qemuarm64", None, None);
+        let runtime = c.build_document(&scopes, "qemuarm64", None, Some("dev"));
+
+        let doc_id = |d: &serde_json::Value| {
+            d["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "SpdxDocument")
+                .unwrap()["spdxId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(doc_id(&device), doc_id(&runtime));
+
+        // Still byte-stable: the same runtime slice twice is the same document.
+        assert_eq!(
+            doc_id(&runtime),
+            doc_id(&c.build_document(&scopes, "qemuarm64", None, Some("dev")))
+        );
+    }
+
+    #[test]
+    fn a_shared_includes_root_rides_along_with_every_runtime() {
+        // A nested-layout remote extension has no rpmdb of its own, so its
+        // packages are only ever under the bare `includes` scope. Dropped from
+        // `in_runtime`, they are in no runtime SBOM and in nothing Connect is
+        // sent.
+        assert!(in_runtime("includes", "dev"));
+
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\tincludes\t/includes\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("tunnels", "1.0", "r0.0", "cortexa57", "MIT", "(none)", 2000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 3000),
+        );
+
+        let c = cmd(false);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let graph = doc["@graph"].as_array().unwrap();
+        let includes_id = graph
+            .iter()
+            .find(|e| e["name"] == "includes")
+            .expect("the shared includes root is a scope element")["spdxId"]
+            .as_str()
+            .unwrap();
+        let runtime_sbom = graph
+            .iter()
+            .find(|e| e["name"] == "avocado qemuarm64 runtime dev SBOM")
+            .unwrap();
+
+        assert!(runtime_sbom["element"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == includes_id));
+    }
+
+    #[test]
+    fn a_runtime_that_installed_nothing_of_its_own_is_not_reported_as_scanned() {
+        // `in_runtime` keeps rootfs whatever the runtime is, so the filtered
+        // slice is non-empty and builds. Only this predicate separates a
+        // runtime that installs nothing from one that was never scanned.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+        let scopes = cmd(false).parse_scopes(&dump);
+        assert!(!scopes.is_empty());
+        assert!(!runtime_has_packages(&scopes, "dev"));
     }
 }
