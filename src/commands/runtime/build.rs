@@ -327,6 +327,12 @@ impl RuntimeBuildCommand {
         container_helper: &SdkContainer,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
+        // Each required extension's recorded image digest, read from the batch
+        // stamp read below and folded into this build's input hash at both the
+        // check and the write.
+        let mut upstream_image_hashes: std::collections::BTreeMap<String, String> =
+            Default::default();
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             // Get detailed extension dependencies for this runtime
@@ -379,8 +385,19 @@ impl RuntimeBuildCommand {
             let install_inputs = merged_runtime
                 .as_ref()
                 .and_then(|mr| compute_runtime_install_input_hash(mr, &self.runtime_name).ok());
+            upstream_image_hashes = crate::utils::stamps::ext_image_content_hashes_from_batch(
+                output.as_deref().unwrap_or(""),
+                ext_deps.iter().map(|d| d.name().to_string()),
+            );
             let build_inputs = merged_runtime.as_ref().and_then(|mr| {
-                compute_runtime_build_input_hash(mr, &self.runtime_name, parsed, &project_root).ok()
+                compute_runtime_build_input_hash(
+                    mr,
+                    &self.runtime_name,
+                    parsed,
+                    &project_root,
+                    &upstream_image_hashes,
+                )
+                .ok()
             });
             let sysroot_inputs =
                 self.sysroot_install_inputs(config, parsed, target_arch, repo_url, repo_release)?;
@@ -936,6 +953,7 @@ impl RuntimeBuildCommand {
                 &self.runtime_name,
                 parsed,
                 &config.project_root(&self.config_path),
+                &upstream_image_hashes,
             )?;
             let stamp = Stamp::runtime_build(
                 &self.runtime_name,
