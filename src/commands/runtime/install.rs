@@ -1,3 +1,4 @@
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -130,6 +131,7 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        let feeds = config.materialize_feeds(&target, FeedStage::Runtime, &self.config_path)?;
 
         // Check if runtime section exists
         let runtime_section = match parsed.get("runtimes") {
@@ -223,6 +225,7 @@ impl RuntimeInstallCommand {
                 container_image,
                 repo_url.as_ref(),
                 repo_release.as_ref(),
+                feeds.as_ref(),
                 &merged_container_args,
                 runs_on_context.as_ref(),
             )
@@ -258,6 +261,7 @@ impl RuntimeInstallCommand {
         container_image: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
@@ -297,6 +301,7 @@ impl RuntimeInstallCommand {
                     container_image,
                     repo_url,
                     repo_release,
+                    feeds,
                     merged_container_args,
                     &mut lock_file,
                     &src_dir,
@@ -332,6 +337,7 @@ impl RuntimeInstallCommand {
                         source_environment: true,
                         interactive: false,
                         repo_url: repo_url.cloned(),
+                        feeds: feeds.cloned(),
                         repo_release: repo_release.cloned(),
                         container_args: merged_container_args.clone(),
                         dnf_args: self.dnf_args.clone(),
@@ -439,6 +445,7 @@ impl RuntimeInstallCommand {
         container_image: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         merged_container_args: &Option<Vec<String>>,
         lock_file: &mut LockFile,
         src_dir: &Path,
@@ -476,6 +483,7 @@ impl RuntimeInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -506,6 +514,7 @@ impl RuntimeInstallCommand {
             source_environment: false,
             interactive: false,
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
@@ -525,6 +534,7 @@ impl RuntimeInstallCommand {
                 source_environment: false,
                 interactive: false,
                 repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
                 repo_release: repo_release.cloned(),
                 container_args: merged_container_args.clone(),
                 dnf_args: self.dnf_args.clone(),
@@ -574,6 +584,7 @@ impl RuntimeInstallCommand {
                     lock_file,
                     repo_url: repo_url.map(|s| s.as_str()),
                     repo_release: repo_release.map(|s| s.as_str()),
+                    feeds,
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     runs_on_context,
@@ -759,6 +770,7 @@ $DNF_SDK_HOST \
                     source_environment: false, // Don't source environment - matches rootfs install behavior
                     interactive: !self.force,
                     repo_url: repo_url.cloned(),
+                    feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),

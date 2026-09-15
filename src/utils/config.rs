@@ -163,7 +163,21 @@ where
 {
     named_or_single_deserializer::deserialize(
         deserializer,
-        &["package", "version", "compile", "install", "image"],
+        // Every field of KernelConfig must appear here: this list is what
+        // distinguishes `kernel: {<field>: ...}` (one anonymous block) from
+        // `kernel: {<name>: {...}}` (a map of named kernels). Omitting a field
+        // makes a block that sets only that field parse as a kernel *named*
+        // after it, failing with "invalid type: string, expected struct
+        // KernelConfig".
+        &[
+            "package",
+            "version",
+            "compile",
+            "install",
+            "image",
+            "cmdline",
+            "cmdline_extra",
+        ],
         "kernel",
     )
 }
@@ -624,12 +638,24 @@ pub struct KernelConfig {
     /// lands in the manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<serde_yaml::Value>,
+    /// Complete kernel command line, replacing whatever the platform would
+    /// otherwise boot with. Mutually exclusive with `cmdline_extra`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    /// Kernel command line arguments appended to the platform's own line.
+    ///
+    /// The common case: a project wants `isolcpus=`/`nohz_full=` or an
+    /// `earlycon` without restating the board-specific `root=`/`console=` that
+    /// only the BSP knows. Mutually exclusive with `cmdline`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline_extra: Option<String>,
 }
 
 impl KernelConfig {
     /// Validate that the kernel config is well-formed:
     /// - `package` and `compile` are mutually exclusive
     /// - `compile` requires `install`
+    /// - `cmdline` and `cmdline_extra` are mutually exclusive
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.package.is_some() && self.compile.is_some() {
             return Err(ConfigError::ValidationError(
@@ -641,7 +667,20 @@ impl KernelConfig {
                 "kernel config: 'compile' requires 'install' to be set".to_string(),
             ));
         }
-        if self.package.is_none() && self.compile.is_none() {
+        if self.cmdline.is_some() && self.cmdline_extra.is_some() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'cmdline' and 'cmdline_extra' are mutually exclusive; \
+                 'cmdline' replaces the platform's line, 'cmdline_extra' appends to it"
+                    .to_string(),
+            ));
+        }
+        // A block that only sets command line arguments is legitimate: the
+        // kernel itself still comes from the resolver (or from the platform),
+        // and the project is only amending how it boots. Requiring `package`
+        // or `compile` here would force every project that wants an extra
+        // kernel argument to also restate where its kernel comes from.
+        let only_cmdline = self.cmdline.is_some() || self.cmdline_extra.is_some();
+        if self.package.is_none() && self.compile.is_none() && !only_cmdline {
             return Err(ConfigError::ValidationError(
                 "kernel config: either 'package' or 'compile' must be set".to_string(),
             ));
@@ -899,8 +938,34 @@ pub struct DistroConfig {
         deserialize_with = "deserialize_string_or_int"
     )]
     pub release: Option<String>,
+    /// The distro feed: either an inline `{url, releasever, ca, tls_verify}`
+    /// block (today's grammar) or the name of a feed defined under `repos:`.
     #[serde(default)]
-    pub repo: Option<DistroRepoConfig>,
+    pub repo: Option<DistroRepoRef>,
+    /// Ordered list of enabled feed names; position is dnf priority (first
+    /// wins). The distro feed is implicitly first unless listed explicitly.
+    /// Absent with `repos:` present means only the distro feed is enabled.
+    #[serde(default)]
+    pub feeds: Option<Vec<String>>,
+}
+
+impl DistroConfig {
+    /// The inline repo block, when `distro.repo` is not a name reference.
+    pub fn repo_inline(&self) -> Option<&DistroRepoConfig> {
+        match self.repo.as_ref()? {
+            DistroRepoRef::Inline(c) => Some(c),
+            DistroRepoRef::Named(_) => None,
+        }
+    }
+}
+
+/// `distro.repo`: a feed name or an inline repo block. Untagged so a bare
+/// string and a mapping both parse.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DistroRepoRef {
+    Named(String),
+    Inline(DistroRepoConfig),
 }
 
 /// Deserialize a value that may be a string or integer into Option<String>
@@ -954,6 +1019,37 @@ pub struct DistroRepoConfig {
     pub ca: Option<String>,
     /// TLS verification toggle for the repo endpoint. Set false to skip verification
     /// (testing only). Env override: AVOCADO_REPO_INSECURE=1. Default: verify.
+    pub tls_verify: Option<bool>,
+}
+
+/// A named package feed under `repos:`. Exactly one locator — `url`, `org`,
+/// or `path` — selects the kind; `release`/`channel` present makes it
+/// distro-shaped. Config names a credential and never holds one: `username`
+/// and `password` are meant to be `{{ env.X }}` references. See
+/// `utils::feeds` for resolution.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct RepoDef {
+    /// Remote feed. `$releasever` and `$target` are expanded CLI-side.
+    pub url: Option<String>,
+    /// Connect-hosted private feed, resolved through the logged-in profile.
+    pub org: Option<String>,
+    /// Directory of RPMs (with `repodata/`) on disk, relative to the config
+    /// file; bind-mounted into the container.
+    pub path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_int")]
+    pub release: Option<String>,
+    pub channel: Option<String>,
+    pub releasever: Option<String>,
+    pub gpgkey: Option<String>,
+    /// Defaults to true when `gpgkey` is set, false otherwise.
+    pub gpgcheck: Option<bool>,
+    /// Only enable for these targets.
+    pub targets: Option<Vec<String>>,
+    /// Only enable during these stages; absent = all.
+    pub stages: Option<Vec<crate::utils::feeds::FeedStage>>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ca: Option<String>,
     pub tls_verify: Option<bool>,
 }
 
@@ -1465,6 +1561,10 @@ pub struct Config {
     pub supported_targets: Option<SupportedTargets>,
     pub src_dir: Option<String>,
     pub distro: Option<DistroConfig>,
+    /// Named package feeds. Definitions only — `distro.feeds` orders and
+    /// enables them. A map so composed/board configs merge by name.
+    #[serde(default)]
+    pub repos: Option<HashMap<String, RepoDef>>,
     #[serde(alias = "runtime")]
     pub runtimes: Option<HashMap<String, RuntimeConfig>>,
     /// Default runtime name for commands that scope by runtime. Mirrors
@@ -1560,6 +1660,33 @@ impl Config {
         }
 
         Ok(None)
+    }
+
+    /// The kernel command line this project wants, as (replace, append).
+    ///
+    /// Same precedence as [`Self::effective_kernel_spec`]: a runtime-level
+    /// `kernel:` wins over the top-level one, so one project can boot two
+    /// runtimes with different arguments off the same kernel. Returns the
+    /// pair rather than a merged string because the two mean different things
+    /// to the platform hook -- `cmdline` replaces the board's line outright,
+    /// `cmdline_extra` is appended to it -- and only the hook knows the base.
+    pub fn effective_kernel_cmdline(
+        &self,
+        runtime_name: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        if let Some(name) = runtime_name {
+            if let Some(kc) = self.resolve_runtime_kernel(name) {
+                if kc.cmdline.is_some() || kc.cmdline_extra.is_some() {
+                    return (kc.cmdline.clone(), kc.cmdline_extra.clone());
+                }
+            }
+        }
+        if let Some(top) = self.kernel_default() {
+            if top.cmdline.is_some() || top.cmdline_extra.is_some() {
+                return (top.cmdline.clone(), top.cmdline_extra.clone());
+            }
+        }
+        (None, None)
     }
 
     /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
@@ -2103,6 +2230,7 @@ impl Config {
                 supported_targets: None,
                 src_dir: None,
                 distro: None,
+                repos: None,
                 runtimes: None,
                 default_runtime: None,
                 sdk: None,
@@ -3920,9 +4048,12 @@ impl Config {
         if let Some(url) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.url.as_ref())
         {
+            return Some(url.clone());
+        }
+        if let Some(url) = self.distro_feed_def().and_then(|d| d.url.as_ref()) {
             return Some(url.clone());
         }
         // Legacy fallback: sdk.repo_url
@@ -3948,8 +4079,9 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.ca.as_ref())
+            .or_else(|| self.distro_feed_def().and_then(|d| d.ca.as_ref()))
             .cloned()
     }
 
@@ -3961,10 +4093,50 @@ impl Config {
         }
         self.distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.tls_verify)
+            .or_else(|| self.distro_feed_def().and_then(|d| d.tls_verify))
             .map(|verify| !verify)
             .unwrap_or(false)
+    }
+
+    /// The `repos:` definition `distro.repo` names, when it is a name reference.
+    pub(crate) fn distro_feed_def(&self) -> Option<&RepoDef> {
+        // No `distro.repo` at all means the default name: `repos.avocado` is the
+        // distro feed, exactly as if `distro.repo: avocado` had been written.
+        let name = match self.distro.as_ref().and_then(|d| d.repo.as_ref()) {
+            Some(DistroRepoRef::Named(n)) => n.as_str(),
+            Some(DistroRepoRef::Inline(_)) => return None,
+            None => crate::utils::feeds::DEFAULT_DISTRO_FEED_NAME,
+        };
+        self.repos.as_ref()?.get(name)
+    }
+
+    /// Resolve, record, and materialize the named feeds for one container run.
+    /// `None` when the project declares no feeds — the zero-cost path. Writes
+    /// the canonical document to `<config_dir>/.avocado/feeds/<target>.json`
+    /// every time so the build cache always sees the current set.
+    pub fn materialize_feeds(
+        &self,
+        target: &str,
+        stage: crate::utils::feeds::FeedStage,
+        config_path: &str,
+    ) -> Result<Option<crate::utils::feeds::FeedMaterialization>> {
+        // `path:` feeds resolve against project_root, like every other relative
+        // path in the config; the canonical document goes under <config_dir>/.avocado/.
+        // Both the resolved feeds and the canonical document key off project_root,
+        // not the config file's directory. `avocado.lock` lives at the top of
+        // `src_dir` and the legacy `.avocado/lock.json` did too, so a project that
+        // sets `src_dir` would otherwise get its feed document beside the config
+        // file while the rest of its build state sits somewhere else.
+        let project_root = self.project_root(config_path);
+        let Some(set) =
+            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
+        else {
+            return Ok(None);
+        };
+        set.write_canonical(&project_root)?;
+        Ok(Some(set.materialize(stage)?))
     }
 
     /// Promote config-file repo TLS settings to the process env so the container
@@ -3997,10 +4169,18 @@ impl Config {
         if let Some(rv) = self
             .distro
             .as_ref()
-            .and_then(|d| d.repo.as_ref())
+            .and_then(|d| d.repo_inline())
             .and_then(|r| r.releasever.as_ref())
         {
             return Some(rv.clone());
+        }
+        if let Some(d) = self.distro_feed_def() {
+            if let Some(rv) = &d.releasever {
+                return Some(rv.clone());
+            }
+            if let (Some(r), Some(c)) = (&d.release, &d.channel) {
+                return Some(format!("{r}/{c}"));
+            }
         }
         // Legacy fallback: sdk.repo_release
         if let Some(rv) = self.sdk.as_ref().and_then(|s| s.repo_release.as_ref()) {
@@ -11407,6 +11587,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11419,6 +11601,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_ok());
     }
@@ -11431,6 +11615,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         assert!(kc.validate().is_err());
     }
@@ -11443,6 +11629,8 @@ sdk:
             compile: Some("kernel-build".to_string()),
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("'compile' requires 'install'"));
@@ -11456,6 +11644,8 @@ sdk:
             compile: None,
             install: None,
             image: None,
+            cmdline: None,
+            cmdline_extra: None,
         };
         let err = kc.validate().unwrap_err();
         assert!(err.to_string().contains("either 'package' or 'compile'"));
@@ -13134,6 +13324,8 @@ runtimes:
                 compile: None,
                 install: None,
                 image: None,
+                cmdline: None,
+                cmdline_extra: None,
             },
         );
         let kc = Config::get_kernel_config_from_runtime(&yaml, Some(&kernels))
@@ -13874,5 +14066,76 @@ extensions:
             }
             other => panic!("expected Git source, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod kernel_cmdline_tests {
+    use super::*;
+
+    fn cfg(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).expect("config parses")
+    }
+
+    /// A `kernel:` block that only amends the command line is valid. Requiring
+    /// `package`/`compile` here would force every project that wants one extra
+    /// kernel argument to also restate where its kernel comes from.
+    #[test]
+    fn cmdline_only_block_is_valid() {
+        let k = KernelConfig {
+            package: None,
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: None,
+            cmdline_extra: Some("isolcpus=4-6".to_string()),
+        };
+        assert!(k.validate().is_ok());
+    }
+
+    /// Replacing and appending are different operations; asking for both is a
+    /// mistake the platform hook cannot resolve.
+    #[test]
+    fn cmdline_and_cmdline_extra_conflict() {
+        let k = KernelConfig {
+            package: Some("kernel-image".to_string()),
+            version: None,
+            compile: None,
+            install: None,
+            image: None,
+            cmdline: Some("root=/dev/x".to_string()),
+            cmdline_extra: Some("earlycon".to_string()),
+        };
+        assert!(k.validate().is_err());
+    }
+
+    #[test]
+    fn top_level_cmdline_extra_is_used_when_no_runtime_override() {
+        let c = cfg("kernel:\n  cmdline_extra: \"earlycon\"\n");
+        let (replace, extra) = c.effective_kernel_cmdline(Some("prod"));
+        assert_eq!(replace, None);
+        assert_eq!(extra.as_deref(), Some("earlycon"));
+    }
+
+    /// Two runtimes off one kernel can boot with different arguments -- the
+    /// reason this resolves per-runtime rather than once per project.
+    #[test]
+    fn runtime_level_cmdline_overrides_top_level() {
+        let c = cfg(concat!(
+            "kernel:\n  cmdline_extra: \"earlycon\"\n",
+            "runtimes:\n  rt:\n    kernel:\n      cmdline_extra: \"isolcpus=4-6 nohz_full=4-6\"\n",
+        ));
+        let (_, extra) = c.effective_kernel_cmdline(Some("rt"));
+        assert_eq!(extra.as_deref(), Some("isolcpus=4-6 nohz_full=4-6"));
+        // a runtime with no kernel block of its own still sees the top level
+        let (_, other) = c.effective_kernel_cmdline(Some("nonexistent"));
+        assert_eq!(other.as_deref(), Some("earlycon"));
+    }
+
+    #[test]
+    fn absent_kernel_block_yields_nothing() {
+        let c = cfg("default_target: qemuarm64\n");
+        assert_eq!(c.effective_kernel_cmdline(Some("rt")), (None, None));
     }
 }
