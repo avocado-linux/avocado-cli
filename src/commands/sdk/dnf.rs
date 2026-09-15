@@ -1,5 +1,6 @@
 //! SDK DNF command implementation.
 
+use crate::utils::feeds::FeedStage;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -98,6 +99,7 @@ impl SdkDnfCommand {
 
         // Resolve target with proper precedence
         let target = resolve_target_required(self.target.as_deref(), config)?;
+        let feeds = config.materialize_feeds(&target, FeedStage::Sdk, &self.config_path)?;
 
         let container_helper = SdkContainer::new();
 
@@ -124,6 +126,7 @@ impl SdkDnfCommand {
                 &command,
                 repo_url.as_ref(),
                 repo_release.as_ref(),
+                feeds.as_ref(),
                 merged_container_args.as_ref(),
             )
             .await?;
@@ -149,6 +152,7 @@ impl SdkDnfCommand {
         command: &str,
         repo_url: Option<&String>,
         repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
         container_args: Option<&Vec<String>>,
     ) -> Result<bool> {
         // Use the container helper's method with repo URL and release support
@@ -160,6 +164,7 @@ impl SdkDnfCommand {
             source_environment: true, // need environment for DNF
             interactive: true,        // allow user input for DNF prompts
             repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
             repo_release: repo_release.cloned(),
             container_args: container_args.cloned(),
             dnf_args: self.dnf_args.clone(),

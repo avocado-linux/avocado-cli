@@ -1,0 +1,5 @@
+#!/bin/bash
+_real=/usr/bin/docker
+_dir="${AVOCADO_PROF_CMDS:-/tmp}"
+[ "$1" = run ] && printf '%s\0' "$@" > "$_dir/$(date +%s%N).argv"
+exec "$_real" "$@"
