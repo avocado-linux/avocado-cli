@@ -99,7 +99,9 @@ impl SdkDnfCommand {
 
         // Resolve target with proper precedence
         let target = resolve_target_required(self.target.as_deref(), config)?;
-        let feeds = config.materialize_feeds(&target, FeedStage::Sdk, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Sdk, &self.config_path)
+            .await?;
 
         let container_helper = SdkContainer::new();
 

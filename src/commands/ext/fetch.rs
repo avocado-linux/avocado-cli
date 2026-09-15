@@ -203,11 +203,15 @@ impl ExtFetchCommand {
             self.verbose,
         )
         .with_repo_url(config.get_sdk_repo_url())
-        .with_feeds(config.materialize_feeds(
-            &target,
-            crate::utils::feeds::FeedStage::Ext,
-            &self.config_path,
-        )?)
+        .with_feeds(
+            config
+                .materialize_feeds(
+                    &target,
+                    crate::utils::feeds::FeedStage::Ext,
+                    &self.config_path,
+                )
+                .await?,
+        )
         .with_repo_release(config.get_sdk_repo_release())
         .with_container_args(effective_container_args)
         .with_sdk_arch(self.sdk_arch.clone())
