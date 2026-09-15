@@ -335,7 +335,10 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # parent runtimes/$RUNTIME_NAME dir uncreated; ensure it exists.
     mkdir -p "$(dirname "$ROOTFS_WORK")"
     rm -rf "$ROOTFS_WORK"
-    cp -a "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
+    # --reflink=auto: a CoW clone where the filesystem supports one (btrfs, xfs),
+    # a plain copy elsewhere. The work copy is mutated below, so it must not be
+    # a hardlink; reflink gives the isolation of a copy without paying for one.
+    cp -a --reflink=auto "$ROOTFS_SYSROOT" "$ROOTFS_WORK"
 
     # A fully-installed sysroot always ships /etc/passwd. If it is absent
     # the build volume is half-populated or stale (e.g. a prior install

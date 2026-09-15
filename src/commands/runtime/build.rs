@@ -27,6 +27,29 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Python helper spliced into the build script's manifest and os_bundle blocks:
+/// places an image under `lib/avocado/images/` by hardlink, falling back to a
+/// copy. Every image already lives on the same volume as var-staging, the
+/// destination name is content-addressed, and nothing edits these files in
+/// place, so a link is a copy that costs no I/O. Brace-free on purpose — it
+/// is interpolated into `format!` strings.
+pub(crate) const LINK_OR_COPY_PY: &str = r#"def link_or_copy(src, dst):
+    # Same name means same bytes by construction, but an interrupted earlier
+    # build can leave a short file under the right name; replace, never trust.
+    if os.path.lexists(dst):
+        os.remove(dst)
+    # Link the file, not a symlink to it. The kernel is staged as
+    # kernel/<kver>/Image -> bzImage-<kver>, a relative symlink; whether os.link
+    # follows that depends on the platform's python, and a hard link to the
+    # symlink lands in images/ as a dangling relative link. copy2 followed it;
+    # so must this.
+    real = os.path.realpath(src)
+    try:
+        os.link(real, dst)
+    except OSError:
+        shutil.copy2(real, dst)
+"#;
+
 pub struct RuntimeBuildCommand {
     runtime_name: String,
     config_path: String,
@@ -304,6 +327,12 @@ impl RuntimeBuildCommand {
         container_helper: &SdkContainer,
         runs_on_context: Option<&RunsOnContext>,
     ) -> Result<()> {
+        // Each required extension's recorded image digest, read from the batch
+        // stamp read below and folded into this build's input hash at both the
+        // check and the write.
+        let mut upstream_image_hashes: std::collections::BTreeMap<String, String> =
+            Default::default();
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             // Get detailed extension dependencies for this runtime
@@ -356,8 +385,19 @@ impl RuntimeBuildCommand {
             let install_inputs = merged_runtime
                 .as_ref()
                 .and_then(|mr| compute_runtime_install_input_hash(mr, &self.runtime_name).ok());
+            upstream_image_hashes = crate::utils::stamps::ext_image_content_hashes_from_batch(
+                output.as_deref().unwrap_or(""),
+                ext_deps.iter().map(|d| d.name().to_string()),
+            );
             let build_inputs = merged_runtime.as_ref().and_then(|mr| {
-                compute_runtime_build_input_hash(mr, &self.runtime_name, parsed, &project_root).ok()
+                compute_runtime_build_input_hash(
+                    mr,
+                    &self.runtime_name,
+                    parsed,
+                    &project_root,
+                    &upstream_image_hashes,
+                )
+                .ok()
             });
             let sysroot_inputs =
                 self.sysroot_install_inputs(config, parsed, target_arch, repo_url, repo_release)?;
@@ -623,24 +663,6 @@ impl RuntimeBuildCommand {
         // Set AVOCADO_VERBOSE=1 when verbose mode is enabled
         if self.verbose {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
-        }
-
-        // Kernel command line, for the platform build hook.
-        //
-        // Exported at BUILD time, not just provision time, because a target
-        // whose boot path is a Unified Kernel Image has to bake the command
-        // line into the UKI -- and that UKI must exist before `stone bundle`
-        // if it is to be a manifest artifact, hence OTA-updatable and
-        // uploadable, rather than something only a physical reflash can
-        // change. See `effective_kernel_cmdline` for the runtime-over-
-        // top-level precedence.
-        let (kernel_cmdline, kernel_cmdline_extra) =
-            config.effective_kernel_cmdline(Some(&self.runtime_name));
-        if let Some(cmdline) = kernel_cmdline {
-            env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
-        }
-        if let Some(extra) = kernel_cmdline_extra {
-            env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
         }
 
         // Reproducibility stamp. This run executes the rootfs and initramfs
@@ -931,9 +953,14 @@ impl RuntimeBuildCommand {
                 &self.runtime_name,
                 parsed,
                 &config.project_root(&self.config_path),
+                &upstream_image_hashes,
             )?;
-            let outputs = StampOutputs::default();
-            let stamp = Stamp::runtime_build(&self.runtime_name, target_arch, inputs, outputs);
+            let stamp = Stamp::runtime_build(
+                &self.runtime_name,
+                target_arch,
+                inputs,
+                StampOutputs::default(),
+            );
             let stamp_script = generate_write_stamp_script(&stamp)?;
 
             let run_config = RunConfig {
@@ -1055,20 +1082,10 @@ SIZE=$(stat -c '%s' "$MANIFEST_FILE")
 echo -n '{{"name":"manifest.json","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
 FIRST=false
 
-# Hash all image files (content-addressable by UUIDv5) — .raw and .kab
-if [ -d "$IMAGES_DIR" ]; then
-    for IMG_FILE in "$IMAGES_DIR"/*.raw "$IMAGES_DIR"/*.kab; do
-        [ -f "$IMG_FILE" ] || continue
-        BASENAME=$(basename "$IMG_FILE")
-        HASH=$(sha256sum "$IMG_FILE" | awk '{{print $1}}')
-        SIZE=$(stat -c '%s' "$IMG_FILE")
-        if [ "$FIRST" = "false" ]; then
-            echo -n ','
-        fi
-        echo -n '{{"name":"'"$BASENAME"'","sha256":"'"$HASH"'","size":'"$SIZE"'}}'
-        FIRST=false
-    done
-fi
+# Image entries (.raw and .kab), read from the manifest rather than re-hashed —
+# see manifest_image_targets_snippet. Every entry is comma-prefixed; the
+# manifest.json entry above is always first.
+{image_targets}
 
 echo -n ']'
 
@@ -1084,6 +1101,8 @@ echo -n ',"runtime_uuid":"'"$RUNTIME_UUID"'"'
 echo -n '}}'
 "#,
             runtime_name = self.runtime_name,
+            image_targets =
+                crate::utils::update_repo::manifest_image_targets_snippet(&["raw", "kab"]),
         )
     }
 
@@ -1417,11 +1436,6 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
 
         // Device-tree overlays declared by this runtime's extensions.
         // Empty section - and no build-time work - unless at least one is declared.
-        let device_tree_overlay_section = {
-            let overlays =
-                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, parsed)?;
-            crate::utils::device_tree_overlay::render_build_section(&overlays)?
-        };
 
         // Extract extension names from the `extensions` array
         let mut required_extensions = HashSet::new();
@@ -1521,13 +1535,13 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
                         copy_commands.push(format!(
                             r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" ]; then
-    cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
+    cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.{ext_suffix}" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.{ext_suffix}"
     echo "  Copied: {ext_name}-{ext_version}.{ext_suffix}"
     # dm-verity sidecars (image.verity: true): hash tree + root hash travel with
     # the image; stale ones from an earlier build never survive here.
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
-        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" ] && cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{ext_name}-{ext_version}.$sc" "$RUNTIME_EXT_DIR/{ext_name}-{ext_version}.$sc"
     done
 fi"#
                         ));
@@ -1544,11 +1558,11 @@ fi"#
                     copy_commands.push(format!(
                         r#"
 if [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" ]; then
-    cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
+    cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{versioned_name}.raw" "$RUNTIME_EXT_DIR/{versioned_name}.raw"
     echo "  Copied: {versioned_name}.raw"
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
-        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
+        [ -f "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" ] && cp -f --reflink=auto "$AVOCADO_PREFIX/output/extensions/{versioned_name}.$sc" "$RUNTIME_EXT_DIR/{versioned_name}.$sc"
     done
 else
     echo "ERROR: Extension image not found: $AVOCADO_PREFIX/output/extensions/{versioned_name}.raw"
@@ -1561,11 +1575,11 @@ fi"#
 EXT_FILE=$(ls "$AVOCADO_PREFIX/output/extensions/{ext_name}"-*.raw 2>/dev/null | head -n 1)
 if [ -n "$EXT_FILE" ]; then
     EXT_BASENAME=$(basename "$EXT_FILE")
-    cp -f "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
+    cp -f --reflink=auto "$EXT_FILE" "$RUNTIME_EXT_DIR/$EXT_BASENAME"
     echo "  Copied: $EXT_BASENAME"
     for sc in verity roothash; do
         rm -f "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
-        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
+        [ -f "${{EXT_FILE%.raw}}.$sc" ] && cp -f --reflink=auto "${{EXT_FILE%.raw}}.$sc" "$RUNTIME_EXT_DIR/${{EXT_BASENAME%.raw}}.$sc"
     done
 fi"#
                     ));
@@ -1834,6 +1848,7 @@ SIGNEOF
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
 import json, hashlib, uuid, os, shutil, struct, sys
+{link_or_copy}
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
 runtime_ext_dir = os.environ["AVOCADO_RT_EXT_DIR"]
@@ -1913,7 +1928,7 @@ for pair in ext_pairs:
     size = os.path.getsize(img_file)
     image_id = str(uuid.uuid5(namespace, sha256))
     dest = os.path.join(images_dir, image_id + ext_suffix)
-    shutil.copy2(img_file, dest)
+    link_or_copy(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
     entry = dict(name=name, version=version, image_id=image_id, sha256=sha256)
     # dm-verity, driven by the configured flag (never by sidecar presence): the
@@ -1929,7 +1944,7 @@ for pair in ext_pairs:
         if not (os.path.isfile(base + ".verity") and os.path.isfile(base + ".roothash")):
             sys.exit("ERROR: extension " + name + "-" + version + " has image.verity: true but its hash tree "
                      "(.verity/.roothash) is missing next to " + img_file + " - rebuild it with `avocado ext image`")
-        shutil.copy2(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
+        link_or_copy(base + ".verity", os.path.join(images_dir, image_id + ".verity"))
         with open(base + ".roothash") as rf:
             entry["root_hash"] = rf.read().strip()
         print("  Verity: " + name + "-" + version + " root hash " + entry["root_hash"][:16] + "...")
@@ -1955,7 +1970,7 @@ def add_image_entry(img_path, version, image_type):
     image_id = str(uuid.uuid5(namespace, sha256))
     suffix = ".kab" if image_type == "kab" else ".raw"
     dest = os.path.join(images_dir, image_id + suffix)
-    shutil.copy2(img_path, dest)
+    link_or_copy(img_path, dest)
     print("  Image: " + os.path.basename(img_path) + " -> " + image_id + suffix)
     entry = dict(version=version, image_id=image_id, sha256=sha256)
     if image_type == "kab":
@@ -2085,6 +2100,7 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             rootfs_image_type = rootfs_image_type,
             initramfs_image_type = initramfs_image_type,
             kernel_image_type = kernel_image_type,
+            link_or_copy = LINK_OR_COPY_PY,
         );
 
         // Generate update authority (root.json) for verified updates.
@@ -2209,110 +2225,11 @@ echo "Provisioned update authority: metadata/root.json""#
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Generate mkfs.btrfs --subvol flags
-        // Always create as rw at mkfs time -- read-only subvolumes need properties
-        // set first (compression, etc.), then flipped to ro in the post-creation step.
-        let has_ro_subvolumes = resolved_subvolumes.iter().any(|s| !s.writable);
-        let subvol_flags: Vec<String> = resolved_subvolumes
-            .iter()
-            .map(|s| format!("    --subvol rw:{}", s.path))
-            .collect();
-
-        let mkfs_flags = subvol_flags.join(" \\\n");
-
-        // Determine if we can use mkfs.btrfs --compress for a global default
-        // (applies compression at image creation time to all packed files)
-        let global_compress_flag = {
-            // Use the runtime-level var.compression as a global --compress flag
-            let var_compression = merged_runtime
-                .get("var")
-                .and_then(|v| v.get("compression"))
-                .and_then(|v| v.as_str());
-            match var_compression {
-                Some(c) if c != "no" => format!("    --compress {c}"),
-                _ => String::new(),
-            }
-        };
-
         // Generate post-creation section for nodatacow, per-subvolume compression, and quotas.
         // These require loop-mounting the btrfs image:
         //   nodatacow: chattr +C (requires e2fsprogs in SDK)
         //   compression: btrfs property set
         //   quotas: btrfs quota enable + btrfs qgroup limit
-        let needs_post_creation = has_ro_subvolumes
-            || resolved_subvolumes
-                .iter()
-                .any(|s| s.nodatacow || s.quota.is_some() || s.compression.is_some());
-
-        let post_creation_section = if needs_post_creation {
-            let mut commands = vec![
-                "# Post-creation: apply per-subvolume properties via loop mount".to_string(),
-                "echo \"Applying subvolume properties...\"".to_string(),
-                "LOOP_DEV=$(losetup --find --show \"$VAR_IMAGE\")".to_string(),
-                "mkdir -p /tmp/btrfs-var-setup".to_string(),
-                "mount -t btrfs \"$LOOP_DEV\" /tmp/btrfs-var-setup".to_string(),
-            ];
-
-            // nodatacow via chattr +C (requires e2fsprogs in SDK)
-            for s in &resolved_subvolumes {
-                if s.nodatacow {
-                    commands.push(format!("chattr +C /tmp/btrfs-var-setup/{}", s.path));
-                    commands.push(format!("echo \"  {}: nodatacow\"", s.path));
-                }
-            }
-
-            // Per-subvolume compression properties
-            // Skip subvolumes with nodatacow -- NOCOW and compression are mutually
-            // exclusive on btrfs (COW is required for transparent compression).
-            for s in &resolved_subvolumes {
-                if s.nodatacow {
-                    continue;
-                }
-                if let Some(ref comp) = s.compression {
-                    if comp != "no" {
-                        commands.push(format!(
-                            "btrfs property set /tmp/btrfs-var-setup/{} compression {}",
-                            s.path, comp
-                        ));
-                        commands.push(format!("echo \"  {}: compression={}\"", s.path, comp));
-                    }
-                }
-            }
-
-            // Quotas
-            let has_quotas = resolved_subvolumes.iter().any(|s| s.quota.is_some());
-            if has_quotas {
-                commands.push("btrfs quota enable /tmp/btrfs-var-setup".to_string());
-                for s in &resolved_subvolumes {
-                    if let Some(ref quota) = s.quota {
-                        if quota != "none" {
-                            commands.push(format!(
-                                "btrfs qgroup limit {} /tmp/btrfs-var-setup/{}",
-                                quota, s.path
-                            ));
-                            commands.push(format!("echo \"  {}: quota={}\"", s.path, quota));
-                        }
-                    }
-                }
-            }
-
-            // Flip read-only subvolumes to ro (created as rw so properties could be set first)
-            for s in &resolved_subvolumes {
-                if !s.writable {
-                    commands.push(format!(
-                        "btrfs property set /tmp/btrfs-var-setup/{} ro true",
-                        s.path
-                    ));
-                    commands.push(format!("echo \"  {}: read-only\"", s.path));
-                }
-            }
-
-            commands.push("umount /tmp/btrfs-var-setup".to_string());
-            commands.push("losetup -d \"$LOOP_DEV\"".to_string());
-            commands.join("\n")
-        } else {
-            String::new()
-        };
 
         // Build var_files section: apply extension var_files to var staging in reverse order
         // (last in extensions list applied first = lowest priority, first applied last = wins conflicts)
@@ -2392,131 +2309,6 @@ fi"#,
 
         // Build Docker image priming section
         // Collect docker_images from all extensions in the runtime
-        let docker_section = {
-            let docker_images: Vec<crate::utils::config::DockerImageRef> = ext_list
-                .iter()
-                .flat_map(|ext_name| {
-                    parsed
-                        .get("extensions")
-                        .and_then(|e| e.get(*ext_name))
-                        .map(crate::utils::config::get_docker_images)
-                        .unwrap_or_default()
-                })
-                .collect();
-            if docker_images.is_empty() {
-                "# No Docker images to prime".to_string()
-            } else {
-                let pull_commands: Vec<String> = docker_images
-                    .iter()
-                    .map(|img| {
-                        format!(
-                            r#"docker --host unix:///tmp/avocado-dockerd.sock pull --platform "linux/$DOCKER_ARCH" "{image}:{tag}"
-echo "  Primed: {image}:{tag}""#,
-                            image = img.image,
-                            tag = img.tag
-                        )
-                    })
-                    .collect();
-
-                format!(
-                    r#"# Prime Docker image cache on var partition
-echo "Priming Docker images on var partition..."
-mkdir -p "$VAR_DIR/lib/docker"
-
-# Verify dockerd is available
-if ! command -v dockerd >/dev/null 2>&1; then
-    echo "ERROR: dockerd not found in SDK container. Docker image priming requires dockerd, containerd, runc, and docker CLI."
-    exit 1
-fi
-
-# Map target arch to Docker platform
-# Use OECORE_TARGET_ARCH (CPU arch like x86_64/aarch64) from SDK environment
-DOCKER_TARGET_ARCH="${{OECORE_TARGET_ARCH:-$TARGET_ARCH}}"
-case "$DOCKER_TARGET_ARCH" in
-    aarch64) DOCKER_ARCH="arm64" ;;
-    x86_64) DOCKER_ARCH="amd64" ;;
-    *) echo "WARNING: Unknown target architecture '$DOCKER_TARGET_ARCH' for Docker platform mapping, defaulting to amd64"; DOCKER_ARCH="amd64" ;;
-esac
-
-# The SDK container may have the host's /sys bind-mounted (-v /sys:/sys),
-# and --privileged gives write access even without that flag.
-# Make the /sys/fs/cgroup mount private so the inner dockerd's mount
-# events do not propagate to the host.  A bind+private mount preserves
-# the existing cgroup controllers (required by dockerd) while isolating
-# mount propagation.
-_AVOCADO_CGROUP_PRIVATE=0
-if mount --bind /sys/fs/cgroup /sys/fs/cgroup 2>/dev/null \
-   && mount --make-private /sys/fs/cgroup 2>/dev/null; then
-    _AVOCADO_CGROUP_PRIVATE=1
-else
-    echo "WARNING: Could not make /sys/fs/cgroup private — inner dockerd may leave stale cgroup entries on the host."
-fi
-
-# When the SDK container uses --network=host the inner dockerd shares the
-# host network namespace and may delete the host's docker0 bridge on exit.
-# Save its address now so we can restore it if needed.
-_DOCKER0_ADDR=""
-if ip link show docker0 >/dev/null 2>&1; then
-    _DOCKER0_ADDR=$(ip -4 addr show docker0 2>/dev/null | awk '/inet /{{print $2}}' | head -1)
-fi
-
-_avocado_docker_cleanup() {{
-    kill $DOCKERD_PID 2>/dev/null || true
-    wait $DOCKERD_PID 2>/dev/null || true
-    rm -f /tmp/avocado-dockerd.sock /tmp/avocado-dockerd.pid /tmp/avocado-dockerd.log
-    [ "$_AVOCADO_CGROUP_PRIVATE" = "1" ] && umount /sys/fs/cgroup 2>/dev/null || true
-    # Restore docker0 if the inner dockerd removed it from the host network namespace
-    if [ -n "$_DOCKER0_ADDR" ] && ! ip link show docker0 >/dev/null 2>&1; then
-        echo "NOTE: inner dockerd removed host docker0 — restoring."
-        ip link add name docker0 type bridge 2>/dev/null || true
-        ip addr add "$_DOCKER0_ADDR" dev docker0 2>/dev/null || true
-        ip link set docker0 up 2>/dev/null || true
-    fi
-}}
-trap _avocado_docker_cleanup EXIT
-
-# Start temporary dockerd with data-root pointing at var staging.
-# cgroupdriver=cgroupfs avoids systemd-cgroup interaction inside the container.
-dockerd --data-root "$VAR_DIR/lib/docker" \
-    --host unix:///tmp/avocado-dockerd.sock \
-    --exec-opt native.cgroupdriver=cgroupfs \
-    --iptables=false --ip-masq=false \
-    --bridge=none \
-    --exec-root /tmp/avocado-dockerd \
-    --pidfile /tmp/avocado-dockerd.pid \
-    >/tmp/avocado-dockerd.log 2>&1 &
-DOCKERD_PID=$!
-
-# Wait for dockerd to be ready
-echo "Waiting for temporary dockerd..."
-for i in $(seq 1 30); do
-    if docker --host unix:///tmp/avocado-dockerd.sock info >/dev/null 2>&1; then
-        break
-    fi
-    if ! kill -0 $DOCKERD_PID 2>/dev/null; then
-        echo "ERROR: dockerd exited unexpectedly. Check /tmp/avocado-dockerd.log"
-        cat /tmp/avocado-dockerd.log
-        exit 1
-    fi
-    sleep 1
-done
-
-if ! docker --host unix:///tmp/avocado-dockerd.sock info >/dev/null 2>&1; then
-    echo "ERROR: dockerd failed to start within 30 seconds"
-    cat /tmp/avocado-dockerd.log
-    exit 1
-fi
-
-echo "Pulling Docker images for platform linux/$DOCKER_ARCH..."
-{pull_commands}
-
-trap - EXIT
-_avocado_docker_cleanup
-echo "Docker image priming complete.""#,
-                    pull_commands = pull_commands.join("\n")
-                )
-            }
-        };
 
         // Helper closure: given the rootfs/initramfs ImageConfig the runtime
         // resolves to, render the users/groups script that will edit the
@@ -2709,199 +2501,13 @@ export AVOCADO_OS_VERSION_ID
 {runtime_var_files_section}
 {manifest_section}
 {update_authority_section}
-{docker_section}
 
-VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
-VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
-VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
-echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
-
-# Background progress reporter — prints size and estimated % every 5s
-(
-    while [ ! -f "$VAR_IMAGE" ]; do sleep 1; done
-    while kill -0 $$ 2>/dev/null; do
-        CUR=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
-        CUR_MB=$(( CUR / 1048576 ))
-        if [ "$VAR_INPUT_SIZE" -gt 0 ] 2>/dev/null; then
-            PCT=$(( CUR * 100 / VAR_INPUT_SIZE ))
-            [ "$PCT" -gt 99 ] && PCT=99
-            printf "\r  var image: %dMB written (~%d%%)" "$CUR_MB" "$PCT"
-        else
-            printf "\r  var image: %dMB written" "$CUR_MB"
-        fi
-        sleep 5
-    done
-) &
-_PROGRESS_PID=$!
-
-mkfs.btrfs -r "$VAR_DIR" \
-{mkfs_flags} \
-{global_compress_flag}    -f "$VAR_IMAGE"
-
-# var.encrypt: the first boot converts this filesystem to LUKS2 in place, which
-# needs 32 MiB in front of the data (cryptsetup reencrypt --reduce-device-size)
-# that cryptsetup-var obtains by shrinking the filesystem. `mkfs.btrfs -r`
-# packs its chunks to the content, so a tight image has nothing to shrink into;
-# rebuild it at the tight size plus 64 MiB so the room is inside the filesystem
-# the runtime declared it needs. The partition stays exactly the image size.
-if [ "{var_luks_room}" = "1" ]; then
-    VAR_TIGHT_SIZE=$(stat -c%s "$VAR_IMAGE")
-    mkfs.btrfs -r "$VAR_DIR" \
-{mkfs_flags} \
-{global_compress_flag}    -b $(( VAR_TIGHT_SIZE + 67108864 )) -f "$VAR_IMAGE"
-fi
-
-kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
-
-{post_creation_section}
-FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
-FINAL_MB=$(( FINAL_SIZE / 1048576 ))
-echo ""
-echo "Built var image: ${{FINAL_MB}}MB"
-
-# Build OS bundle (.aos) — needs rootfs + initramfs + kernel + var (all built above)
-STONE_MANIFEST="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-$TARGET_ARCH.json}}"
-STONE_INPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
-STONE_BUILD_DIR="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/stone"
-# Clean previous stone build artifacts to prevent stale image reuse
-rm -rf "$STONE_BUILD_DIR"
-STONE_AOS_OUTPUT="$AVOCADO_PREFIX/output/runtimes/$RUNTIME_NAME/os-bundle.aos"
-export STONE_AOS_OUTPUT
-
-# Build include path flags from AVOCADO_STONE_INCLUDE_PATHS
-STONE_INCLUDE_FLAGS=""
-if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
-    for path in $AVOCADO_STONE_INCLUDE_PATHS; do
-        STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $path"
-    done
-fi
-STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
-# Also search the SDK's stone dir. A BSP's stone-<arch>.json references boot
-# artifacts it does not build here - u-boot.bin, bootfiles/ - and the runtime
-# input dir only ever holds what this build produced (rootfs, kernel, initramfs,
-# var), so a manifest naming any of them fails resolution with "not found in any
-# input directory".
-#
-# This is the consumer half of a two-part change and is inert without the
-# other: today meta-avocado's avocado-sdk-target installs only the stone JSON
-# into this directory, so nothing new resolves from it yet. It is the right
-# half to land regardless - stone resolves first-match-wins across -i dirs, so
-# an empty extra input changes no current behaviour - but the finalize failure
-# it targets stays until the BSP recipe stages those artifacts here.
-STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $AVOCADO_SDK_PREFIX/stone"
-
-STONE_OVERLAY_FLAG=""
-{device_tree_overlay_section}
-# Platform build hook. A BSP uses this to stage artifacts the manifest
-# references but the generic pipeline cannot build, because they are specific to
-# the SoC rather than to Avocado -- on Tegra, the Android boot image that backs
-# the kernel A/B partitions, which has to wrap whichever kernel this project
-# pinned and so cannot be built in Yocto either. Runs before stone bundle so
-# whatever it writes into the runtime input dir resolves as an input.
-#
-# Optional: absent or a no-op on every target that needs nothing extra. Invoked
-# by absolute path with the SDK's bin on PATH because the hook shells out to
-# nativesdk tools (jq, mkbootimg) that are not otherwise on PATH here.
-AVOCADO_BUILD_HOOK="$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH"
-if [ -x "$AVOCADO_BUILD_HOOK" ]; then
-    echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-build' for '$RUNTIME_NAME'."
-    PATH="$AVOCADO_SDK_PREFIX/usr/bin:$PATH" "$AVOCADO_BUILD_HOOK" "$RUNTIME_NAME"
-fi
-
-echo -e "\033[94m[INFO]\033[0m Running stone bundle."
-echo -e "  Manifest:  $STONE_MANIFEST"
-echo -e "  Output:    $STONE_AOS_OUTPUT"
-echo -e "  Build dir: $STONE_BUILD_DIR"
-
-STONE_INITRD_FLAG=""
-INITRD_OS_RELEASE="$AVOCADO_PREFIX/initramfs/usr/lib/os-release-initrd"
-if [ -f "$INITRD_OS_RELEASE" ]; then
-    STONE_INITRD_FLAG="--os-release-initrd $INITRD_OS_RELEASE"
-fi
-
-stone bundle \
-    --os-release "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
-    $STONE_INITRD_FLAG \
-    -m "$STONE_MANIFEST" \
-    $STONE_INCLUDE_FLAGS \
-    $STONE_OVERLAY_FLAG \
-    --partition-size "var=$FINAL_SIZE" \
-    -o "$STONE_AOS_OUTPUT" \
-    --build-dir "$STONE_BUILD_DIR"
-
-# Patch manifest in var-staging to add os_bundle reference (for connect upload)
-# The btrfs image for provisioning doesn't need os_bundle — initial flash doesn't OTA.
-# Connect upload reads from var-staging directly, so it sees this update.
-python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil
-
-aos_path = os.environ.get("STONE_AOS_OUTPUT", "")
-if not (aos_path and os.path.isfile(aos_path)):
-    print("No .aos file found, skipping os_bundle manifest patch.")
-    exit(0)
-
-namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
-images_dir = os.environ["AVOCADO_IMAGES_DIR"]
-manifest_path = os.environ["AVOCADO_MANIFEST_PATH"]
-
-# Streaming SHA256 — see HASH_CHUNK rationale in the manifest builder
-# above. .aos bundles routinely exceed available RAM on builders.
-HASH_CHUNK = 1024 * 1024
-aos_h = hashlib.sha256()
-with open(aos_path, "rb") as f:
-    for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
-        aos_h.update(chunk)
-aos_sha256 = aos_h.hexdigest()
-aos_image_id = str(uuid.uuid5(namespace, aos_sha256))
-dest = os.path.join(images_dir, aos_image_id + ".raw")
-shutil.copy2(aos_path, dest)
-print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
-
-with open(manifest_path, "r") as f:
-    manifest = json.load(f)
-os_build_id = None
-os_release_path = os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "rootfs/usr/lib/os-release")
-if os.path.isfile(os_release_path):
-    with open(os_release_path) as f:
-        for line in f:
-            if line.startswith("AVOCADO_OS_BUILD_ID="):
-                os_build_id = line.strip().split("=", 1)[1]
-                break
-
-initramfs_build_id = os.environ.get("AVOCADO_INITRAMFS_BUILD_ID")
-
-os_bundle = dict(image_id=aos_image_id, sha256=aos_sha256)
-if os_build_id:
-    os_bundle["os_build_id"] = os_build_id
-if initramfs_build_id:
-    os_bundle["initramfs_build_id"] = initramfs_build_id
-manifest["os_bundle"] = os_bundle
-with open(manifest_path, "w") as f:
-    json.dump(manifest, f, indent=2)
-print("Patched manifest with os_bundle reference.")
-
-# Clean up stale os_bundle images
-current_image_files = set()
-for ext in manifest.get("extensions", []):
-    current_image_files.add(ext["image_id"] + ".raw")
-for key in ("rootfs", "initramfs", "kernel"):
-    block = manifest.get(key)
-    if block:
-        sfx = ".kab" if block.get("image_type") == "kab" else ".raw"
-        current_image_files.add(block["image_id"] + sfx)
-current_image_files.add(aos_image_id + ".raw")
-for fname in os.listdir(images_dir):
-    if fname.endswith(".raw") and fname not in current_image_files:
-        os.remove(os.path.join(images_dir, fname))
-        print("  Removed stale image: " + fname)
-PYEOF
-
-# Re-sign the var-staging manifest after the os_bundle patch — the
-# earlier pre-mkfs.btrfs signature is now invalid for this mutated
-# content. The btrfs image flashed onto fresh devices already carries
-# the pre-patch signature; this second signature covers the
-# var-staging manifest that OTA upload / Studio publishing consumes.
-sign_amf "$AVOCADO_MANIFEST_PATH"
+# The OTA tail: the platform build hook, `stone bundle`, the os_bundle manifest
+# patch and the re-sign after it. All of it produces or names OTA payload, so it
+# belongs to `build` — an `avocado deploy` with none of this reports success and
+# ships extensions onto an unchanged OS. The var image, which only `provision`
+# consumes, is not here; see commands/runtime/var_image.rs.
+{ota_tail_section}
 "#,
             runtime_name = self.runtime_name,
             target_arch = target_arch,
@@ -2915,20 +2521,20 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
             kernel_kab_wrap = kernel_kab_wrap,
             subvol_mkdir_section = subvol_mkdir_section,
             subvol_warnings_section = subvol_warnings_section,
-            mkfs_flags = mkfs_flags,
-            global_compress_flag = if global_compress_flag.is_empty() {
-                "".to_string()
-            } else {
-                format!("{global_compress_flag} \\\n")
-            },
-            post_creation_section = post_creation_section,
             var_files_section = var_files_section,
             runtime_var_files_section = runtime_var_files_section,
             manifest_section = manifest_section,
             update_authority_section = update_authority_section,
-            docker_section = docker_section,
-            device_tree_overlay_section = device_tree_overlay_section,
-            var_luks_room = if var_encrypt(target_arch) { "1" } else { "0" },
+            ota_tail_section = crate::commands::runtime::var_image::render_ota_tail(
+                &crate::commands::runtime::var_image::VarImageContext {
+                    runtime_name: &self.runtime_name,
+                    target_arch,
+                    config,
+                    parsed,
+                    merged_runtime: &merged_runtime,
+                    ext_list: resolved_extensions,
+                },
+            )?,
         );
 
         Ok(script)
@@ -4187,39 +3793,57 @@ runtimes:
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("TARGET_ARCH=\"x86_64\""));
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
-        assert!(script.contains("stone bundle"));
-        // 35124cb replaced the avocado-build hook call with stone bundle and
-        // left the hooks orphaned, removing the only point where a BSP can stage
-        // an artifact the manifest references but no generic step builds (the
-        // Tegra boot.img backing the kernel A/B partitions). Bundling before the
-        // hook runs resolves those inputs as missing.
-        // Anchor on the execution line, not the AVOCADO_BUILD_HOOK assignment
-        // above it: "avocado-build-$TARGET_ARCH" is matched by the assignment
-        // alone, so both the presence and the ordering check would survive the
-        // invocation being deleted or moved past the bundle - the one
-        // regression they exist to catch.
-        let hook_call =
-            "PATH=\"$AVOCADO_SDK_PREFIX/usr/bin:$PATH\" \"$AVOCADO_BUILD_HOOK\" \"$RUNTIME_NAME\"";
-        let hook_at = script
-            .find(hook_call)
-            .expect("the platform build hook must actually be invoked");
-        let guard_at = script
-            .find("if [ -x \"$AVOCADO_BUILD_HOOK\" ]")
-            .expect("the hook is optional and must be guarded on existence");
+        // The split: what an OTA needs is here, what only provisioning
+        // consumes is not. Asserted in both directions, because getting it
+        // backwards does not fail a build — it produces a `deploy` that reports
+        // success and leaves the device on its old OS. That is how the first cut
+        // of this shipped, and it was caught on hardware, not here.
+        for present in [
+            "$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH",
+            "\nstone bundle ",
+            "os_bundle",
+        ] {
+            assert!(
+                script.contains(present),
+                "a build must emit the OTA tail, missing: {present}"
+            );
+        }
+        for absent in ["mkfs.btrfs -r", "VAR_IMAGE="] {
+            assert!(
+                !script.contains(absent),
+                "the var image is provisioning-only, found: {absent}"
+            );
+        }
+        // Ordering the hook actually depends on: it stages inputs that `stone
+        // bundle` then resolves, and it must run after the manifest exists.
+        let hook = script
+            .find("\"$AVOCADO_BUILD_HOOK\" \"$RUNTIME_NAME\"")
+            .expect("the platform build hook must be invoked");
         assert!(
-            guard_at < hook_at,
-            "the invocation must sit inside the existence guard"
+            hook < script.find("\nstone bundle ").unwrap(),
+            "hook before bundle"
         );
-        // The bare string "stone bundle" also appears in an earlier comment
-        // about os_bundle cleanup, so anchor on the command at start-of-line.
         assert!(
-            hook_at < script.find("\nstone bundle ").unwrap(),
-            "the hook must run before stone bundle resolves its inputs"
+            script.find("Created runtime manifest").unwrap() < hook,
+            "manifest before hook"
         );
-        assert!(script.contains("mkfs.btrfs"));
-        // No overlays declared: the device-tree overlay section is inert.
-        assert!(!script.contains("device-tree overlays"));
-        assert!(script.contains("STONE_OVERLAY_FLAG=\"\""));
+        // The OTA tail calls `sign_amf` and deliberately does not define it —
+        // it inherits the helper from this script. When the tail lived in
+        // `provision` that call resolved to nothing and provisioning died with
+        // `sign_amf: command not found` after the bundle was already built.
+        let def = script
+            .find("sign_amf() {")
+            .expect("sign_amf must be defined in the build script");
+        let resign = script.rfind("sign_amf \"$AVOCADO_MANIFEST_PATH\"").unwrap();
+        assert!(
+            def < resign,
+            "sign_amf must be defined before the OTA tail calls it"
+        );
+        // And the re-sign covers the patched manifest, so it must follow the patch.
+        assert!(
+            script.find("Patched manifest with os_bundle").unwrap() < resign,
+            "the re-sign must follow the os_bundle patch it exists for"
+        );
         // No var.encrypt: the plaintext path writes no marker.
         assert!(!script.contains("/etc/avocado/var-encrypt"));
         // A previous build's re-keyed bootloader is removed before stone can
@@ -4268,50 +3892,122 @@ runtimes:
         assert!(!script.contains("$INITRAMFS_SYSROOT/etc/avocado/var-encrypt"));
     }
 
+    /// The staging copy into `lib/avocado/images/` is a hardlink — one inode,
+    /// no second write — and an existing file under the content-addressed
+    /// name is replaced rather than trusted, so a short file left by an
+    /// interrupted build cannot survive into the next one.
+    #[cfg(unix)]
     #[test]
-    fn var_encrypt_builds_the_var_image_with_room_to_shrink_for_the_luks_header() {
+    fn link_or_copy_hardlinks_and_replaces_a_stale_destination() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.raw");
+        let dst = dir.path().join("dst.raw");
+        std::fs::write(&src, b"image bytes").unwrap();
+        std::fs::write(&dst, b"short").unwrap(); // the interrupted-build case
+
+        let script = format!(
+            "import os, shutil, sys\n{LINK_OR_COPY_PY}\nlink_or_copy(sys.argv[1], sys.argv[2])\n"
+        );
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(&src)
+            .arg(&dst)
+            .status()
+            .expect("python3 on PATH");
+        assert!(status.success());
+
+        let (a, b) = (
+            std::fs::metadata(&src).unwrap(),
+            std::fs::metadata(&dst).unwrap(),
+        );
+        assert_eq!(a.ino(), b.ino(), "same inode: a link, not a copy");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"image bytes",
+            "stale dst replaced"
+        );
+
+        // A symlink source — the kernel's `Image -> bzImage-<kver>` — must
+        // produce a link to the target file, never a copy of the symlink: a
+        // relative link relocated into images/ dangles, and the manifest
+        // hashed the target's bytes.
+        let link = dir.path().join("Image");
+        std::os::unix::fs::symlink("src.raw", &link).unwrap();
+        let dst2 = dir.path().join("kernel.raw");
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(&link)
+            .arg(&dst2)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let m = std::fs::symlink_metadata(&dst2).unwrap();
+        assert!(
+            !m.file_type().is_symlink(),
+            "linked the target, not the symlink"
+        );
+        assert_eq!(m.ino(), a.ino(), "same inode as the real file");
+    }
+
+    /// The build script stages images by link and clones its work trees, so
+    /// no full image byte is copied that the filesystem could share instead.
+    #[test]
+    fn build_script_links_images_and_reflinks_copies() {
         let temp_dir = TempDir::new().unwrap();
-        let on = r#"
+        let content = r#"
 connect:
   org: test
 
 runtimes:
   test-runtime:
     target: "x86_64"
-    var:
-      encrypt: true
-"#;
-        let build = |content: &str| {
-            let config_path = create_test_config_file(&temp_dir, content);
-            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
-            let cmd = RuntimeBuildCommand::new(
-                "test-runtime".to_string(),
-                config_path,
-                false,
-                Some("x86_64".to_string()),
-                None,
-                None,
-            );
-            let config = Config::load(&cmd.config_path).unwrap();
-            cmd.create_build_script(&config, &parsed, "x86_64", &[])
-                .unwrap()
-        };
-        let script = build(on);
-        assert!(
-            script.contains("if [ \"1\" = \"1\" ]; then"),
-            "second mkfs pass is armed"
-        );
-        assert!(script.contains("-b $(( VAR_TIGHT_SIZE + 67108864 ))"));
-        assert!(
-            script.contains("--partition-size \"var=$FINAL_SIZE\""),
-            "partition stays the image size"
-        );
+    extensions:
+      - test-ext
 
-        let script = build(&on.replace("encrypt: true", "encrypt: false"));
-        assert!(
-            script.contains("if [ \"0\" = \"1\" ]; then"),
-            "plaintext runtime keeps the tight image"
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+"#;
+        let config_path = create_test_config_file(&temp_dir, content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
         );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(&config, &parsed, "x86_64", &["test-ext-1.0.0".to_string()])
+            .unwrap();
+
+        // Four image stagings: three in the manifest block, one for the
+        // os_bundle. The os_bundle one is rendered in from `var_image`'s OTA
+        // half, which is part of this script — the helper is spliced into both
+        // python blocks, hence two definitions.
+        assert_eq!(
+            script.matches("link_or_copy(").count(),
+            4 + 2,
+            "3 + 1 calls, 2 defs"
+        );
+        assert!(
+            !script.contains("shutil.copy2(img_file"),
+            "no plain copy remains"
+        );
+        assert!(script.contains("cp -a --reflink=auto \"$ROOTFS_SYSROOT\""));
+        assert!(script.contains("cp -a --reflink=auto \"$INITRAMFS_SYSROOT\""));
+        assert!(script.contains("cp -f --reflink=auto \"$AVOCADO_PREFIX/output/extensions/"));
+        // The hash collection reads the manifest instead of re-hashing.
+        let hashes = cmd.create_hash_collection_script();
+        assert!(hashes.contains("TARGETS_PY"));
+        assert!(!hashes.contains("sha256sum \"$IMG_FILE\""));
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
@@ -4555,78 +4251,6 @@ extensions:
         assert!(script.contains("$AVOCADO_PREFIX/output/extensions"));
         assert!(script.contains("$RUNTIME_EXT_DIR/test-ext-1.0.0.raw"));
         assert!(!script.contains("$VAR_DIR/lib/avocado/extensions/"));
-    }
-
-    #[test]
-    fn test_create_build_script_with_device_tree_overlays() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_content = r#"
-sdk:
-  image: "test-image"
-
-connect:
-  org: test
-
-runtimes:
-  test-runtime:
-    target: "x86_64"
-    extensions:
-      - test-ext
-
-extensions:
-  test-ext:
-    version: "1.0.0"
-    types:
-      - sysext
-    device_tree_overlays:
-      - name: my-spi
-        src: overlays/my-spi.dtso
-"#;
-        let config_path = create_test_config_file(&temp_dir, config_content);
-        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
-        let cmd = RuntimeBuildCommand::new(
-            "test-runtime".to_string(),
-            config_path,
-            false,
-            Some("x86_64".to_string()),
-            None,
-            None,
-        );
-
-        let config = Config::load(&cmd.config_path).unwrap();
-        let resolved_extensions = vec!["test-ext-1.0.0".to_string()];
-        let script = cmd
-            .create_build_script(&config, &parsed, "x86_64", &resolved_extensions)
-            .unwrap();
-
-        // The overlay section is emitted, builds the declared overlay via the
-        // SDK wrapper, and wires the delivery hook + stone --overlay before the
-        // bundle call.
-        assert!(script.contains("device-tree overlays"));
-        assert!(script.contains(
-            "avocado-dtc-overlay --name \"my-spi\" --src \"/opt/src/overlays/my-spi.dtso\""
-        ));
-        assert!(script.contains("device-tree-overlay-deliver"));
-        assert!(script.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
-        // And the bundle call consumes the flag.
-        assert!(script.contains("$STONE_OVERLAY_FLAG \\"));
-
-        // The staging dir must be PREPENDED to the include flags. stone takes
-        // the first -i dir that holds a matching name, and the merged DTB is
-        // published under the BSP's own base filename, so appending lets any
-        // earlier dir - including the project's own stone_include_paths - win
-        // the lookup and ship an unmerged tree. That failure boots cleanly with
-        // no overlay applied and reports nothing, so nothing downstream catches
-        // it; the ordering is the only thing that prevents it.
-        assert!(
-            script.contains("STONE_INCLUDE_FLAGS=\"-i $DTBO_STAGING $STONE_INCLUDE_FLAGS\""),
-            "staging dir must be prepended, not appended, or a same-named DTB \
-             in an earlier -i dir silently wins over the merged one"
-        );
-        assert!(
-            !script.contains("STONE_INCLUDE_FLAGS=\"$STONE_INCLUDE_FLAGS -i $DTBO_STAGING\""),
-            "the appended form reintroduces the silent unmerged-DTB failure"
-        );
     }
 
     #[test]
@@ -4907,8 +4531,6 @@ extensions:
         assert!(script.contains("AVOCADO_SPOT_HASHES_PATH"));
         assert!(script.contains("spot_hashes.json"));
         assert!(script.contains("compute_spot_hash"));
-
-        assert!(script.contains("--subvol rw:lib/avocado "));
     }
 
     /// When a top-level `rootfs:` (or initramfs / kernel) declares
