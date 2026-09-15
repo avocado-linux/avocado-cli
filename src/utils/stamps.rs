@@ -1039,8 +1039,29 @@ pub fn compute_config_hash(value: &serde_yaml::Value) -> Result<String> {
 /// (comments, metadata, future additions that don't drive selection) do
 /// not invalidate stamps.
 fn narrow_kernel_for_hash(kernel: &serde_yaml::Value) -> serde_yaml::Value {
+    const KEYS: [&str; 4] = ["package", "version", "compile", "install"];
+    // `kernel:` is either the inline form or a named map -- `kernel: { default:
+    // {...} }`, or a sole named entry. Mirror `Config::kernel_default()`: the
+    // `default` entry wins, else the only entry. Narrowing the outer map of a
+    // named form would hash nothing, so a bumped `default.version` would leave
+    // every stamp that folds the kernel valid.
+    if let Some(m) = kernel.as_mapping() {
+        let has_field = KEYS
+            .iter()
+            .any(|k| m.contains_key(serde_yaml::Value::String(k.to_string())));
+        if !has_field {
+            if let Some(d) = m.get("default") {
+                return narrow_kernel_for_hash(d);
+            }
+            if m.len() == 1 {
+                if let Some(v) = m.values().next() {
+                    return narrow_kernel_for_hash(v);
+                }
+            }
+        }
+    }
     let mut out = serde_yaml::Mapping::new();
-    for key in ["package", "version", "compile", "install"] {
+    for key in KEYS {
         if let Some(v) = kernel.get(key) {
             out.insert(serde_yaml::Value::String(key.to_string()), v.clone());
         }
@@ -4946,6 +4967,42 @@ extensions:
             k665,
             ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.5\"\n"))
         );
+    }
+
+    /// The named-map form -- `kernel: { default: {...} }`, or a sole named
+    /// entry -- is what `effective_kernel_spec` resolves for extensions, so it
+    /// must move the hash exactly like the inline form does. Before this, the
+    /// narrowing step looked for `version` on the outer map, found nothing,
+    /// and a bumped `default.version` left every extension stamp valid.
+    #[test]
+    fn named_kernel_map_moves_the_ext_install_hash_like_the_inline_form() {
+        let inline = ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.5\"\n"));
+        let named = ext_install_hash(&ext_with_extras(
+            "kernel:\n  default:\n    version: \"6.6.5\"\n",
+        ));
+        let sole = ext_install_hash(&ext_with_extras(
+            "kernel:\n  lts:\n    version: \"6.6.5\"\n",
+        ));
+        assert_eq!(inline, named, "default entry narrows to the inline shape");
+        assert_eq!(
+            inline, sole,
+            "a sole named entry narrows to the inline shape"
+        );
+        let bumped = ext_install_hash(&ext_with_extras(
+            "kernel:\n  default:\n    version: \"6.6.6\"\n",
+        ));
+        assert_ne!(named, bumped, "a bumped default.version must move the hash");
+        // Two named entries and no `default`: there is no effective kernel to
+        // pick (`kernel_default()` returns None too), so a version bump inside
+        // that shape is invisible to the hash -- the pre-existing limitation,
+        // pinned here so a change to it is deliberate.
+        let ambiguous_a = ext_install_hash(&ext_with_extras(
+            "kernel:\n  a:\n    version: \"6.6.5\"\n  b:\n    version: \"6.6.6\"\n",
+        ));
+        let ambiguous_b = ext_install_hash(&ext_with_extras(
+            "kernel:\n  a:\n    version: \"6.6.7\"\n  b:\n    version: \"6.6.6\"\n",
+        ));
+        assert_eq!(ambiguous_a, ambiguous_b);
     }
 
     /// A range/`*` spec keeps the declared config byte-identical while the

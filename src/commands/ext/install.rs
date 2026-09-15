@@ -640,6 +640,16 @@ impl ExtInstallCommand {
         Ok(())
     }
 
+    /// A pin change is only a change between two known pins: the first pin
+    /// (`prev` = None) and an extension that resolves no kernel at all
+    /// (`resolved` = None) both leave the sysroot as it is.
+    fn kernel_pin_change(prev: Option<&str>, resolved: Option<&str>) -> Option<(String, String)> {
+        match (prev, resolved) {
+            (Some(p), Some(n)) if p != n => Some((p.to_string(), n.to_string())),
+            _ => None,
+        }
+    }
+
     /// Compare the config's current package list with the lock file's previously installed
     /// packages to detect removals. Returns true if the sysroot needs to be cleaned and
     /// reinstalled from scratch.
@@ -743,6 +753,99 @@ impl ExtInstallCommand {
             })?;
         }
 
+        // Snapshot the previously-pinned kernel BEFORE the resolver runs: it
+        // overwrites the lock's pin in place, so reading afterwards would only
+        // return what it just wrote. The kernel is resolved up here, ahead of
+        // the clean decision, because a pin change is one of its inputs.
+        let prev_pinned_kver = lock_file.get_kernel_version(target, &sysroot).cloned();
+
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config
+        // For local extensions, this comes from the main config's ext section
+        let raw_ext_config = match ext_location {
+            ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
+                // Use the already-merged config from `parsed` which contains remote extension configs
+                parsed
+                    .get("extensions")
+                    .and_then(|ext| ext.get(extension))
+                    .cloned()
+            }
+        };
+
+        // Resolve the kernel version up-front when the extension declares
+        // overrides that depend on it OR has packages that could include
+        // kernel-family names. Skip the container roundtrip for trivial
+        // extensions (no packages, no overrides).
+        let has_overrides_or_packages = raw_ext_config.as_ref().is_some_and(|ec| {
+            ec.get("packages").is_some()
+                || ec.as_mapping().is_some_and(|m| {
+                    m.keys().any(|k| {
+                        k.as_str()
+                            .is_some_and(|s| s.starts_with("target-") || s.starts_with("kernel-"))
+                    })
+                })
+        });
+
+        // Resolve the kernel version AND, while the resolver still has its
+        // ResolveParams in scope, compute dnf --exclude flags for every other
+        // kernel in the feed. Excludes block transitive RDEPENDS/RRECOMMENDS
+        // from resolving unqualified `kernel-module-X` virtuals against an
+        // off-kernel package — the same pattern that leaks 5.15 modules into
+        // a 6.6-pinned extension via k3s-server's iptables/conntrack chain.
+        let (resolved_kver, off_kernel_excludes) = if has_overrides_or_packages {
+            // Extensions inherit the top-level kernel.version (they're not
+            // runtime-scoped), so pass None for runtime_name.
+            let mut resolve_params = ResolveParams {
+                container_helper,
+                container_image,
+                target,
+                sysroot: sysroot.clone(),
+                runtime_name: None,
+                config,
+                lock_file,
+                repo_url: repo_url.map(|s| s.as_str()),
+                repo_release: repo_release.map(|s| s.as_str()),
+                feeds,
+                merged_container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                runs_on_context,
+                sdk_arch: self.sdk_arch.as_ref(),
+                verbose: self.verbose,
+                tui_context: effective_tui_context.clone(),
+            };
+            let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+            let excludes = match kver.as_deref() {
+                Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
+                None => Vec::new(),
+            };
+            (kver, excludes)
+        } else {
+            (None, Vec::new())
+        };
+
+        // The resolver pinned in memory. The stamp written after the install
+        // folds that pin, and the next reader (`ext build`/`ext image`, the
+        // install fast path) loads it from disk -- so persist it now, on every
+        // path, including the ones that never reach the package-install save.
+        if resolved_kver.is_some() {
+            lock_file.save(src_dir)?;
+        }
+
+        // dnf is additive: a re-install after a kernel pin change would land
+        // the new kernel's module packages *alongside* the old pin's, leaving
+        // /lib/modules/<old-kver>/ and stale module packages in the sysroot.
+        // Same rule as rootfs/initramfs: a changed pin means a clean sysroot.
+        let kernel_pin_change =
+            Self::kernel_pin_change(prev_pinned_kver.as_deref(), resolved_kver.as_deref());
+        if let Some((prev, new_kver)) = &kernel_pin_change {
+            print_info(
+                &format!(
+                    "Extension '{extension}': kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                ),
+                OutputLevel::Normal,
+            );
+        }
+
         // Detect package removals: compare current config packages with lock file.
         // If packages were removed, we must clean the sysroot and reinstall from scratch
         // because DNF install is additive-only and cannot remove packages.
@@ -768,7 +871,7 @@ impl ExtInstallCommand {
         // stamps are off), so rebuilding a dependent is not extra work in the
         // steady state.
         let reseed_required = !direct_deps.is_empty();
-        if needs_clean_reinstall || self.force || reseed_required {
+        if needs_clean_reinstall || self.force || reseed_required || kernel_pin_change.is_some() {
             // Clean the sysroot so it will be recreated fresh below
             let clean_command = format!(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}""#);
 
@@ -891,70 +994,6 @@ impl ExtInstallCommand {
                 return Ok(false);
             }
         }
-
-        // Get extension configuration from the composed/merged config
-        // For remote extensions, this comes from the merged remote extension config
-        // For local extensions, this comes from the main config's ext section
-        let raw_ext_config = match ext_location {
-            ExtensionLocation::Remote { .. } | ExtensionLocation::Local { .. } => {
-                // Use the already-merged config from `parsed` which contains remote extension configs
-                parsed
-                    .get("extensions")
-                    .and_then(|ext| ext.get(extension))
-                    .cloned()
-            }
-        };
-
-        // Resolve the kernel version up-front when the extension declares
-        // overrides that depend on it OR has packages that could include
-        // kernel-family names. Skip the container roundtrip for trivial
-        // extensions (no packages, no overrides).
-        let has_overrides_or_packages = raw_ext_config.as_ref().is_some_and(|ec| {
-            ec.get("packages").is_some()
-                || ec.as_mapping().is_some_and(|m| {
-                    m.keys().any(|k| {
-                        k.as_str()
-                            .is_some_and(|s| s.starts_with("target-") || s.starts_with("kernel-"))
-                    })
-                })
-        });
-
-        // Resolve the kernel version AND, while the resolver still has its
-        // ResolveParams in scope, compute dnf --exclude flags for every other
-        // kernel in the feed. Excludes block transitive RDEPENDS/RRECOMMENDS
-        // from resolving unqualified `kernel-module-X` virtuals against an
-        // off-kernel package — the same pattern that leaks 5.15 modules into
-        // a 6.6-pinned extension via k3s-server's iptables/conntrack chain.
-        let (resolved_kver, off_kernel_excludes) = if has_overrides_or_packages {
-            // Extensions inherit the top-level kernel.version (they're not
-            // runtime-scoped), so pass None for runtime_name.
-            let mut resolve_params = ResolveParams {
-                container_helper,
-                container_image,
-                target,
-                sysroot: sysroot.clone(),
-                runtime_name: None,
-                config,
-                lock_file,
-                repo_url: repo_url.map(|s| s.as_str()),
-                repo_release: repo_release.map(|s| s.as_str()),
-                feeds,
-                merged_container_args: merged_container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                runs_on_context,
-                sdk_arch: self.sdk_arch.as_ref(),
-                verbose: self.verbose,
-                tui_context: effective_tui_context.clone(),
-            };
-            let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
-            let excludes = match kver.as_deref() {
-                Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
-                None => Vec::new(),
-            };
-            (kver, excludes)
-        } else {
-            (None, Vec::new())
-        };
 
         // Apply target/kernel sub-section overrides now that kver is known.
         // Strips override sub-keys and merges matching ones into the parent
@@ -1260,5 +1299,24 @@ async fn run_container_command(
             .await
     } else {
         container_helper.run_in_container(config).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExtInstallCommand as C;
+
+    /// Only a change between two known pins cleans the sysroot: the first pin
+    /// has nothing stale to remove, and an extension that resolves no kernel
+    /// never had kernel-family packages to begin with.
+    #[test]
+    fn a_kernel_pin_change_is_only_a_change_between_two_pins() {
+        assert_eq!(
+            C::kernel_pin_change(Some("6.6.5"), Some("6.6.6")),
+            Some(("6.6.5".to_string(), "6.6.6".to_string()))
+        );
+        assert_eq!(C::kernel_pin_change(Some("6.6.5"), Some("6.6.5")), None);
+        assert_eq!(C::kernel_pin_change(None, Some("6.6.5")), None);
+        assert_eq!(C::kernel_pin_change(Some("6.6.5"), None), None);
     }
 }
