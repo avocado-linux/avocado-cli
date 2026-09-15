@@ -169,18 +169,23 @@ where
         // makes a block that sets only that field parse as a kernel *named*
         // after it, failing with "invalid type: string, expected struct
         // KernelConfig".
-        &[
-            "package",
-            "version",
-            "compile",
-            "install",
-            "image",
-            "cmdline",
-            "cmdline_extra",
-        ],
+        KERNEL_CONFIG_FIELDS,
         "kernel",
     )
 }
+
+/// Every field of `KernelConfig`, by name. Shared by the `kernel:` deserializer
+/// (to tell one anonymous block from a map of named kernels) and by the stamp
+/// hashes, which must agree with it on what an inline block looks like.
+pub const KERNEL_CONFIG_FIELDS: &[&str] = &[
+    "package",
+    "version",
+    "compile",
+    "install",
+    "image",
+    "cmdline",
+    "cmdline_extra",
+];
 
 /// Custom deserializer for top-level `rootfs:` field.
 fn deserialize_rootfs_map<'de, D>(

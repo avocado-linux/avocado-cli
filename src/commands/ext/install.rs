@@ -661,7 +661,18 @@ impl ExtInstallCommand {
                         )
                     })
                     .collect();
-                match compute_ext_install_input_hash_with_deps(parsed, ext_name, &dep_state) {
+                // The pin is read across scopes, the same way the `ext build`
+                // and `ext image` readers do: a scope-specific key would make
+                // this fast path and those readers disagree with the writer.
+                let resolved_kernel = lock_file
+                    .get_kernel_version_any_scope(target, ext_name)
+                    .cloned();
+                match compute_ext_install_input_hash_with_deps(
+                    parsed,
+                    ext_name,
+                    &dep_state,
+                    resolved_kernel.as_deref(),
+                ) {
                     Ok(inputs) => {
                         let req = StampRequirement::ext_install(ext_name);
                         let json = stamp_reads
@@ -768,8 +779,20 @@ impl ExtInstallCommand {
                         )
                     })
                     .collect();
-                let inputs =
-                    compute_ext_install_input_hash_with_deps(parsed, ext_name, &dep_state)?;
+                // Resolved kernel pin for this extension — set by
+                // `resolve_and_pin_kernel_version` during the install above,
+                // read across scopes like every other reader of it. Folding
+                // it in means `avocado clean --unlock` clearing the pin (or a
+                // range spec resolving to a new version) invalidates the stamp.
+                let resolved_kernel = lock_file
+                    .get_kernel_version_any_scope(target, ext_name)
+                    .cloned();
+                let inputs = compute_ext_install_input_hash_with_deps(
+                    parsed,
+                    ext_name,
+                    &dep_state,
+                    resolved_kernel.as_deref(),
+                )?;
                 let outputs = StampOutputs::default();
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
                 let stamp_script = generate_write_stamp_script(&stamp)?;
@@ -812,6 +835,24 @@ impl ExtInstallCommand {
         }
 
         Ok(())
+    }
+
+    /// A pin change is a move between two pins, or a first pin over a sysroot
+    /// that already exists: `avocado update` and `avocado clean --unlock`
+    /// erase every pin and keep the sysroots, so `prev` is `None` exactly
+    /// when the sysroot most likely holds another kernel's modules. A first
+    /// pin over no sysroot, and an extension that resolves no kernel at all
+    /// (`resolved` = None), leave things as they are.
+    fn kernel_pin_change(
+        prev: Option<&str>,
+        resolved: Option<&str>,
+        sysroot_exists: bool,
+    ) -> Option<(String, String)> {
+        match (prev, resolved) {
+            (Some(p), Some(n)) if p != n => Some((p.to_string(), n.to_string())),
+            (None, Some(n)) if sysroot_exists => Some(("none".to_string(), n.to_string())),
+            _ => None,
+        }
     }
 
     /// Compare the config's current package list with the lock file's previously installed
@@ -930,163 +971,11 @@ impl ExtInstallCommand {
             return Ok(true);
         }
 
-        // Detect package removals: compare current config packages with lock file.
-        // If packages were removed, we must clean the sysroot and reinstall from scratch
-        // because DNF install is additive-only and cannot remove packages.
-        let needs_clean_reinstall = self.detect_package_removals(
-            parsed,
-            extension,
-            ext_location,
-            config,
-            target,
-            lock_file,
-        );
-
-        // The rpmdb seed is applied only when the sysroot is created, so a
-        // surviving sysroot keeps whatever it was seeded from originally.
-        //
-        // That silently defeats de-duplication: an extension first built
-        // before it had a dependency — or before its dependency changed —
-        // keeps a rootfs-seeded rpmdb, dnf sees the shared packages as absent,
-        // and installs a private copy again. The seed source is part of the
-        // sysroot's identity, so any reason to re-seed is a reason to recreate.
-        //
-        // Reaching here at all means the stamp was already judged stale (or
-        // stamps are off), so rebuilding a dependent is not extra work in the
-        // steady state.
-        let reseed_required = !direct_deps.is_empty();
-        if needs_clean_reinstall || self.force || reseed_required {
-            // Clean the sysroot so it will be recreated fresh below, and drop
-            // the stamps that vouch for what was in it. `ext build`'s output —
-            // the extension-release files, unit wiring, the overlay — lives in
-            // this sysroot and is not reinstalled by the dnf transaction that
-            // follows; only `ext build` puts it back. Its stamp's inputs are
-            // unchanged by a clean, so leaving the stamp behind lets `ext build`
-            // report "up to date" over a sysroot that no longer holds its work,
-            // and `ext image` then images an empty extension. Same rule as
-            // `--no-stamps`: a step that destroys an output invalidates the
-            // stamp that claims it exists.
-            let clean_command = clean_ext_sysroot_command(extension);
-
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command: clean_command,
-                verbose: self.verbose,
-                source_environment: false,
-                interactive: false,
-                repo_url: repo_url.cloned(),
-                feeds: feeds.cloned(),
-                repo_release: repo_release.cloned(),
-                container_args: merged_container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                sdk_arch: self.sdk_arch.clone(),
-                tui_context: effective_tui_context.clone(),
-                env_vars: self.runtime_env_vars(),
-                ..Default::default()
-            };
-            // Best-effort clean -- if sysroot doesn't exist, this is a no-op
-            let _ = run_container_command(container_helper, run_config, runs_on_context).await;
-        }
-
-        // Check if the sysroot exists (it may have just been cleaned above, or never created)
-        let check_command = format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]");
-
-        // Seed this extension's rpmdb — the mechanism that de-duplicates
-        // shared packages.
-        //
-        // An extension's image is the *net-new files* over whatever its rpmdb
-        // already claims is installed. Seeding from the rootfs alone means a
-        // dependency's packages look absent, so dnf installs a second private
-        // copy and both images ship it. Seeding from the dependency's sysroot
-        // instead makes those packages look present, and dnf omits them.
-        //
-        // A chain composes naturally: mid seeds from base (rootfs ∪ base),
-        // app-b then seeds from mid (rootfs ∪ base ∪ mid). Topological install
-        // order guarantees the dependency's sysroot is already populated.
-        let seed_source = match direct_deps {
-            [] => "$AVOCADO_PREFIX/rootfs".to_string(),
-            [only] => format!("$AVOCADO_EXT_SYSROOTS/{only}"),
-            [first, rest @ ..] => {
-                // True diamond. Seeding from one dependency still de-duplicates
-                // that branch; packages unique to the others are not yet
-                // subtracted, so they ship twice. Correct, just not optimal —
-                // say so rather than let it look fully deduplicated.
-                print_warning(
-                    &format!(
-                        "Extension '{extension}' depends on {} extensions; \
-                         de-duplicating against '{first}' only. Packages unique to {} \
-                         may be duplicated in this image.",
-                        direct_deps.len(),
-                        rest.join(", ")
-                    ),
-                    OutputLevel::Normal,
-                );
-                format!("$AVOCADO_EXT_SYSROOTS/{first}")
-            }
-        };
-        if self.verbose && !direct_deps.is_empty() {
-            print_info(
-                &format!("Seeding '{extension}' rpmdb from {seed_source}"),
-                OutputLevel::Normal,
-            );
-        }
-        let setup_command = format!(
-            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf {seed_source}/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
-        );
-
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: check_command,
-            verbose: self.verbose,
-            source_environment: false,
-            interactive: false,
-            repo_url: repo_url.cloned(),
-            feeds: feeds.cloned(),
-            repo_release: repo_release.cloned(),
-            container_args: merged_container_args.clone(),
-            dnf_args: self.dnf_args.clone(),
-            tui_context: effective_tui_context.clone(),
-            env_vars: self.runtime_env_vars(),
-            ..Default::default()
-        };
-        let sysroot_exists =
-            run_container_command(container_helper, run_config, runs_on_context).await?;
-
-        if !sysroot_exists {
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command: setup_command,
-                verbose: self.verbose,
-                source_environment: false,
-                interactive: false,
-                repo_url: repo_url.cloned(),
-                feeds: feeds.cloned(),
-                repo_release: repo_release.cloned(),
-                container_args: merged_container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                tui_context: effective_tui_context.clone(),
-                env_vars: self.runtime_env_vars(),
-                ..Default::default()
-            };
-            let success =
-                run_container_command(container_helper, run_config, runs_on_context).await?;
-
-            if success {
-                print_success(
-                    &format!("Created sysroot for extension '{extension}'."),
-                    OutputLevel::Normal,
-                );
-            } else {
-                print_error(
-                    &format!("Failed to create sysroot for extension '{extension}'."),
-                    OutputLevel::Normal,
-                );
-                return Ok(false);
-            }
-        }
+        // Snapshot the previously-pinned kernel BEFORE the resolver runs: it
+        // overwrites the lock's pin in place, so reading afterwards would only
+        // return what it just wrote. The kernel is resolved up here, ahead of
+        // the clean decision, because a pin change is one of its inputs.
+        let prev_pinned_kver = lock_file.get_kernel_version(target, &sysroot).cloned();
 
         // Get extension configuration from the composed/merged config
         // For remote extensions, this comes from the merged remote extension config
@@ -1151,6 +1040,209 @@ impl ExtInstallCommand {
         } else {
             (None, Vec::new())
         };
+
+        // The resolver pinned in memory only. The lock is saved once, at the
+        // end of a successful install: a save before the clean and the dnf
+        // transaction below would let an interrupted run claim the new kernel
+        // over the old sysroot, and the next run would then see no change to
+        // clean. On any failure the in-memory lock is dropped and the one on
+        // disk still says what the sysroot actually holds.
+
+        // Does the sysroot exist? Decides whether a first pin counts as a
+        // change (a cleared pin over a populated sysroot) and, further down,
+        // whether a fresh rpmdb has to be seeded.
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]"),
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            tui_context: effective_tui_context.clone(),
+            env_vars: self.runtime_env_vars(),
+            ..Default::default()
+        };
+        let sysroot_existed =
+            run_container_command(container_helper, run_config, runs_on_context).await?;
+
+        // dnf is additive: a re-install after a kernel pin change would land
+        // the new kernel's module packages *alongside* the old pin's, leaving
+        // /lib/modules/<old-kver>/ and stale module packages in the sysroot.
+        // Same rule as rootfs/initramfs: a changed pin means a clean sysroot.
+        let kernel_pin_change = Self::kernel_pin_change(
+            prev_pinned_kver.as_deref(),
+            resolved_kver.as_deref(),
+            sysroot_existed,
+        );
+        if let Some((prev, new_kver)) = &kernel_pin_change {
+            print_info(
+                &format!(
+                    "Extension '{extension}': kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                ),
+                OutputLevel::Normal,
+            );
+            // The package pins name exact builds from the old kernel's
+            // install; asked for again in the fresh sysroot, a rolling feed
+            // may no longer carry them. Same as `clear_rootfs` on the rootfs
+            // path: a wiped sysroot gets a wiped package map.
+            lock_file.clear_sysroot_packages(target, &sysroot);
+        }
+
+        // Detect package removals: compare current config packages with lock file.
+        // If packages were removed, we must clean the sysroot and reinstall from scratch
+        // because DNF install is additive-only and cannot remove packages.
+        let needs_clean_reinstall = self.detect_package_removals(
+            parsed,
+            extension,
+            ext_location,
+            config,
+            target,
+            lock_file,
+        );
+
+        // The rpmdb seed is applied only when the sysroot is created, so a
+        // surviving sysroot keeps whatever it was seeded from originally.
+        //
+        // That silently defeats de-duplication: an extension first built
+        // before it had a dependency — or before its dependency changed —
+        // keeps a rootfs-seeded rpmdb, dnf sees the shared packages as absent,
+        // and installs a private copy again. The seed source is part of the
+        // sysroot's identity, so any reason to re-seed is a reason to recreate.
+        //
+        // Reaching here at all means the stamp was already judged stale (or
+        // stamps are off), so rebuilding a dependent is not extra work in the
+        // steady state.
+        let reseed_required = !direct_deps.is_empty();
+        let clean_first =
+            needs_clean_reinstall || self.force || reseed_required || kernel_pin_change.is_some();
+        if clean_first {
+            // Clean the sysroot so it will be recreated fresh below, and drop
+            // the stamps that vouch for what was in it. `ext build`'s output —
+            // the extension-release files, unit wiring, the overlay — lives in
+            // this sysroot and is not reinstalled by the dnf transaction that
+            // follows; only `ext build` puts it back. Its stamp's inputs are
+            // unchanged by a clean, so leaving the stamp behind lets `ext build`
+            // report "up to date" over a sysroot that no longer holds its work,
+            // and `ext image` then images an empty extension. Same rule as
+            // `--no-stamps`: a step that destroys an output invalidates the
+            // stamp that claims it exists.
+            let clean_command = clean_ext_sysroot_command(extension);
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: clean_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
+                ..Default::default()
+            };
+            // `rm -rf` on a missing sysroot is a no-op; a failure here is a
+            // real one (container did not start, read-only or busy mount).
+            // Installing over it anyway would add the new kernel's packages
+            // next to the old contents and then stamp the result current, so
+            // stop instead; the lock on disk still names the old pin and the
+            // next run detects the change again.
+            let clean_ok =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+            if !clean_ok {
+                return Err(anyhow::anyhow!(
+                    "Failed to clean sysroot for extension '{extension}'; refusing to install over it"
+                ));
+            }
+        }
+        // A cleaned sysroot is gone by construction; otherwise it is as probed.
+        let sysroot_exists = sysroot_existed && !clean_first;
+
+        // Seed this extension's rpmdb — the mechanism that de-duplicates
+        // shared packages.
+        //
+        // An extension's image is the *net-new files* over whatever its rpmdb
+        // already claims is installed. Seeding from the rootfs alone means a
+        // dependency's packages look absent, so dnf installs a second private
+        // copy and both images ship it. Seeding from the dependency's sysroot
+        // instead makes those packages look present, and dnf omits them.
+        //
+        // A chain composes naturally: mid seeds from base (rootfs ∪ base),
+        // app-b then seeds from mid (rootfs ∪ base ∪ mid). Topological install
+        // order guarantees the dependency's sysroot is already populated.
+        let seed_source = match direct_deps {
+            [] => "$AVOCADO_PREFIX/rootfs".to_string(),
+            [only] => format!("$AVOCADO_EXT_SYSROOTS/{only}"),
+            [first, rest @ ..] => {
+                // True diamond. Seeding from one dependency still de-duplicates
+                // that branch; packages unique to the others are not yet
+                // subtracted, so they ship twice. Correct, just not optimal —
+                // say so rather than let it look fully deduplicated.
+                print_warning(
+                    &format!(
+                        "Extension '{extension}' depends on {} extensions; \
+                         de-duplicating against '{first}' only. Packages unique to {} \
+                         may be duplicated in this image.",
+                        direct_deps.len(),
+                        rest.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+                format!("$AVOCADO_EXT_SYSROOTS/{first}")
+            }
+        };
+        if self.verbose && !direct_deps.is_empty() {
+            print_info(
+                &format!("Seeding '{extension}' rpmdb from {seed_source}"),
+                OutputLevel::Normal,
+            );
+        }
+        let setup_command = format!(
+            "mkdir -p $AVOCADO_EXT_SYSROOTS/{extension}/var/lib && cp -rf {seed_source}/var/lib/rpm $AVOCADO_EXT_SYSROOTS/{extension}/var/lib"
+        );
+
+        if !sysroot_exists {
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: setup_command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                tui_context: effective_tui_context.clone(),
+                env_vars: self.runtime_env_vars(),
+                ..Default::default()
+            };
+            let success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+
+            if success {
+                print_success(
+                    &format!("Created sysroot for extension '{extension}'."),
+                    OutputLevel::Normal,
+                );
+            } else {
+                print_error(
+                    &format!("Failed to create sysroot for extension '{extension}'."),
+                    OutputLevel::Normal,
+                );
+                return Ok(false);
+            }
+        }
 
         // Apply target/kernel sub-section overrides now that kver is known.
         // Strips override sub-keys and merges matching ones into the parent
@@ -1428,8 +1520,6 @@ $DNF_SDK_HOST \
                                 OutputLevel::Normal,
                             );
                         }
-                        // Save lock file immediately after extension install
-                        lock_file.save(src_dir)?;
                     }
                 }
             } else if self.verbose {
@@ -1463,6 +1553,9 @@ $DNF_SDK_HOST \
             );
         }
 
+        // The one save: kernel pin, package versions and origins land together,
+        // and only once the sysroot holds what they describe.
+        lock_file.save(src_dir)?;
         Ok(true)
     }
 }
@@ -1521,5 +1614,28 @@ mod tests {
         // The install stamp is rewritten by the install that follows; removing
         // it here would be harmless but is not this function's job.
         assert!(!cmd.contains("install.stamp"));
+    }
+
+    /// A move between two pins cleans the sysroot, and so does a first pin
+    /// over a sysroot that already exists -- `avocado update` and `clean
+    /// --unlock` erase the pins and keep the sysroots. A first pin over no
+    /// sysroot has nothing stale to remove, and an extension that resolves no
+    /// kernel never had kernel-family packages to begin with.
+    #[test]
+    fn a_kernel_pin_change_is_a_move_or_a_first_pin_over_a_populated_sysroot() {
+        let change = |p, n, exists| ExtInstallCommand::kernel_pin_change(p, n, exists);
+        assert_eq!(
+            change(Some("6.6.5"), Some("6.6.6"), true),
+            Some(("6.6.5".to_string(), "6.6.6".to_string()))
+        );
+        assert_eq!(change(Some("6.6.5"), Some("6.6.5"), true), None);
+        // Cleared pin, populated sysroot: the `avocado update` path.
+        assert_eq!(
+            change(None, Some("6.6.5"), true),
+            Some(("none".to_string(), "6.6.5".to_string()))
+        );
+        // Cleared pin, no sysroot: a plain first install.
+        assert_eq!(change(None, Some("6.6.5"), false), None);
+        assert_eq!(change(Some("6.6.5"), None, true), None);
     }
 }
