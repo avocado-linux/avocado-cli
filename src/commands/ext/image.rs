@@ -183,12 +183,18 @@ impl ExtImageCommand {
             // for the rationale. Imaging a non-member extension standalone (to
             // verify it builds for a PR, with no `runtimes:` block in a shared-
             // extension config) is a supported workflow; warn but proceed.
-            let ext_deps = config.get_runtime_extension_dependencies_detailed(
+            // Membership is the `depends_on` closure, not the authored list:
+            // `build` schedules an ext build/image for every extension the
+            // closure reaches, so a dependency-only extension arrives here
+            // legitimately and must not be told to add itself to a list it is
+            // already reached from.
+            let members = crate::utils::ext_deps::runtime_members(
+                &composed,
                 runtime_name,
                 &target,
                 &self.config_path,
             )?;
-            let is_member = ext_deps.iter().any(|d| d.name() == self.extension);
+            let is_member = members.iter().any(|name| name == &self.extension);
             if !is_member {
                 print_warning(
                     &format!(
