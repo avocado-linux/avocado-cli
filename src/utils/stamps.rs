@@ -1460,6 +1460,20 @@ pub fn compute_ext_install_input_hash_with_deps(
         }
     }
 
+    // The effective kernel version is substituted into package names
+    // (`{{ avocado.kernel.version }}`) and is a dnf resolution input, so a
+    // kernel change installs a different module set. The declared `kernel`
+    // config is what selects that version; fold it in — mirroring the
+    // rootfs/initramfs sysroot hashes, which already do — so a kernel bump
+    // invalidates every extension's stamp (feed-driven "latest" moves go
+    // through `avocado update`, which clears the pins the reader also checks).
+    if let Some(kernel) = config.get("kernel") {
+        hash_data.insert(
+            serde_yaml::Value::String("kernel".to_string()),
+            narrow_kernel_for_hash(kernel),
+        );
+    }
+
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
 }
@@ -4868,6 +4882,25 @@ extensions:
         assert_ne!(
             plain, with_deps,
             "a validator using the plain hash can never accept a deps-aware stamp"
+        );
+    }
+
+    /// A kernel version change must invalidate an extension's install stamp:
+    /// the version is substituted into package names and is a dnf resolution
+    /// input, so the installed module set differs. Without folding the kernel
+    /// config into the ext-install hash, a fast-path/build validator accepts
+    /// the old stamp and skips a sysroot built against the wrong kernel.
+    #[test]
+    fn kernel_version_change_invalidates_ext_install_hash() {
+        let k665 = ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.5\"\n"));
+        let k666 = ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.6\"\n"));
+        let none = ext_install_hash(&ext_with_extras(""));
+        assert_ne!(k665, k666, "a kernel version bump must move the hash");
+        assert_ne!(k665, none, "adding a kernel pin must move the hash");
+        // Same kernel, recomputed: stable (no spurious invalidation).
+        assert_eq!(
+            k665,
+            ext_install_hash(&ext_with_extras("kernel:\n  version: \"6.6.5\"\n"))
         );
     }
 
