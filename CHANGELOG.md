@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption level boundaries). Lock-only; the
+  fix version pulls `aws-lc-rs` 1.16.3 -> 1.18.1 and `aws-lc-sys` 0.40.0 ->
+  0.45.0 with it.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated
@@ -119,29 +125,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two halves live in `commands/runtime/var_image.rs` behind one context,
   which is the set of things a portable provisioning bundle has to carry — what a
   later `avocado provision --bundle <path>` would source from a bundle.
-  The ~200 lines that did this work moved to `commands/runtime/var_image.rs`
-  behind one entry point taking an explicit context. That context is exactly
-  the set of things a portable provisioning bundle has to carry, which is what
-  a future `avocado provision --bundle <path>` needs.
-  `provision` is gated on a stamp of its own — `runtime/<name>/provisionable.stamp`
-  — rather than a field on the build stamp, so "did a provisionable build run for
-  this runtime?" is a question with a direct answer. It shares the build's input
-  hash, so anything that makes the build stale makes the tail stale. And because
-  a plain rebuild deletes the tail's artifacts, it deletes that stamp too: a step
-  that destroys an output invalidates the stamp claiming it exists.
-
-  `avocado vm` is unaffected — it manages the macOS/Windows helper VM and never
-  reads runtime build artifacts.
-- **`avocado build --ota` / `avocado runtime build --ota` — skip the
-  provisioning tail.** The var image, stone's OS bundle and Docker priming are
-  flash-time artifacts; `avocado deploy` and `avocado connect upload` read only
-  the var-staging directory, which is complete before any of them run. `--ota`
-  gates that tail off, leaving the manifest, its signature, the update
-  authority and the content-addressed images exactly as a full build writes
-  them. The `.btrfs` and `.aos` a previous full build left behind are removed
-  so they cannot be flashed stale, and the runtime build stamp records
-  `ota_only`, which `runtime provision` refuses with the fix. An `--ota`
-  manifest carries no `os_bundle`: extensions update, the OS is left alone.
 
 ## [1.0.0-rc.3] - 2026-09-01
 
@@ -411,13 +394,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typo silently dating every document to 1970 is worse than one that is honestly
   not reproducible.
 
-  The command never transmits the document. It writes the file and, with `-o`,
+  `avocado sbom` itself never transmits the document — `avocado connect
+  upload` does, see its entry below. The command writes the file and, with `-o`,
   points at <https://tools.spdx.org/app/validate/> for anyone who wants the
   reference SPDX tools' verdict, along with the reason to think first: that
   service stores every upload and serves it back without authentication for
   about ten days, and an SBOM is a component inventory of a shipped product.
   Whether a given document can be published is the operator's call, on a
   document they can read first.
+- **`avocado sbom` now emits a `software_Sbom` per runtime and per extension,
+  not only one for the whole device.** (ENG-2219) Connect needs something
+  narrower than "everything on the device" to ingest, and each SBOM now says
+  whether it describes what is running or what was built.
+
+  More elements in the one existing document rather than a file each, for the
+  same reason `avocado sbom` already writes one document: a package in both
+  `rootfs` and a runtime is one package in two places, and a scanner unioning
+  files would count it twice. A runtime's SBOM roots itself, `rootfs`,
+  `initramfs`, the shared `includes` root and every extension it carries; every
+  extension gets one of its own as well, including a legacy `ext:<name>` and a
+  remote `includes:<name>` — neither names a runtime, so no runtime's SBOM
+  claims them. A nested-layout remote extension is the other way round: it
+  installs into the shared `includes` root and keeps no database of its own, so
+  it appears under that one name or nowhere, and every runtime claims it rather
+  than none. With
+  `--include-sdk` the build-host scopes get one too, typed `build` rather than
+  `deployed`. Nothing mints new elements: the added lists only reference ids
+  the device-wide document already emits. A group whose own defining scope is
+  empty is left out, since a document named for it would name nothing.
+
+  The pre-existing device-wide `software_Sbom` is unchanged apart from the
+  same plain-language `comment`, and is still the first in `@graph`.
+- **`avocado connect upload` attaches the uploaded runtime's own SBOM to the
+  create-runtime request.** (ENG-2219) The runtime-scoped slice of the same
+  document is sent as `runtime.sbom` on `POST .../runtimes`; `RuntimeParams`
+  carries no runtime name for a server to scope an unfiltered one by. Its root
+  element is named for the runtime rather than the device, and a runtime that
+  installed no packages of its own sends no SBOM at all — the slice still holds
+  `rootfs`, so such a document would name the runtime and describe only the
+  base system.
+
+  Never allowed to fail the upload. Building it is best-effort: any error
+  warns and the field is left off, so a server that does not read it yet
+  (ENG-2284) sees today's request unchanged. If the server refuses the call
+  in a way that means this body was refused, the upload retries once without
+  it — gated on the status, via a new `HttpStatus` error type, rather than on
+  message text. That is `400` and `413`, not any 4xx: the likeliest refusal is
+  `413 Payload Too Large`, since ~400 packages of SPDX is megabytes into a body
+  that is otherwise kilobytes, while `401`, `403`, `409`, `422` and `429` are
+  ordinary outcomes of this API that a smaller body does not fix. A body
+  refused mid-write carries no status at all — a proxy over its size cap can
+  close the connection rather than answer — so a transport error on the send
+  counts too, but a decode or timeout error does not, since the runtime may
+  already exist by then. Both notices use
+  `print_warning_above`, since `print_warning` is suppressed under
+  `--output json` — the one path where a silently SBOM-less upload would go
+  unnoticed. The scan's own incomplete-read warnings take the same route, so an
+  SBOM short a package raises a `warning` event on the NDJSON stream instead of
+  only on stderr. The `--file` host path never builds one: that tarball may have
+  been built elsewhere. `AVOCADO_UPLOAD_NO_SBOM=1` skips the build.
 
 ### Changed
 - **`avocado vm update` migrates state instead of destroying it.** A version

@@ -9,6 +9,7 @@ pub mod ext_deps;
 pub mod ext_fetch;
 pub mod ext_source_reader;
 pub mod ext_version_source;
+pub mod feeds;
 pub mod host_copy;
 pub mod image_signing;
 pub mod install_method;
