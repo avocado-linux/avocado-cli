@@ -58,3 +58,7 @@ docs/_build/
 
 # Scratch dir of scripts/local-feeds/run.sh
 .local-feeds-test/
+
+# python bytecode from the local-feeds rig
+__pycache__/
+*.pyc

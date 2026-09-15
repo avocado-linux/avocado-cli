@@ -112,7 +112,9 @@ impl InitramfsInstallCommand {
 
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
-        let feeds = config.materialize_feeds(&target, FeedStage::Initramfs, &self.config_path)?;
+        let feeds = config
+            .materialize_feeds(&target, FeedStage::Initramfs, &self.config_path)
+            .await?;
 
         let container_helper =
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
