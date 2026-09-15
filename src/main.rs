@@ -1735,8 +1735,7 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Run non-interactively: no live checklist, and the container is
-        /// started without a TTY.
+        /// Run without the live checklist.
         ///
         /// Clears nothing. Not needed to skip dnf's prompts — installs never
         /// prompt.
@@ -4714,7 +4713,7 @@ enum RootfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Run non-interactively: the container is started without a TTY.
+        /// Accepted for compatibility with older scripts; has no effect.
         ///
         /// Clears nothing. Not needed to skip dnf's prompts — installs never
         /// prompt.
@@ -4784,7 +4783,7 @@ enum InitramfsCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Run non-interactively: the container is started without a TTY.
+        /// Accepted for compatibility with older scripts; has no effect.
         ///
         /// Clears nothing. Not needed to skip dnf's prompts — installs never
         /// prompt.

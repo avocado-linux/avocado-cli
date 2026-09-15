@@ -760,7 +760,8 @@ $DNF_SDK_HOST \
                     command: dnf_command,
                     verbose: self.verbose,
                     source_environment: false, // Don't source environment - matches rootfs install behavior
-                    interactive: !self.force,
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),

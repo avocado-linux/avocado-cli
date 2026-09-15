@@ -20,6 +20,9 @@ use crate::commands::rootfs::install::{
 pub struct InitramfsInstallCommand {
     config_path: String,
     verbose: bool,
+    /// Accepted for compatibility with scripts that pass `-f`; nothing reads it
+    /// any more: installs never prompt, and this command clears nothing.
+    #[allow(dead_code)]
     force: bool,
     target: Option<String>,
     target_board: Option<String>,
@@ -166,7 +169,6 @@ impl InitramfsInstallCommand {
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     verbose: self.verbose,
-                    force: self.force,
                     runs_on_context: runs_on_context.as_ref(),
                     sdk_arch: self.sdk_arch.as_ref(),
                     no_stamps: self.no_stamps,

@@ -1135,7 +1135,8 @@ $DNF_SDK_HOST \
                     command,
                     verbose: self.verbose,
                     source_environment: false, // don't source environment
-                    interactive: !self.force,  // interactive if not forced
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
                     repo_release: repo_release.cloned(),
                     container_args: merged_container_args.clone(),

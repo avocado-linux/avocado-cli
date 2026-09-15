@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gated on `--force` either, so an interactive `avocado install` gets the live
   checklist without asking for a rebuild to see it.
 
+  Installs also no longer ask the container for a PTY. They used to run with
+  `-i` only; the new stdio decision granted `-i -t` to any step declaring
+  itself interactive, which put the terminal into raw mode under the TUI and,
+  on macOS through avocado-vm, failed a plain `avocado install` with
+  `unable to set IO streams as raw terminal: interrupted system call` while
+  `install -f` (which never asked) worked. With `-y` unconditional there is
+  nothing to answer, so the five install sites declare `interactive: false`.
+  `sdk dnf`, `ext dnf`, `runtime dnf` and `provision` keep their terminals.
+
 ### Fixed
 - `avocado signing-keys create` no longer generates a key before discovering
   the name is taken. A duplicate name is rejected up front, so a repeated
