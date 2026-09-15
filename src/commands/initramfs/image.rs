@@ -584,6 +584,7 @@ export AVOCADO_OS_VERSION_ID
             copy_volume_path_to_host(
                 &container_helper.container_tool,
                 volume_name,
+                container_image,
                 &container_path,
                 &host_dir.join(&host_filename),
             )
