@@ -1843,6 +1843,10 @@ mod tests {
     /// misclassification, the non-canonical prefix false refusal, the provider
     /// gating the whole check - was found by executing it and none of them was
     /// visible in its text.
+    ///
+    /// Unix only: it shells out to `sh` and creates a real symlink, neither of
+    /// which the Windows target this crate also builds for can do.
+    #[cfg(unix)]
     #[test]
     fn attestation_script_refuses_each_tampered_sysroot() {
         use std::os::unix::fs::symlink;
@@ -1958,6 +1962,9 @@ mod tests {
     /// checked. The first version gated every component on `var-key.sh`, so
     /// deleting it disarmed the `cryptsetup-var.sh` check entirely - measured
     /// rc=0 on a sysroot whose unlock script had been substituted.
+    ///
+    /// Unix only: runs the generated script under `sh`.
+    #[cfg(unix)]
     #[test]
     fn a_rootfs_unlock_script_is_checked_without_a_provider() {
         let root = tempfile::tempdir().unwrap();
@@ -1987,6 +1994,9 @@ mod tests {
     /// path, so a symlinked component or a trailing slash refused every
     /// component with "resolves outside the sysroot" - measured on a tree with
     /// no symlink in it.
+    ///
+    /// Unix only: it shells out to `sh` and creates a real symlink.
+    #[cfg(unix)]
     #[test]
     fn a_non_canonical_prefix_does_not_refuse_a_clean_sysroot() {
         use std::os::unix::fs::symlink;
@@ -2025,6 +2035,10 @@ mod tests {
 
     /// Writes a sysroot the script should accept: the capability declared, and
     /// both required scripts present with matching attestations.
+    ///
+    /// Unix only: stages a real symlink for the callers that execute the
+    /// script; used by no test on a non-unix build.
+    #[cfg(unix)]
     fn build_attestation_fixture(prefix: &std::path::Path, initramfs: bool) -> std::path::PathBuf {
         let sysroot = prefix.join(if initramfs { "initramfs" } else { "rootfs" });
         let dir = sysroot.join("usr/libexec/cryptsetup-var");
@@ -2077,6 +2091,8 @@ mod tests {
             .collect()
     }
 
+    /// Unix only: shells out to `sh`, which the Windows target does not have.
+    #[cfg(unix)]
     fn run_attestation_script(prefix: &std::path::Path, initramfs: bool) -> (i32, String) {
         let script = generate_var_key_attestation_script(
             if initramfs { "initramfs" } else { "rootfs" },
