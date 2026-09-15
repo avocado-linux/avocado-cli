@@ -86,7 +86,6 @@ pub struct SysrootInstallParams<'a> {
     pub merged_container_args: Option<Vec<String>>,
     pub dnf_args: Option<Vec<String>>,
     pub verbose: bool,
-    pub force: bool,
     pub runs_on_context: Option<&'a RunsOnContext>,
     pub sdk_arch: Option<&'a String>,
     /// Skip stamp reading and writing when true — the escape hatch that
@@ -1054,7 +1053,10 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     }
     let pkg = pkg_specs.join(" ");
 
-    let yes = if params.force { "-y" } else { "" };
+    // dnf never prompts here: this applies the package set avocado.yaml and
+    // avocado.lock already declare, so there is no decision left to make.
+    // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+    let yes = "-y";
     let dnf_args_str = if let Some(args) = &params.dnf_args {
         format!(" {} ", args.join(" "))
     } else {
@@ -1190,7 +1192,8 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         command,
         verbose: params.verbose,
         source_environment: false,
-        interactive: !params.force,
+        // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+        interactive: false,
         repo_url: params.repo_url.map(|s| s.to_string()),
         feeds: params.feeds.cloned(),
         repo_release: params.repo_release.map(|s| s.to_string()),
@@ -1390,6 +1393,9 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
 pub struct RootfsInstallCommand {
     config_path: String,
     verbose: bool,
+    /// Accepted for compatibility with scripts that pass `-f`; nothing reads it
+    /// any more: installs never prompt, and this command clears nothing.
+    #[allow(dead_code)]
     force: bool,
     target: Option<String>,
     target_board: Option<String>,
@@ -1542,7 +1548,6 @@ impl RootfsInstallCommand {
                     merged_container_args: merged_container_args.clone(),
                     dnf_args: self.dnf_args.clone(),
                     verbose: self.verbose,
-                    force: self.force,
                     runs_on_context: runs_on_context.as_ref(),
                     sdk_arch: self.sdk_arch.as_ref(),
                     no_stamps: self.no_stamps,
@@ -1678,6 +1683,74 @@ mod tests {
 
     fn name_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Installs must never wait on a dnf prompt.
+    ///
+    /// This used to depend on `--force`, which also clears every extension
+    /// sysroot and drops its stamps — so the only way to avoid the prompt was
+    /// to pay a full rebuild, and the documented invocation (`install -f`) did
+    /// exactly that on every iteration. A prompt here also hangs CI and the
+    /// TUI, which is why the renderer was gated on `--force` too. The `yes`
+    /// argument is now a constant at all five install call sites; this pins the
+    /// step that consumes it.
+    #[test]
+    fn dnf_sync_step_passes_assume_yes() {
+        use crate::commands::rootfs::install::dnf_sync_step;
+        let step = dnf_sync_step(true, "rootfs", "", "-y", "");
+        assert!(step.contains("-y"), "expected -y in: {step}");
+        // And the sources agree, across every install site. One exact string in
+        // one file was too narrow: the coupling can come back in any of the five
+        // and can be spelled several ways, so match the shape instead — the
+        // assume-yes literal and a flag on the same line.
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains("\"-y\"") && line.contains("force")),
+                    "{name}:{} derives the assume-yes flag from a flag: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// With `-y` unconditional there is nothing in an install a person could
+    /// answer, so no install step may ask the container for a PTY. Asking is
+    /// not harmless: `docker run -t` puts the caller's terminal into raw mode,
+    /// which the TUI already owns, and on macOS through avocado-vm that setup
+    /// fails with "unable to set IO streams as raw terminal: interrupted system
+    /// call" on a plain `avocado install`, while `install -f` -- which never
+    /// asked -- works. Before this branch installs ran with `-i` only; the
+    /// stdio decision in `utils::interactivity` grants `-i -t` to any step that
+    /// declares itself interactive, so the declaration has to go, not the
+    /// decision. Provision is deliberately not scanned: flashing tools do talk
+    /// to a person. The needle is assembled at runtime so this test cannot
+    /// match its own source.
+    #[test]
+    fn no_install_step_ties_the_container_pty_to_a_flag() {
+        let key = ["inter", "active:"].concat();
+        let flag = ["for", "ce"].concat();
+        for (name, src) in [
+            ("rootfs/install.rs", include_str!("install.rs")),
+            ("install.rs", include_str!("../install.rs")),
+            ("sdk/install.rs", include_str!("../sdk/install.rs")),
+            ("runtime/install.rs", include_str!("../runtime/install.rs")),
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+        ] {
+            for (n, line) in src.lines().enumerate() {
+                assert!(
+                    !(line.contains(&key) && line.contains(&flag)),
+                    "{name}:{} ties the container PTY to a flag: {line}",
+                    n + 1
+                );
+            }
+        }
     }
 
     #[test]

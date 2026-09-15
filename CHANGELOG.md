@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Installs no longer prompt, and `--force` no longer means "don't prompt".**
+  `avocado install`, `ext install`, `runtime install` and `sdk install` apply
+  the package set `avocado.yaml` and `avocado.lock` already declare, so dnf's
+  confirmation offers no decision: approving it changes nothing and declining
+  it leaves a half-configured sysroot. All four now pass `-y` unconditionally.
+
+  Previously `-y` was passed only under `--force`, which conflated two
+  unrelated things and made the documented invocation the expensive one.
+  `--force` *also* clears every extension's sysroot and drops its build and
+  image stamps, so anyone passing `-f` merely to skip the prompts — which is
+  what our own material tells people to do — discarded all built extension
+  content and paid a full rebuild on the next `avocado build`, every
+  iteration. Measured on a four-extension project: `install -f` then `build`
+  skipped 2 of 10 steps and took 10.2s; without `-f` it skips all 10 and takes
+  6.6s.
+
+  `--force` now means only what its name says: reinstall from scratch. Existing
+  scripts and docs using `-f` keep working, but should drop the flag — its help
+  text now says so. `sdk dnf`, `ext dnf` and `runtime dnf` are unchanged: they
+  pass their arguments to dnf verbatim and still prompt, which is the right
+  behaviour when a person is driving dnf directly.
+
+  No opt-out flag was added. An interactive confirmation cannot be answered
+  usefully in CI or under the TUI, and the dnf pass-through commands already
+  cover reviewing a transaction by hand.
+
+- **`--output json` no longer implies `--force`.** It did, because the TUI
+  renderer was gated on `--force` — dnf could prompt without it, and the
+  renderer made the prompt invisible — and because `docker run -it` fails
+  where no terminal is attached. Both reasons are gone: installs now always
+  pass `-y`, and `utils::interactivity` decides the container's stdio flags
+  from what the environment can actually support. With `--force` meaning
+  reinstall from scratch, keeping the coercion would have turned every request
+  for machine-readable output into a full rebuild. The renderer is no longer
+  gated on `--force` either, so an interactive `avocado install` gets the live
+  checklist without asking for a rebuild to see it.
+
+  Installs also no longer ask the container for a PTY. They used to run with
+  `-i` only; the new stdio decision granted `-i -t` to any step declaring
+  itself interactive, which put the terminal into raw mode under the TUI and,
+  on macOS through avocado-vm, failed a plain `avocado install` with
+  `unable to set IO streams as raw terminal: interrupted system call` while
+  `install -f` (which never asked) worked. With `-y` unconditional there is
+  nothing to answer, so the five install sites declare `interactive: false`.
+  `sdk dnf`, `ext dnf`, `runtime dnf` and `provision` keep their terminals.
 ### Security
 - `rustls` 0.23.39 -> 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption level boundaries). Lock-only; the

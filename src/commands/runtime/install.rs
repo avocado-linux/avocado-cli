@@ -700,7 +700,10 @@ impl RuntimeInstallCommand {
                     OutputLevel::Normal,
                 );
 
-                let yes = if self.force { "-y" } else { "" };
+                // dnf never prompts here: this applies the package set avocado.yaml and
+                // avocado.lock already declare, so there is no decision left to make.
+                // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
+                let yes = "-y";
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
                     format!(" {} ", args.join(" "))
                 } else {
@@ -770,7 +773,8 @@ $DNF_SDK_HOST \
                     command: dnf_command,
                     verbose: self.verbose,
                     source_environment: false, // Don't source environment - matches rootfs install behavior
-                    interactive: !self.force,
+                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                    interactive: false,
                     repo_url: repo_url.cloned(),
                     feeds: feeds.cloned(),
                     repo_release: repo_release.cloned(),
