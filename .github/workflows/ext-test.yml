@@ -1,43 +1,53 @@
 name: Extension Test
 
 # "Does it build" check on PRs for the avocado-ext-cli extension (this repo's Rust source
-# is compiled in place by `avocado ext build`). The matrix lives here (the caller owns it);
-# each leg calls the single-combo reusable helper. This is separate from pr.yml, which runs
-# the CLI's own unit tests + security audit, and from release.yml, which builds the
-# standalone binaries.
+# is compiled in place by `avocado ext build`). Separate from pr.yml, which runs the CLI's
+# own unit tests + security audit, and from release.yml, which builds the standalone
+# binaries.
 #
-# `ext build` validates the extension version, and this extension's version tracks the
-# packaged program (Cargo.toml), so we resolve it here and pass it through as `ext-version`.
+# The driver is the CLI THIS PR builds. It used to be the latest published release, via
+# avocado-linux/actions/.github/workflows/extension-test.yml@v1, whose setup-avocado-cli
+# step downloads a release asset. That combination never ran the PR's own code: it checked
+# the shipped binary against the PR's extension config. A regression in the extension path
+# therefore went green here, shipped, and only turned these legs red once the release
+# became "latest" -- which is how 1.0.0-rc.4 (#265) reached users and then broke every
+# subsequent PR (#271, #274).
+#
+# Other extension repos still call the reusable helper, which is right for them: they want
+# the CLI their users run. This repo is the one that must not, because it IS the CLI.
 on:
   pull_request:
   workflow_dispatch:
 
-# Least privilege: these jobs only check out and build (no GitHub writes). The
-# reusable workflow inherits this cap.
+# Least privilege: these jobs only check out, compile, and pass one binary between jobs.
 permissions:
   contents: read
 
 jobs:
-  version:
-    name: Resolve version from Cargo.toml
+  cli:
+    name: Build the CLI under test
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.cargo.outputs.version }}
     steps:
       - uses: actions/checkout@v5
-      - name: Read Cargo.toml [package] version
-        id: cargo
-        run: |
-          v="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
-          if [ -z "$v" ]; then
-            echo "::error::could not read [package] version from Cargo.toml" >&2
-            exit 1
-          fi
-          echo "Program version (Cargo.toml): $v"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built once and shared, rather than per leg: this is a host tool that drives the
+      # build, so it is identical for every (target, feed) combination below.
+      # --locked matches avocado-cli-compile.sh -- fail on a stale Cargo.lock instead of
+      # silently re-resolving.
+      - name: cargo build --release
+        run: cargo build --release --locked --bin avocado
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avocado-cli-under-test
+          path: target/release/avocado
+          if-no-files-found: error
+          retention-days: 1
 
   build:
-    needs: version
+    needs: cli
+    name: Build ${{ matrix.target }} @ ${{ matrix.distro-release }}/${{ matrix.distro-channel }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -52,9 +62,46 @@ jobs:
           # the wrong pick goes through qemu-user and fails every C probe.
           # qemuarm64, not a board: CI legs stay on qemu targets.
           - { target: qemuarm64, distro-release: "2024", distro-channel: next }
-    uses: avocado-linux/actions/.github/workflows/extension-test.yml@v1
-    with:
-      target:         ${{ matrix.target }}
-      distro-release: ${{ matrix.distro-release }}
-      distro-channel: ${{ matrix.distro-channel }}
-      ext-version:    ${{ needs.version.outputs.version }}
+    env:
+      AVOCADO_DISTRO_RELEASE: ${{ matrix.distro-release }}
+      AVOCADO_DISTRO_CHANNEL: ${{ matrix.distro-channel }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Into the runner temp dir, never the checkout: the checkout is the project root
+      # that `package_files` globs walk, and `ext build` stages what it finds there.
+      - uses: actions/download-artifact@v4
+        with:
+          name: avocado-cli-under-test
+          path: ${{ runner.temp }}/cli
+      - name: Put the CLI under test on PATH
+        run: |
+          install -D -m 0755 "${RUNNER_TEMP}/cli/avocado" "${HOME}/.local/bin/avocado"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show the CLI under test
+        run: avocado --version
+
+      # `ext build` rejects an empty or invalid version, and this extension's version
+      # tracks the packaged program: avocado.yaml reads it back out of the environment.
+      - name: Export extension version from Cargo.toml
+        run: |
+          v="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
+          if [ -z "$v" ]; then
+            echo "::error::could not read [package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "Program version (Cargo.toml): $v"
+          echo "AVOCADO_EXT_VERSION=$v" >> "$GITHUB_ENV"
+
+      # Explicit install sequence. -f is required: CI has no TTY to answer the dnf
+      # y/n prompts. --no-tui streams plain sequential output into the job log, and
+      # is also the only way a stamp error prints its `Caused by:` line.
+      - name: avocado sdk install
+        run: avocado sdk install -f --no-tui --target "${{ matrix.target }}"
+
+      - name: avocado ext install
+        run: avocado ext install -f --no-tui avocado-ext-cli --target "${{ matrix.target }}"
+
+      - name: avocado ext build
+        run: avocado ext build --no-tui avocado-ext-cli --target "${{ matrix.target }}"
