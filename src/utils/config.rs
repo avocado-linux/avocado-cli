@@ -20,10 +20,16 @@ use crate::utils::output::{print_warning, OutputLevel};
 /// carries a `./` prefix) returns `Some("")`, not `None`. Every call site that
 /// wrote `config_path.parent().unwrap_or(Path::new("."))` therefore skipped
 /// its own fallback exactly when the default config path was in play, and
-/// resolved every project-relative path against `""`. `WalkDir::new("")`
-/// fails outright; a `.join()` onto `""` silently drops the parent and reads
-/// the wrong file elsewhere. Fold the empty case into the same fallback the
-/// `None` case already had.
+/// resolved every project-relative path against `""`.
+///
+/// Which callers that actually breaks is worth stating, because most of them
+/// are fine and that is what hid this. `"".join(x)` is `x`, which resolves
+/// against the cwd just as `"./x"` would, so a call site that only joins is
+/// unaffected. The ones that walk or print the root are not: `WalkDir::new("")`
+/// fails outright (the `package_files` glob hash), `canonicalize("")` fails so
+/// a containment check falling back to the raw root compares against `""` and
+/// admits everything, and a message interpolating it trails off mid-sentence.
+/// Fold the empty case into the same fallback the `None` case already had.
 pub(crate) fn config_file_dir(config_path: &Path) -> &Path {
     match config_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -6690,26 +6696,39 @@ pub fn find_active_compile_sections(
 #[cfg(test)]
 mod tests {
 
-    /// `Path::parent()` on a single-component relative path returns `Some("")`,
-    /// not `None` — so a naive `.parent().unwrap_or(Path::new("."))` never
-    /// reaches its own fallback for exactly the input every default `--config`
-    /// carries: the bare filename `avocado.yaml`, with no `./` prefix. Pin the
-    /// corrected behaviour directly, since a regression here does not fail
-    /// loudly — it produces an empty root that only breaks downstream at
-    /// whichever caller first tries to join or walk it.
+    /// `avocado.yaml` is `--config`'s own default and carries no directory
+    /// component, so `Path::parent()` answers `Some("")` rather than `None`
+    /// and the `unwrap_or(".")` guard beside it never fires. The resulting
+    /// empty root joins like the current directory, which is why this went
+    /// unnoticed for so long — the callers that merely `.join()` onto it are
+    /// genuinely unaffected. Assert walkability rather than just non-emptiness:
+    /// `read_dir("")` is the operation that actually failed, via `WalkDir` in
+    /// `package_files_digest`, and an equality check against `"."` would pass
+    /// on a root no caller can open.
     #[test]
-    fn config_file_dir_treats_a_bare_filename_as_the_current_directory() {
-        use super::config_file_dir;
-        use std::path::Path;
+    fn project_root_of_a_bare_config_path_is_walkable() {
+        let config = super::Config::load_from_yaml_str("extensions: {}\n").unwrap();
 
-        assert_eq!(config_file_dir(Path::new("avocado.yaml")), Path::new("."));
-        // A path that does carry a directory component is unaffected.
+        // No `src_dir`, so the root comes from the config path alone.
+        for bare in ["avocado.yaml", "avocado.yml", "./avocado.yaml"] {
+            let root = config.project_root(bare);
+            assert!(
+                !root.as_os_str().is_empty(),
+                "`{bare}` has no directory component, so the root must fall back \
+                 to the current directory rather than the empty path"
+            );
+            assert!(
+                std::fs::read_dir(&root).is_ok(),
+                "a project root must be walkable; `{}` is not",
+                root.display()
+            );
+        }
+
+        // A path that already carries a directory keeps it untouched.
         assert_eq!(
-            config_file_dir(Path::new("project/avocado.yaml")),
-            Path::new("project")
+            config.project_root("nested/dir/avocado.yaml"),
+            std::path::PathBuf::from("nested/dir")
         );
-        // Already-rooted at "." stays "."; nothing double-applies the fallback.
-        assert_eq!(config_file_dir(Path::new("./avocado.yaml")), Path::new("."));
     }
 
     /// Recording the feed set must be a no-op when there is nothing to record.
