@@ -1638,8 +1638,8 @@ mod tests {
     fn clean_ext_sysroot_drops_the_stamps_that_vouch_for_its_contents() {
         let cmd = clean_ext_sysroot_command("app");
         assert!(cmd.contains(r#"rm -rf "$AVOCADO_EXT_SYSROOTS/app""#));
-        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/build.stamp""#));
-        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/image.stamp""#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/build.stamp'"#));
+        assert!(cmd.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/image.stamp'"#));
         // The install stamp is rewritten by the install that follows; removing
         // it here would be harmless but is not this function's job.
         assert!(!cmd.contains("install.stamp"));
@@ -1684,7 +1684,7 @@ mod tests {
 
         // The stamp is written, and says how it was written.
         let script = generate_write_stamp_script(&marked).unwrap();
-        assert!(script.contains(r#""$AVOCADO_PREFIX/.stamps/ext/app/install.stamp""#));
+        assert!(script.contains(r#""$AVOCADO_PREFIX/.stamps/"'ext/app/install.stamp'"#));
         assert!(script.contains("\"nonstandard_options\": true"));
 
         // `ext build`'s validator accepts it -- the sysroot is installed.
@@ -1720,8 +1720,8 @@ mod tests {
     #[test]
     fn a_nonstandard_transaction_drops_the_stamps_that_vouch_for_the_sysroot() {
         let script = nonstandard_cleanup_script("app", false);
-        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/build.stamp""#));
-        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/image.stamp""#));
+        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/build.stamp'"#));
+        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/image.stamp'"#));
         // The install stamp is written right after this, and is what `ext
         // build` needs to run at all -- removing it is the bug being fixed.
         assert!(!script.contains("install.stamp"));

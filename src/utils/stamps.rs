@@ -2691,16 +2691,31 @@ pub fn compute_runtime_build_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
+/// One shell word naming a stamp file, safe for any component name.
+///
+/// A stamp path carries an extension or runtime name, which is a YAML key and
+/// is not constrained to shell-safe characters — a name holding `"` or `$(…)`
+/// would otherwise escape the command it is interpolated into and run in the
+/// SDK container. `$AVOCADO_PREFIX` still has to expand, so it stays in double
+/// quotes and the rest is emitted single-quoted, with each `'` closed and
+/// reopened. Concatenated, the shell reads the two halves as one word.
+fn stamps_path_word(relative_path: &str) -> String {
+    format!(
+        "\"$AVOCADO_PREFIX/.stamps/\"'{}'",
+        relative_path.replace('\'', r"'\''")
+    )
+}
+
 /// Generate shell script to write a stamp file
 pub fn generate_write_stamp_script(stamp: &Stamp) -> Result<String> {
     let stamp_json = stamp.to_json()?;
-    let stamp_path = stamp.relative_path();
+    let stamp_word = stamps_path_word(&stamp.relative_path());
 
     Ok(format!(
         r#"
 # Write stamp file
-mkdir -p "$AVOCADO_PREFIX/.stamps/$(dirname '{stamp_path}')"
-cat > "$AVOCADO_PREFIX/.stamps/{stamp_path}" << 'STAMP_EOF'
+mkdir -p "$(dirname {stamp_word})"
+cat > {stamp_word} << 'STAMP_EOF'
 {stamp_json}
 STAMP_EOF
 # Stamp written (use --verbose to see stamp operations)
@@ -2779,6 +2794,7 @@ pub fn generate_write_stamp_script_with_digest(
     with_placeholder.outputs.content_hash = Some(CONTENT_HASH_PLACEHOLDER.to_string());
     let stamp_json = with_placeholder.to_json()?;
     let stamp_path = stamp.relative_path();
+    let stamp_word = stamps_path_word(&stamp_path);
 
     Ok(format!(
         r#"
@@ -2787,7 +2803,7 @@ pub fn generate_write_stamp_script_with_digest(
 case "$AVOCADO_CONTENT_HASH" in
     *[!0-9a-f]*|"") echo "ERROR: content digest for {stamp_path} is empty or not hex: '$AVOCADO_CONTENT_HASH'" >&2; exit 1 ;;
 esac
-_avocado_stamp="$AVOCADO_PREFIX/.stamps/{stamp_path}"
+_avocado_stamp={stamp_word}
 mkdir -p "$(dirname "$_avocado_stamp")" || exit 1
 cat > "$_avocado_stamp" << 'STAMP_EOF' || exit 1
 {stamp_json}
@@ -2932,10 +2948,7 @@ pub fn generate_batch_read_stamps_script(requirements: &[StampRequirement]) -> S
 /// either runs with `--no-stamps` too or fails its precondition loudly;
 /// neither silently skips over stale bytes.
 pub fn remove_own_stamp_line(req: &StampRequirement) -> String {
-    format!(
-        "rm -f \"$AVOCADO_PREFIX/.stamps/{}\"\n",
-        req.relative_path()
-    )
+    format!("rm -f {}\n", stamps_path_word(&req.relative_path()))
 }
 
 /// Key under which [`generate_output_listing_probe`] reports in a batch read.
@@ -3578,7 +3591,8 @@ mod tests {
 
         let script = generate_write_stamp_script(&stamp).unwrap();
         assert!(script.contains("mkdir -p"));
-        assert!(script.contains(".stamps/sdk"));
+        assert!(script.contains(".stamps/"));
+        assert!(script.contains("sdk/"));
         assert!(script.contains("install.stamp"));
     }
 
@@ -6202,7 +6216,66 @@ extensions:
         let line = remove_own_stamp_line(&StampRequirement::ext_build("app"));
         assert_eq!(
             line,
-            "rm -f \"$AVOCADO_PREFIX/.stamps/ext/app/build.stamp\"\n"
+            "rm -f \"$AVOCADO_PREFIX/.stamps/\"'ext/app/build.stamp'\n"
+        );
+    }
+
+    /// A component name is a YAML key, not a shell-safe token. Interpolated
+    /// raw it escapes the command it sits in and runs in the SDK container, so
+    /// every generated stamp path is one shell word: `$AVOCADO_PREFIX` in
+    /// double quotes, the rest single-quoted with each `'` closed and reopened.
+    ///
+    /// Asserted by running the generated shell, because a substring check
+    /// cannot tell an inert `;` inside quotes from a live one outside them.
+    #[cfg(unix)]
+    #[test]
+    fn a_stamp_path_is_one_shell_word_whatever_the_component_is_called() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        // A name that closes the double quote, runs a command, and reopens it.
+        let hostile = format!("a\"; touch '{}'; \"b", marker.display());
+
+        let run = |script: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -e; export AVOCADO_PREFIX='{}'; mkdir -p \"$AVOCADO_PREFIX/.stamps\"; {script}",
+                    dir.path().display()
+                ))
+                .output()
+                .expect("sh ran")
+        };
+
+        run(&remove_own_stamp_line(&StampRequirement::ext_build(
+            &hostile,
+        )));
+        assert!(!marker.exists(), "the removal line ran an injected command");
+
+        let stamp = Stamp::ext_build(
+            &hostile,
+            "qemux86-64",
+            StampInputs::new("c".into()),
+            StampOutputs::default(),
+        );
+        run(&generate_write_stamp_script(&stamp).unwrap());
+        assert!(!marker.exists(), "the write script ran an injected command");
+
+        // ...and the write still lands, under the literal name.
+        let written = dir
+            .path()
+            .join(".stamps")
+            .join(StampRequirement::ext_build(&hostile).relative_path());
+        assert!(
+            written.is_file(),
+            "the stamp was not written at {}",
+            written.display()
+        );
+
+        // A single quote closes and reopens rather than ending the word.
+        assert!(
+            remove_own_stamp_line(&StampRequirement::ext_build("it's"))
+                .contains(r"ext/it'\''s/build.stamp"),
+            "a single quote must be escaped, not ended"
         );
     }
 

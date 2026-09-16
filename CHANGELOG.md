@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one. Such an install also drops the extension's build and image stamps, since
   `ext build`'s hash is config-only and its skip would otherwise fire over a
   sysroot the unrecorded options changed. Regression in 1.0.0-rc.4 (#260).
+- **A stamp path is now one shell word, whatever the component is called.** An
+  extension or runtime name is a YAML key and is not constrained to shell-safe
+  characters. The generated scripts that write and remove a stamp interpolated
+  it raw, so a name holding a quote escaped the command and ran in the SDK
+  container. `$AVOCADO_PREFIX` is still expanded, and the rest of the path is
+  single-quoted.
 
 ## [1.0.0-rc.4] - 2026-09-15
 
