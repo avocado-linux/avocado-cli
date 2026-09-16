@@ -77,9 +77,23 @@ pub struct DiscoveredExt {
 
 impl ExtSourceReader {
     /// A reader rooted at a plain directory.
+    ///
+    /// An empty root is normalized to `.` rather than stored as-is. `""` is
+    /// what `Path::parent()` answers for a bare `avocado.yaml`, and it reads
+    /// like the current directory everywhere except the two places it matters:
+    /// `canonicalize("")` fails, so `read`'s containment check would compare
+    /// against `""` and `Path::starts_with("")` is true for every path, which
+    /// disables the escape guard outright; and `describe()` renders the origin
+    /// label with nothing after it. Normalizing once at construction fixes both
+    /// and keeps a future caller from reintroducing either.
     pub fn dir(root: impl Into<PathBuf>, origin: DirOrigin) -> Self {
+        let root = root.into();
         Self::Dir {
-            root: root.into(),
+            root: if root.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                root
+            },
             origin,
         }
     }
@@ -422,6 +436,51 @@ mod tests {
         assert!(
             err.to_string().contains("outside the extension root"),
             "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same escape the test above rejects, with the root spelled `""`.
+    ///
+    /// That is not a contrived input: `Path::parent()` answers `Some("")` for
+    /// a bare `avocado.yaml`, which is `--config`'s own default. `canonicalize`
+    /// then fails on it, the fallback left `real_root` empty, and
+    /// `Path::starts_with("")` is true for every path on earth - so the guard
+    /// kept returning Ok while admitting anything the symlink pointed at. For a
+    /// `type: git` extension that tree is third-party content.
+    ///
+    /// Fixing the call site that produced the empty root does not pin this.
+    /// Revert only that and the suite stays green with the hole reopened, which
+    /// is why the normalization lives in `dir()` and this test addresses it
+    /// there.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn dir_reader_rejects_symlink_out_of_an_empty_root() {
+        let dir = tmpdir("escape_empty_root");
+        let outside = dir.join("outside");
+        let root = dir.join("ext");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "sekrit\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("VERSION")).unwrap();
+
+        // Restore the cwd before asserting: a panic here would otherwise leave
+        // every later test in this process running from a deleted directory.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let result = ExtSourceReader::dir("", DirOrigin::LocalConfig).read("VERSION");
+        let described = ExtSourceReader::dir("", DirOrigin::LocalConfig).describe();
+        std::env::set_current_dir(prev).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("outside the extension root"),
+            "an empty root must still refuse a symlink leaving the tree: {err:#}"
+        );
+        assert!(
+            described.ends_with('.'),
+            "an empty root must describe as a path, not trail off: {described:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
