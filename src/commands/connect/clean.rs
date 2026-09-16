@@ -22,7 +22,7 @@ impl ConnectCleanCommand {
             );
         }
 
-        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        let config_dir = crate::utils::config::config_file_dir(config_path);
         let mut any_changes = false;
         let mut removed_connect_section = false;
         let mut removed_extension = false;

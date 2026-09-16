@@ -246,7 +246,7 @@ impl ConnectInitCommand {
         }
 
         // 10. Ensure avocado-ext-connect-config extension has overlay: set
-        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        let config_dir = crate::utils::config::config_file_dir(config_path);
         let overlay_dir = config_edit::ensure_extension_overlay(
             config_path,
             "avocado-ext-connect-config",
