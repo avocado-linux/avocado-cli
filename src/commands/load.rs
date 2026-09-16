@@ -177,7 +177,7 @@ fn import_archive(
     }
 
     // Restore config files
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let config_dir = crate::utils::config::config_file_dir(config_path);
     let archive_config_dir = temp_path.join("avocado-state/config");
 
     // Restore avocado.yaml

@@ -13,6 +13,30 @@ use crate::utils::ext_version_source::{ExtFileReader, VersionSource};
 use crate::utils::kernel_version::KernelVersionSpec;
 use crate::utils::output::{print_warning, OutputLevel};
 
+/// The directory a config file lives in, for resolving paths relative to it.
+///
+/// `Path::parent()` on a single-component relative path (`"avocado.yaml"`,
+/// which is `--config`'s own default - nothing users type explicitly ever
+/// carries a `./` prefix) returns `Some("")`, not `None`. Every call site that
+/// wrote `config_path.parent().unwrap_or(Path::new("."))` therefore skipped
+/// its own fallback exactly when the default config path was in play, and
+/// resolved every project-relative path against `""`.
+///
+/// Which callers that actually breaks is worth stating, because most of them
+/// are fine and that is what hid this. `"".join(x)` is `x`, which resolves
+/// against the cwd just as `"./x"` would, so a call site that only joins is
+/// unaffected. The ones that walk or print the root are not: `WalkDir::new("")`
+/// fails outright (the `package_files` glob hash), `canonicalize("")` fails so
+/// a containment check falling back to the raw root compares against `""` and
+/// admits everything, and a message interpolating it trails off mid-sentence.
+/// Fold the empty case into the same fallback the `None` case already had.
+pub(crate) fn config_file_dir(config_path: &Path) -> &Path {
+    match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
 /// Shape-inferred deserializer for top-level fields that accept either a
 /// singleton config object (today's grammar) OR a map of `name → config`
 /// (the new named-reference grammar).
@@ -532,7 +556,7 @@ impl ComposedConfig {
         }
 
         // Fallback: resolve relative to the source config's directory
-        let config_dir = source_config_path.parent().unwrap_or(Path::new("."));
+        let config_dir = config_file_dir(source_config_path);
         config_dir.join(target_path)
     }
 
@@ -544,7 +568,7 @@ impl ComposedConfig {
     pub fn get_extension_src_dir(&self, ext_name: &str) -> PathBuf {
         let source_config = self.get_extension_source_config(ext_name);
         let source_config_path = Path::new(source_config);
-        let config_dir = source_config_path.parent().unwrap_or(Path::new("."));
+        let config_dir = config_file_dir(source_config_path);
 
         // Try to load the source config to get its src_dir
         if let Ok(content) = fs::read_to_string(source_config_path) {
@@ -1803,7 +1827,7 @@ impl Config {
             .strip_prefix("extensions.")
             .filter(|name| !name.contains('.'))
         {
-            let root = Path::new(config_path).parent().unwrap_or(Path::new("."));
+            let root = config_file_dir(Path::new(config_path));
             let reader = ExtSourceReader::dir(root, DirOrigin::LocalConfig);
             crate::utils::ext_version_source::resolve_in_ext_value(
                 &mut base_section,
@@ -1903,7 +1927,7 @@ impl Config {
         // Readers rooted at each extension's source tree, used to resolve a
         // `version: { file, key }` provider once everything is merged.
         let mut ext_readers: HashMap<String, ExtSourceReader> = HashMap::new();
-        let main_config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let main_config_dir = config_file_dir(path).to_path_buf();
 
         // Record extensions from the main config
         if let Some(ext_section) = main_config.get("extensions").and_then(|e| e.as_mapping()) {
@@ -1934,7 +1958,7 @@ impl Config {
         // Load and merge each external config
         for (ext_name, external_config_path) in &external_refs {
             // Resolve the external config path relative to the main config's directory
-            let main_config_dir = path.parent().unwrap_or(Path::new("."));
+            let main_config_dir = config_file_dir(path);
             let resolved_path = main_config_dir.join(external_config_path);
 
             if !resolved_path.exists() {
@@ -2092,7 +2116,7 @@ impl Config {
         main_config: &mut serde_yaml::Value,
         config_path: &Path,
     ) -> Result<()> {
-        let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let config_dir = config_file_dir(config_path).to_path_buf();
 
         // Resolve path sources relative to `src_dir` when set (falling back to
         // the config file's directory), so rootfs/initramfs/kernel `source.path`
@@ -2276,7 +2300,7 @@ impl Config {
         let config_path_str = config_path.to_string_lossy();
         let src_dir = temp_config
             .get_resolved_src_dir::<&str>(config_path_str.as_ref())
-            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+            .unwrap_or_else(|| config_file_dir(config_path).to_path_buf());
 
         // Try to load volume state for container-based config reading
         let volume_state = crate::utils::volume::VolumeState::load_from_dir(&src_dir)
@@ -4897,13 +4921,8 @@ impl Config {
     /// disk on the host. Uses the resolved `src_dir` when set, otherwise
     /// falls back to the directory containing the config file.
     pub fn project_root<P: AsRef<Path>>(&self, config_path: P) -> PathBuf {
-        self.get_resolved_src_dir(&config_path).unwrap_or_else(|| {
-            config_path
-                .as_ref()
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        })
+        self.get_resolved_src_dir(&config_path)
+            .unwrap_or_else(|| config_file_dir(config_path.as_ref()).to_path_buf())
     }
 
     /// If src_dir is configured, it resolves relative paths relative to the config file
@@ -4915,7 +4934,7 @@ impl Config {
                 path.to_path_buf()
             } else {
                 // Resolve relative to config file directory
-                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                let config_dir = config_file_dir(config_path.as_ref());
                 config_dir.join(path).canonicalize().unwrap_or_else(|_| {
                     // If canonicalize fails, just join the paths
                     config_dir.join(path)
@@ -4941,7 +4960,7 @@ impl Config {
                 src_dir.join(target_path)
             } else {
                 // Fallback to config file directory
-                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                let config_dir = config_file_dir(config_path.as_ref());
                 config_dir.join(target_path)
             }
         }
@@ -6676,6 +6695,41 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+
+    /// `avocado.yaml` is `--config`'s own default and carries no directory
+    /// component, so `Path::parent()` answers `Some("")` rather than `None`
+    /// and the `unwrap_or(".")` guard beside it never fires. The resulting
+    /// empty root joins like the current directory, which is why this went
+    /// unnoticed for so long — the callers that merely `.join()` onto it are
+    /// genuinely unaffected. Assert walkability rather than just non-emptiness:
+    /// `read_dir("")` is the operation that actually failed, via `WalkDir` in
+    /// `package_files_digest`, and an equality check against `"."` would pass
+    /// on a root no caller can open.
+    #[test]
+    fn project_root_of_a_bare_config_path_is_walkable() {
+        let config = super::Config::load_from_yaml_str("extensions: {}\n").unwrap();
+
+        // No `src_dir`, so the root comes from the config path alone.
+        for bare in ["avocado.yaml", "avocado.yml", "./avocado.yaml"] {
+            let root = config.project_root(bare);
+            assert!(
+                !root.as_os_str().is_empty(),
+                "`{bare}` has no directory component, so the root must fall back \
+                 to the current directory rather than the empty path"
+            );
+            assert!(
+                std::fs::read_dir(&root).is_ok(),
+                "a project root must be walkable; `{}` is not",
+                root.display()
+            );
+        }
+
+        // A path that already carries a directory keeps it untouched.
+        assert_eq!(
+            config.project_root("nested/dir/avocado.yaml"),
+            std::path::PathBuf::from("nested/dir")
+        );
+    }
 
     /// Recording the feed set must be a no-op when there is nothing to record.
     ///

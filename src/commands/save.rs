@@ -212,7 +212,7 @@ fn build_save_archive(
     // otherwise the `.avocado/` archive below and step 3b would both carry a lock
     // and they could disagree on restore. `load()` + `save_replacing()` writes
     // `avocado.lock` and (via `write_to_disk`) drops the legacy file.
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let config_dir = crate::utils::config::config_file_dir(config_path);
     if LockFile::legacy_path(config_dir).exists() {
         if let Ok(lock) = LockFile::load(config_dir) {
             let _ = lock.save_replacing(config_dir);
