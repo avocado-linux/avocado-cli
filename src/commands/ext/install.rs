@@ -18,7 +18,7 @@ use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     compute_ext_install_input_hash_with_deps, ext_dep_fingerprint,
     generate_batch_read_stamps_script, generate_write_stamp_script, parse_batch_stamps_output,
-    validate_stamp, Stamp, StampOutputs, StampRequirement, StampStatus,
+    remove_own_stamp_line, validate_stamp, Stamp, StampOutputs, StampRequirement, StampStatus,
 };
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
@@ -34,6 +34,46 @@ fn ext_name_stamp_safe(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Whether every install option this invocation carries is covered by the ext
+/// install input hash.
+///
+/// `--dnf-arg` and `sdk.disable_weak_dependencies` change what dnf resolves and
+/// neither reaches the hash, so a sysroot installed under them is not described
+/// by the stamp's inputs alone. Shared by the fast path and the stamp writer so
+/// the two cannot disagree about what "standard" means.
+fn transaction_is_standard(dnf_args: Option<&[String]>, disable_weak_dependencies: bool) -> bool {
+    dnf_args.is_none_or(|a| a.is_empty()) && !disable_weak_dependencies
+}
+
+/// Shell that drops an extension's build and image stamps, for prefixing to the
+/// install-stamp write after a non-standard transaction.
+///
+/// The install stamp records what the config asked for; a `--dnf-arg` or a
+/// disabled weak-dependency setting resolves a different package set into the
+/// same sysroot. Nothing chains that sysroot into `ext build`'s input hash,
+/// which is config-only, so its skip would otherwise fire over content that
+/// changed underneath it and `ext image` would ship the previous build. Drop
+/// the two stamps that vouch for the sysroot's contents instead, the same way
+/// `clean_ext_sysroot_command` does when it clears one. `ext build` writes them
+/// back, so this costs a rebuild, not a loop.
+fn nonstandard_cleanup_script(ext_name: &str, standard: bool) -> String {
+    if standard {
+        return String::new();
+    }
+    remove_own_stamp_line(&StampRequirement::ext_build(ext_name))
+        + &remove_own_stamp_line(&StampRequirement::ext_image(ext_name))
+}
+
+/// Whether the fast path may skip an install on this stamp read.
+///
+/// Current, and not written by a transaction whose options the input hash does
+/// not cover (`--dnf-args`, `sdk.disable_weak_dependencies`). The fast path
+/// itself only runs for a standard transaction, so a `nonstandard_options`
+/// stamp is one this invocation would resolve differently -- reinstall.
+fn stamp_allows_skip(status: &StampStatus) -> bool {
+    matches!(status, StampStatus::Current(stamp) if !stamp.outputs.nonstandard_options)
 }
 
 /// Shell that clears an extension's sysroot and drops the stamps that vouch for
@@ -573,8 +613,10 @@ impl ExtInstallCommand {
         let fast_path = !self.force
             && !self.no_stamps
             && runs_on_context.is_none()
-            && self.dnf_args.as_ref().is_none_or(|a| a.is_empty())
-            && !config.get_sdk_disable_weak_dependencies();
+            && transaction_is_standard(
+                self.dnf_args.as_deref(),
+                config.get_sdk_disable_weak_dependencies(),
+            );
         // Only fast-path shell-safe names (see `ext_name_stamp_safe`); the rest
         // fall through to a normal install rather than being skipped.
         let stamp_safe = ext_name_stamp_safe;
@@ -678,12 +720,16 @@ impl ExtInstallCommand {
                         let json = stamp_reads
                             .get(&req.relative_path())
                             .and_then(|v| v.as_deref());
+                        // A stamp carrying `nonstandard_options` describes a
+                        // sysroot resolved with `--dnf-args` or weak
+                        // dependencies disabled -- neither of which the input
+                        // hash covers. The fast path only ever runs for a
+                        // standard transaction, so skipping on one would leave
+                        // a sysroot this invocation would have resolved
+                        // differently. Reinstall instead.
                         sysroot_present
                             && has_pins
-                            && matches!(
-                                validate_stamp(&req, json, Some(&inputs)),
-                                StampStatus::Current(_)
-                            )
+                            && stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs)))
                     }
                     Err(_) => false,
                 }
@@ -718,41 +764,20 @@ impl ExtInstallCommand {
             // The config-only stamp fingerprints extension config, not the
             // per-invocation transaction: `--dnf-args` and a disabled
             // weak-dependency setting install a different package set than the
-            // stamp records. Writing a clean stamp after such a transaction
-            // would let a later plain install skip a sysroot missing those
-            // packages, so instead drop any existing stamp and force the next
-            // install to re-resolve.
-            let transaction_is_standard = self.dnf_args.as_ref().is_none_or(|a| a.is_empty())
-                && !config.get_sdk_disable_weak_dependencies();
-            if !self.no_stamps
-                && !ext_up_to_date
-                && !transaction_is_standard
-                && stamp_safe(ext_name)
-            {
-                let req = StampRequirement::ext_install(ext_name);
-                let run_config = RunConfig {
-                    container_image: container_image.to_string(),
-                    target: target.to_string(),
-                    command: format!("rm -f \"$AVOCADO_PREFIX/.stamps/{}\"", req.relative_path()),
-                    verbose: self.verbose,
-                    source_environment: true,
-                    interactive: false,
-                    repo_url: repo_url.cloned(),
-                    repo_release: repo_release.cloned(),
-                    container_args: merged_container_args.clone(),
-                    dnf_args: self.dnf_args.clone(),
-                    sdk_arch: self.sdk_arch.clone(),
-                    tui_context: effective_tui_context.clone(),
-                    env_vars: self.runtime_env_vars(),
-                    ..Default::default()
-                };
-                run_container_command(container_helper, run_config, runs_on_context).await?;
-            }
-
-            // Write extension install stamp (unless --no-stamps, it was already
-            // up to date -- the stamp is already current -- or the transaction
-            // was non-standard, handled above).
-            if !self.no_stamps && !ext_up_to_date && transaction_is_standard {
+            // stamp records. The stamp is still written -- it is what says the
+            // sysroot exists, and `ext build` refuses to run without it -- but
+            // it is marked so this command's own fast path will not skip over
+            // it on a later plain install. Deleting it instead made every
+            // `install --dnf-arg=...` project unbuildable: `ext build` demands
+            // the install stamp, and the only advertised fix (`avocado ext
+            // install <name>`) deleted it again.
+            let standard = transaction_is_standard(
+                self.dnf_args.as_deref(),
+                config.get_sdk_disable_weak_dependencies(),
+            );
+            // Write extension install stamp (unless --no-stamps, or it was
+            // already up to date -- the stamp is already current).
+            if !self.no_stamps && !ext_up_to_date {
                 // Update peek line so it doesn't stay on "Complete!" during stamp write
                 if let Some(ref ctx) = effective_tui_context {
                     ctx.renderer
@@ -793,9 +818,13 @@ impl ExtInstallCommand {
                     &dep_state,
                     resolved_kernel.as_deref(),
                 )?;
-                let outputs = StampOutputs::default();
+                let outputs = StampOutputs {
+                    nonstandard_options: !standard,
+                    ..Default::default()
+                };
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
-                let stamp_script = generate_write_stamp_script(&stamp)?;
+                let stamp_script = nonstandard_cleanup_script(ext_name, standard)
+                    + &generate_write_stamp_script(&stamp)?;
 
                 let run_config = RunConfig {
                     container_image: container_image.to_string(),
@@ -1614,6 +1643,90 @@ mod tests {
         // The install stamp is rewritten by the install that follows; removing
         // it here would be harmless but is not this function's job.
         assert!(!cmd.contains("install.stamp"));
+    }
+
+    /// `--dnf-arg` and `sdk.disable_weak_dependencies` change what dnf resolves
+    /// and neither reaches the install hash, so the stamp written after one
+    /// must say so. Both the fast path and the writer read this, so a drift
+    /// between them would either skip a differently-resolved sysroot or mark
+    /// every ordinary install.
+    #[test]
+    fn only_options_the_hash_cannot_see_make_a_transaction_nonstandard() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(transaction_is_standard(None, false));
+        assert!(transaction_is_standard(Some(&[]), false));
+        assert!(!transaction_is_standard(Some(&args(&["--refresh"])), false));
+        assert!(!transaction_is_standard(None, true));
+        assert!(!transaction_is_standard(Some(&args(&["--refresh"])), true));
+    }
+
+    /// An install run with `--dnf-arg` (or weak dependencies disabled) still
+    /// leaves an install stamp behind. It used to delete one instead, which
+    /// made such a project permanently unbuildable: `ext build` hard-requires
+    /// `ext/<name>/install.stamp`, and the fix it advertised
+    /// (`avocado ext install <name>`) deleted the stamp again on every run.
+    /// The stamp is marked instead, and only this command's fast path reads
+    /// the mark.
+    #[test]
+    fn a_nonstandard_transaction_marks_the_install_stamp_instead_of_deleting_it() {
+        use crate::utils::stamps::{generate_write_stamp_script, StampInputs};
+        let inputs = StampInputs::new("h".to_string());
+        let marked = Stamp::ext_install(
+            "app",
+            "t",
+            inputs.clone(),
+            StampOutputs {
+                nonstandard_options: true,
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&marked).unwrap();
+
+        // The stamp is written, and says how it was written.
+        let script = generate_write_stamp_script(&marked).unwrap();
+        assert!(script.contains(r#""$AVOCADO_PREFIX/.stamps/ext/app/install.stamp""#));
+        assert!(script.contains("\"nonstandard_options\": true"));
+
+        // `ext build`'s validator accepts it -- the sysroot is installed.
+        let req = StampRequirement::ext_install("app");
+        assert!(matches!(
+            validate_stamp(&req, Some(&json), Some(&inputs)),
+            StampStatus::Current(_)
+        ));
+        // ...but a later plain install must not skip over it.
+        assert!(!stamp_allows_skip(&validate_stamp(
+            &req,
+            Some(&json),
+            Some(&inputs)
+        )));
+
+        // A standard transaction's stamp still takes the fast path, and a
+        // stamp written before the field existed reads as standard.
+        let plain = Stamp::ext_install("app", "t", inputs.clone(), StampOutputs::default());
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("nonstandard_options"));
+        assert!(stamp_allows_skip(&validate_stamp(
+            &req,
+            Some(&plain_json),
+            Some(&inputs)
+        )));
+    }
+
+    /// `ext build`'s input hash is config-only, so nothing in it moves when an
+    /// unrecorded install option changes the sysroot underneath it. Its skip
+    /// would then fire over content that changed, and `ext image` would ship
+    /// the previous build. Dropping both stamps is what `clean_ext_sysroot`
+    /// already does for the same reason.
+    #[test]
+    fn a_nonstandard_transaction_drops_the_stamps_that_vouch_for_the_sysroot() {
+        let script = nonstandard_cleanup_script("app", false);
+        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/build.stamp""#));
+        assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/ext/app/image.stamp""#));
+        // The install stamp is written right after this, and is what `ext
+        // build` needs to run at all -- removing it is the bug being fixed.
+        assert!(!script.contains("install.stamp"));
+        // An ordinary install leaves every stamp alone.
+        assert!(nonstandard_cleanup_script("app", true).is_empty());
     }
 
     /// A move between two pins cleans the sysroot, and so does a first pin

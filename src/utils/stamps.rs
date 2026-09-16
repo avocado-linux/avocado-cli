@@ -159,6 +159,19 @@ pub struct StampOutputs {
     /// script, recorded so a skipped re-run can replay them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exports: Option<std::collections::BTreeMap<String, String>>,
+    /// The step ran with install options the input hash does not cover —
+    /// `--dnf-arg`, `sdk.disable_weak_dependencies` — so the sysroot holds what
+    /// those options resolved, not what the config alone would. Only `ext
+    /// install` sets it, and only its own fast path reads it: a later plain
+    /// install must not skip over a sysroot it would resolve differently.
+    ///
+    /// Downstream validators accept a marked stamp, because the sysroot really
+    /// is installed and that is all the precondition asks. They are not left
+    /// trusting stale content either: the same install drops the extension's
+    /// build and image stamps, whose skips are the only ones the unrecorded
+    /// options could have fooled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nonstandard_options: bool,
 }
 
 /// A stamp representing successful completion of a command
