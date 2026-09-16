@@ -1674,12 +1674,9 @@ enum SdkCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Install the SDK, rootfs, initramfs and target-dev sysroots in
-        /// parallel rather than one at a time.
-        ///
-        /// Clears nothing. Not needed to skip dnf's prompts — installs never
-        /// prompt.
-        #[arg(short, long)]
+        /// No effect. Kept so existing `-f` invocations keep parsing: the
+        /// sysroots always install in parallel, and installs never prompt.
+        #[arg(short, long, hide = true)]
         force: bool,
         /// Target architecture
         #[arg(short, long)]
@@ -1752,11 +1749,9 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Run without the live checklist.
-        ///
-        /// Clears nothing. Not needed to skip dnf's prompts — installs never
-        /// prompt.
-        #[arg(short, long)]
+        /// No effect. Kept so existing `-f` invocations keep parsing:
+        /// installs never prompt.
+        #[arg(short, long, hide = true)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
         #[arg(short = 'r', long = "runtime", hide = true)]
@@ -2742,7 +2737,7 @@ async fn main() -> Result<()> {
                 runtime,
                 config,
                 verbose,
-                force,
+                force: _,
                 target,
                 container_args,
                 dnf_args,
@@ -2755,7 +2750,6 @@ async fn main() -> Result<()> {
                     runtime,
                     config,
                     verbose,
-                    force,
                     target.or(cli.target.clone()),
                     container_args,
                     dnf_args,
@@ -3615,7 +3609,7 @@ async fn main() -> Result<()> {
             SdkCommands::Install {
                 config,
                 verbose,
-                force,
+                force: _,
                 target,
                 target_board,
                 container_args,
@@ -3624,7 +3618,6 @@ async fn main() -> Result<()> {
                 let mut install_cmd = SdkInstallCommand::new(
                     config,
                     verbose,
-                    force,
                     target.or(cli.target.clone()),
                     container_args,
                     dnf_args,

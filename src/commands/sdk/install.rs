@@ -50,8 +50,6 @@ pub struct SdkInstallCommand {
     pub config_path: String,
     /// Enable verbose output
     pub verbose: bool,
-    /// Force operation without prompts
-    pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
     /// Target board override for `{{ avocado.target.board }}`
@@ -78,7 +76,6 @@ impl SdkInstallCommand {
     pub fn new(
         config_path: String,
         verbose: bool,
-        force: bool,
         target: Option<String>,
         container_args: Option<Vec<String>>,
         dnf_args: Option<Vec<String>>,
@@ -86,7 +83,6 @@ impl SdkInstallCommand {
         Self {
             config_path,
             verbose,
-            force,
             target,
             target_board: None,
             container_args,
@@ -138,7 +134,7 @@ impl SdkInstallCommand {
 
     /// Execute the sdk install command
     pub async fn execute(&mut self) -> Result<()> {
-        let tui_guard = if self.tui_context.is_none() && self.force {
+        let tui_guard = if self.tui_context.is_none() {
             Some(TuiGuard::new(
                 TaskId::SdkInstall,
                 "sdk install",
@@ -674,10 +670,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             };
         }
 
-        // With --force (non-interactive), run all four tasks in parallel.
-        // Without --force, dnf may prompt — run sequentially so each prompt
-        // gets exclusive stdin access.
-        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = if self.force {
+        // Same rule as the install and build DAGs: sequential only under
+        // `--runs-on` or `AVOCADO_PARALLEL_TASKS=1`.
+        let parallel = crate::utils::scheduler::max_parallel(self.runs_on.is_some()) > 1;
+        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = if parallel {
             tokio::join!(
                 with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
                 with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
@@ -2155,7 +2151,7 @@ mod tests {
 
     #[test]
     fn test_build_package_list_with_lock() {
-        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, None, None, None);
         let lock_file = LockFile::new();
         let target = "qemux86-64";
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -2178,7 +2174,7 @@ mod tests {
 
     #[test]
     fn test_build_package_list_with_lock_uses_locked_version() {
-        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, None, None, None);
         let mut lock_file = LockFile::new();
         let target = "qemux86-64";
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -2210,7 +2206,6 @@ mod tests {
         let cmd = SdkInstallCommand::new(
             "config.toml".to_string(),
             true,
-            false,
             Some("test-target".to_string()),
             None,
             None,
@@ -2218,7 +2213,6 @@ mod tests {
 
         assert_eq!(cmd.config_path, "config.toml");
         assert!(cmd.verbose);
-        assert!(!cmd.force);
         assert_eq!(cmd.target, Some("test-target".to_string()));
     }
 }

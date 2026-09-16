@@ -255,18 +255,7 @@ impl BuildCommand {
             None
         };
 
-        // Determine parallelism
-        let max_parallel: usize = std::env::var("AVOCADO_PARALLEL_TASKS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| num_cpus::get().min(4));
-
-        // --runs-on forces sequential (remote execution)
-        let max_parallel = if self.runs_on.is_some() {
-            1
-        } else {
-            max_parallel
-        };
+        let max_parallel = crate::utils::scheduler::max_parallel(self.runs_on.is_some());
 
         // Phase 1: Build extension builds + images in parallel via the scheduler.
         // ExtBuild(name) → no deps, ExtImage(name) → ExtBuild(name)
