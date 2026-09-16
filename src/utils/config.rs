@@ -4891,19 +4891,31 @@ impl Config {
             .unwrap_or_else(|| format!(".avocado/provision-{profile_name}.state"))
     }
 
+    /// The directory holding `config_path`, as a path something can actually
+    /// open, walk or print.
+    ///
+    /// `Path::parent` does not answer `None` for a bare relative filename, it
+    /// answers `Some("")` — so the `unwrap_or(Path::new("."))` this replaces
+    /// never fired on the DEFAULT config path, `avocado.yaml`, and the root
+    /// came back empty. An empty root joins and opens like the current
+    /// directory, which is why most callers never saw it. The ones that walk
+    /// or print it did: `walkdir` on `""` fails outright, and a message
+    /// interpolating it trails off after "under".
+    fn config_dir_of(config_path: &Path) -> &Path {
+        match config_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        }
+    }
+
     /// Get the resolved source directory path
     /// Best-effort project root for resolving project-relative paths
     /// (`post_install` / `post_build` scripts, etc.) when reading them off
     /// disk on the host. Uses the resolved `src_dir` when set, otherwise
     /// falls back to the directory containing the config file.
     pub fn project_root<P: AsRef<Path>>(&self, config_path: P) -> PathBuf {
-        self.get_resolved_src_dir(&config_path).unwrap_or_else(|| {
-            config_path
-                .as_ref()
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        })
+        self.get_resolved_src_dir(&config_path)
+            .unwrap_or_else(|| Self::config_dir_of(config_path.as_ref()).to_path_buf())
     }
 
     /// If src_dir is configured, it resolves relative paths relative to the config file
@@ -4915,7 +4927,7 @@ impl Config {
                 path.to_path_buf()
             } else {
                 // Resolve relative to config file directory
-                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                let config_dir = Self::config_dir_of(config_path.as_ref());
                 config_dir.join(path).canonicalize().unwrap_or_else(|_| {
                     // If canonicalize fails, just join the paths
                     config_dir.join(path)
@@ -4941,7 +4953,7 @@ impl Config {
                 src_dir.join(target_path)
             } else {
                 // Fallback to config file directory
-                let config_dir = config_path.as_ref().parent().unwrap_or(Path::new("."));
+                let config_dir = Self::config_dir_of(config_path.as_ref());
                 config_dir.join(target_path)
             }
         }
@@ -6676,6 +6688,41 @@ pub fn find_active_compile_sections(
 
 #[cfg(test)]
 mod tests {
+
+    /// `avocado.yaml` is the DEFAULT config path, and it has no directory
+    /// component, so `Path::parent` answers `Some("")` rather than `None` —
+    /// which means the `unwrap_or(".")` guard beside it never fires and the
+    /// project root comes back empty. An empty root joins and opens like the
+    /// current directory, so most callers never noticed; the ones that walk it
+    /// or print it did. `walkdir` on `""` fails outright, which broke
+    /// `package_files` glob hashing for every project invoked the default way,
+    /// and the stamp errors rendered as `... does not exist under ` with
+    /// nothing after "under".
+    #[test]
+    fn project_root_of_a_bare_config_path_is_usable() {
+        // No `src_dir`, so the root comes from the config path alone.
+        let config = super::Config::load_from_yaml_str("extensions: {}\n").unwrap();
+
+        for bare in ["avocado.yaml", "avocado.yml"] {
+            let root = config.project_root(bare);
+            assert!(
+                !root.as_os_str().is_empty(),
+                "`{bare}` has no directory component, so the root must fall back \
+                 to the current directory rather than the empty path"
+            );
+            assert!(
+                std::fs::read_dir(&root).is_ok(),
+                "a project root must be walkable; `{}` is not",
+                root.display()
+            );
+        }
+
+        // A path that already carries a directory keeps it untouched.
+        assert_eq!(
+            config.project_root("nested/dir/avocado.yaml"),
+            std::path::PathBuf::from("nested/dir")
+        );
+    }
 
     /// Recording the feed set must be a no-op when there is nothing to record.
     ///
