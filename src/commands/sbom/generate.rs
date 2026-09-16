@@ -56,6 +56,18 @@ struct Package {
     summary: String,
 }
 
+fn package_key(pkg: &Package) -> (String, String, String, String, String, String) {
+    let (name, epoch, version, release, arch) = pkg.key();
+    (
+        name.to_string(),
+        epoch.to_string(),
+        version.to_string(),
+        release.to_string(),
+        arch.to_string(),
+        present(&pkg.sha256).unwrap_or_default().to_string(),
+    )
+}
+
 impl Package {
     /// Identity for de-duplication across scopes. Deliberately excludes the
     /// scope: the same package in two sysroots is one package. Includes the
@@ -1241,6 +1253,9 @@ impl SbomCommand {
     /// they are empty, so on a single-runtime project both would otherwise
     /// land on the same `{ns}/sbom` and `{ns}/document` IRIs while asserting
     /// different coverage.
+    ///
+    /// Each package's rpm header digest is folded in too: two builds of one
+    /// NEVRA are different software and become different package elements.
     fn namespace_digest(scopes: &[&Scope], runtime: Option<&str>) -> String {
         let mut hasher = Sha256::new();
         if let Some(r) = runtime {
@@ -1252,8 +1267,9 @@ impl SbomCommand {
         for scope in scopes.iter().filter(|s| !s.packages.is_empty()) {
             for pkg in &scope.packages {
                 let (name, epoch, version, release, arch) = pkg.key();
+                let header = present(&pkg.sha256).unwrap_or_default();
                 lines.push(format!(
-                    "{}\t{name}\t{epoch}\t{version}\t{release}\t{arch}",
+                    "{}\t{name}\t{epoch}\t{version}\t{release}\t{arch}\t{header}",
                     scope.name
                 ));
             }
@@ -1332,7 +1348,13 @@ impl SbomCommand {
         for (name, id) in &images.extensions {
             images_in_order.push((id, name));
         }
+        // Content-addressed: two manifest entries can name one image, which
+        // gets one fragment, under the first name.
+        let mut seen_images = BTreeSet::new();
         for (image_id, artifact_name) in images_in_order {
+            if !seen_images.insert(image_id) {
+                continue;
+            }
             let Some(members) = by_image.get(image_id) else {
                 continue;
             };
@@ -1438,8 +1460,47 @@ impl SbomCommand {
         // unchanged database the same way each time — but that is rpm's
         // property, not this map's, and the stability test replays a fixed
         // dump so it cannot see the difference.
-        let mut emitted: BTreeMap<(String, String, String, String, String), String> =
+        let mut emitted: BTreeMap<(String, String, String, String, String, String), String> =
             BTreeMap::new();
+        // Ids come from the sorted keys, not rpm's walk order, so two builds
+        // of one NEVRA keep the same ids whichever the scan lists first.
+        let mut first_seen: BTreeMap<(String, String, String, String, String, String), &Package> =
+            BTreeMap::new();
+        for pkg in scopes.iter().flat_map(|s| &s.packages) {
+            first_seen.entry(package_key(pkg)).or_insert(pkg);
+        }
+        let mut package_ids = BTreeSet::new();
+        let mut id_of: BTreeMap<(String, String, String, String, String, String), String> =
+            BTreeMap::new();
+        for (key, pkg) in &first_seen {
+            // Slugged as one string rather than per component: slugging
+            // the parts and joining them lets a dash inside a name
+            // trade places with the separator, so `a-b` at version `c`
+            // and `a` at version `b-c` would land on the same id.
+            let base_id = format!(
+                "{ns}/package/{}",
+                slug_id(&format!("{}-{}.{}", pkg.name, pkg.evr(), pkg.arch))
+            );
+            // A different header for the same NEVRA is another package
+            // element, even when both live in one image's scopes.
+            let id = if package_ids.insert(base_id.clone()) {
+                base_id
+            } else {
+                let header = present(&pkg.sha256).unwrap_or("unknown");
+                let suffix: String = header.chars().take(12).collect();
+                let candidate = format!("{base_id}-header-{}", slug_id(&suffix));
+                let mut id = candidate.clone();
+                let mut ordinal = 2;
+                // The short suffix is only an element label. Never
+                // let two full digests sharing that prefix alias.
+                while !package_ids.insert(id.clone()) {
+                    id = format!("{candidate}-{ordinal}");
+                    ordinal += 1;
+                }
+                id
+            };
+            id_of.insert(key.clone(), id);
+        }
         let mut licenses: BTreeMap<String, String> = BTreeMap::new();
         let mut suppliers: BTreeMap<String, String> = BTreeMap::new();
         let mut scope_ids: Vec<(String, String)> = Vec::new();
@@ -1511,23 +1572,9 @@ impl SbomCommand {
 
             let mut members: Vec<String> = Vec::new();
             for pkg in &scope.packages {
-                let (name, epoch, version, release, arch) = pkg.key();
-                let key = (
-                    name.to_string(),
-                    epoch.to_string(),
-                    version.to_string(),
-                    release.to_string(),
-                    arch.to_string(),
-                );
-                let id = emitted.entry(key).or_insert_with(|| {
-                    // Slugged as one string rather than per component: slugging
-                    // the parts and joining them lets a dash inside a name
-                    // trade places with the separator, so `a-b` at version `c`
-                    // and `a` at version `b-c` would land on the same id.
-                    let id = format!(
-                        "{ns}/package/{}",
-                        slug_id(&format!("{}-{}.{}", pkg.name, pkg.evr(), pkg.arch))
-                    );
+                let key = package_key(pkg);
+                let id = emitted.entry(key.clone()).or_insert_with(|| {
+                    let id = id_of[&key].clone();
                     emit_package(
                         &mut graph,
                         &ns,
@@ -1764,6 +1811,7 @@ impl SbomCommand {
                         version.to_string(),
                         release.to_string(),
                         arch.to_string(),
+                        present(&pkg.sha256).unwrap_or_default().to_string(),
                     );
                     if let Some(id) = emitted.get(&pkg_key) {
                         element_ids.insert(id.clone());
@@ -1833,13 +1881,18 @@ impl SbomCommand {
         })
     }
 
+    /// Package elements the document carries: one per NEVRA and rpm header.
+    fn distinct_packages(scopes: &[Scope]) -> usize {
+        scopes
+            .iter()
+            .flat_map(|s| &s.packages)
+            .map(|p| (p.key(), present(&p.sha256).unwrap_or_default()))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     fn print_summary(&self, scopes: &[Scope], path: Option<&str>) {
-        let mut distinct: BTreeSet<(&str, &str, &str, &str, &str)> = BTreeSet::new();
-        for scope in scopes {
-            for pkg in &scope.packages {
-                distinct.insert(pkg.key());
-            }
-        }
+        let distinct = Self::distinct_packages(scopes);
         let occurrences: usize = scopes.iter().map(|s| s.packages.len()).sum();
 
         // With `--output json` the document itself has gone to a file, so what
@@ -1847,20 +1900,19 @@ impl SbomCommand {
         // to parse. Printing the human table here would put unparseable lines
         // on a stream a consumer reads as JSON.
         if self.output.is_json() {
-            emit_json_object(&self.summary_json(scopes, path, distinct.len(), occurrences));
+            emit_json_object(&self.summary_json(scopes, path, distinct, occurrences));
             return;
         }
 
         for scope in scopes {
             println!("{:<40} {:>6}", scope.name, scope.packages.len());
         }
-        if occurrences > distinct.len() {
+        if occurrences > distinct {
             print_info(
                 &format!(
                     "{} package occurrence(s) across scopes resolve to {} distinct package(s); \
                      one shared by two sysroots is one SPDX element with two containments.",
-                    occurrences,
-                    distinct.len()
+                    occurrences, distinct
                 ),
                 OutputLevel::Normal,
             );
@@ -1874,7 +1926,7 @@ impl SbomCommand {
         }
         if let Some(path) = path {
             print_success(
-                &format!("{} package(s) written to {path}.", distinct.len()),
+                &format!("{} package(s) written to {path}.", distinct),
                 OutputLevel::Normal,
             );
             // Pointed at rather than done for you, and the offline route
@@ -2391,6 +2443,201 @@ mod tests {
         // the collection they root.
         assert_eq!(sbom["element"].as_array().unwrap().len(), 4);
         assert_eq!(sbom["rootElement"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_different_rpm_header_moves_the_namespace() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}",
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT")
+        );
+        let c = cmd(false);
+        let mut scopes = c.parse_scopes(&dump);
+        let digest = |scopes: &[Scope]| {
+            SbomCommand::namespace_digest(&scopes.iter().collect::<Vec<_>>(), None)
+        };
+        scopes[0].packages[0].sha256 = "a".repeat(64);
+        let a = digest(&scopes);
+        scopes[0].packages[0].sha256 = "b".repeat(64);
+        assert_ne!(a, digest(&scopes));
+    }
+
+    #[test]
+    fn package_ids_do_not_depend_on_scan_order() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}##SCOPE\tinitramfs\t/initramfs\n{}",
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+        );
+        let c = cmd(false);
+        let mut scopes = c.parse_scopes(&dump);
+        scopes[0].packages[0].sha256 = "b".repeat(64);
+        scopes[1].packages[0].sha256 = "a".repeat(64);
+        let ids_by_header = |scopes: &[Scope]| -> BTreeMap<String, String> {
+            let doc = c.build_document(scopes, "qemuarm64", None, None, None);
+            doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["name"] == "curl")
+                .map(|e| {
+                    (
+                        e["verifiedUsing"][0]["hashValue"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                        e["spdxId"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let forward = ids_by_header(&scopes);
+        scopes.reverse();
+        let reversed = ids_by_header(&scopes);
+        assert_eq!(forward.len(), 2);
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn two_manifest_entries_naming_one_image_get_one_fragment() {
+        let dump = format!(
+            "##SCOPE\text:dev/a\t/a\n{}##SCOPE\text:dev/b\t/b\n{}",
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            row("zlib", "1.3.1", "r0.0", "cortexa57", "Zlib"),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"name": "a", "version": "1.0", "image_id": "same-image"},
+                {"name": "b", "version": "1.0", "image_id": "same-image"},
+            ],
+        });
+        let fragments =
+            c.build_fragments(&scopes, &manifest, "qemuarm64", None, "dev", &mut |_| {});
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].image_id, "same-image");
+        assert_eq!(fragments[0].package_count, 2);
+    }
+
+    #[test]
+    fn the_summary_counts_each_rpm_header_as_its_own_package() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}##SCOPE\tinitramfs\t/initramfs\n{}",
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+        );
+        let c = cmd(false);
+        let mut scopes = c.parse_scopes(&dump);
+        scopes[0].packages[0].sha256 = "a".repeat(64);
+        scopes[1].packages[0].sha256 = "a".repeat(64);
+        assert_eq!(SbomCommand::distinct_packages(&scopes), 1);
+        scopes[1].packages[0].sha256 = "b".repeat(64);
+        assert_eq!(SbomCommand::distinct_packages(&scopes), 2);
+    }
+
+    #[test]
+    fn different_headers_for_one_nevra_survive_in_one_image_fragment() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\tinitramfs\t/initramfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}{}",
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            row("curl", "8.5.0", "r0.0", "cortexa57", "MIT"),
+            // A real runtime transaction includes something beyond the base;
+            // otherwise the scan intentionally classifies it as seeded data.
+            row("app-marker", "1.0", "r0.0", "cortexa57", "MIT"),
+        );
+        let c = cmd(false);
+        let mut scopes = c.parse_scopes(&dump);
+        // The last two deliberately share the shortened id suffix. The full
+        // digest is the dedup key, and even shortened-id collisions must not
+        // merge elements or misattribute their scopes.
+        let headers = [
+            "a".repeat(64),
+            "b".repeat(64),
+            format!("{}{}", "b".repeat(12), "c".repeat(52)),
+        ];
+        for (scope, header) in scopes.iter_mut().zip(&headers) {
+            scope.packages[0].sha256 = header.clone();
+        }
+        for count in [2, 3] {
+            let mut warnings = Vec::new();
+            let fragments = c.build_fragments(
+                &scopes[..count],
+                &jetson_manifest(),
+                "qemuarm64",
+                None,
+                "dev",
+                &mut |warning| warnings.push(warning.to_string()),
+            );
+            assert!(warnings.is_empty());
+            assert_eq!(fragments.len(), 1);
+            let doc: serde_json::Value = serde_json::from_slice(&fragments[0].bytes).unwrap();
+            let graph = doc["@graph"].as_array().unwrap();
+            let packages: Vec<_> = graph.iter().filter(|e| e["name"] == "curl").collect();
+            assert_eq!(packages.len(), count);
+            let ids: BTreeSet<_> = packages
+                .iter()
+                .map(|p| p["spdxId"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.len(), count, "every artifact has a distinct element id");
+            for (scope, header) in scopes[..count].iter().zip(&headers) {
+                let element = packages
+                    .iter()
+                    .find(|p| p["verifiedUsing"][0]["hashValue"] == *header)
+                    .unwrap();
+                let scope_id = &graph.iter().find(|e| e["name"] == scope.name).unwrap()["spdxId"];
+                let contains = graph
+                    .iter()
+                    .find(|e| {
+                        e["relationshipType"] == "contains"
+                            && e["from"] == *scope_id
+                            && e["to"]
+                                .as_array()
+                                .is_some_and(|members| members.contains(&element["spdxId"]))
+                    })
+                    .unwrap();
+                let curl_members: Vec<_> = contains["to"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|id| ids.contains(id.as_str().unwrap()))
+                    .collect();
+                assert_eq!(curl_members, vec![&element["spdxId"]]);
+            }
+            let second = packages
+                .iter()
+                .find(|p| p["verifiedUsing"][0]["hashValue"] == headers[1])
+                .unwrap();
+            assert!(second["spdxId"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("-header-{}", &headers[1][..12])));
+            // The first occurrence keeps exactly the id a single-header input
+            // had. The existing stability test covers repeated generation.
+            let single = c.build_fragments(
+                &scopes[..1],
+                &jetson_manifest(),
+                "qemuarm64",
+                None,
+                "dev",
+                &mut |_| {},
+            );
+            let single_doc: serde_json::Value = serde_json::from_slice(&single[0].bytes).unwrap();
+            let single_id = &single_doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "curl")
+                .unwrap()["spdxId"];
+            let first = packages
+                .iter()
+                .find(|p| p["verifiedUsing"][0]["hashValue"] == headers[0])
+                .unwrap();
+            assert_eq!(&first["spdxId"], single_id);
+        }
     }
 
     /// Every `spdxId` in the graph carrying the given element name.
