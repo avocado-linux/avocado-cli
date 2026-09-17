@@ -740,6 +740,16 @@ impl RuntimeBuildCommand {
             env_vars.insert("AVOCADO_VERBOSE".to_string(), "1".to_string());
         }
 
+        // Kernel command line, for the platform build hook.
+        //
+        // Exported at BUILD time, not just provision time, because a target
+        // whose boot path is a Unified Kernel Image has to bake the command
+        // line into the UKI -- and that UKI must exist before `stone bundle`
+        // if it is to be a manifest artifact, hence OTA-updatable and
+        // uploadable, rather than something only a physical reflash can
+        // change.
+        crate::utils::container::inject_kernel_cmdline(&mut env_vars, config, &self.runtime_name);
+
         // Reproducibility stamp. This run executes the rootfs and initramfs
         // image sections, so one insert covers both. Extension images are NOT
         // built here -- this run only copies their pre-built artifacts, and

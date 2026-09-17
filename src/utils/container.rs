@@ -622,6 +622,30 @@ pub fn inject_source_date_epoch(
     }
 }
 
+/// Inject the project's kernel command line into a container's env map.
+///
+/// Read by the SDK's platform lifecycle hooks, which are the only code that
+/// knows how a given boot path carries a command line. On a UKI target the
+/// *build* hook bakes it into the image it assembles, so the value has to be
+/// present for `avocado build` and not only for `avocado provision`.
+///
+/// Both runs call this instead of each spelling out the two inserts: they were
+/// duplicate blocks, and a merge deleted the build one while every test stayed
+/// green.
+pub fn inject_kernel_cmdline(
+    env_vars: &mut HashMap<String, String>,
+    config: &crate::utils::config::Config,
+    runtime_name: &str,
+) {
+    let (cmdline, cmdline_extra) = config.effective_kernel_cmdline(Some(runtime_name));
+    if let Some(cmdline) = cmdline {
+        env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
+    }
+    if let Some(extra) = cmdline_extra {
+        env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
+    }
+}
+
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -3998,6 +4022,56 @@ mod tests {
             let mut env_vars = std::collections::HashMap::new();
             inject_source_date_epoch(&mut env_vars, None);
             assert!(!env_vars.contains_key("SOURCE_DATE_EPOCH"));
+        }
+    }
+
+    /// `effective_kernel_cmdline`'s precedence is covered in `utils::config`;
+    /// these cover the step after it -- that the resolved pair lands in the
+    /// container env under the names the SDK's platform hooks read.
+    mod kernel_cmdline {
+        use super::*;
+
+        fn cfg(yaml: &str) -> crate::utils::config::Config {
+            serde_yaml::from_str(yaml).expect("config parses")
+        }
+
+        #[test]
+        fn configured_extra_reaches_the_container_env() {
+            let config = cfg("kernel:\n  cmdline_extra: \"kvm-arm.mode=nvhe\"\n");
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("kvm-arm.mode=nvhe")
+            );
+            // Append must not masquerade as replace: the hook writes the whole
+            // line from CMDLINE, so an empty one would drop root= and console=.
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE"));
+        }
+
+        #[test]
+        fn configured_replacement_reaches_the_container_env() {
+            let config = cfg("kernel:\n  cmdline: \"root=/dev/sda2 console=ttyS0\"\n");
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            assert_eq!(
+                env_vars.get("AVOCADO_KERNEL_CMDLINE").map(String::as_str),
+                Some("root=/dev/sda2 console=ttyS0")
+            );
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE_EXTRA"));
+        }
+
+        #[test]
+        fn unset_config_leaves_both_vars_absent() {
+            // The hooks treat an empty value as "not set", but only because
+            // they test `-n`. A project that configured nothing must produce
+            // the same env it did before the feature existed.
+            let config = cfg("default_target: qemuarm64\n");
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            assert!(env_vars.is_empty());
         }
     }
 
