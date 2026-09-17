@@ -4064,14 +4064,26 @@ mod tests {
         }
 
         #[test]
-        fn unset_config_leaves_both_vars_absent() {
-            // The hooks treat an empty value as "not set", but only because
-            // they test `-n`. A project that configured nothing must produce
-            // the same env it did before the feature existed.
+        fn unset_config_leaves_the_env_untouched() {
+            // Starting from an empty map would only prove we add nothing.
+            // `provision` hands us a map already seeded from the user's
+            // `--env` flags and `--provision-profile` (provision.rs:224), so
+            // clearing or rewriting an existing entry would silently drop
+            // their settings. Seed a sentinel and assert it survives.
             let config = cfg("default_target: qemuarm64\n");
             let mut env_vars = HashMap::new();
+            env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), "dev".to_string());
             inject_kernel_cmdline(&mut env_vars, &config, "prod");
-            assert!(env_vars.is_empty());
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_PROVISION_PROFILE")
+                    .map(String::as_str),
+                Some("dev"),
+                "a caller-supplied entry must survive an unset kernel cmdline"
+            );
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE"));
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE_EXTRA"));
+            assert_eq!(env_vars.len(), 1, "nothing else may be added either");
         }
     }
 
