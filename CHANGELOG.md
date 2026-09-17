@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix the error advertised (`avocado ext install <name>`) deleted the stamp
   again. The stamp is now written and marked `nonstandard_options` instead,
   and only `ext install`'s own fast path reads the mark: it declines to skip on
-  one. Such an install also drops the extension's build and image stamps, since
-  `ext build`'s hash is config-only and its skip would otherwise fire over a
-  sysroot the unrecorded options changed. Regression in 1.0.0-rc.4 (#260).
+  one. An install that runs a transaction also drops that extension's build and
+  image stamps, since `ext build`'s hash is config-only and its skip would
+  otherwise fire over a sysroot the transaction changed. Regression in
+  1.0.0-rc.4 (#260).
 - **A stamp path is now one shell word, whatever the component is called.** An
   extension or runtime name is a YAML key and is not constrained to shell-safe
   characters. The generated scripts that write and remove a stamp interpolated

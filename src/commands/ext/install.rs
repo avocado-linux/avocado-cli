@@ -48,20 +48,29 @@ fn transaction_is_standard(dnf_args: Option<&[String]>, disable_weak_dependencie
 }
 
 /// Shell that drops an extension's build and image stamps, for prefixing to the
-/// install-stamp write after a non-standard transaction.
+/// install-stamp write.
 ///
-/// The install stamp records what the config asked for; a `--dnf-arg` or a
-/// disabled weak-dependency setting resolves a different package set into the
-/// same sysroot. Nothing chains that sysroot into `ext build`'s input hash,
-/// which is config-only, so its skip would otherwise fire over content that
-/// changed underneath it and `ext image` would ship the previous build. Drop
-/// the two stamps that vouch for the sysroot's contents instead, the same way
-/// `clean_ext_sysroot_command` does when it clears one. `ext build` writes them
-/// back, so this costs a rebuild, not a loop.
-fn nonstandard_cleanup_script(ext_name: &str, standard: bool) -> String {
-    if standard {
-        return String::new();
-    }
+/// Nothing chains the installed sysroot into `ext build`'s input hash, which is
+/// config-only: `ext install` writes through the plain stamp writer and records
+/// no digest for `ext build` to fold. So a transaction that changed the sysroot
+/// without changing the config leaves both downstream stamps reading current,
+/// `ext build` skips, and `ext image` chains off the stale digest and ships the
+/// previous build. Drop the two stamps that vouch for the sysroot's contents,
+/// the same way `clean_ext_sysroot_command` does when it clears one. `ext build`
+/// writes them back, so this costs a rebuild, not a loop.
+///
+/// Unconditional, because the condition has no safe direction. Gating it on a
+/// non-standard transaction covered entering one and not leaving it: a
+/// `--dnf-arg` install builds a lean sysroot and drops the stamps, the build
+/// records new ones, and the next plain install correctly declines the mark and
+/// re-resolves the sysroot fatter -- then runs no cleanup, because that
+/// transaction is standard. The build after it skips over the sysroot that just
+/// grew.
+///
+/// It costs nothing to run every time. An extension that is already up to date
+/// never reaches this block, and an install that runs because the config moved
+/// implies a rebuild the config moved anyway.
+fn drop_content_stamps_script(ext_name: &str) -> String {
     remove_own_stamp_line(&StampRequirement::ext_build(ext_name))
         + &remove_own_stamp_line(&StampRequirement::ext_image(ext_name))
 }
@@ -762,7 +771,7 @@ impl ExtInstallCommand {
             }
 
             // The config-only stamp fingerprints extension config, not the
-            // per-invocation transaction: `--dnf-args` and a disabled
+            // per-invocation transaction: `--dnf-arg` and a disabled
             // weak-dependency setting install a different package set than the
             // stamp records. The stamp is still written -- it is what says the
             // sysroot exists, and `ext build` refuses to run without it -- but
@@ -823,8 +832,8 @@ impl ExtInstallCommand {
                     ..Default::default()
                 };
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
-                let stamp_script = nonstandard_cleanup_script(ext_name, standard)
-                    + &generate_write_stamp_script(&stamp)?;
+                let stamp_script =
+                    drop_content_stamps_script(ext_name) + &generate_write_stamp_script(&stamp)?;
 
                 let run_config = RunConfig {
                     container_image: container_image.to_string(),
@@ -1712,21 +1721,25 @@ mod tests {
         )));
     }
 
-    /// `ext build`'s input hash is config-only, so nothing in it moves when an
-    /// unrecorded install option changes the sysroot underneath it. Its skip
-    /// would then fire over content that changed, and `ext image` would ship
-    /// the previous build. Dropping both stamps is what `clean_ext_sysroot`
-    /// already does for the same reason.
+    /// `ext build`'s input hash is config-only, so nothing in it moves when a
+    /// transaction changes the sysroot without changing the config. Its skip
+    /// would then fire over content that changed, and `ext image` would chain
+    /// off the stale digest and ship the previous build. Dropping both stamps
+    /// is what `clean_ext_sysroot` already does for the same reason.
+    ///
+    /// Not gated on the transaction being non-standard. That gate covered
+    /// entering a non-standard install and not leaving one: a `--dnf-arg`
+    /// install builds a lean sysroot, the build records stamps for it, and the
+    /// next plain install re-resolves the sysroot fatter while running no
+    /// cleanup, because that transaction is standard.
     #[test]
-    fn a_nonstandard_transaction_drops_the_stamps_that_vouch_for_the_sysroot() {
-        let script = nonstandard_cleanup_script("app", false);
+    fn an_install_that_runs_drops_the_stamps_that_vouch_for_the_sysroot() {
+        let script = drop_content_stamps_script("app");
         assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/build.stamp'"#));
         assert!(script.contains(r#"rm -f "$AVOCADO_PREFIX/.stamps/"'ext/app/image.stamp'"#));
         // The install stamp is written right after this, and is what `ext
         // build` needs to run at all -- removing it is the bug being fixed.
         assert!(!script.contains("install.stamp"));
-        // An ordinary install leaves every stamp alone.
-        assert!(nonstandard_cleanup_script("app", true).is_empty());
     }
 
     /// A move between two pins cleans the sysroot, and so does a first pin
