@@ -66,4 +66,23 @@ mod tests {
             );
         }
     }
+
+    /// Reading the limit is not the same as honouring it. The SDK phase runs a
+    /// fixed four tasks, so it is the one site that can reduce the limit to a
+    /// yes/no and still look right -- and it did: `max_parallel(..) > 1` started
+    /// all four at `AVOCADO_PARALLEL_TASKS=2`, which made the override
+    /// meaningful only at `1` and could oversubscribe a smaller host. The DAG
+    /// sites cannot regress this way, because a scheduler takes the number.
+    #[test]
+    fn the_sdk_phase_bounds_by_the_limit_not_a_boolean() {
+        let src = include_str!("../../commands/sdk/install.rs");
+        assert!(
+            src.contains("Semaphore::new(limit)"),
+            "the SDK phase must bound its fixed tasks by the shared limit"
+        );
+        assert!(
+            !src.contains("max_parallel(self.runs_on.is_some()) > 1"),
+            "the SDK phase must not collapse the limit to a boolean"
+        );
+    }
 }
