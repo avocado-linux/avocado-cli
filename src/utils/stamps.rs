@@ -2100,12 +2100,8 @@ fn ext_build_hash_data(
         // and the closest thing to a manifest of what a compile script reads.
         // Folded only when something is compiled; without a compile step the
         // list only feeds RPM packaging, which has no stamp.
-        let has_compile = ext
-            .get("packages")
-            .and_then(|p| p.as_mapping())
-            .is_some_and(|m| m.values().any(|spec| spec.get("compile").is_some()));
         if let (true, Some(files), Some(root)) = (
-            has_compile,
+            ext_has_compile_package(ext),
             ext.get("package_files").and_then(|v| v.as_sequence()),
             content_root.as_deref(),
         ) {
@@ -2118,6 +2114,83 @@ fn ext_build_hash_data(
     }
 
     Ok(hash_data)
+}
+
+/// Whether any of an extension's packages names an `sdk.compile` section.
+/// Gates the `package_files` fold, and with it
+/// [`ext_build_inputs_are_complete`].
+fn ext_has_compile_package(ext: &serde_yaml::Value) -> bool {
+    ext.get("packages")
+        .and_then(|p| p.as_mapping())
+        .is_some_and(|m| m.values().any(|spec| spec.get("compile").is_some()))
+}
+
+/// Whether an extension's build input hash describes everything its build
+/// reads. `ext build` may skip itself only when this holds.
+///
+/// It holds for an extension with no `post_build` hook: its content comes from
+/// the package set, the overlay and the compile scripts, and the hash folds all
+/// three. A hook breaks that. The hook installs whatever it reaches for — the
+/// output of an `sdk.compile` section, a directory of prebuilt artifacts — and
+/// the hash folds the hook's own bytes, never the bytes it copies. A source
+/// edit then leaves every input unmoved, `ext build` reports "up to date", and
+/// the extension image ships the previous build with no error anywhere.
+///
+/// `package_files` is the way out: it is the extension's declaration of what it
+/// is built from, and it *is* folded, so an edit under it moves the hash. The
+/// declaration only counts when the fold actually happens, which needs a
+/// package that names a compile section — a `package_files` list without one is
+/// ignored by the hash, and treating it as a promise would restore the silent
+/// skip it is meant to prevent.
+///
+/// The conservative answer for everything else is to rebuild. A hook run costs
+/// one script; a wrong answer costs a developer their afternoon on the device.
+pub fn ext_build_inputs_are_complete(
+    config: &serde_yaml::Value,
+    ext_name: &str,
+    project_root: &Path,
+) -> bool {
+    // Same lookup `ext_build_hash_data` uses, so the two cannot disagree about
+    // which node describes the extension.
+    let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) else {
+        return true;
+    };
+    // A hook under a `target-<name>:` override is the one `ext build` runs, and
+    // never the one the hash folded: `ext build` resolves the overrides, the
+    // hash reads the unresolved node. No `package_files` list can cover that,
+    // because the hook's own bytes are missing from every input too. Rebuild.
+    if declares_post_build_in_target_override(ext) {
+        return false;
+    }
+    if ext.get("post_build").and_then(|v| v.as_str()).is_none() {
+        return true;
+    }
+    // Every condition the fold is gated on, and nothing else. Reproducing only
+    // some of them hands back the silent skip through whichever door was left
+    // out: `content_root` is `None` for any source the host cannot see, so a
+    // package- or git-sourced extension can carry the full declaration while
+    // not one byte of it reaches the hash.
+    ext_has_compile_package(ext)
+        && ext_content_root(ext, project_root).is_some()
+        && ext
+            .get("package_files")
+            .and_then(|v| v.as_sequence())
+            .is_some_and(|files| !files.is_empty())
+}
+
+/// Whether any `target-<name>:` override declares a `post_build` hook.
+///
+/// `ext build` merges those overrides before it runs the hook
+/// (`get_merged_ext_config_with_board`, `resolve_remote_ext_config`), while
+/// every input hash reads the unresolved node. A hook that only an override
+/// names therefore runs with not even its own bytes in the hash.
+fn declares_post_build_in_target_override(ext: &serde_yaml::Value) -> bool {
+    ext.as_mapping().is_some_and(|m| {
+        m.iter().any(|(key, value)| {
+            key.as_str().is_some_and(|k| k.starts_with("target-"))
+                && value.get("post_build").and_then(|v| v.as_str()).is_some()
+        })
+    })
 }
 
 /// One digest over every file a `package_files` list names, patterns expanded
@@ -6628,6 +6701,73 @@ extensions:
             "    var_files:\n      - \"var/lib/docker/**\"\n    subvolumes:\n      lib/x:\n        nodatacow: true",
         );
         assert_ne!(ext_image_hash(&base), ext_image_hash(&with));
+    }
+
+    /// `ext build` may skip itself only when its input hash describes the whole
+    /// build. A `post_build` hook installs content the config never names — the
+    /// output of a compile section, a tree of prebuilt artifacts — and the hash
+    /// folds the hook's own bytes, not the bytes it copies. Skipping over one
+    /// reported "up to date" and shipped the previous build, with every command
+    /// in the chain exiting 0. `package_files` is the declaration that buys the
+    /// skip back, and it counts only when it is folded, which needs a package
+    /// that names a compile section.
+    #[test]
+    fn only_a_declared_post_build_extension_may_be_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = |body: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&format!("extensions:\n  app:\n{body}")).unwrap()
+        };
+        let complete = |cfg: &serde_yaml::Value| ext_build_inputs_are_complete(cfg, "app", root);
+
+        let compiled = "    packages:\n      pkg:\n        compile: sec\n";
+        let files = "    package_files:\n      - src\n";
+        let hook = "    post_build: install.sh\n";
+
+        // No hook: config, overlay and scripts describe the whole build.
+        assert!(complete(&config("    overlay: app/overlay\n")));
+        assert!(complete(&config(&format!("{compiled}{files}"))));
+
+        // A hook with nothing declared is the reported bug.
+        assert!(!complete(&config(hook)));
+        assert!(!complete(&config(&format!("{hook}{compiled}"))));
+
+        // `package_files` earns the skip back, but only when it is folded.
+        assert!(complete(&config(&format!("{hook}{compiled}{files}"))));
+        assert!(
+            !complete(&config(&format!("{hook}{files}"))),
+            "no compile package means package_files is never folded, so it promises nothing"
+        );
+        assert!(!complete(&config(&format!(
+            "{hook}{compiled}    package_files: []\n"
+        ))));
+
+        // A source the host cannot see folds nothing, whatever it declares.
+        // This is the shape the `ext-*` repos ship.
+        let packaged = "    source:\n      type: package\n      version: \"*\"\n";
+        assert!(
+            !complete(&config(&format!("{hook}{compiled}{files}{packaged}"))),
+            "a package source has no content root, so package_files reaches no hash"
+        );
+        // A path source does have one, and keeps the fast path.
+        std::fs::create_dir_all(root.join("vendored")).unwrap();
+        let path_src = "    source:\n      type: path\n      path: vendored\n";
+        assert!(complete(&config(&format!(
+            "{hook}{compiled}{files}{path_src}"
+        ))));
+
+        // `ext build` resolves `target-<name>:` overrides before running the
+        // hook, while the hash reads the unresolved node, so a hook declared
+        // only under an override runs with nothing of it in any input.
+        let target_hook = "    target-qemux86-64:\n      post_build: install.sh\n";
+        assert!(!complete(&config(target_hook)));
+        assert!(
+            !complete(&config(&format!("{target_hook}{compiled}{files}"))),
+            "the override's hook is still unreachable by the fold"
+        );
+
+        // An extension the config does not describe is not this check's call.
+        assert!(ext_build_inputs_are_complete(&config(hook), "other", root));
     }
 
     #[test]
