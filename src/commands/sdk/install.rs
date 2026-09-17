@@ -50,8 +50,6 @@ pub struct SdkInstallCommand {
     pub config_path: String,
     /// Enable verbose output
     pub verbose: bool,
-    /// Force operation without prompts
-    pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
     /// Target board override for `{{ avocado.target.board }}`
@@ -78,7 +76,6 @@ impl SdkInstallCommand {
     pub fn new(
         config_path: String,
         verbose: bool,
-        force: bool,
         target: Option<String>,
         container_args: Option<Vec<String>>,
         dnf_args: Option<Vec<String>>,
@@ -86,7 +83,6 @@ impl SdkInstallCommand {
         Self {
             config_path,
             verbose,
-            force,
             target,
             target_board: None,
             container_args,
@@ -138,7 +134,7 @@ impl SdkInstallCommand {
 
     /// Execute the sdk install command
     pub async fn execute(&mut self) -> Result<()> {
-        let tui_guard = if self.tui_context.is_none() && self.force {
+        let tui_guard = if self.tui_context.is_none() {
             Some(TuiGuard::new(
                 TaskId::SdkInstall,
                 "sdk install",
@@ -650,10 +646,25 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         };
 
-        // Helper: wrap a future so it sets TUI status immediately on completion.
+        // Same rule AND the same number as the install and build DAGs. Reading
+        // it as a plain yes/no is what the fixed four tasks here invite, and it
+        // is wrong: at `AVOCADO_PARALLEL_TASKS=2` all four would still start at
+        // once, so the override only ever meant anything at `1`. Bounding by
+        // the limit also removes the separate sequential path -- at `1` the
+        // permits serialize these in the order `tokio::join!` first polls them,
+        // because tokio hands out permits first-come-first-served.
+        let limit = crate::utils::scheduler::max_parallel(self.runs_on.is_some());
+        let permits = tokio::sync::Semaphore::new(limit);
+
+        // Helper: hold a permit for the whole task, and set TUI status
+        // immediately on completion.
         macro_rules! with_tui_status {
             ($fut:expr, $task_id:expr) => {
                 async {
+                    let _permit = permits
+                        .acquire()
+                        .await
+                        .expect("the parallelism semaphore is never closed");
                     let result = $fut.await;
                     if let Some(r) = crate::utils::tui::get_active_renderer() {
                         match &result {
@@ -674,31 +685,15 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             };
         }
 
-        // With --force (non-interactive), run all four tasks in parallel.
-        // Without --force, dnf may prompt — run sequentially so each prompt
-        // gets exclusive stdin access.
-        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = if self.force {
-            tokio::join!(
-                with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
-                with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
-                with_tui_status!(
-                    install_sysroot(&mut initramfs_params),
-                    TaskId::InitramfsInstall
-                ),
-                with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
-            )
-        } else {
-            let r1 = with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages).await;
-            let r2 =
-                with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall).await;
-            let r3 = with_tui_status!(
+        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
+            with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
+            with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
+            with_tui_status!(
                 install_sysroot(&mut initramfs_params),
                 TaskId::InitramfsInstall
-            )
-            .await;
-            let r4 = with_tui_status!(target_dev_fut, TaskId::TargetDevInstall).await;
-            (r1, r2, r3, r4)
-        };
+            ),
+            with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
+        );
 
         // Merge lock file changes back into a single lock file for saving
         let mut final_lock = lock_file.clone();
@@ -2155,7 +2150,7 @@ mod tests {
 
     #[test]
     fn test_build_package_list_with_lock() {
-        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, None, None, None);
         let lock_file = LockFile::new();
         let target = "qemux86-64";
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -2178,7 +2173,7 @@ mod tests {
 
     #[test]
     fn test_build_package_list_with_lock_uses_locked_version() {
-        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, false, None, None, None);
+        let cmd = SdkInstallCommand::new("test.yaml".to_string(), false, None, None, None);
         let mut lock_file = LockFile::new();
         let target = "qemux86-64";
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
@@ -2210,7 +2205,6 @@ mod tests {
         let cmd = SdkInstallCommand::new(
             "config.toml".to_string(),
             true,
-            false,
             Some("test-target".to_string()),
             None,
             None,
@@ -2218,7 +2212,6 @@ mod tests {
 
         assert_eq!(cmd.config_path, "config.toml");
         assert!(cmd.verbose);
-        assert!(!cmd.force);
         assert_eq!(cmd.target, Some("test-target".to_string()));
     }
 }

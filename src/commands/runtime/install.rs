@@ -24,7 +24,6 @@ pub struct RuntimeInstallCommand {
     runtime: Option<String>,
     config_path: String,
     verbose: bool,
-    force: bool,
     target: Option<String>,
     container_args: Option<Vec<String>>,
     dnf_args: Option<Vec<String>>,
@@ -42,7 +41,6 @@ impl RuntimeInstallCommand {
         runtime: Option<String>,
         config_path: String,
         verbose: bool,
-        force: bool,
         target: Option<String>,
         container_args: Option<Vec<String>>,
         dnf_args: Option<Vec<String>>,
@@ -51,7 +49,6 @@ impl RuntimeInstallCommand {
             runtime,
             config_path,
             verbose,
-            force,
             target,
             container_args,
             dnf_args,
@@ -96,7 +93,7 @@ impl RuntimeInstallCommand {
 
     pub async fn execute(&mut self) -> Result<()> {
         let name = self.runtime.as_deref().unwrap_or("all");
-        let tui_guard = if self.tui_context.is_none() && self.force {
+        let tui_guard = if self.tui_context.is_none() {
             Some(TuiGuard::new(
                 TaskId::RuntimeInstall(name.to_string()),
                 &format!("runtime install {}", name),
@@ -1082,7 +1079,6 @@ mod tests {
             Some("test-runtime".to_string()),
             "avocado.yaml".to_string(),
             false,
-            false,
             Some("x86_64".to_string()),
             None,
             None,
@@ -1091,7 +1087,6 @@ mod tests {
         assert_eq!(cmd.runtime, Some("test-runtime".to_string()));
         assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(!cmd.verbose);
-        assert!(!cmd.force);
         assert_eq!(cmd.target, Some("x86_64".to_string()));
     }
 
@@ -1101,7 +1096,6 @@ mod tests {
             None,
             "avocado.yaml".to_string(),
             true,
-            true,
             None,
             Some(vec!["--arg1".to_string()]),
             Some(vec!["--dnf-arg".to_string()]),
@@ -1110,7 +1104,6 @@ mod tests {
         assert_eq!(cmd.runtime, None);
         assert_eq!(cmd.config_path, "avocado.yaml");
         assert!(cmd.verbose);
-        assert!(cmd.force);
         assert_eq!(cmd.target, None);
         assert_eq!(cmd.container_args, Some(vec!["--arg1".to_string()]));
         assert_eq!(cmd.dnf_args, Some(vec!["--dnf-arg".to_string()]));
@@ -1128,7 +1121,6 @@ sdk:
         let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
-            false,
             false,
             Some("x86_64".to_string()),
             None,
@@ -1157,7 +1149,6 @@ runtimes:
             Some("test-runtime".to_string()),
             config_path,
             false,
-            false,
             Some("x86_64".to_string()),
             None,
             None,
@@ -1183,7 +1174,6 @@ runtimes:
         let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
-            false,
             false,
             Some("x86_64".to_string()),
             None,
@@ -1217,7 +1207,6 @@ runtimes:
         let mut cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
-            false,
             false,
             Some("x86_64".to_string()),
             None,
@@ -1259,7 +1248,6 @@ types = ["sysext"]
             Some("test-runtime".to_string()),
             config_path,
             false,
-            false,
             Some("x86_64".to_string()),
             None,
             None,
@@ -1296,7 +1284,6 @@ python3 = "*"
             None, // Install for all runtimes
             config_path,
             false,
-            false,
             Some("x86_64".to_string()),
             None,
             None,
@@ -1322,7 +1309,6 @@ target = "x86_64"
         let cmd = RuntimeInstallCommand::new(
             Some("test-runtime".to_string()),
             config_path,
-            false,
             false,
             Some("x86_64".to_string()),
             None,
@@ -1352,7 +1338,6 @@ gcc = "*"
             Some("test-runtime".to_string()),
             config_path,
             true,
-            true,
             Some("x86_64".to_string()),
             Some(vec!["--cap-add=SYS_ADMIN".to_string()]),
             Some(vec!["--nogpgcheck".to_string()]),
@@ -1364,7 +1349,6 @@ gcc = "*"
         );
         assert_eq!(cmd.dnf_args, Some(vec!["--nogpgcheck".to_string()]));
         assert!(cmd.verbose);
-        assert!(cmd.force);
     }
 
     #[test]
@@ -1389,7 +1373,6 @@ avocado-img-initramfs = "*"
         let cmd = RuntimeInstallCommand::new(
             Some("dev".to_string()),
             config_path,
-            false,
             false,
             Some("jetson-orin-nano-devkit".to_string()),
             None,

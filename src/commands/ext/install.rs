@@ -201,7 +201,7 @@ impl ExtInstallCommand {
 
     pub async fn execute(&self) -> Result<()> {
         let ext_label = self.extension.as_deref().unwrap_or("all");
-        let tui_guard = if self.tui_context.is_none() && self.force {
+        let tui_guard = if self.tui_context.is_none() {
             Some(TuiGuard::new(
                 TaskId::ExtInstall(ext_label.to_string()),
                 &format!("ext install {}", ext_label),

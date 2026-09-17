@@ -243,7 +243,6 @@ impl InstallCommand {
         let mut sdk_install_cmd = SdkInstallCommand::new(
             self.config_path.clone(),
             self.verbose,
-            self.force,
             self.target.clone(),
             self.container_args.clone(),
             self.dnf_args.clone(),
@@ -377,16 +376,7 @@ impl InstallCommand {
             }
         }
 
-        // Determine parallelism
-        let max_parallel: usize = std::env::var("AVOCADO_PARALLEL_TASKS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| num_cpus::get().min(4));
-        let max_parallel = if self.runs_on.is_some() {
-            1
-        } else {
-            max_parallel
-        };
+        let max_parallel = crate::utils::scheduler::max_parallel(self.runs_on.is_some());
 
         // Build DAG: ext installs run in parallel except along `depends_on`
         // edges, runtime installs depend on all ext installs completing first.
@@ -435,12 +425,7 @@ impl InstallCommand {
             let sched_renderer = renderer
                 .clone()
                 .unwrap_or_else(|| Arc::new(TaskRenderer::new(true)));
-            // Without a renderer, run tasks sequentially: parallel tasks write
-            // to the same terminal, and interleaved dnf output is unreadable.
-            // (It used to be about giving each prompt exclusive stdin; installs
-            // no longer prompt.)
-            let effective_parallel = if renderer.is_some() { max_parallel } else { 1 };
-            let mut scheduler = TaskScheduler::new(graph, sched_renderer, effective_parallel);
+            let mut scheduler = TaskScheduler::new(graph, sched_renderer, max_parallel);
 
             let sched_result = scheduler
                 .run(move |task_id: TaskId| {
@@ -489,7 +474,6 @@ impl InstallCommand {
                                     Some(name.clone()),
                                     config_path,
                                     verbose,
-                                    force,
                                     cli_target,
                                     container_args,
                                     dnf_args,
@@ -712,7 +696,6 @@ impl PackageAddCommand {
                     Some(name.clone()),
                     self.config_path.clone(),
                     self.verbose,
-                    self.force,
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
@@ -726,7 +709,6 @@ impl PackageAddCommand {
                 let mut cmd = SdkInstallCommand::new(
                     self.config_path.clone(),
                     self.verbose,
-                    self.force,
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
@@ -831,7 +813,6 @@ impl PackageRemoveCommand {
                     Some(name.clone()),
                     self.config_path.clone(),
                     self.verbose,
-                    self.force,
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
@@ -845,7 +826,6 @@ impl PackageRemoveCommand {
                 let mut cmd = SdkInstallCommand::new(
                     self.config_path.clone(),
                     self.verbose,
-                    self.force,
                     self.target.clone(),
                     self.container_args.clone(),
                     self.dnf_args.clone(),
