@@ -1097,19 +1097,38 @@ pub fn compute_config_hash(value: &serde_yaml::Value) -> Result<String> {
 // `narrow_kernel_for_hash` and `hash_script_at` are shared building blocks
 // to keep the hash-data construction consistent across components.
 
-/// Extract the subset of a `kernel:` YAML block that actually affects what
-/// gets installed or built. Returns a fresh mapping with only `package`,
-/// `version`, `compile`, `install` keys (when present). Unknown / new
-/// fields are deliberately ignored so cosmetic kernel-block edits
-/// (comments, metadata, future additions that don't drive selection) do
-/// not invalidate stamps.
-/// The `kernel` fields that select packages, and so belong in an install
-/// hash. `cmdline`/`cmdline_extra` reach the platform hook at build time and
-/// `image` is an image input; none of them changes what dnf installs.
+/// Extract the subset of a `kernel:` YAML block that affects the step being
+/// hashed. Returns a fresh mapping holding only `keys` (when present).
+/// Unknown / new fields are deliberately ignored so cosmetic kernel-block
+/// edits (comments, metadata, future additions that don't drive selection)
+/// do not invalidate stamps.
+///
+/// The list differs by step, which is the point: see [`KERNEL_HASH_KEYS`] and
+/// [`KERNEL_BUILD_HASH_KEYS`].
+/// The `kernel` fields that select packages, and so belong in an INSTALL
+/// hash. `cmdline`/`cmdline_extra` are deliberately absent: they never change
+/// what dnf installs. They ARE a build input, though -- see
+/// [`KERNEL_BUILD_HASH_KEYS`] -- so do not reach for this list from a build
+/// hash. `image` is an image input and belongs to neither.
 const KERNEL_HASH_KEYS: [&str; 4] = ["package", "version", "compile", "install"];
 
-fn narrow_kernel_for_hash(kernel: &serde_yaml::Value) -> serde_yaml::Value {
-    const KEYS: [&str; 4] = KERNEL_HASH_KEYS;
+/// The `kernel` fields a runtime BUILD reads. Everything the install hash
+/// covers, plus the command line, which the platform build hook receives as
+/// `AVOCADO_KERNEL_CMDLINE`/`_EXTRA` and a UKI target bakes into the image.
+/// Leaving those out let the build stamp certify a build whose inputs it did
+/// not cover: an edit to `cmdline_extra` alone moved nothing, so any skip
+/// added in the shape of the `ext build` one would ship a UKI carrying the
+/// previous kernel arguments under a stamp reading as current.
+const KERNEL_BUILD_HASH_KEYS: [&str; 6] = [
+    "package",
+    "version",
+    "compile",
+    "install",
+    "cmdline",
+    "cmdline_extra",
+];
+
+fn narrow_kernel_for_hash(kernel: &serde_yaml::Value, keys: &[&str]) -> serde_yaml::Value {
     // `kernel:` is either the inline form or a named map -- `kernel: { default:
     // {...} }`, or a sole named entry. Mirror `Config::kernel_default()`: the
     // `default` entry wins, else the only entry. Narrowing the outer map of a
@@ -1122,19 +1141,19 @@ fn narrow_kernel_for_hash(kernel: &serde_yaml::Value) -> serde_yaml::Value {
             .any(|k| m.contains_key(serde_yaml::Value::String(k.to_string())));
         if !has_field {
             if let Some(d) = m.get("default") {
-                return narrow_kernel_for_hash(d);
+                return narrow_kernel_for_hash(d, keys);
             }
             if m.len() == 1 {
                 if let Some(v) = m.values().next() {
-                    return narrow_kernel_for_hash(v);
+                    return narrow_kernel_for_hash(v, keys);
                 }
             }
         }
     }
     let mut out = serde_yaml::Mapping::new();
-    for key in KEYS {
-        if let Some(v) = kernel.get(key) {
-            out.insert(serde_yaml::Value::String(key.to_string()), v.clone());
+    for key in keys {
+        if let Some(v) = kernel.get(*key) {
+            out.insert(serde_yaml::Value::String((*key).to_string()), v.clone());
         }
     }
     serde_yaml::Value::Mapping(out)
@@ -1589,7 +1608,7 @@ pub fn compute_ext_install_input_hash_with_deps(
     if let Some(kernel) = config.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String("kernel".to_string()),
-            narrow_kernel_for_hash(kernel),
+            narrow_kernel_for_hash(kernel, &KERNEL_HASH_KEYS),
         );
     }
     if let Some(kver) = resolved_kernel {
@@ -2417,7 +2436,7 @@ fn compute_sysroot_install_input_hash(
     if let Some(kernel) = config.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String("kernel".to_string()),
-            narrow_kernel_for_hash(kernel),
+            narrow_kernel_for_hash(kernel, &KERNEL_HASH_KEYS),
         );
     }
 
@@ -2607,7 +2626,7 @@ pub fn compute_runtime_build_input_hash(
     if let Some(kernel) = merged_runtime.get("kernel") {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
-            narrow_kernel_for_hash(kernel),
+            narrow_kernel_for_hash(kernel, &KERNEL_BUILD_HASH_KEYS),
         );
     }
 
@@ -5387,18 +5406,32 @@ extensions:
     /// out of every stamp. The deserializer's list is the source of truth.
     #[test]
     fn kernel_hash_keys_are_kernel_config_fields() {
+        for k in KERNEL_HASH_KEYS.iter().chain(KERNEL_BUILD_HASH_KEYS.iter()) {
+            assert!(
+                crate::utils::config::KERNEL_CONFIG_FIELDS.contains(k),
+                "{k} is not a KernelConfig field"
+            );
+        }
+        // The build list is the install list plus the command line. Stated as a
+        // containment check so adding a package-selecting field to the install
+        // list cannot leave the build hash behind.
         for k in KERNEL_HASH_KEYS {
             assert!(
-                crate::utils::config::KERNEL_CONFIG_FIELDS.contains(&k),
-                "{k} is not a KernelConfig field"
+                KERNEL_BUILD_HASH_KEYS.contains(&k),
+                "{k} is in the install hash but not the build hash"
             );
         }
         // And an inline block that sets only a non-hashed field is still an
         // inline block, not a kernel named after that field.
         let only_cmdline = serde_yaml::from_str::<serde_yaml::Value>("cmdline: quiet").unwrap();
         assert_eq!(
-            narrow_kernel_for_hash(&only_cmdline),
+            narrow_kernel_for_hash(&only_cmdline, &KERNEL_HASH_KEYS),
             serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        );
+        // ...but the build hash keeps it, because the build hook reads it.
+        assert_eq!(
+            narrow_kernel_for_hash(&only_cmdline, &KERNEL_BUILD_HASH_KEYS),
+            only_cmdline
         );
     }
 
