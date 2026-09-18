@@ -366,8 +366,13 @@ export STONE_AOS_OUTPUT
 STONE_INCLUDE_FLAGS=""
 if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
     # Colon-separated, matching the `avocado-build-<target>` hooks. Splitting on
-    # whitespace here instead made this reader and those disagree about a
-    # multi-path value, and about any path containing a space.
+    # whitespace here instead made this reader and those disagree about any
+    # value holding more than one path.
+    #
+    # A path containing a space still does not survive: the flags collapse into
+    # one scalar that the stone call below expands unquoted. Carrying them as an
+    # array would fix that, here and in the overlay prepend that rewrites this
+    # variable -- worth doing, and not what this change is.
     _avocado_ifs=$IFS
     IFS=':'
     for path in $AVOCADO_STONE_INCLUDE_PATHS; do

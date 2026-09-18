@@ -4968,8 +4968,14 @@ impl Config {
 
     /// Get stone include paths for a runtime and convert them to container paths.
     ///
-    /// Returns a space-separated string of paths from the container's
-    /// perspective. The composed list is built from two origins, in this
+    /// Returns a **colon-separated** string of paths from the container's
+    /// perspective, matching the `IFS=':'` split every `avocado-build-<target>`
+    /// and `avocado-provision-<target>` hook performs on it. A path containing
+    /// a colon cannot be expressed; a path containing a space survives this
+    /// join but not every reader (see `var_image.rs`, which flattens the list
+    /// into one scalar).
+    ///
+    /// The composed list is built from two origins, in this
     /// priority order (earlier entries win on stone's first-hit search):
     ///
     /// 1. **Runtime-level** `runtimes.<name>.stone_include_paths` — paths
@@ -5043,8 +5049,8 @@ impl Config {
         //
         // Why absolute and not "$AVOCADO_PREFIX/...": this string ends up
         // as an entry inside the AVOCADO_STONE_INCLUDE_PATHS env var. The
-        // recipe scripts iterate that var with `for path in
-        // $AVOCADO_STONE_INCLUDE_PATHS` — bash does NOT perform variable
+        // recipe scripts split that var with `IFS=':' read -ra PATHS` — bash
+        // does NOT perform variable
         // expansion on the contents of an env var value, so a literal
         // "$AVOCADO_PREFIX" survives unchanged into stone's `-i` flag and
         // resolves to a non-existent path. The SDK convention is
