@@ -748,7 +748,12 @@ impl RuntimeBuildCommand {
         // if it is to be a manifest artifact, hence OTA-updatable and
         // uploadable, rather than something only a physical reflash can
         // change.
-        crate::utils::container::inject_kernel_cmdline(&mut env_vars, config, &self.runtime_name);
+        crate::utils::container::inject_kernel_cmdline(
+            &mut env_vars,
+            config,
+            &self.runtime_name,
+            merged_runtime.as_ref(),
+        )?;
 
         // Reproducibility stamp. This run executes the rootfs and initramfs
         // image sections, so one insert covers both. Extension images are NOT

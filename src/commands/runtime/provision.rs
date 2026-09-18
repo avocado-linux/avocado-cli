@@ -402,11 +402,19 @@ impl RuntimeProvisionCommand {
         // Kernel command line, for the provision hook. Also exported at build
         // time (see runtime/build.rs) -- a target that assembles its boot image
         // at provision time needs the same value a build would have baked in.
+        // Resolved for this target, so a `target-<name>:` kernel override
+        // reaches the hook. The typed accessor alone reads the base document.
+        let merged_runtime = config.get_merged_runtime_config(
+            &self.config.runtime_name,
+            &target_arch,
+            &self.config.config_path,
+        )?;
         crate::utils::container::inject_kernel_cmdline(
             &mut env_vars,
             config,
             &self.config.runtime_name,
-        );
+            merged_runtime.as_ref(),
+        )?;
 
         // Determine state file path and container location if a provision profile is set
         let state_file_info = if let Some(profile) = &self.config.provision_profile {

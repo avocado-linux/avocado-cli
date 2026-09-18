@@ -22,6 +22,13 @@ use std::path::PathBuf;
 /// The call every run that can shape the boot image has to make.
 const INJECTION: &str = "inject_kernel_cmdline(";
 
+/// ...and the argument that makes it read the config as resolved FOR THIS
+/// TARGET. Passing `None` still compiles and still exports a line, just the
+/// unresolved one, so a `target-<name>:` kernel override would go back to
+/// vanishing with every test green -- the same shape of silence this file
+/// exists to catch.
+const RESOLVED_ARG: &str = "merged_runtime.as_ref()";
+
 fn source(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
@@ -34,6 +41,11 @@ fn runtime_build_injects_kernel_cmdline() {
         "`avocado build` must inject the kernel cmdline: the UKI is assembled by the \
          build hook, before `stone bundle`, so a provision-only export never reaches it"
     );
+    assert!(
+        source("src/commands/runtime/build.rs").contains(RESOLVED_ARG),
+        "`avocado build` must pass the merged runtime section, or a `target-<name>:` \
+         kernel override is dropped and the UKI bakes the platform default"
+    );
 }
 
 #[test]
@@ -42,5 +54,10 @@ fn runtime_provision_injects_kernel_cmdline() {
         source("src/commands/runtime/provision.rs").contains(INJECTION),
         "`avocado provision` must inject the kernel cmdline for targets that assemble \
          their boot image at provision time"
+    );
+    assert!(
+        source("src/commands/runtime/provision.rs").contains(RESOLVED_ARG),
+        "`avocado provision` must pass the merged runtime section, so a per-target \
+         kernel override reaches the provision hook too"
     );
 }

@@ -632,18 +632,57 @@ pub fn inject_source_date_epoch(
 /// Both runs call this instead of each spelling out the two inserts: they were
 /// duplicate blocks, and a merge deleted the build one while every test stayed
 /// green.
+/// `merged_runtime` is the runtime section already resolved for the target, the
+/// same value `AVOCADO_KERNEL_SOURCE` and `AVOCADO_KERNEL_PACKAGE` are read
+/// from. It is taken rather than derived so all three kernel values in this
+/// map resolve one way: `Config::effective_kernel_cmdline` reads the typed
+/// structs, which are the base document, so a `target-<name>:` block carrying
+/// a `kernel:` override was invisible to it and the export silently fell back
+/// to the platform default. `KernelConfig` sets no `deny_unknown_fields`, so
+/// nothing reported the miss. Pass `None` only when there is no runtime
+/// section to resolve; the typed fallback still covers the top-level
+/// `kernel:` block.
+///
+/// Errors when the pair is contradictory. `KernelConfig::validate` already
+/// rejects `cmdline` together with `cmdline_extra`, but it runs only inside
+/// `get_kernel_config_from_runtime`, so the typed fallback reached here with
+/// both set and exported both. The SDK hook then resolves the contradiction by
+/// its own rules, which the CLI does not control.
 pub fn inject_kernel_cmdline(
     env_vars: &mut HashMap<String, String>,
     config: &crate::utils::config::Config,
     runtime_name: &str,
-) {
-    let (cmdline, cmdline_extra) = config.effective_kernel_cmdline(Some(runtime_name));
+    merged_runtime: Option<&serde_yaml::Value>,
+) -> anyhow::Result<()> {
+    let resolved = merged_runtime
+        .map(|v| {
+            crate::utils::config::Config::get_kernel_config_from_runtime(v, config.kernel.as_ref())
+        })
+        .transpose()?
+        .flatten();
+
+    let (cmdline, cmdline_extra) = match resolved {
+        // A runtime that names a line wins outright, exactly as the typed
+        // accessor's own precedence has it -- but resolved for this target.
+        Some(kc) if kc.cmdline.is_some() || kc.cmdline_extra.is_some() => {
+            (kc.cmdline, kc.cmdline_extra)
+        }
+        _ => config.effective_kernel_cmdline(Some(runtime_name)),
+    };
+
+    if cmdline.is_some() && cmdline_extra.is_some() {
+        anyhow::bail!(
+            "kernel config: 'cmdline' and 'cmdline_extra' are mutually exclusive; \
+             'cmdline' replaces the platform's line, 'cmdline_extra' appends to it"
+        );
+    }
     if let Some(cmdline) = cmdline {
         env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
     }
     if let Some(extra) = cmdline_extra {
         env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
     }
+    Ok(())
 }
 
 /// Configuration for running commands in containers
@@ -4039,7 +4078,7 @@ mod tests {
         fn configured_extra_reaches_the_container_env() {
             let config = cfg("kernel:\n  cmdline_extra: \"kvm-arm.mode=nvhe\"\n");
             let mut env_vars = HashMap::new();
-            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", None).unwrap();
             assert_eq!(
                 env_vars
                     .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
@@ -4055,7 +4094,7 @@ mod tests {
         fn configured_replacement_reaches_the_container_env() {
             let config = cfg("kernel:\n  cmdline: \"root=/dev/sda2 console=ttyS0\"\n");
             let mut env_vars = HashMap::new();
-            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", None).unwrap();
             assert_eq!(
                 env_vars.get("AVOCADO_KERNEL_CMDLINE").map(String::as_str),
                 Some("root=/dev/sda2 console=ttyS0")
@@ -4073,7 +4112,7 @@ mod tests {
             let config = cfg("default_target: qemuarm64\n");
             let mut env_vars = HashMap::new();
             env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), "dev".to_string());
-            inject_kernel_cmdline(&mut env_vars, &config, "prod");
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", None).unwrap();
             assert_eq!(
                 env_vars
                     .get("AVOCADO_PROVISION_PROFILE")
@@ -4084,6 +4123,63 @@ mod tests {
             assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE"));
             assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE_EXTRA"));
             assert_eq!(env_vars.len(), 1, "nothing else may be added either");
+        }
+
+        /// The typed `Config` fields are the base document, so a
+        /// `target-<name>:` block carrying a `kernel:` override never reached
+        /// the export and the board booted on the platform default -- silently,
+        /// because `KernelConfig` sets no `deny_unknown_fields`. The merged
+        /// runtime section is the resolved view, and is what
+        /// `AVOCADO_KERNEL_SOURCE`/`_PACKAGE` beside it already read.
+        #[test]
+        fn the_resolved_runtime_wins_over_the_unresolved_top_level() {
+            let config = cfg("kernel:\n  cmdline_extra: \"platform-default\"\n");
+            // What `get_merged_runtime_config` yields once a `target-qcs6490:`
+            // block has been merged into `runtimes.prod`.
+            let merged: serde_yaml::Value =
+                serde_yaml::from_str("kernel:\n  cmdline_extra: \"earlycon\"\n").unwrap();
+
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", Some(&merged)).unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("earlycon"),
+                "the per-target line must beat the top-level default"
+            );
+
+            // And with nothing resolved for the runtime, the top level still
+            // applies -- the fallback is a fallback, not a replacement.
+            let bare: serde_yaml::Value = serde_yaml::from_str("image:\n  type: ext4\n").unwrap();
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", Some(&bare)).unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("platform-default")
+            );
+        }
+
+        /// `KernelConfig::validate` rejects the pair, but it runs only inside
+        /// `get_kernel_config_from_runtime`; the typed fallback skipped it and
+        /// exported both, handing the SDK hook a contradiction to resolve by
+        /// rules the CLI does not control. Fail instead, and say which two
+        /// keys conflict.
+        #[test]
+        fn a_contradictory_pair_is_an_error_rather_than_two_exports() {
+            let config =
+                cfg("kernel:\n  cmdline: \"root=/dev/sda2\"\n  cmdline_extra: \"earlycon\"\n");
+            let mut env_vars = HashMap::new();
+            let err = inject_kernel_cmdline(&mut env_vars, &config, "prod", None)
+                .expect_err("both set must not silently export both");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("mutually exclusive"), "{msg}");
+            assert!(
+                env_vars.is_empty(),
+                "nothing may be exported from a rejected pair"
+            );
         }
     }
 
