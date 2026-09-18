@@ -22,42 +22,60 @@ use std::path::PathBuf;
 /// The call every run that can shape the boot image has to make.
 const INJECTION: &str = "inject_kernel_cmdline(";
 
-/// ...and the argument that makes it read the config as resolved FOR THIS
-/// TARGET. Passing `None` still compiles and still exports a line, just the
-/// unresolved one, so a `target-<name>:` kernel override would go back to
-/// vanishing with every test green -- the same shape of silence this file
-/// exists to catch.
-const RESOLVED_ARG: &str = "merged_runtime.as_ref()";
+/// ...and the two arguments that make it read the config as resolved FOR THIS
+/// TARGET: the merged runtime section, and the raw composed document the
+/// top-level `kernel:` block is resolved from. Each is an `Option`, so `None`
+/// still compiles and still exports a line, just the unresolved one, and a
+/// `target-<name>:` kernel override at that level goes back to vanishing with
+/// every test green -- the same shape of silence this file exists to catch.
+const RESOLVED_ARGS: [&str; 2] = ["merged_runtime.as_ref()", "Some(parsed)"];
 
 fn source(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+/// The argument text of the one `inject_kernel_cmdline(` call in `relative`.
+/// Scoped to the call: both needles are ordinary spellings elsewhere in these
+/// files, so a whole-file `contains` would hold with the call passing `None`.
+fn injection_args(relative: &str, must: &str) -> String {
+    let src = source(relative);
+    let start = src.find(INJECTION).unwrap_or_else(|| panic!("{must}"));
+    let rest = &src[start + INJECTION.len()..];
+    let end = rest
+        .find(")?;")
+        .expect("the injection call is terminated with `)?;`");
+    rest[..end].to_string()
+}
+
 #[test]
 fn runtime_build_injects_kernel_cmdline() {
-    assert!(
-        source("src/commands/runtime/build.rs").contains(INJECTION),
+    let args = injection_args(
+        "src/commands/runtime/build.rs",
         "`avocado build` must inject the kernel cmdline: the UKI is assembled by the \
-         build hook, before `stone bundle`, so a provision-only export never reaches it"
+         build hook, before `stone bundle`, so a provision-only export never reaches it",
     );
-    assert!(
-        source("src/commands/runtime/build.rs").contains(RESOLVED_ARG),
-        "`avocado build` must pass the merged runtime section, or a `target-<name>:` \
-         kernel override is dropped and the UKI bakes the platform default"
-    );
+    for arg in RESOLVED_ARGS {
+        assert!(
+            args.contains(arg),
+            "`avocado build` must pass {arg}, or a `target-<name>:` kernel override at \
+             that level is dropped and the UKI bakes the platform default"
+        );
+    }
 }
 
 #[test]
 fn runtime_provision_injects_kernel_cmdline() {
-    assert!(
-        source("src/commands/runtime/provision.rs").contains(INJECTION),
+    let args = injection_args(
+        "src/commands/runtime/provision.rs",
         "`avocado provision` must inject the kernel cmdline for targets that assemble \
-         their boot image at provision time"
+         their boot image at provision time",
     );
-    assert!(
-        source("src/commands/runtime/provision.rs").contains(RESOLVED_ARG),
-        "`avocado provision` must pass the merged runtime section, so a per-target \
-         kernel override reaches the provision hook too"
-    );
+    for arg in RESOLVED_ARGS {
+        assert!(
+            args.contains(arg),
+            "`avocado provision` must pass {arg}, so a per-target kernel override at \
+             that level reaches the provision hook too"
+        );
+    }
 }
