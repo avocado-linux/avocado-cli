@@ -622,6 +622,50 @@ pub fn inject_source_date_epoch(
     }
 }
 
+/// Inject the project's kernel command line into a container's env map.
+///
+/// Read by the SDK's platform lifecycle hooks, which are the only code that
+/// knows how a given boot path carries a command line. On a UKI target the
+/// *build* hook bakes it into the image it assembles, so the value has to be
+/// present for `avocado build` and not only for `avocado provision`.
+///
+/// Both runs call this instead of each spelling out the two inserts: they were
+/// duplicate blocks, and a merge deleted the build one while every test stayed
+/// green.
+/// Resolution lives in `Config::effective_kernel_cmdline_for_target`, which
+/// reads both the merged runtime section and the top-level `kernel:` block as
+/// they resolve FOR THIS TARGET. The typed accessor cannot: the `kernel:`
+/// deserializer strips `target-<name>:` sub-keys before they reach the typed
+/// fields, so a per-target command line was silently absent from the export at
+/// either level while `runtime build` read the same top-level section
+/// target-resolved for its image type. One run, two readings.
+///
+/// Errors only on `cmdline` together with `cmdline_extra`, which
+/// `KernelConfig::validate` rejects but no path reaching here ran. The rest of
+/// that validation is deliberately left alone -- it rejects shapes that build
+/// today, and failing them here would turn a command-line export into a new
+/// build failure naming package selection.
+pub fn inject_kernel_cmdline(
+    env_vars: &mut HashMap<String, String>,
+    config: &crate::utils::config::Config,
+    runtime_name: &str,
+    target: &str,
+    parsed: Option<&serde_yaml::Value>,
+    merged_runtime: Option<&serde_yaml::Value>,
+) -> anyhow::Result<()> {
+    let (cmdline, cmdline_extra) = config
+        .effective_kernel_cmdline_for_target(parsed, merged_runtime, runtime_name, target)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if let Some(cmdline) = cmdline {
+        env_vars.insert("AVOCADO_KERNEL_CMDLINE".to_string(), cmdline);
+    }
+    if let Some(extra) = cmdline_extra {
+        env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
+    }
+    Ok(())
+}
+
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -3998,6 +4042,217 @@ mod tests {
             let mut env_vars = std::collections::HashMap::new();
             inject_source_date_epoch(&mut env_vars, None);
             assert!(!env_vars.contains_key("SOURCE_DATE_EPOCH"));
+        }
+    }
+
+    /// `effective_kernel_cmdline`'s precedence is covered in `utils::config`;
+    /// these cover the step after it -- that the resolved pair lands in the
+    /// container env under the names the SDK's platform hooks read.
+    mod kernel_cmdline {
+        use super::*;
+
+        fn cfg(yaml: &str) -> crate::utils::config::Config {
+            serde_yaml::from_str(yaml).expect("config parses")
+        }
+
+        #[test]
+        fn configured_extra_reaches_the_container_env() {
+            let config = cfg("kernel:\n  cmdline_extra: \"kvm-arm.mode=nvhe\"\n");
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", "qemuarm64", None, None).unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("kvm-arm.mode=nvhe")
+            );
+            // Append must not masquerade as replace: the hook writes the whole
+            // line from CMDLINE, so an empty one would drop root= and console=.
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE"));
+        }
+
+        #[test]
+        fn configured_replacement_reaches_the_container_env() {
+            let config = cfg("kernel:\n  cmdline: \"root=/dev/sda2 console=ttyS0\"\n");
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", "qemuarm64", None, None).unwrap();
+            assert_eq!(
+                env_vars.get("AVOCADO_KERNEL_CMDLINE").map(String::as_str),
+                Some("root=/dev/sda2 console=ttyS0")
+            );
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE_EXTRA"));
+        }
+
+        #[test]
+        fn unset_config_leaves_the_env_untouched() {
+            // Starting from an empty map would only prove we add nothing.
+            // `provision` hands us a map already seeded from the user's
+            // `--env` flags and `--provision-profile` (provision.rs:224), so
+            // clearing or rewriting an existing entry would silently drop
+            // their settings. Seed a sentinel and assert it survives.
+            let config = cfg("default_target: qemuarm64\n");
+            let mut env_vars = HashMap::new();
+            env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), "dev".to_string());
+            inject_kernel_cmdline(&mut env_vars, &config, "prod", "qemuarm64", None, None).unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_PROVISION_PROFILE")
+                    .map(String::as_str),
+                Some("dev"),
+                "a caller-supplied entry must survive an unset kernel cmdline"
+            );
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE"));
+            assert!(!env_vars.contains_key("AVOCADO_KERNEL_CMDLINE_EXTRA"));
+            assert_eq!(env_vars.len(), 1, "nothing else may be added either");
+        }
+
+        /// The typed `Config` fields are the base document, so a
+        /// `target-<name>:` block carrying a `kernel:` override never reached
+        /// the export and the board booted on the platform default -- silently,
+        /// because `KernelConfig` sets no `deny_unknown_fields`. The merged
+        /// runtime section is the resolved view, and is what
+        /// `AVOCADO_KERNEL_SOURCE`/`_PACKAGE` beside it already read.
+        #[test]
+        fn the_resolved_runtime_wins_over_the_unresolved_top_level() {
+            let config = cfg("kernel:\n  cmdline_extra: \"platform-default\"\n");
+            // What `get_merged_runtime_config` yields once a `target-qcs6490:`
+            // block has been merged into `runtimes.prod`.
+            let merged: serde_yaml::Value =
+                serde_yaml::from_str("kernel:\n  cmdline_extra: \"earlycon\"\n").unwrap();
+
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(
+                &mut env_vars,
+                &config,
+                "prod",
+                "qemuarm64",
+                None,
+                Some(&merged),
+            )
+            .unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("earlycon"),
+                "the per-target line must beat the top-level default"
+            );
+
+            // And with nothing resolved for the runtime, the top level still
+            // applies -- the fallback is a fallback, not a replacement.
+            let bare: serde_yaml::Value = serde_yaml::from_str("image:\n  type: ext4\n").unwrap();
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(
+                &mut env_vars,
+                &config,
+                "prod",
+                "qemuarm64",
+                None,
+                Some(&bare),
+            )
+            .unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("platform-default")
+            );
+        }
+
+        /// The `kernel:` deserializer strips `target-<name>:` before it reaches
+        /// the typed fields, so the top-level per-target line was invisible to
+        /// the export while `runtime build` read the very same section
+        /// target-resolved for its image type. A qcs6490 project following the
+        /// documented shape booted the platform default, silently.
+        #[test]
+        fn a_top_level_target_override_reaches_the_export() {
+            let yaml = "supported_targets:\n  - qcs6490\n  - qemuarm64\nkernel:\n  package: kernel-image\n  cmdline_extra: \"quiet\"\n  target-qcs6490:\n    cmdline_extra: \"earlycon console=ttyMSM0,115200\"\n";
+            let config = cfg(yaml);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(
+                &mut env_vars,
+                &config,
+                "prod",
+                "qcs6490",
+                Some(&parsed),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("earlycon console=ttyMSM0,115200"),
+                "the per-target line must win for the target it names"
+            );
+
+            // And any other target still gets the base line, not the override.
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(
+                &mut env_vars,
+                &config,
+                "prod",
+                "qemuarm64",
+                Some(&parsed),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_KERNEL_CMDLINE_EXTRA")
+                    .map(String::as_str),
+                Some("quiet")
+            );
+        }
+
+        /// Exporting a command line must not start failing builds over kernel
+        /// shapes it has no opinion on. `KernelConfig::validate` also rejects a
+        /// block with neither `package` nor `compile` nor a command line, and
+        /// projects carrying one build today because the caller that validates
+        /// discards the error. Running the whole validation here would stop
+        /// those builds with a message about package selection.
+        #[test]
+        fn an_unrelated_kernel_shape_is_not_turned_into_a_build_failure() {
+            let yaml = "kernel:\n  version: \"6.6\"\n";
+            let config = cfg(yaml);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let merged: serde_yaml::Value =
+                serde_yaml::from_str("kernel:\n  version: \"6.6\"\n").unwrap();
+
+            let mut env_vars = HashMap::new();
+            inject_kernel_cmdline(
+                &mut env_vars,
+                &config,
+                "prod",
+                "qemuarm64",
+                Some(&parsed),
+                Some(&merged),
+            )
+            .expect("a version-only kernel block must not fail the export");
+            assert!(env_vars.is_empty(), "and must export nothing");
+        }
+
+        /// `KernelConfig::validate` rejects the pair, but it runs only inside
+        /// `get_kernel_config_from_runtime`; the typed fallback skipped it and
+        /// exported both, handing the SDK hook a contradiction to resolve by
+        /// rules the CLI does not control. Fail instead, and say which two
+        /// keys conflict.
+        #[test]
+        fn a_contradictory_pair_is_an_error_rather_than_two_exports() {
+            let config =
+                cfg("kernel:\n  cmdline: \"root=/dev/sda2\"\n  cmdline_extra: \"earlycon\"\n");
+            let mut env_vars = HashMap::new();
+            let err =
+                inject_kernel_cmdline(&mut env_vars, &config, "prod", "qemuarm64", None, None)
+                    .expect_err("both set must not silently export both");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("mutually exclusive"), "{msg}");
+            assert!(
+                env_vars.is_empty(),
+                "nothing may be exported from a rejected pair"
+            );
         }
     }
 
