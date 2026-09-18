@@ -2628,6 +2628,22 @@ pub fn compute_runtime_build_input_hash(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
             narrow_kernel_for_hash(kernel, &KERNEL_BUILD_HASH_KEYS),
         );
+    } else if let Some(top) = parsed.get("kernel") {
+        // The command line export falls back to the top-level `kernel:` block
+        // for a runtime that declares none -- the single-runtime shape that
+        // fallback exists to serve -- so the hash has to follow it there or
+        // that line is a build input nothing reads.
+        //
+        // Folded WHOLE rather than narrowed. This node is the raw section, so
+        // it still carries its `target-<name>:` sub-keys, and narrowing would
+        // drop exactly the per-target line that matters. Hashing the lot
+        // over-invalidates on a cosmetic edit, which is the safe direction:
+        // the alternative is a stamp certifying a build over a command line it
+        // never saw.
+        hash_data.insert(
+            serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel.top_level")),
+            top.clone(),
+        );
     }
 
     if let Some(ext_list) = merged_runtime
@@ -4825,6 +4841,66 @@ kernel:
 
         // Hashes should differ when kernel config is added
         assert_ne!(hash_without.config_hash, hash_with.config_hash);
+    }
+
+    /// The command line export falls back to the top-level `kernel:` block for
+    /// a runtime that declares none -- the single-runtime shape that fallback
+    /// exists to serve. Folding only `merged_runtime.kernel` left that line an
+    /// unhashed build input, so the stamp certified a build over a value it
+    /// never read, and a skip in the shape of the `ext build` one would ship a
+    /// UKI carrying the previous arguments.
+    #[test]
+    fn a_top_level_cmdline_edit_moves_the_runtime_build_hash() {
+        let runtime: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  avocado-img-rootfs: \"*\"\ntarget: \"x86_64\"\n")
+                .unwrap();
+        let top = |extra: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&format!(
+                "kernel:\n  package: kernel-image\n  cmdline_extra: \"{extra}\"\n"
+            ))
+            .unwrap()
+        };
+        let hash = |parsed: &serde_yaml::Value| {
+            compute_runtime_build_input_hash(
+                &runtime,
+                "dev",
+                parsed,
+                std::path::Path::new("."),
+                &Default::default(),
+            )
+            .unwrap()
+            .config_hash
+        };
+        assert_ne!(hash(&top("quiet")), hash(&top("earlycon")));
+    }
+
+    /// ...and a per-target line inside that block moves it too. The raw section
+    /// still carries its `target-<name>:` sub-keys, so this only holds while
+    /// the fallback folds the node whole: narrowing it to the known kernel keys
+    /// would drop exactly the override that matters.
+    #[test]
+    fn a_top_level_per_target_cmdline_edit_moves_the_runtime_build_hash() {
+        let runtime: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  avocado-img-rootfs: \"*\"\ntarget: \"x86_64\"\n")
+                .unwrap();
+        let top = |extra: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&format!(
+                "kernel:\n  package: kernel-image\n  cmdline_extra: \"quiet\"\n  target-qcs6490:\n    cmdline_extra: \"{extra}\"\n"
+            ))
+            .unwrap()
+        };
+        let hash = |parsed: &serde_yaml::Value| {
+            compute_runtime_build_input_hash(
+                &runtime,
+                "dev",
+                parsed,
+                std::path::Path::new("."),
+                &Default::default(),
+            )
+            .unwrap()
+            .config_hash
+        };
+        assert_ne!(hash(&top("earlycon")), hash(&top("console=ttyMSM0,115200")));
     }
 
     #[test]

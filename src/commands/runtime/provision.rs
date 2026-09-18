@@ -403,7 +403,11 @@ impl RuntimeProvisionCommand {
         // time (see runtime/build.rs) -- a target that assembles its boot image
         // at provision time needs the same value a build would have baked in.
         // Resolved for this target, so a `target-<name>:` kernel override
-        // reaches the hook. The typed accessor alone reads the base document.
+        // reaches the hook. The typed accessor alone reads the stripped
+        // document. Bound once here and reused by the bundle step below --
+        // `get_merged_section` re-reads and re-interpolates avocado.yaml on
+        // every call, and two bindings of the same name 70 lines apart drift
+        // apart without a compile error to catch it.
         let merged_runtime = config.get_merged_runtime_config(
             &self.config.runtime_name,
             &target_arch,
@@ -413,6 +417,8 @@ impl RuntimeProvisionCommand {
             &mut env_vars,
             config,
             &self.config.runtime_name,
+            &target_arch,
+            Some(parsed),
             merged_runtime.as_ref(),
         )?;
 
@@ -473,13 +479,8 @@ impl RuntimeProvisionCommand {
         // Build the var image and the OS bundle, then run the stone hook.
         // `avocado build` produces the deployable set only; this is the
         // provisioning tail, and it is provisioning's to run.
-        let merged_runtime = config
-            .get_merged_runtime_config(
-                &self.config.runtime_name,
-                &target_arch,
-                &self.config.config_path,
-            )?
-            .unwrap_or_default();
+        // Bound above, before the kernel cmdline export.
+        let merged_runtime = merged_runtime.clone().unwrap_or_default();
         let var_section = crate::commands::runtime::var_image::render_var_image(
             &crate::commands::runtime::var_image::VarImageContext {
                 runtime_name: &self.config.runtime_name,

@@ -1718,6 +1718,91 @@ impl Config {
         (None, None)
     }
 
+    /// The kernel command line as it resolves FOR THIS TARGET, and the pair
+    /// the hooks are handed.
+    ///
+    /// [`Self::effective_kernel_cmdline`] reads the typed fields, and those are
+    /// the STRIPPED document: the `kernel:` deserializer removes every
+    /// `target-<name>:` and `kernel-<spec>:` sub-key, stating that they are
+    /// "resolved later by the image commands on the raw composed value". So a
+    /// per-target command line cannot be read from it at all, at either level.
+    ///
+    /// Both levels are resolved here instead, in the same precedence the typed
+    /// accessor uses:
+    ///
+    /// 1. the runtime's own `kernel:` block, already target-resolved by
+    ///    `get_merged_runtime_config`;
+    /// 2. the top-level `kernel:` section, resolved through
+    ///    [`Self::resolve_image_section`] -- the same reader `runtime build`
+    ///    already uses for that section, so one run stops reading it two ways.
+    ///
+    /// Errors only on `cmdline` together with `cmdline_extra`. The rest of
+    /// [`KernelConfig::validate`] is deliberately not run: it rejects shapes
+    /// this has no opinion on (`version:` alone, an `image:`-only block), and
+    /// those build today because the one caller that validates discards the
+    /// error. Turning them into failures belongs at config load, not here.
+    pub fn effective_kernel_cmdline_for_target(
+        &self,
+        parsed: Option<&serde_yaml::Value>,
+        merged_runtime: Option<&serde_yaml::Value>,
+        runtime_name: &str,
+        target: &str,
+    ) -> Result<(Option<String>, Option<String>), ConfigError> {
+        let pair = merged_runtime
+            .and_then(|v| v.get("kernel"))
+            .and_then(|node| self.kernel_cmdline_pair(node))
+            .or_else(|| {
+                parsed
+                    .and_then(|p| self.resolve_image_section(p, "kernel", target))
+                    .and_then(|node| self.kernel_cmdline_pair(&node))
+            })
+            // Nothing declared for this target at either level: fall back to
+            // the typed accessor so an override-free config behaves exactly as
+            // before, named refs on the runtime included.
+            .unwrap_or_else(|| self.effective_kernel_cmdline(Some(runtime_name)));
+
+        if pair.0.is_some() && pair.1.is_some() {
+            return Err(ConfigError::ValidationError(
+                "kernel config: 'cmdline' and 'cmdline_extra' are mutually exclusive; \
+                 'cmdline' replaces the platform's line, 'cmdline_extra' appends to it"
+                    .to_string(),
+            ));
+        }
+        Ok(pair)
+    }
+
+    /// The `cmdline`/`cmdline_extra` pair carried by one resolved `kernel:`
+    /// node, or `None` when it names neither. Handles the three shapes the
+    /// section can take: a named ref (`kernel: yocto-6-6`), an inline block,
+    /// and the named map (`kernel: { default: {...} }`, or a sole entry) that
+    /// [`Self::kernel_default`] resolves.
+    fn kernel_cmdline_pair(
+        &self,
+        node: &serde_yaml::Value,
+    ) -> Option<(Option<String>, Option<String>)> {
+        if let Some(name) = node.as_str() {
+            let kc = self.kernel.as_ref()?.get(name)?;
+            return (kc.cmdline.is_some() || kc.cmdline_extra.is_some())
+                .then(|| (kc.cmdline.clone(), kc.cmdline_extra.clone()));
+        }
+        let m = node.as_mapping()?;
+        let has_field = KERNEL_CONFIG_FIELDS
+            .iter()
+            .any(|k| m.contains_key(serde_yaml::Value::String((*k).to_string())));
+        if !has_field {
+            if let Some(d) = m.get("default") {
+                return self.kernel_cmdline_pair(d);
+            }
+            if m.len() == 1 {
+                return self.kernel_cmdline_pair(m.values().next()?);
+            }
+            return None;
+        }
+        let get = |k: &str| node.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let (c, e) = (get("cmdline"), get("cmdline_extra"));
+        (c.is_some() || e.is_some()).then_some((c, e))
+    }
+
     /// Resolve a runtime's `kernel:` field to a concrete [`KernelConfig`],
     /// following named refs to the top-level `kernel.<name>` map.
     ///

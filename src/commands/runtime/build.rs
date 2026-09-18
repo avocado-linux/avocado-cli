@@ -752,6 +752,8 @@ impl RuntimeBuildCommand {
             &mut env_vars,
             config,
             &self.runtime_name,
+            target_arch,
+            Some(parsed),
             merged_runtime.as_ref(),
         )?;
 
