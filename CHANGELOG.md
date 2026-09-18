@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] - 2026-09-17
+
+### Changed
+- **`avocado install` runs the SDK phase in parallel without `--force`.** The
+  sdk packages, rootfs, initramfs and target-dev installs ran one at a time
+  unless `--force` was passed, a gate left over from when `--force` was how dnf
+  got `-y`. The install DAG, the build DAG and the SDK phase now share one
+  parallelism rule: `AVOCADO_PARALLEL_TASKS`, else `min(cpus, 4)`, and `1`
+  under `--runs-on`. The install DAG no longer drops to one task when there is
+  no renderer (`-v`, CI, `--no-tui`). `sdk install`, `runtime install` and
+  `ext install` show the live checklist without `--force`; `-f` on `sdk
+  install` and `runtime install` is hidden but still parses. `avocado install
+  --force` (reseed every extension) is unchanged. (#275)
+
 ### Fixed
 - **`avocado build` no longer deletes the i.MX bootloader it then validates
   against.** The build opened by removing `$OUTPUT_DIR/imx-boot*` to clear a
@@ -27,8 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-i` argument naming a directory that does not exist. Silently: one path
   worked, two did not. The CLI now joins with `:` and its own var-image reader
   splits on `:` to match the hooks.
-
-### Fixed
 - **`avocado install --dnf-arg` no longer makes a project unbuildable.** An
   extension install that passed `--dnf-arg`, or ran with
   `sdk.disable_weak_dependencies`, deleted the extension's install stamp after
@@ -63,6 +75,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is treated as absent. A hook declared under a `target-<name>:` override
   never counts, since `ext build` merges those overrides and the hash does
   not.
+- **`avocado ext build` no longer fails with `Failed to walk` and an empty
+  path.** `--config` defaults to the bare `avocado.yaml`, whose `Path::parent()`
+  is `Some("")`, not `None`, so every `parent().unwrap_or(".")` fallback was
+  skipped on exactly the default input. The crash surfaced in the
+  `package_files` glob walk (any extension with a glob in `package_files`,
+  `avocado-ext-cli` included). A shared `config_file_dir()` treats the empty
+  parent as the current directory at 13 sites. Regression in 1.0.0-rc.4
+  (#265). (#274)
+- **A package-sourced extension that declares a compile script builds
+  again.** After the extension compiled and installed, `avocado build` failed
+  with `Config names avocado-cli-compile.sh but it does not exist under` and
+  an empty path: the stamp hash tried to fold a script the host cannot see
+  (package and git sources unpack inside the SDK volume) by falling back to
+  the project root. The compile script is now skipped when the extension has
+  no host-visible content root, as `post_build` and `install` already were;
+  the extension still invalidates by its resolved version from the lock.
+  Reaches every extension consumed as a package, which is how the `ext-*`
+  repos ship. Regression in 1.0.0-rc.4. (#271)
+- **`kernel.cmdline` / `kernel.cmdline_extra` reach the platform build hook
+  again.** #264 resolved a merge conflict by deleting the build-side export
+  that #252 added, so from 1.0.0-rc.4 the documented field was inert on any
+  target that bakes the command line into a UKI at build time (qcs6490:
+  rb3gen2, rubikpi3); only the provision hook still saw it. Both `runtime
+  build` and `runtime provision` now export through one helper, and a
+  `tests/kernel_cmdline_wiring.rs` guard fails if either call site goes
+  missing. The value is resolved for the target, so a `target-<name>:`
+  override of the command line, at the runtime or the top level, is honored
+  where before it was silently dropped. `cmdline` together with
+  `cmdline_extra` is now an error naming the two keys instead of two exports
+  the hook had to reconcile. The runtime build stamp covers the command line,
+  so an edit to it alone invalidates the build. (#277)
+
+### Security
+- **`cryptoki` 0.12.1 for RUSTSEC-2026-0286** (out-of-bounds read decoding
+  `CKA_ALLOWED_MECHANISMS`). Lockfile bump only. (#278)
+- **The extension source symlink guard is armed on the default config path.**
+  `ExtSourceReader` requires a resolved symlink to stay under the extension
+  root, because a `type: git` tree is third-party content. With the empty
+  root above, `canonicalize("")` failed, the check fell back to the raw root,
+  and `Path::starts_with("")` is true for every path, so a symlink to anywhere
+  passed. The reader now normalizes an empty root to `.` itself, with a test
+  that fails if the guard is disarmed. (#274)
 
 ## [1.0.0-rc.4] - 2026-09-15
 
