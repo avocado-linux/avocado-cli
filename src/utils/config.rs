@@ -4968,8 +4968,14 @@ impl Config {
 
     /// Get stone include paths for a runtime and convert them to container paths.
     ///
-    /// Returns a space-separated string of paths from the container's
-    /// perspective. The composed list is built from two origins, in this
+    /// Returns a **colon-separated** string of paths from the container's
+    /// perspective, matching the `IFS=':'` split every `avocado-build-<target>`
+    /// and `avocado-provision-<target>` hook performs on it. A path containing
+    /// a colon cannot be expressed; a path containing a space survives this
+    /// join but not every reader (see `var_image.rs`, which flattens the list
+    /// into one scalar).
+    ///
+    /// The composed list is built from two origins, in this
     /// priority order (earlier entries win on stone's first-hit search):
     ///
     /// 1. **Runtime-level** `runtimes.<name>.stone_include_paths` — paths
@@ -5043,8 +5049,8 @@ impl Config {
         //
         // Why absolute and not "$AVOCADO_PREFIX/...": this string ends up
         // as an entry inside the AVOCADO_STONE_INCLUDE_PATHS env var. The
-        // recipe scripts iterate that var with `for path in
-        // $AVOCADO_STONE_INCLUDE_PATHS` — bash does NOT perform variable
+        // recipe scripts split that var with `IFS=':' read -ra PATHS` — bash
+        // does NOT perform variable
         // expansion on the contents of an env var value, so a literal
         // "$AVOCADO_PREFIX" survives unchanged into stone's `-i` flag and
         // resolves to a non-existent path. The SDK convention is
@@ -5178,7 +5184,12 @@ impl Config {
         if composed_paths.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(composed_paths.join(" ")))
+            // Colon, not space. The `avocado-build-<target>` hooks that consume
+            // this read it as `IFS=':' read -ra PATHS`, so a space-joined value
+            // with two entries reached stone as one `-i` argument naming a path
+            // that does not exist. A path holding a space is likewise one entry
+            // here and one there.
+            Ok(Some(composed_paths.join(":")))
         }
     }
 
@@ -9814,7 +9825,40 @@ runtimes:
 
         assert!(stone_paths.is_some());
         let paths = stone_paths.unwrap();
-        assert_eq!(paths, "/opt/src/stone-a /opt/src/stone-b /opt/src/stone-c");
+        assert_eq!(paths, "/opt/src/stone-a:/opt/src/stone-b:/opt/src/stone-c");
+    }
+
+    /// The value is read by shell that splits on `:` -- the
+    /// `avocado-build-<target>` hooks do `IFS=\':\' read -ra PATHS`, and the
+    /// CLI's own var-image script matches them. Joined with a space instead,
+    /// a two-path value reached stone as a single `-i` argument naming a
+    /// directory that does not exist, so `stone_include_paths` silently
+    /// accepted only its first entry.
+    #[test]
+    fn stone_include_paths_round_trip_through_the_colon_splitter() {
+        let config_content = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:latest"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    stone_include_paths: ["stone-a", "stone-b"]
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        let config = Config::load(temp_file.path()).unwrap();
+        let joined = config
+            .get_stone_include_paths_for_runtime("test-runtime", "x86_64", temp_file.path())
+            .unwrap()
+            .unwrap();
+
+        // What the hooks do with it.
+        let split: Vec<&str> = joined.split(':').filter(|p| !p.is_empty()).collect();
+        assert_eq!(split, vec!["/opt/src/stone-a", "/opt/src/stone-b"]);
+
+        // A space-separated reader would have seen one path, which is the bug.
+        assert_eq!(joined.split_whitespace().count(), 1);
     }
 
     #[test]
@@ -10110,8 +10154,8 @@ extensions:
 
         assert_eq!(
             stone_paths,
-            "/opt/_avocado/x86_64/includes/ext-a/stone-a \
-/opt/_avocado/x86_64/includes/ext-b/stone-b \
+            "/opt/_avocado/x86_64/includes/ext-a/stone-a:\
+/opt/_avocado/x86_64/includes/ext-b/stone-b:\
 /opt/_avocado/x86_64/includes/ext-c/stone-c"
         );
     }
@@ -10149,7 +10193,7 @@ extensions:
             .unwrap();
         assert_eq!(
             stone_paths,
-            "/opt/src/consumer-stone /opt/_avocado/x86_64/includes/avocado-bsp-foo/ext-stone"
+            "/opt/src/consumer-stone:/opt/_avocado/x86_64/includes/avocado-bsp-foo/ext-stone"
         );
     }
 
@@ -10214,7 +10258,7 @@ extensions:
             .get_stone_include_paths_for_runtime("dev", "x86_64", temp_file.path())
             .unwrap()
             .unwrap();
-        assert_eq!(stone_paths, "/abs/runtime /abs/extension");
+        assert_eq!(stone_paths, "/abs/runtime:/abs/extension");
     }
 
     #[test]
