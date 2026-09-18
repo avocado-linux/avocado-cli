@@ -746,13 +746,24 @@ impl RuntimeBuildCommand {
         // `ext image` exports the epoch inside its own script.
         crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
-        if let Some(stone_paths) = config.get_stone_include_paths_for_runtime(
+        // Where a re-keyed bootloader lands, searched before anything else.
+        // `avocado-build-<target>` appends the runtime dir last, so a re-keyed
+        // image shadows the BSP's copy of the same name without either being
+        // written over. Absolute rather than `$AVOCADO_PREFIX/...`: the recipe
+        // scripts reading this value do not re-expand shell variables in it.
+        let rekeyed_dir = format!(
+            "/opt/_avocado/{target_arch}/runtimes/{}/rekeyed",
+            self.runtime_name
+        );
+        let stone_paths = match config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             target_arch,
             &self.config_path,
         )? {
-            env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
-        }
+            Some(configured) => format!("{rekeyed_dir}:{configured}"),
+            None => rekeyed_dir,
+        };
+        env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
 
         // Get stone manifest if configured
         if let Some(stone_manifest) = config.get_stone_manifest_for_runtime(
@@ -2587,10 +2598,17 @@ mkdir -p "$RUNTIME_EXT_DIR"
 # Clean up stale extensions to ensure fresh copies
 echo "Cleaning up stale extensions..."
 rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
-# Re-keyed bootloader outputs from an earlier build (the feed's re-key script writes
-# them here, where stone resolves them ahead of the SDK's copies). A build that
-# does not re-key must not ship a bootloader closed to the previous key.
-rm -f "$OUTPUT_DIR"/imx-boot-*.bin-* "$OUTPUT_DIR"/imx-boot "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null || true
+# Re-keyed bootloader outputs from an earlier build. A build that does not
+# re-key must not ship a bootloader closed to the previous key, so the whole
+# directory goes. It is one the build owns: $OUTPUT_DIR itself is the runtime's
+# dnf install root, and a BSP installs its bootloader straight into it --
+# `avocado-img-bootfiles` ships /imx-boot and its variants there, and the same
+# RPM ships the stone manifest naming them. Deleting by glob from this
+# directory took the feed's own files with it and left the build validating a
+# manifest against files it had just removed, unrecoverably: a reinstall is a
+# no-op because dnf still considers the package installed.
+rm -rf "$OUTPUT_DIR/rekeyed"
+mkdir -p "$OUTPUT_DIR/rekeyed"
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -3248,10 +3266,14 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
         echo "Built boot FIT: $OUTPUT_DIR/fitImage${AVOCADO_FIT_KEY_DIR:+ (signed)}${AVOCADO_ROOTFS_ROOTHASH:+ (rootfs root hash embedded)}"
         # Make the bootloader enforce that key. The feed ships the procedure and
         # its inputs (imx-boot-tools/rekey-imx-boot.sh + rekey.env, i.MX8M); the
-        # re-packed images take the feed's file names, so stone's imx_boot* image
-        # keys resolve to them ahead of the SDK's copies. A feed without the
-        # tooling is an error, not a silent distro bootloader: a project that
-        # asked for its key in the bootloader must not ship one that ignores it.
+        # re-packed images take the feed's file names, but land in
+        # $OUTPUT_DIR/rekeyed rather than beside the originals. Both the build
+        # hook and the bundle step search that directory ahead of the runtime
+        # dir, so stone's imx_boot* keys still resolve to the re-keyed images --
+        # without the build ever writing into, or deleting from, a directory dnf
+        # owns. A feed without the tooling is an error, not a silent distro
+        # bootloader: a project that asked for its key in the bootloader must not
+        # ship one that ignores it.
         if [ "${AVOCADO_FIT_KEY_IN_BOOTLOADER:-0}" = "1" ]; then
             REKEY="$OUTPUT_DIR/imx-boot-tools/rekey-imx-boot.sh"
             if [ ! -x "$REKEY" ]; then
@@ -3259,11 +3281,11 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
                 exit 1
             fi
             echo "Rebuilding the bootloader to enforce the FIT key..."
-            "$REKEY" "$OUTPUT_DIR/imx-boot-tools" "$AVOCADO_FIT_KEY_DIR" "$OUTPUT_DIR" "${AVOCADO_FIT_ALGO:-sha256,rsa2048}" \
+            "$REKEY" "$OUTPUT_DIR/imx-boot-tools" "$AVOCADO_FIT_KEY_DIR" "$OUTPUT_DIR/rekeyed" "${AVOCADO_FIT_ALGO:-sha256,rsa2048}" \
                 || { echo "ERROR: bootloader re-key failed" >&2; exit 1; }
             # The keyed control DTB is what U-Boot will verify with; run that
             # verification here so a mismatch fails the build, not the boot.
-            KEYED_DTB=$(ls "$OUTPUT_DIR"/u-boot-*.dtb.keyed 2>/dev/null | head -1)
+            KEYED_DTB=$(ls "$OUTPUT_DIR/rekeyed"/u-boot-*.dtb.keyed 2>/dev/null | head -1)
             if [ -n "$KEYED_DTB" ] && command -v fit_check_sign >/dev/null 2>&1; then
                 fit_check_sign -f "$OUTPUT_DIR/fitImage" -k "$KEYED_DTB" >/dev/null 2>&1 \
                     || { echo "ERROR: the re-keyed bootloader does not verify this runtime's boot FIT" >&2; exit 1; }
@@ -3992,12 +4014,42 @@ runtimes:
         assert!(!script.contains("/etc/avocado/var-encrypt"));
         // A previous build's re-keyed bootloader is removed before stone can
         // pick it up, unconditionally and ahead of the FIT assembly that may
-        // regenerate it.
+        // regenerate it. By directory: $OUTPUT_DIR is the runtime's dnf install
+        // root, and a glob across it deleted the BSP's own bootloader -- files
+        // the stone manifest in the same RPM goes on to name.
         let rm = script
-            .find("rm -f \"$OUTPUT_DIR\"/imx-boot-*.bin-* \"$OUTPUT_DIR\"/imx-boot \"$OUTPUT_DIR\"/u-boot-*.dtb.keyed")
+            .find("rm -rf \"$OUTPUT_DIR/rekeyed\"")
             .expect("re-key outputs are cleaned up");
         assert!(rm < script.find("rekey-imx-boot.sh").unwrap());
         assert!(rm < script.find("stone bundle").unwrap());
+        let mkdir = script.find("mkdir -p \"$OUTPUT_DIR/rekeyed\"").unwrap();
+        assert!(
+            rm < mkdir,
+            "the directory is recreated after the removal, not before"
+        );
+        // And it exists before stone is handed it as an include path: the CLI
+        // puts it in AVOCADO_STONE_INCLUDE_PATHS unconditionally, so a target
+        // that never re-keys still passes `-i` for it.
+        assert!(
+            mkdir < script.find("STONE_INCLUDE_FLAGS").unwrap(),
+            "the re-key directory must exist before it is used as an include path"
+        );
+
+        // Nothing in the script may delete from the top level of $OUTPUT_DIR.
+        // It is a dnf install root: the CLI does not own what is in it and
+        // cannot put back what it removes -- a reinstall is a no-op, because
+        // dnf still considers the package installed.
+        for line in script.lines().filter(|l| l.trim_start().starts_with("rm ")) {
+            if !line.contains("$OUTPUT_DIR") {
+                continue;
+            }
+            assert!(
+                line.contains("$OUTPUT_DIR/rekeyed")
+                    || line.contains("$OUTPUT_DIR/fitImage")
+                    || line.contains("$RUNTIME_EXT_DIR"),
+                "removes a path the build does not own from the runtime install root: {line}"
+            );
+        }
     }
 
     #[test]

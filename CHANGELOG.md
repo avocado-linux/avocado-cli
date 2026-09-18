@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`avocado build` no longer deletes the i.MX bootloader it then validates
+  against.** The build opened by removing `$OUTPUT_DIR/imx-boot*` to clear a
+  previous build's re-keyed bootloader. `$OUTPUT_DIR` is the runtime directory,
+  which is also the runtime's dnf install root, so the glob took
+  `avocado-img-bootfiles`' own `/imx-boot` and its variants with it — and the
+  stone manifest shipped by that same RPM names exactly those files. Every
+  `imx8mp-evk` and `imx93-evk` build failed in `stone validate` with two files
+  not found, on a fresh project, with no working state to regress from and no
+  recovery: a reinstall is a no-op, because dnf still considers the package
+  installed. A re-key now writes to `$OUTPUT_DIR/rekeyed`, a directory the build
+  owns and clears wholesale, and that directory is searched ahead of the runtime
+  dir so a re-keyed image still shadows the BSP's. Regression in 1.0.0-rc.3
+  (#224).
+- **`runtimes.<rt>.stone_include_paths` accepts more than one path.** The value
+  was joined with a space and read back with `IFS=':'` by every
+  `avocado-build-<target>` hook, so a second path reached stone as part of one
+  `-i` argument naming a directory that does not exist. Silently: one path
+  worked, two did not. The CLI now joins with `:` and its own var-image reader
+  splits on `:` to match the hooks.
+
+### Fixed
 - **`avocado install --dnf-arg` no longer makes a project unbuildable.** An
   extension install that passed `--dnf-arg`, or ran with
   `sdk.disable_weak_dependencies`, deleted the extension's install stamp after

@@ -365,9 +365,16 @@ export STONE_AOS_OUTPUT
 # Build include path flags from AVOCADO_STONE_INCLUDE_PATHS
 STONE_INCLUDE_FLAGS=""
 if [ -n "${{AVOCADO_STONE_INCLUDE_PATHS:-}}" ]; then
+    # Colon-separated, matching the `avocado-build-<target>` hooks. Splitting on
+    # whitespace here instead made this reader and those disagree about a
+    # multi-path value, and about any path containing a space.
+    _avocado_ifs=$IFS
+    IFS=':'
     for path in $AVOCADO_STONE_INCLUDE_PATHS; do
+        [ -n "$path" ] || continue
         STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $path"
     done
+    IFS=$_avocado_ifs
 fi
 STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
 # Also search the SDK's stone dir. A BSP's stone-<arch>.json references boot
