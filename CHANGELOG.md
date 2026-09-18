@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`avocado install --dnf-arg` no longer makes a project unbuildable.** An
+  extension install that passed `--dnf-arg`, or ran with
+  `sdk.disable_weak_dependencies`, deleted the extension's install stamp after
+  installing successfully — the install hash does not cover either option, and
+  dropping the stamp was how a later plain install was kept from skipping the
+  reinstall. But `ext build` hard-requires `ext/<name>/install.stamp`, so every
+  extension failed with "dependencies not satisfied" on every build, and the
+  fix the error advertised (`avocado ext install <name>`) deleted the stamp
+  again. The stamp is now written and marked `nonstandard_options` instead,
+  and only `ext install`'s own fast path reads the mark: it declines to skip on
+  one. An install that runs a transaction also drops that extension's build and
+  image stamps, since `ext build`'s hash is config-only and its skip would
+  otherwise fire over a sysroot the transaction changed. Regression in
+  1.0.0-rc.4 (#260).
+- **A stamp path is now one shell word, whatever the component is called.** An
+  extension or runtime name is a YAML key and is not constrained to shell-safe
+  characters. The generated scripts that write and remove a stamp interpolated
+  it raw, so a name holding a quote escaped the command and ran in the SDK
+  container. `$AVOCADO_PREFIX` is still expanded, and the rest of the path is
+  single-quoted.
+
 ## [1.0.0-rc.4] - 2026-09-15
 
 ### Added
