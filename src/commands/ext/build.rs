@@ -375,14 +375,25 @@ impl ExtBuildCommand {
             // above — config, compile and install script content, the
             // `package_files` source tree, the overlay — and the sysroot it
             // built is still there. Nothing it would do could change the tree.
-            // A compiled extension's source edit reaches `build_inputs`, so it
-            // is never skipped over one. The stamp is left as it is; `ext image`
-            // reads the same content_hash from it and reaches the same verdict.
+            // The stamp is left as it is; `ext image` reads the same
+            // content_hash from it and reaches the same verdict.
+            //
+            // The skip is only sound while those inputs describe the whole
+            // build. A `post_build` hook installs content the config never
+            // names, so an extension with one is rebuilt unless it declares
+            // `package_files` — see `ext_build_inputs_are_complete`.
             let sysroot_present = crate::utils::stamps::output_listing_from_batch(batch)
                 .iter()
                 .any(|d| d == &self.extension);
+            let inputs_are_complete = crate::utils::stamps::ext_build_inputs_are_complete(
+                parsed,
+                &self.extension,
+                &project_root,
+            );
             if let Some(ref i) = build_inputs {
-                if sysroot_present && crate::utils::stamps::own_stamp_is_current(batch, &own_req, i)
+                if inputs_are_complete
+                    && sysroot_present
+                    && crate::utils::stamps::own_stamp_is_current(batch, &own_req, i)
                 {
                     print_success(
                         &format!("Extension '{}' is up to date.", self.extension),

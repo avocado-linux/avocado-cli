@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it raw, so a name holding a quote escaped the command and ran in the SDK
   container. `$AVOCADO_PREFIX` is still expanded, and the rest of the path is
   single-quoted.
+- **`ext build` no longer reports "up to date" for an extension whose content
+  comes from a `post_build` hook.** The build input hash folds the hook's own
+  bytes, never the bytes it copies, so an edit to the source a compile section
+  builds left every input unmoved. `ext build` skipped the extension, `ext
+  image` rebuilt from the stale sysroot, and `deploy` shipped it — every
+  command exiting 0, with nothing anywhere to say the artifact did not hold the
+  code just compiled. An extension with a hook is now rebuilt unless it
+  declares `package_files`, which is folded and so does describe the source.
+  The declaration counts only when it is really folded: the fold needs a
+  package that names a compile section and a source the host can see, so a
+  `package_files` list on a package- or git-sourced extension promises nothing
+  and is treated as absent. A hook declared under a `target-<name>:` override
+  never counts, since `ext build` merges those overrides and the hash does
+  not.
 
 ## [1.0.0-rc.4] - 2026-09-15
 
