@@ -2623,27 +2623,35 @@ pub fn compute_runtime_build_input_hash(
     }
 
     // Build-only inputs.
-    if let Some(kernel) = merged_runtime.get("kernel") {
+    let runtime_kernel = merged_runtime
+        .get("kernel")
+        .map(|kernel| narrow_kernel_for_hash(kernel, &KERNEL_BUILD_HASH_KEYS));
+    if let Some(kernel) = &runtime_kernel {
         hash_data.insert(
             serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel")),
-            narrow_kernel_for_hash(kernel, &KERNEL_BUILD_HASH_KEYS),
+            kernel.clone(),
         );
-    } else if let Some(top) = parsed.get("kernel") {
-        // The command line export falls back to the top-level `kernel:` block
-        // for a runtime that declares none -- the single-runtime shape that
-        // fallback exists to serve -- so the hash has to follow it there or
-        // that line is a build input nothing reads.
-        //
-        // Folded WHOLE rather than narrowed. This node is the raw section, so
-        // it still carries its `target-<name>:` sub-keys, and narrowing would
-        // drop exactly the per-target line that matters. Hashing the lot
-        // over-invalidates on a cosmetic edit, which is the safe direction:
-        // the alternative is a stamp certifying a build over a command line it
-        // never saw.
-        hash_data.insert(
-            serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel.top_level")),
-            top.clone(),
-        );
+    }
+    // The command line export falls back to the top-level `kernel:` block
+    // whenever the runtime's own block names no command line: no `kernel:`
+    // at all, an inline block without one, or a named ref (whose line lives
+    // in the top-level entry and narrows to nothing here). Follow it in every
+    // one of those cases, or that line is a build input the stamp never saw.
+    //
+    // Folded WHOLE rather than narrowed. This node is the raw section, so
+    // it still carries its `target-<name>:` sub-keys, and narrowing would
+    // drop exactly the per-target line that matters. Hashing the lot
+    // over-invalidates on a cosmetic edit, which is the safe direction.
+    let runtime_names_a_cmdline = runtime_kernel
+        .as_ref()
+        .is_some_and(|k| k.get("cmdline").is_some() || k.get("cmdline_extra").is_some());
+    if !runtime_names_a_cmdline {
+        if let Some(top) = parsed.get("kernel") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("runtime.{runtime_name}.kernel.top_level")),
+                top.clone(),
+            );
+        }
     }
 
     if let Some(ext_list) = merged_runtime
@@ -4872,6 +4880,76 @@ kernel:
             .config_hash
         };
         assert_ne!(hash(&top("quiet")), hash(&top("earlycon")));
+    }
+
+    /// The fallback also fires for a runtime whose `kernel:` block names no
+    /// command line, and for a named ref. Both read the top-level line; both
+    /// left it unhashed when the top level was folded only for a runtime with
+    /// no `kernel:` key at all.
+    #[test]
+    fn a_top_level_cmdline_edit_moves_the_hash_behind_a_runtime_kernel_block() {
+        let yaml = |extra: &str| -> String {
+            format!(
+                "supported_targets:\n  - x86_64\nkernel:\n  package: kernel-image\n  cmdline_extra: \"{extra}\"\nruntimes:\n  dev:\n    target: \"x86_64\"\n    packages:\n      avocado-img-rootfs: \"*\"\n    kernel:\n      package: kernel-image\n"
+            )
+        };
+        assert_top_level_cmdline_is_read_and_hashed(yaml);
+    }
+
+    #[test]
+    fn a_named_ref_cmdline_edit_moves_the_runtime_build_hash() {
+        let yaml = |extra: &str| -> String {
+            format!(
+                "supported_targets:\n  - x86_64\nkernel:\n  yocto-6-6:\n    package: kernel-image\n    cmdline_extra: \"{extra}\"\nruntimes:\n  dev:\n    target: \"x86_64\"\n    packages:\n      avocado-img-rootfs: \"*\"\n    kernel: yocto-6-6\n"
+            )
+        };
+        assert_top_level_cmdline_is_read_and_hashed(yaml);
+    }
+
+    /// Ties the hash to the export: the same document must yield the edited
+    /// line from `effective_kernel_cmdline_for_target` AND a moved hash.
+    fn assert_top_level_cmdline_is_read_and_hashed(yaml: impl Fn(&str) -> String) {
+        let doc = |extra: &str| -> (crate::utils::config::Config, serde_yaml::Value) {
+            let text = yaml(extra);
+            (
+                serde_yaml::from_str(&text).unwrap(),
+                serde_yaml::from_str(&text).unwrap(),
+            )
+        };
+        let merged = |parsed: &serde_yaml::Value| -> serde_yaml::Value {
+            parsed.get("runtimes").unwrap().get("dev").unwrap().clone()
+        };
+        let export = |extra: &str| -> Option<String> {
+            let (config, parsed) = doc(extra);
+            config
+                .effective_kernel_cmdline_for_target(
+                    Some(&parsed),
+                    Some(&merged(&parsed)),
+                    "dev",
+                    "x86_64",
+                )
+                .unwrap()
+                .1
+        };
+        let hash = |extra: &str| -> String {
+            let (_, parsed) = doc(extra);
+            compute_runtime_build_input_hash(
+                &merged(&parsed),
+                "dev",
+                &parsed,
+                std::path::Path::new("."),
+                &Default::default(),
+            )
+            .unwrap()
+            .config_hash
+        };
+        assert_eq!(export("quiet").as_deref(), Some("quiet"));
+        assert_eq!(export("earlycon").as_deref(), Some("earlycon"));
+        assert_ne!(
+            hash("quiet"),
+            hash("earlycon"),
+            "the export reads this line, so the build hash must move with it"
+        );
     }
 
     /// ...and a per-target line inside that block moves it too. The raw section
