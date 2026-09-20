@@ -65,6 +65,41 @@ impl RuntimeExtensionSpec {
     }
 }
 
+/// One extension resolved for a runtime build: its name plus the exact
+/// version that build must use.
+///
+/// Deliberately a pair and not a joined `"{name}-{version}"` string. That
+/// encoding is ambiguous, because a semver pre-release carries a dash of its
+/// own: `kos-layer-osconf-0.0.0-SNAPSHOT` has no recoverable split point, and
+/// splitting at the last dash yields the name `kos-layer-osconf-0.0.0` and the
+/// version `SNAPSHOT`. Every consumer that needs the joined form asks for it
+/// via [`ResolvedExtension::versioned_name`]; nothing decodes it back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResolvedExtension {
+    /// Extension name, already interpolated (no `{{ avocado.target }}` left).
+    pub name: String,
+    /// Resolved version, exactly as it will appear in artifact filenames —
+    /// from the local `extensions.<name>.version` when declared, otherwise
+    /// from the RPM database.
+    pub version: String,
+}
+
+impl ResolvedExtension {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+
+    /// The `<name>-<version>` form: how extension artifacts are named on disk
+    /// and the shape of the `AVOCADO_EXT_LIST` contract with the SDK build
+    /// scripts. Produce it here, never parse it back.
+    pub fn versioned_name(&self) -> String {
+        format!("{}-{}", self.name, self.version)
+    }
+}
+
 /// Extract `enabled` from the options sub-mapping. A null value
 /// (`microclaw:`) is treated as "no options provided" → defaults to
 /// enabled. Anything other than a boolean is ignored.
