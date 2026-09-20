@@ -206,6 +206,7 @@ pub const KERNEL_CONFIG_FIELDS: &[&str] = &[
     "version",
     "compile",
     "install",
+    "binary",
     "image",
     "cmdline",
     "cmdline_extra",
@@ -661,6 +662,26 @@ pub struct KernelConfig {
     pub compile: Option<String>,
     /// Install script path (copies kernel artifacts to runtime build dir). Required when `compile` is set.
     pub install: Option<String>,
+    /// Which kernel binary to stage as `$AVOCADO_PREFIX/kernel/<kver>/Image`.
+    ///
+    /// The value is the Yocto `KERNEL_IMAGETYPE` — i.e. the filename prefix
+    /// ahead of `-<kver>` in the rootfs sysroot's `/boot`:
+    ///
+    /// ```text
+    ///   /boot/Image-6.12.25-v8      -> binary: Image
+    ///   /boot/Image.gz-6.12.25-v8   -> binary: Image.gz
+    ///   /boot/bzImage-6.6.52-yocto  -> binary: bzImage
+    /// ```
+    ///
+    /// When unset, staging keeps its historical behaviour: prefer an
+    /// uncompressed variant, falling back to the first match in sort order.
+    /// When set, the named variant must exist or the install fails — a
+    /// silent fallback here ships the wrong kernel in every downstream kab.
+    ///
+    /// Note this is distinct from `image.type`, which selects kab-vs-raw
+    /// wrapping of whatever binary this key resolves to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
     /// Optional KAB-wrapper config. Same shape as the `image:` block on
     /// extensions and on rootfs/initramfs. When `type: kab` is set, the
     /// staged kernel `Image` is wrapped + signed via kabtool before it
@@ -723,6 +744,10 @@ impl KernelConfig {
 ///
 /// Untagged deserialization: a YAML scalar string parses as `Named`, a YAML
 /// mapping parses as `Inline`.
+///
+/// `Inline` is boxed for the same reason as [`ImageRef`]: `KernelConfig` is
+/// far larger than `String` and clippy's `large_enum_variant` lint otherwise
+/// flags the disparity.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum KernelRef {
@@ -730,7 +755,7 @@ pub enum KernelRef {
     Named(String),
     /// Inline kernel definition. Equivalent to today's `kernel: { ... }`
     /// runtime-level syntax; treated as an anonymous override.
-    Inline(KernelConfig),
+    Inline(Box<KernelConfig>),
 }
 
 /// An image (rootfs/initramfs) reference on a runtime: either a named
@@ -1492,6 +1517,32 @@ pub fn get_post_install(config_node: Option<&serde_yaml::Value>) -> Option<Strin
         .map(String::from)
 }
 
+/// Read `kernel.binary` off an already-resolved `kernel:` node.
+///
+/// Read dynamically (rather than off the typed `KernelConfig`) for the same
+/// reason as `get_ext_image_type`: the caller resolves `target-<name>:`
+/// overrides with `resolve_image_section` first, and that hands back a
+/// `serde_yaml::Value`, not a typed struct.
+pub fn get_kernel_binary(config_node: Option<&serde_yaml::Value>) -> Option<String> {
+    config_node
+        .and_then(|n| n.get("binary"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Read `kernel.package` off an already-resolved `kernel:` node. Same dynamic
+/// access rationale as [`get_kernel_binary`].
+pub fn get_kernel_package(config_node: Option<&serde_yaml::Value>) -> Option<String> {
+    config_node
+        .and_then(|n| n.get("package"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Extract docker_images from a config value (extension or runtime).
 /// Returns an empty Vec if no docker_images are configured.
 pub fn get_docker_images(config: &serde_yaml::Value) -> Vec<DockerImageRef> {
@@ -1812,7 +1863,7 @@ impl Config {
     pub fn resolve_runtime_kernel(&self, runtime_name: &str) -> Option<&KernelConfig> {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.kernel.as_ref()? {
-            KernelRef::Inline(kc) => Some(kc),
+            KernelRef::Inline(kc) => Some(kc.as_ref()),
             KernelRef::Named(name) => self.kernel.as_ref()?.get(name),
         }
     }
@@ -12043,12 +12094,76 @@ sdk:
     }
 
     #[test]
+    fn test_get_kernel_binary_reads_and_normalizes() {
+        let node: serde_yaml::Value = serde_yaml::from_str("binary: Image.gz\n").unwrap();
+        assert_eq!(
+            get_kernel_binary(Some(&node)),
+            Some("Image.gz".to_string()),
+            "plain string value"
+        );
+
+        // Absent / blank must fall through to the default staging behaviour
+        // rather than becoming a literal "" that matches nothing and hard-errors.
+        let empty: serde_yaml::Value = serde_yaml::from_str("binary: '   '\n").unwrap();
+        assert_eq!(
+            get_kernel_binary(Some(&empty)),
+            None,
+            "blank is not a value"
+        );
+        let missing: serde_yaml::Value = serde_yaml::from_str("image: {type: kab}\n").unwrap();
+        assert_eq!(get_kernel_binary(Some(&missing)), None, "absent key");
+        assert_eq!(get_kernel_binary(None), None, "absent section");
+    }
+
+    #[test]
+    fn test_kernel_binary_honors_target_override() {
+        // The multi-arch case this key has to survive: one config serving
+        // arm64 (Image.gz) and x86-64 (bzImage, which has no separate
+        // compressed variant). Resolution goes through resolve_image_section
+        // exactly as rootfs install does it.
+        let yaml = r#"
+kernel:
+  binary: Image.gz
+  image:
+    type: kab
+    args: '-b -t kos.layer.kernel'
+  target-qemux86-64:
+    binary: bzImage
+"#;
+        let composed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+
+        let arm = config.resolve_image_section(&composed, "kernel", "raspberrypi4");
+        assert_eq!(
+            get_kernel_binary(arm.as_ref()),
+            Some("Image.gz".to_string()),
+            "base value applies to targets without an override"
+        );
+
+        let x86 = config.resolve_image_section(&composed, "kernel", "qemux86-64");
+        assert_eq!(
+            get_kernel_binary(x86.as_ref()),
+            Some("bzImage".to_string()),
+            "target-<name> override must win"
+        );
+
+        // `binary` and `image.type` are independent knobs; overriding one
+        // must not disturb the other.
+        assert_eq!(
+            get_ext_image_type(x86.as_ref().unwrap()),
+            Some("kab".to_string()),
+            "image.type survives a binary override"
+        );
+    }
+
+    #[test]
     fn test_kernel_config_validate_package_mode() {
         let kc = KernelConfig {
             package: Some("kernel-image".to_string()),
             version: Some("*".to_string()),
             compile: None,
             install: None,
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: None,
@@ -12063,6 +12178,7 @@ sdk:
             version: None,
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: None,
@@ -12077,6 +12193,7 @@ sdk:
             version: Some("*".to_string()),
             compile: Some("kernel-build".to_string()),
             install: Some("kernel-install.sh".to_string()),
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: None,
@@ -12091,6 +12208,7 @@ sdk:
             version: None,
             compile: Some("kernel-build".to_string()),
             install: None,
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: None,
@@ -12106,6 +12224,7 @@ sdk:
             version: None,
             compile: None,
             install: None,
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: None,
@@ -13786,6 +13905,7 @@ runtimes:
                 version: Some("6.6.*".to_string()),
                 compile: None,
                 install: None,
+                binary: None,
                 image: None,
                 cmdline: None,
                 cmdline_extra: None,
@@ -14550,6 +14670,7 @@ mod kernel_cmdline_tests {
             version: None,
             compile: None,
             install: None,
+            binary: None,
             image: None,
             cmdline: None,
             cmdline_extra: Some("isolcpus=4-6".to_string()),
@@ -14566,6 +14687,7 @@ mod kernel_cmdline_tests {
             version: None,
             compile: None,
             install: None,
+            binary: None,
             image: None,
             cmdline: Some("root=/dev/x".to_string()),
             cmdline_extra: Some("earlycon".to_string()),
