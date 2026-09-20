@@ -1740,7 +1740,8 @@ fi"#
             .unwrap_or_else(|| build_id[..8].to_string());
 
         // Build "name:version:image_type" triples for dynamic manifest generation.
-        // The shell script will compute SHA-256 + UUIDv5 image IDs at build time.
+        // The shell script resolves each image's id at build time: kabs take
+        // their KAB header identifier, everything else uuid5(sha256).
         let ext_info_pairs: Vec<String> = resolved_extensions
             .iter()
             .map(|versioned_name| {
@@ -1984,7 +1985,7 @@ SIGNEOF
 
 echo "Computing content-addressable image IDs..."
 python3 << 'PYEOF'
-import json, hashlib, uuid, os, shutil, struct, sys
+import json, hashlib, uuid, os, shutil, struct, sys, subprocess
 {link_or_copy}
 
 namespace = uuid.UUID(os.environ["AVOCADO_NS_UUID"])
@@ -2026,6 +2027,39 @@ def sha256_file(filepath):
             h.update(chunk)
     return h.hexdigest()
 
+# --- KAB identity -----------------------------------------------------
+# kabtool stamps every KAB it builds with a random UUIDv4 "Identifier"
+# in the header and offers no build-time flag to pin it. For kab-typed
+# images that identifier — not a uuid5(sha256) of the wrapped file — is
+# the authoritative image id: it is what the KOS layer stack sees once
+# the kab is registered. Read it back with `kabtool -l` and use it as
+# both the image_id and the on-disk filename, so the manifest, the
+# filename, and the KAB header all agree.
+def kab_identifier(filepath):
+    out = subprocess.run(
+        ["kabtool", "-l", filepath],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    for line in out.splitlines():
+        # " Identifier : eb946c2d-a349-4fbf-995a-1809c0b9af62"
+        if line.strip().startswith("Identifier"):
+            _, _, val = line.partition(":")
+            return str(uuid.UUID(val.strip()))
+    raise ValueError("no Identifier field in kabtool -l output")
+
+def image_id_for(filepath, sha256, image_type):
+    """kab -> KAB header identifier; anything else -> uuid5(namespace, sha256)."""
+    if image_type != "kab":
+        return str(uuid.uuid5(namespace, sha256))
+    try:
+        return kab_identifier(filepath)
+    except Exception as exc:
+        # Never fall back to a content-derived id here: that is exactly
+        # the mismatch this lookup exists to prevent.
+        raise SystemExit(
+            "ERROR: could not read the KAB identifier from " + filepath + ": " + str(exc)
+        )
+
 def mini_hash(filepath):
     file_size = os.path.getsize(filepath)
     n = min(MINI_HASH_BLOCK, file_size)
@@ -2063,7 +2097,7 @@ for pair in ext_pairs:
         continue
     sha256 = sha256_file(img_file)
     size = os.path.getsize(img_file)
-    image_id = str(uuid.uuid5(namespace, sha256))
+    image_id = image_id_for(img_file, sha256, image_type)
     dest = os.path.join(images_dir, image_id + ext_suffix)
     link_or_copy(img_file, dest)
     print("  Image: " + name + "-" + version + ext_suffix + " -> " + image_id + ext_suffix)
@@ -2094,17 +2128,18 @@ for pair in ext_pairs:
         entry["mini_hash"] = mini_hash(img_file)
     extensions.append(entry)
 
-# rootfs / initramfs / kernel entries. Same content-addressing pattern
-# as extensions: sha256 of the on-disk image -> UUIDv5 image_id, copied
-# into images_dir. Suffix follows image_type: ".kab" when the artifact
-# was wrapped + signed by kabtool earlier in the build, ".raw"
+# rootfs / initramfs / kernel entries. Same id rules as extensions, via
+# image_id_for(): kabs take their KAB header identifier, everything else
+# is content-addressed as uuid5(namespace, sha256). Copied into
+# images_dir under that id. Suffix follows image_type: ".kab" when the
+# artifact was wrapped + signed by kabtool earlier in the build, ".raw"
 # otherwise. Skipped when the corresponding image isn't built.
 def add_image_entry(img_path, version, image_type):
     if not (img_path and os.path.isfile(img_path)):
         return None
     sha256 = sha256_file(img_path)
     size = os.path.getsize(img_path)
-    image_id = str(uuid.uuid5(namespace, sha256))
+    image_id = image_id_for(img_path, sha256, image_type)
     suffix = ".kab" if image_type == "kab" else ".raw"
     dest = os.path.join(images_dir, image_id + suffix)
     link_or_copy(img_path, dest)
@@ -3518,13 +3553,20 @@ fi"#,
 /// with no modular driver. So the pinned kernel is selected by version, and a
 /// pin whose kernel is not staged fails the build while others are. With no
 /// pin, a single staged kernel is unambiguous; several are not. Nothing staged
-/// leaves the variable unset, as for targets that stage no kernel.
+/// leaves the variable unset, as for targets that stage no kernel. A dangling
+/// `Image` link fails the build instead of leaving the manifest without a
+/// `kernel` entry.
 pub(crate) fn render_kernel_image_section(pinned_kver: Option<&str>) -> String {
     match pinned_kver {
         Some(kver) => format!(
             r#"if [ -e "$AVOCADO_PREFIX/kernel/{kver}/Image" ]; then
     export AVOCADO_KERNEL_IMAGE="$AVOCADO_PREFIX/kernel/{kver}/Image"
     export AVOCADO_KERNEL_VERSION="{kver}"
+elif [ -L "$AVOCADO_PREFIX/kernel/{kver}/Image" ]; then
+    echo "[ERROR] kernel image '$AVOCADO_PREFIX/kernel/{kver}/Image' is a broken symlink" >&2
+    echo "        -> $(readlink "$AVOCADO_PREFIX/kernel/{kver}/Image" 2>/dev/null)" >&2
+    echo "        Re-run 'avocado rootfs install' to restage the kernel sysroot." >&2
+    exit 1
 elif ls "$AVOCADO_PREFIX"/kernel/*/Image >/dev/null 2>&1; then
     echo "[ERROR] the lock pins kernel {kver} for the rootfs, but $AVOCADO_PREFIX/kernel/{kver}/Image is not staged; run 'avocado install'" >&2
     exit 1
@@ -3539,6 +3581,11 @@ fi"#
     elif [ -e "$1" ]; then
         export AVOCADO_KERNEL_IMAGE="$1"
         export AVOCADO_KERNEL_VERSION="$(basename "$(dirname "$1")")"
+    elif [ -L "$1" ]; then
+        echo "[ERROR] kernel image '$1' is a broken symlink" >&2
+        echo "        -> $(readlink "$1" 2>/dev/null)" >&2
+        echo "        Re-run 'avocado rootfs install' to restage the kernel sysroot." >&2
+        exit 1
     fi
 }
 avocado_staged_kernel"#
@@ -3591,6 +3638,37 @@ mod tests {
         );
         assert_eq!(run_kernel_image_section(None, &[old, new]).0, 1);
         assert_eq!(run_kernel_image_section(None, &[]), (0, String::new()));
+    }
+
+    #[test]
+    fn kernel_image_dangling_link_fails_the_build() {
+        let kver = "6.12.25-v8";
+        for pinned in [Some(kver), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path().join("kernel").join(kver);
+            std::fs::create_dir_all(&d).unwrap();
+            std::os::unix::fs::symlink(format!("Image.gz-{kver}"), d.join("Image")).unwrap();
+            let script = format!(
+                "AVOCADO_PREFIX='{}'\n{}\n",
+                dir.path().display(),
+                super::render_kernel_image_section(pinned)
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{pinned:?}: {stderr}");
+            assert!(
+                stderr.contains("is a broken symlink"),
+                "{pinned:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("-> Image.gz-{kver}")),
+                "{pinned:?}: {stderr}"
+            );
+        }
     }
 
     use super::{Config, SdkContainer};
@@ -5764,6 +5842,73 @@ runtimes:
         // operators can reference it in their kab args without
         // worrying about ordering or visibility across image blocks.
         assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
+    }
+
+    /// A kab's image_id must be the identifier kabtool stamped into the
+    /// KAB header, not a uuid5 of the wrapped bytes — otherwise the
+    /// manifest `image_id`, the `<image_id>.kab` filename, and the
+    /// header's `Identifier` all disagree. Non-kab images must keep the
+    /// content-addressed uuid5(namespace, sha256) derivation, and must
+    /// never shell out to kabtool (it isn't present for non-kos builds).
+    #[test]
+    fn test_manifest_kab_image_id_comes_from_kab_header() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+distro:
+  version: "0.1.0"
+
+runtimes:
+  test-runtime:
+    target: "raspberrypi4"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("raspberrypi4".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(
+                &config,
+                &parsed,
+                "raspberrypi4",
+                &[],
+                SysrootImageReuse::default(),
+            )
+            .unwrap();
+
+        // Identifier is read back from the kab via kabtool, not recomputed.
+        assert!(script.contains("[\"kabtool\", \"-l\", filepath]"));
+        assert!(script.contains("line.strip().startswith(\"Identifier\")"));
+
+        // Both id sources live behind one helper, keyed on image_type,
+        // so extensions and rootfs/initramfs/kernel cannot diverge.
+        assert!(script.contains("def image_id_for(filepath, sha256, image_type):"));
+        assert!(script.contains(
+            "if image_type != \"kab\":\n        return str(uuid.uuid5(namespace, sha256))"
+        ));
+
+        // Both id-assigning sites route through it: extensions, and the
+        // shared rootfs/initramfs/kernel entry builder.
+        assert!(script.contains("image_id = image_id_for(img_file, sha256, image_type)"));
+        assert!(script.contains("image_id = image_id_for(img_path, sha256, image_type)"));
+        // ...and none of them derives an id inline any more.
+        assert!(!script.contains("image_id = str(uuid.uuid5(namespace, sha256))"));
+
+        // A kab whose identifier can't be read fails the build rather than
+        // silently falling back to a content-derived id.
+        assert!(script.contains("could not read the KAB identifier from"));
     }
 
     #[test]

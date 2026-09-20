@@ -1454,6 +1454,15 @@
             "kernel-install.sh"
           ]
         },
+        "binary": {
+          "type": "string",
+          "description": "Kernel binary to stage as the kernel image: the KERNEL_IMAGETYPE prefix of a /boot/<type>-<kver> file in the rootfs sysroot. The install fails when that variant is not staged. When omitted, an uncompressed variant is preferred.",
+          "examples": [
+            "Image.gz",
+            "Image",
+            "bzImage"
+          ]
+        },
         "image": {
           "type": "object",
           "description": "Optional image wrapper for the staged kernel image.",
