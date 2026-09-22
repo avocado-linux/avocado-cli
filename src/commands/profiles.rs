@@ -139,12 +139,14 @@ impl ProfilesListCommand {
             }
         }
 
+        // The provision section is the source of truth for both env
+        // blocks and field metadata. Both output modes resolve each
+        // profile's enabled fields by walking the env blocks it
+        // references and pulling the matching entries from
+        // `provision.fields`.
+        let provision = manifest.provision.as_ref();
+
         if self.output.is_json() {
-            // The provision section is the source of truth for both
-            // env blocks and field metadata. We resolve each profile's
-            // enabled fields by walking the env blocks it references
-            // and pulling the matching entries from `provision.fields`.
-            let provision = manifest.provision.as_ref();
             emit_json_object(&json!({
                 "available": true,
                 "target": target,
@@ -172,6 +174,27 @@ impl ProfilesListCommand {
                 for (name, p) in &profiles {
                     let script = p.script.as_deref().unwrap_or("(no script)");
                     println!("  {name} → {script}");
+                    let fields = provision
+                        .map(|prov| resolve_profile_fields(prov, p))
+                        .unwrap_or_default();
+                    for field in &fields {
+                        let var = field["name"].as_str().unwrap_or("?");
+                        let field_type = field["type"].as_str().unwrap_or("string");
+                        let required = if field["required"].as_bool().unwrap_or(false) {
+                            "required"
+                        } else {
+                            "optional"
+                        };
+                        let label = field["label"].as_str();
+                        let description = field["description"].as_str();
+                        let text = label.or(description).unwrap_or("");
+                        if text.is_empty() {
+                            println!("      {var} ({field_type}, {required})");
+                        } else {
+                            println!("      {var} ({field_type}, {required}): {text}");
+                        }
+                        println!("        supply with: --env {var}=<value>");
+                    }
                 }
             }
         }
