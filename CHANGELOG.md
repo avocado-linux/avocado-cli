@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **SBOM extension scopes carry a stable image id.** (ENG-2199)
+  `ext:<runtime>/<name>` scope elements now carry `externalIdentifier`/
+  `verifiedUsing` from the runtime's build manifest, and `rootfs`/
+  `initramfs` carry `os_build_id`/`initramfs_build_id` once `runtime
+  var-image` has run — so a device-reported image can be joined back onto
+  the scope that describes it. `spdxId`s and the namespace are unchanged.
+
 ## [1.0.0-rc.5] - 2026-09-17
 
 ### Changed
