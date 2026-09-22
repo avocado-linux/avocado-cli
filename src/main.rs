@@ -450,6 +450,11 @@ enum Commands {
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
+        /// USB disk to provision, as a bare kernel device name (e.g. `sda`),
+        /// not a `/dev` path or a partition. Only meaningful with
+        /// `--profile tegraflash-usb`; sets `AVOCADO_PROVISION_USB_DEVICE`.
+        #[arg(long = "usb-device")]
+        usb_device: Option<String>,
         /// Output path relative to src_dir for provisioning artifacts
         #[arg(long = "out")]
         out: Option<String>,
@@ -463,7 +468,7 @@ enum Commands {
         /// target instead of provisioning. Reads the stone manifest
         /// from the installed SDK volume; requires `avocado install`
         /// to have run.
-        #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
+        #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile", "usb_device"])]
         list: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -1823,6 +1828,11 @@ enum RuntimeCommands {
         /// Environment variables to pass to the provision process
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
+        /// USB disk to provision, as a bare kernel device name (e.g. `sda`),
+        /// not a `/dev` path or a partition. Only meaningful with
+        /// `--profile tegraflash-usb`; sets `AVOCADO_PROVISION_USB_DEVICE`.
+        #[arg(long = "usb-device")]
+        usb_device: Option<String>,
         /// Output path relative to src_dir for provisioning artifacts
         #[arg(long = "out")]
         out: Option<String>,
@@ -2066,15 +2076,20 @@ fn run_with_json_lifecycle(
     Some(guard)
 }
 
-/// Combine provision profile and env vars into a single HashMap
+/// Combine provision profile, env vars, and the USB device override into a single HashMap
 fn build_env_vars(
     provision_profile: Option<&String>,
     env_args: Option<&Vec<String>>,
+    usb_device: Option<&String>,
 ) -> Option<HashMap<String, String>> {
     let mut env_vars = parse_env_vars(env_args).unwrap_or_default();
 
     if let Some(profile) = provision_profile {
         env_vars.insert("AVOCADO_PROVISION_PROFILE".to_string(), profile.clone());
+    }
+
+    if let Some(device) = usb_device {
+        env_vars.insert("AVOCADO_PROVISION_USB_DEVICE".to_string(), device.clone());
     }
 
     if env_vars.is_empty() {
@@ -2477,6 +2492,7 @@ async fn main() -> Result<()> {
             target_board,
             provision_profile,
             env,
+            usb_device,
             out,
             container_args,
             dnf_args,
@@ -2516,7 +2532,11 @@ async fn main() -> Result<()> {
                     target: target.or(cli.target),
                     target_board: park_target_board(target_board),
                     provision_profile: provision_profile.clone(),
-                    env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                    env_vars: build_env_vars(
+                        provision_profile.as_ref(),
+                        env.as_ref(),
+                        usb_device.as_ref(),
+                    ),
                     out,
                     container_args,
                     dnf_args,
@@ -2798,6 +2818,7 @@ async fn main() -> Result<()> {
                 target_board,
                 provision_profile,
                 env,
+                usb_device,
                 out,
                 container_args,
                 dnf_args,
@@ -2814,7 +2835,11 @@ async fn main() -> Result<()> {
                         target: target.or(cli.target),
                         target_board: park_target_board(target_board),
                         provision_profile: provision_profile.clone(),
-                        env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                        env_vars: build_env_vars(
+                            provision_profile.as_ref(),
+                            env.as_ref(),
+                            usb_device.as_ref(),
+                        ),
                         out,
                         container_args,
                         dnf_args,
@@ -5289,7 +5314,7 @@ mod tests {
 
     #[test]
     fn test_build_env_vars_with_provision_profile_only() {
-        let result = build_env_vars(Some(&"production".to_string()), None).unwrap();
+        let result = build_env_vars(Some(&"production".to_string()), None, None).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -5302,7 +5327,7 @@ mod tests {
     fn test_build_env_vars_with_env_args_only() {
         let env_args = vec!["CUSTOM_VAR=custom_value".to_string()];
 
-        let result = build_env_vars(None, Some(&env_args)).unwrap();
+        let result = build_env_vars(None, Some(&env_args), None).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result.get("CUSTOM_VAR"), Some(&"custom_value".to_string()));
@@ -5315,7 +5340,7 @@ mod tests {
             "AVOCADO_DEVICE_CERT=cert_data".to_string(),
         ];
 
-        let result = build_env_vars(Some(&"staging".to_string()), Some(&env_args)).unwrap();
+        let result = build_env_vars(Some(&"staging".to_string()), Some(&env_args), None).unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(
@@ -5331,14 +5356,47 @@ mod tests {
             Some(&"cert_data".to_string())
         );
     }
+    #[test]
+    fn test_build_env_vars_with_usb_device_only() {
+        let result = build_env_vars(None, None, Some(&"sda".to_string())).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get("AVOCADO_PROVISION_USB_DEVICE"),
+            Some(&"sda".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_env_vars_combined_with_usb_device() {
+        let env_args = vec!["CUSTOM_VAR=custom_value".to_string()];
+
+        let result = build_env_vars(
+            Some(&"staging".to_string()),
+            Some(&env_args),
+            Some(&"sdb".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result.get("AVOCADO_PROVISION_PROFILE"),
+            Some(&"staging".to_string())
+        );
+        assert_eq!(result.get("CUSTOM_VAR"), Some(&"custom_value".to_string()));
+        assert_eq!(
+            result.get("AVOCADO_PROVISION_USB_DEVICE"),
+            Some(&"sdb".to_string())
+        );
+    }
 
     #[test]
     fn test_build_env_vars_empty() {
-        let result = build_env_vars(None, None);
+        let result = build_env_vars(None, None, None);
         assert_eq!(result, None);
 
         let empty_vec = vec![];
-        let result = build_env_vars(None, Some(&empty_vec));
+        let result = build_env_vars(None, Some(&empty_vec), None);
         assert_eq!(result, None);
     }
 
