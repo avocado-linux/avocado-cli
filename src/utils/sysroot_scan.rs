@@ -267,6 +267,11 @@ pub async fn run_discovery(config: &Config, req: ScanRequest<'_>) -> Result<Scan
 /// paraphrase of it here would be a guess. Empty when there is nothing to show,
 /// so the caller's message reads normally in the ordinary case.
 pub fn stderr_tail(stderr: &str) -> String {
+    stderr_tail_from(stderr, "rpm")
+}
+
+/// [`stderr_tail`] for stderr that isn't rpm's, labelled with `source`.
+pub fn stderr_tail_from(stderr: &str, source: &str) -> String {
     const LINES: usize = 10;
     let lines: Vec<&str> = stderr
         .lines()
@@ -277,7 +282,7 @@ pub fn stderr_tail(stderr: &str) -> String {
         return String::new();
     }
     let tail = lines[lines.len().saturating_sub(LINES)..].join("\n  ");
-    format!(" rpm reported:\n  {tail}")
+    format!(" {source} reported:\n  {tail}")
 }
 
 /// The discovery script, with its placeholders left in. Exposed so tests can

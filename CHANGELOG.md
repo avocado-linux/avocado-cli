@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initramfs` carry `os_build_id`/`initramfs_build_id` once `runtime
   var-image` has run — so a device-reported image can be joined back onto
   the scope that describes it. `spdxId`s and the namespace are unchanged.
+- **`avocado sbom --device [user@]host[:port]` describes a running
+  device.** (ENG-2199) Reads the device's active runtime and merged
+  extensions over SSH and filters the build SBOM to that set. Anything
+  merged that the build doesn't cover is listed as an uncovered element
+  instead of dropped, and a runtime/OS build id that disagrees with the
+  device's is warned about rather than failed on.
 
 ## [1.0.0-rc.5] - 2026-09-17
 
