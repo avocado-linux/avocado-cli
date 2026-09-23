@@ -185,13 +185,22 @@ impl ProfilesListCommand {
                         } else {
                             "optional"
                         };
-                        let label = field["label"].as_str();
-                        let description = field["description"].as_str();
-                        let text = label.or(description).unwrap_or("");
-                        if text.is_empty() {
-                            println!("      {var} ({field_type}, {required})");
-                        } else {
-                            println!("      {var} ({field_type}, {required}): {text}");
+                        let label = field["label"].as_str().filter(|s| !s.is_empty());
+                        let description = field["description"].as_str().filter(|s| !s.is_empty());
+                        match (label, description) {
+                            (Some(l), Some(d)) => {
+                                println!("      {var} ({field_type}, {required}): {l}");
+                                println!("        {d}");
+                            }
+                            (Some(l), None) => {
+                                println!("      {var} ({field_type}, {required}): {l}");
+                            }
+                            (None, Some(d)) => {
+                                println!("      {var} ({field_type}, {required}): {d}");
+                            }
+                            (None, None) => {
+                                println!("      {var} ({field_type}, {required})");
+                            }
                         }
                         println!("        supply with: --env {var}=<value>");
                     }
