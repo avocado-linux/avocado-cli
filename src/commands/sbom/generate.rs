@@ -12,12 +12,16 @@
 //! element every `software_Sbom` references by id.
 
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use super::device;
 use crate::utils::config::{ComposedConfig, Config};
+use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::device::DeviceSpec;
 use crate::utils::lockfile::{LockFile, RepoSnapshot, RPM_SBOM_FIELDS, RPM_SBOM_FORMAT};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 use crate::utils::output_format::{emit_json_object, JsonOutputGuard, OutputFormat};
@@ -155,6 +159,128 @@ pub(crate) struct Scope {
     unreadable: usize,
 }
 
+/// A scope's join key onto the runtime build manifest, so a consumer that
+/// already stores that manifest can match a device-reported image to the
+/// scope that describes it. Not folded into `namespace_digest` or any
+/// `spdxId`, which must stay stable across a rebuild that only moves image
+/// bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageEntry {
+    pub(crate) image_id: String,
+    /// Tells a consumer which kind of id `image_id` is.
+    pub(crate) authority: &'static str,
+    /// Absent when the manifest has none, or when `image_id` isn't a hash
+    /// of the scope's own bytes (see `rootfs`/`initramfs` below).
+    pub(crate) sha256: Option<String>,
+}
+
+/// Uuid5 of an uploaded image file's sha256.
+const IMAGE_ID_AUTHORITY: &str = "https://avocadolinux.org/image-id";
+/// Build id baked into `os-release`; never equals any uploaded image's id.
+const OS_BUILD_ID_AUTHORITY: &str = "https://avocadolinux.org/os-build-id";
+
+/// Image ids keyed by scope name (`ext:<runtime>/<name>`, `rootfs`,
+/// `initramfs`), matching the names `build_document` uses.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ImageIds {
+    entries: BTreeMap<String, ImageEntry>,
+    /// Shared scopes whose runtimes' manifests disagreed; kept so a later
+    /// runtime can't re-add them.
+    conflicts: BTreeSet<String>,
+}
+
+impl ImageIds {
+    /// `rootfs`/`initramfs` use `os_bundle.os_build_id`/`initramfs_build_id`,
+    /// not the manifest's top-level `image_id` fields: `os_build_id` is
+    /// written into the shipped rootfs's own `os-release`, so it's the only
+    /// id a device can echo back. `os_bundle` only exists once `runtime
+    /// var-image` has run, so a manifest without it leaves these unmapped.
+    pub(crate) fn from_manifest(manifest: &serde_json::Value, runtime: &str) -> Self {
+        let mut map = BTreeMap::new();
+
+        if let Some(extensions) = manifest.get("extensions").and_then(|v| v.as_array()) {
+            for ext in extensions {
+                let (Some(name), Some(image_id)) = (
+                    ext.get("name").and_then(|v| v.as_str()),
+                    ext.get("image_id").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                let sha256 = ext
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                map.insert(
+                    format!("ext:{runtime}/{name}"),
+                    ImageEntry {
+                        image_id: image_id.to_string(),
+                        authority: IMAGE_ID_AUTHORITY,
+                        sha256,
+                    },
+                );
+            }
+        }
+
+        if let Some(os_bundle) = manifest.get("os_bundle") {
+            if let Some(id) = os_bundle.get("os_build_id").and_then(|v| v.as_str()) {
+                map.insert(
+                    "rootfs".to_string(),
+                    ImageEntry {
+                        image_id: id.to_string(),
+                        authority: OS_BUILD_ID_AUTHORITY,
+                        sha256: None,
+                    },
+                );
+            }
+            if let Some(id) = os_bundle.get("initramfs_build_id").and_then(|v| v.as_str()) {
+                map.insert(
+                    "initramfs".to_string(),
+                    ImageEntry {
+                        image_id: id.to_string(),
+                        authority: OS_BUILD_ID_AUTHORITY,
+                        sha256: None,
+                    },
+                );
+            }
+        }
+
+        Self {
+            entries: map,
+            conflicts: BTreeSet::new(),
+        }
+    }
+
+    /// Fold another runtime's mapping in, for a document covering several
+    /// runtimes. A shared scope (`rootfs`/`initramfs`) whose ids disagree is
+    /// dropped, since no single id describes the scanned sysroot; returns the
+    /// scopes newly dropped.
+    pub(crate) fn merge(&mut self, other: ImageIds) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.conflicts.extend(other.conflicts);
+        for (scope, entry) in other.entries {
+            if self.conflicts.contains(&scope) {
+                continue;
+            }
+            match self.entries.get(&scope) {
+                Some(existing) if existing.image_id != entry.image_id => {
+                    self.entries.remove(&scope);
+                    self.conflicts.insert(scope.clone());
+                    dropped.push(scope);
+                }
+                Some(_) => {}
+                None => {
+                    self.entries.insert(scope, entry);
+                }
+            }
+        }
+        dropped
+    }
+
+    pub(crate) fn get(&self, scope: &str) -> Option<&ImageEntry> {
+        self.entries.get(scope)
+    }
+}
+
 /// Whether a scope's installroot was seeded with a copy of the rootfs RPM
 /// database, and so needs the seed subtracted before its packages can be read
 /// as its own content. See `parse_scopes` for what the seed is and why.
@@ -253,6 +379,54 @@ pub(crate) fn runtime_has_packages(scopes: &[Scope], runtime: &str) -> bool {
     scopes
         .iter()
         .any(|s| s.name == format!("runtime:{runtime}") && !s.packages.is_empty())
+}
+
+/// Finds each runtime's active manifest.json and prints it as
+/// `##MANIFEST\t<runtime>\t<base64>`. Base64 because the manifest is
+/// pretty-printed, and raw newlines would break the line-oriented output.
+const MANIFEST_SCRIPT: &str = r#"
+set -u
+for runtime_dir in "$AVOCADO_PREFIX"/runtimes/*/; do
+    [ -d "$runtime_dir" ] || continue
+    name=$(basename "$runtime_dir")
+    staging="${runtime_dir}var-staging/lib/avocado"
+    manifest=""
+    if [ -f "$staging/active/manifest.json" ]; then
+        manifest="$staging/active/manifest.json"
+    else
+        for d in "$staging"/runtimes/*/; do
+            [ -f "${d}manifest.json" ] || continue
+            manifest="${d}manifest.json"
+            break
+        done
+    fi
+    [ -n "$manifest" ] || continue
+    printf '##MANIFEST\t%s\t' "$name"
+    base64 "$manifest" | tr -d '\n'
+    printf '\n'
+done
+"#;
+
+/// Parse `MANIFEST_SCRIPT`'s output into runtime name -> manifest JSON.
+/// Unparseable lines are dropped rather than failing the whole read.
+fn parse_manifests(output: &str) -> BTreeMap<String, serde_json::Value> {
+    let mut manifests = BTreeMap::new();
+    for line in output.lines() {
+        let Some(rest) = line.strip_prefix("##MANIFEST\t") else {
+            continue;
+        };
+        let Some((name, b64)) = rest.split_once('\t') else {
+            continue;
+        };
+        let Ok(bytes) = BASE64_STANDARD.decode(b64) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        manifests.insert(name.to_string(), value);
+    }
+    manifests
 }
 
 /// Tripwires on the seeded-scope subtraction, which is a heuristic and has been
@@ -518,6 +692,91 @@ fn spdx_time(epoch: &str) -> Option<String> {
     Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
+/// A deterministic id for an uncovered device entry, keyed on its own
+/// identity (name/version/origin) rather than encounter order.
+fn uncovered_id(ns: &str, entry: &device::UncoveredEntry) -> String {
+    let version = entry.version.as_deref().unwrap_or("(none)");
+    let origin = entry.origin.as_deref().unwrap_or("(none)");
+    format!(
+        "{ns}/uncovered/{}",
+        slug_id(&format!("{}\t{version}\t{origin}", entry.name))
+    )
+}
+
+/// Rewrites the first `software_Sbom` node `build_document` just built into
+/// a device-identified one, and appends one `software_Package` per
+/// uncovered device entry. Every scope/package id it minted is left as-is,
+/// so this document can still be diffed against a plain one built from the
+/// same scopes.
+fn attach_device_identity(
+    doc: &mut serde_json::Value,
+    ns: &str,
+    creation_id: &str,
+    target: &str,
+    host: &str,
+    uncovered: &[device::UncoveredEntry],
+) {
+    // Per-host ids: `ns` doesn't include the host, so `{ns}/sbom` and
+    // `{ns}/document` would collide with other devices and the runtime
+    // document.
+    let device_sbom_id = format!("{ns}/sbom/device/{}", slug_id(host));
+    let device_doc_id = format!("{ns}/document/device/{}", slug_id(host));
+    let uncovered_ids: Vec<String> = uncovered.iter().map(|u| uncovered_id(ns, u)).collect();
+
+    let graph = doc["@graph"]
+        .as_array_mut()
+        .expect("build_document always emits an @graph array");
+
+    {
+        let sbom = graph
+            .iter_mut()
+            .find(|e| e["type"] == "software_Sbom")
+            .expect("build_document always emits a software_Sbom, and it is first");
+        sbom["spdxId"] = serde_json::json!(device_sbom_id);
+        sbom["name"] = serde_json::json!(format!("avocado {target} device {host} SBOM"));
+        // "runtime": this composition was observed on a running system, not
+        // just declared by avocado.yaml.
+        sbom["software_sbomType"] = serde_json::json!(["deployed", "runtime"]);
+        if !uncovered_ids.is_empty() {
+            let element = sbom["element"]
+                .as_array_mut()
+                .expect("build_document's element is always an array");
+            element.extend(uncovered_ids.iter().cloned().map(serde_json::Value::String));
+            // Uncovered entries are roots too: no parent scope contains them.
+            let root_element = sbom["rootElement"]
+                .as_array_mut()
+                .expect("build_document's rootElement is always an array");
+            root_element.extend(uncovered_ids.iter().cloned().map(serde_json::Value::String));
+        }
+    }
+
+    if let Some(spdx_doc) = graph.iter_mut().find(|e| e["type"] == "SpdxDocument") {
+        spdx_doc["spdxId"] = serde_json::json!(device_doc_id);
+        spdx_doc["rootElement"] = serde_json::json!([device_sbom_id]);
+    }
+
+    for entry in uncovered {
+        let mut node = serde_json::json!({
+            "type": "software_Package",
+            "spdxId": uncovered_id(ns, entry),
+            "creationInfo": creation_id,
+            "name": entry.name,
+            "software_primaryPurpose": "archive",
+            // No `contains` edge: unlike a kept scope, there is no rpmdb or
+            // manifest behind this entry to say what packages it holds.
+            "comment": format!(
+                "Merged on the device with origin {}, not covered by this build's SBOM: no \
+                 scope in this document carries a matching image id.",
+                entry.origin.as_deref().unwrap_or("unknown"),
+            ),
+        });
+        if let Some(version) = &entry.version {
+            node["software_packageVersion"] = serde_json::json!(version);
+        }
+        graph.push(node);
+    }
+}
+
 pub struct SbomCommand {
     config_path: String,
     /// The global `--runs-on`, carried only so the command can refuse it.
@@ -533,6 +792,9 @@ pub struct SbomCommand {
     output: OutputFormat,
     sdk_arch: Option<String>,
     composed_config: Option<Arc<ComposedConfig>>,
+    /// `-d/--device`: read the merged extension set from a running device
+    /// and filter the build SBOM to exactly that.
+    device: Option<String>,
 }
 
 impl SbomCommand {
@@ -557,7 +819,14 @@ impl SbomCommand {
             runs_on: None,
             sdk_arch: None,
             composed_config: None,
+            device: None,
         }
+    }
+
+    /// Record `-d/--device`. `None` is byte-identical to a plain `avocado sbom`.
+    pub fn with_device(mut self, device: Option<String>) -> Self {
+        self.device = device;
+        self
     }
 
     /// Record the global `--runs-on` so `execute` can refuse it rather than
@@ -591,16 +860,40 @@ impl SbomCommand {
             );
         }
 
+        // The SDK and target sysroot never run on a device.
+        if self.device.is_some() && self.include_sdk {
+            anyhow::bail!(
+                "--device and --include-sdk cannot be combined: the SDK and target sysroot run \
+                 on the build host, not the device, so there is nothing on the device for \
+                 --include-sdk to describe."
+            );
+        }
+
         let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
 
-        let (scopes, target, snapshot) = self.scan(|m| eprintln!("[WARN] {m}")).await?;
-        let doc = self.build_document(&scopes, &target, snapshot.as_ref(), None);
+        let warn: fn(&str) = |m| eprintln!("[WARN] {m}");
+        let (scopes, target, snapshot) = self.scan(warn).await?;
+
+        let (doc, summary_scopes, uncovered) = match &self.device {
+            Some(device_str) => {
+                let (doc, kept_scopes, uncovered) = self
+                    .build_device_document(scopes, &target, snapshot.as_ref(), device_str, warn)
+                    .await?;
+                (doc, kept_scopes, Some(uncovered))
+            }
+            None => {
+                let images = self.read_images(&scopes, &target, warn).await;
+                let doc =
+                    self.build_document(&scopes, &target, snapshot.as_ref(), None, images.as_ref());
+                (doc, scopes, None)
+            }
+        };
 
         match &self.output_path {
             Some(path) => {
                 std::fs::write(path, serde_json::to_string_pretty(&doc)?)
                     .with_context(|| format!("Failed to write SBOM to '{path}'"))?;
-                self.print_summary(&scopes, Some(path));
+                self.print_summary(&summary_scopes, Some(path), uncovered.as_deref());
             }
             None if self.output.is_json() => emit_json_object(&doc),
             None => {
@@ -609,6 +902,18 @@ impl SbomCommand {
         }
 
         Ok(())
+    }
+
+    /// The project's composed config, reused if `with_composed_config`
+    /// already set one. Shared by `scan` and `read_images`.
+    fn composed_config(&self) -> Result<Arc<ComposedConfig>> {
+        match &self.composed_config {
+            Some(cc) => Ok(Arc::clone(cc)),
+            None => Ok(Arc::new(
+                Config::load_composed(&self.config_path, self.target.as_deref())
+                    .context("Failed to load composed config")?,
+            )),
+        }
     }
 
     /// Scan every sysroot and return the parsed scopes, the resolved target,
@@ -630,13 +935,7 @@ impl SbomCommand {
         &self,
         warn: fn(&str),
     ) -> Result<(Vec<Scope>, String, Option<RepoSnapshot>)> {
-        let composed = match &self.composed_config {
-            Some(cc) => Arc::clone(cc),
-            None => Arc::new(
-                Config::load_composed(&self.config_path, self.target.as_deref())
-                    .context("Failed to load composed config")?,
-            ),
-        };
+        let composed = self.composed_config()?;
         let config = &composed.config;
         let target = resolve_target_required(self.target.as_deref(), config)?;
 
@@ -736,6 +1035,237 @@ impl SbomCommand {
             .and_then(|lock| lock.get_repo_snapshot(&target).cloned());
 
         Ok((scopes, target, snapshot))
+    }
+
+    /// Image ids for this document's scopes, read from each runtime's build
+    /// manifest in the container volume. `connect upload` skips this and
+    /// calls `ImageIds::from_manifest` directly, since it already has the
+    /// one manifest it needs; this covers `avocado sbom`'s document, which
+    /// may span several runtimes.
+    ///
+    /// Never fails `avocado sbom`: a project with no build yet just gets a
+    /// document without image ids, reported through `warn`.
+    async fn read_images(
+        &self,
+        scopes: &[Scope],
+        target: &str,
+        warn: fn(&str),
+    ) -> Option<ImageIds> {
+        let runtimes: Vec<&str> = scopes
+            .iter()
+            .filter_map(|s| s.name.strip_prefix("runtime:"))
+            .collect();
+        if runtimes.is_empty() {
+            return None;
+        }
+
+        let manifests = match self.fetch_manifests(target).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn(&format!(
+                    "no build manifest: extension scopes carry no image id ({e:#})"
+                ));
+                return None;
+            }
+        };
+
+        let missing: Vec<&str> = runtimes
+            .iter()
+            .filter(|r| !manifests.contains_key(**r))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            warn(&format!(
+                "no build manifest for runtime(s) {}: extension scopes carry no image id",
+                missing.join(", ")
+            ));
+        }
+
+        let mut images = ImageIds::default();
+        for (name, manifest) in &manifests {
+            for scope in images.merge(ImageIds::from_manifest(manifest, name)) {
+                warn(&format!(
+                    "runtimes' build manifests disagree on {scope}: it carries no build id (rebuild the stale runtime)"
+                ));
+            }
+        }
+        Some(images)
+    }
+
+    /// Run `MANIFEST_SCRIPT` in the SDK container and parse its output.
+    async fn fetch_manifests(&self, target: &str) -> Result<BTreeMap<String, serde_json::Value>> {
+        let composed = self.composed_config()?;
+        let config = &composed.config;
+        let container_image = config.get_sdk_image().cloned().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
+        })?;
+
+        let container = SdkContainer::from_config(&self.config_path, config)?;
+        let run_config = RunConfig {
+            container_image,
+            target: target.to_string(),
+            command: MANIFEST_SCRIPT.to_string(),
+            source_environment: false,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url: config.get_sdk_repo_url(),
+            repo_release: config.get_sdk_repo_release(),
+            container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
+
+        let out = container.run_in_container_capture(run_config).await?;
+        if !out.success {
+            anyhow::bail!(
+                "the manifest discovery script exited non-zero inside the SDK container.{}",
+                sysroot_scan::stderr_tail_from(&out.stderr, "the SDK container")
+            );
+        }
+        Ok(parse_manifests(&out.stdout))
+    }
+
+    /// Runs `avocadoctl` queries over SSH, inside the SDK container — as
+    /// `runtime deploy` does, since only the container is guaranteed a
+    /// route to the device (e.g. macOS/Windows, where it runs in a VM).
+    async fn fetch_device_report(
+        &self,
+        target: &str,
+        spec: &DeviceSpec,
+    ) -> Result<device::DeviceReport> {
+        let composed = self.composed_config()?;
+        let config = &composed.config;
+        let container_image = config.get_sdk_image().cloned().ok_or_else(|| {
+            anyhow::anyhow!("No container image specified in config under 'sdk.image'.")
+        })?;
+
+        let container = SdkContainer::from_config(&self.config_path, config)?;
+        let run_config = RunConfig {
+            container_image,
+            target: target.to_string(),
+            command: device::ssh_query_script(spec),
+            // The SDK environment is what puts `ssh` on PATH, as for deploy.
+            source_environment: true,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url: config.get_sdk_repo_url(),
+            repo_release: config.get_sdk_repo_release(),
+            container_args: config.merge_sdk_container_args(self.container_args.as_ref()),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
+
+        let out = container.run_in_container_capture(run_config).await?;
+        device::parse_device_report(&out.stdout).with_context(|| {
+            format!(
+                "querying {} over SSH failed.{}",
+                spec.ssh_destination(),
+                sysroot_scan::stderr_tail_from(&out.stderr, "ssh")
+            )
+        })
+    }
+
+    /// Queries the device, reconciles its merged set against this project's
+    /// build manifest, and builds the document from the matching scopes.
+    /// Returns the document, the scopes it was built from, and the
+    /// merged-but-unmatched entries.
+    async fn build_device_document(
+        &self,
+        scopes: Vec<Scope>,
+        target: &str,
+        snapshot: Option<&RepoSnapshot>,
+        device_str: &str,
+        warn: fn(&str),
+    ) -> Result<(serde_json::Value, Vec<Scope>, Vec<device::UncoveredEntry>)> {
+        let spec = DeviceSpec::parse(device_str)
+            .with_context(|| format!("invalid --device value '{device_str}'"))?;
+        let report = self.fetch_device_report(target, &spec).await?;
+
+        // Matched by name, not build id: the id is expected to move across
+        // an OTA (see `runtime_id_warning` below).
+        let rt_name = report.runtime.runtime.name.clone();
+        let rt_scope = format!("runtime:{rt_name}");
+        if !scopes.iter().any(|s| s.name == rt_scope) {
+            anyhow::bail!(
+                "the device's active runtime '{rt_name}' has no matching runtime in this \
+                 project; run `avocado build` for a runtime named '{rt_name}', or point \
+                 --device at a device running a runtime this project declares."
+            );
+        }
+
+        // A missing manifest doesn't fail the command: every merged
+        // extension just ends up uncovered instead.
+        let manifests = match self.fetch_manifests(target).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn(&format!(
+                    "no build manifest: every extension merged on the device will be reported \
+                     as uncovered ({e:#})"
+                ));
+                BTreeMap::new()
+            }
+        };
+        let local_manifest = manifests.get(&rt_name);
+        let local_images = local_manifest
+            .map(|m| ImageIds::from_manifest(m, &rt_name))
+            .unwrap_or_default();
+
+        if let Some(warning) = device::runtime_id_warning(
+            &report.runtime.id,
+            local_manifest
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str()),
+        ) {
+            warn(&warning);
+        }
+        for warning in device::build_id_warnings(&report.runtime, &local_images) {
+            warn(&warning);
+        }
+
+        let merged = device::joined_merged_extensions(&report.runtime, &report.statuses);
+        let scanned_scopes: BTreeSet<String> = scopes.iter().map(|s| s.name.clone()).collect();
+        let state =
+            device::resolve_kept_and_uncovered(&merged, &rt_name, &local_images, &scanned_scopes);
+
+        for entry in &state.uncovered {
+            warn(&format!(
+                "merged on the device but not covered by this build's SBOM: {}",
+                entry.label()
+            ));
+        }
+
+        let kept_scopes: Vec<Scope> = scopes
+            .into_iter()
+            .filter(|s| state.kept_scopes.contains(&s.name))
+            .collect();
+
+        // Computed the same way `build_document` computes it internally, so
+        // ids from `kept_scopes` match a plain document built from the same
+        // scope list (only when nothing was dropped — see the stability test).
+        let ns = format!(
+            "https://avocadolinux.org/spdx/{}/{}",
+            slug_id(target),
+            Self::namespace_digest(&kept_scopes, Some(&rt_name)),
+        );
+        let creation_id = format!("{ns}/creationinfo/1");
+
+        let mut doc = self.build_document(
+            &kept_scopes,
+            target,
+            snapshot,
+            Some(&rt_name),
+            Some(&local_images),
+        );
+        attach_device_identity(
+            &mut doc,
+            &ns,
+            &creation_id,
+            target,
+            &spec.host,
+            &state.uncovered,
+        );
+
+        Ok((doc, kept_scopes, state.uncovered))
     }
 
     /// Map the raw dump onto packages, dropping what a scope only sees because
@@ -935,6 +1465,7 @@ impl SbomCommand {
         target: &str,
         snapshot: Option<&RepoSnapshot>,
         runtime: Option<&str>,
+        images: Option<&ImageIds>,
     ) -> serde_json::Value {
         let ns = format!(
             "https://avocadolinux.org/spdx/{}/{}",
@@ -1012,14 +1543,43 @@ impl SbomCommand {
         // "scanned and empty" stays visible where it belongs.
         for scope in scopes.iter().filter(|s| !s.packages.is_empty()) {
             let scope_id = format!("{ns}/scope/{}", slug_id(&scope.name));
-            graph.push(serde_json::json!({
+            let mut scope_element = serde_json::json!({
                 "type": "software_Package",
                 "spdxId": scope_id,
                 "creationInfo": creation_id,
                 "name": scope.name,
                 "software_primaryPurpose": "archive",
                 "comment": format!("avocado sysroot at {}", scope.root),
-            }));
+            });
+
+            // Not folded into scope_id/ns: those feed namespace_digest, which
+            // must stay stable across a rebuild that only moves image bytes.
+            if let Some(entry) = images.and_then(|images| images.get(&scope.name)) {
+                let obj = scope_element
+                    .as_object_mut()
+                    .expect("json! built an object");
+                obj.insert(
+                    "externalIdentifier".into(),
+                    serde_json::json!([{
+                        "type": "ExternalIdentifier",
+                        "externalIdentifierType": "other",
+                        "identifier": entry.image_id,
+                        "issuingAuthority": entry.authority,
+                    }]),
+                );
+                if let Some(sha256) = &entry.sha256 {
+                    obj.insert(
+                        "verifiedUsing".into(),
+                        serde_json::json!([{
+                            "type": "Hash",
+                            "algorithm": "sha256",
+                            "hashValue": sha256,
+                        }]),
+                    );
+                }
+            }
+
+            graph.push(scope_element);
             scope_ids.push((scope.name.clone(), scope_id.clone()));
 
             let mut members: Vec<String> = Vec::new();
@@ -1307,8 +1867,9 @@ impl SbomCommand {
         path: Option<&str>,
         packages: usize,
         occurrences: usize,
+        uncovered: Option<&[device::UncoveredEntry]>,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "output_path": path,
             "packages": packages,
             "occurrences": occurrences,
@@ -1317,10 +1878,29 @@ impl SbomCommand {
                 .iter()
                 .map(|s| serde_json::json!({ "name": s.name, "packages": s.packages.len() }))
                 .collect::<Vec<_>>(),
-        })
+        });
+        // Only present under `--device`, so a plain summary is unchanged.
+        if let Some(uncovered) = uncovered {
+            obj["uncovered"] = serde_json::json!(uncovered
+                .iter()
+                .map(|u| serde_json::json!({
+                    "name": u.name,
+                    "version": u.version,
+                    "origin": u.origin,
+                }))
+                .collect::<Vec<_>>());
+        }
+        obj
     }
 
-    fn print_summary(&self, scopes: &[Scope], path: Option<&str>) {
+    /// `uncovered` is `Some` only under `--device`: merged device entries no
+    /// kept scope could account for.
+    fn print_summary(
+        &self,
+        scopes: &[Scope],
+        path: Option<&str>,
+        uncovered: Option<&[device::UncoveredEntry]>,
+    ) {
         let mut distinct: BTreeSet<(&str, &str, &str, &str, &str)> = BTreeSet::new();
         for scope in scopes {
             for pkg in &scope.packages {
@@ -1334,7 +1914,13 @@ impl SbomCommand {
         // to parse. Printing the human table here would put unparseable lines
         // on a stream a consumer reads as JSON.
         if self.output.is_json() {
-            emit_json_object(&self.summary_json(scopes, path, distinct.len(), occurrences));
+            emit_json_object(&self.summary_json(
+                scopes,
+                path,
+                distinct.len(),
+                occurrences,
+                uncovered,
+            ));
             return;
         }
 
@@ -1358,6 +1944,17 @@ impl SbomCommand {
                  nothing. Pass --include-sdk to audit them too.",
                 OutputLevel::Normal,
             );
+        }
+        if let Some(uncovered) = uncovered.filter(|u| !u.is_empty()) {
+            println!();
+            print_info(
+                "Merged on the device but not covered by this build's SBOM (no scope carries \
+                 a matching image id — see the uncovered package(s) in the document itself):",
+                OutputLevel::Normal,
+            );
+            for entry in uncovered {
+                println!("  {}", entry.label());
+            }
         }
         if let Some(path) = path {
             print_success(
@@ -1774,7 +2371,7 @@ mod tests {
         let mut scopes = c.parse_scopes(&dump);
         scopes[0].packages[0].sourcerpm = "(none)".to_string();
 
-        let doc = c.build_document(&scopes, "qemuarm64", None, None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, None);
         let pkg = doc["@graph"]
             .as_array()
             .unwrap()
@@ -1841,7 +2438,7 @@ mod tests {
         let scopes = c.parse_scopes(&dump);
         assert_eq!(scopes.len(), 2);
 
-        let doc = c.build_document(&scopes, "qemuarm64", None, None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let packages: Vec<&str> = graph
@@ -1919,7 +2516,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let runtime = ids_named(graph, "runtime:dev").remove(0);
@@ -1960,7 +2557,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
         let ext = ids_named(graph, "ext:app").remove(0);
 
@@ -1985,7 +2582,7 @@ mod tests {
             created: Some("2026-07-08T02:17:53Z".into()),
         };
 
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", Some(&snap), None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", Some(&snap), None, None);
         let graph = doc["@graph"].as_array().unwrap();
         let sbom = graph.iter().find(|e| e["type"] == "software_Sbom").unwrap();
 
@@ -2002,7 +2599,7 @@ mod tests {
         // Unpinned, the document says nothing rather than repeating the
         // release and channel the config asked for: the channel head moves, so
         // that would be provenance the document cannot stand behind.
-        let bare = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let bare = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let bare = bare["@graph"]
             .as_array()
             .unwrap()
@@ -2028,7 +2625,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let spdx_doc = graph.iter().find(|e| e["type"] == "SpdxDocument").unwrap();
@@ -2104,7 +2701,7 @@ mod tests {
 
         let c = cmd(false);
         let scopes = c.parse_scopes(&dump);
-        let summary = c.summary_json(&scopes, Some("sbom.json"), 2, 2);
+        let summary = c.summary_json(&scopes, Some("sbom.json"), 2, 2, None);
 
         assert_eq!(summary["output_path"], "sbom.json");
         assert_eq!(summary["packages"], 2);
@@ -2137,7 +2734,7 @@ mod tests {
         let scopes = c.parse_scopes(&dump);
         assert_eq!(scopes.len(), 2, "still scanned, and still summarised");
 
-        let doc = c.build_document(&scopes, "qemuarm64", None, None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
         assert!(!graph.iter().any(|e| e["name"] == "includes:etc"));
         assert!(graph.iter().all(
@@ -2199,8 +2796,8 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc_a = c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None);
-        let doc_b = c.build_document(&c.parse_scopes(&b), "qemuarm64", None, None);
+        let doc_a = c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None, None);
+        let doc_b = c.build_document(&c.parse_scopes(&b), "qemuarm64", None, None, None);
 
         let id = |d: &serde_json::Value| {
             d["@graph"]
@@ -2219,7 +2816,7 @@ mod tests {
         // the namespace becoming content-derived.
         assert_eq!(
             id(&doc_a),
-            id(&c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None))
+            id(&c.build_document(&c.parse_scopes(&a), "qemuarm64", None, None, None))
         );
     }
 
@@ -2321,7 +2918,7 @@ mod tests {
         assert!(ext.packages.is_empty(), "the known limitation");
 
         // Still in the inventory, under the rootfs.
-        let doc = c.build_document(&scopes, "qemuarm64", None, None);
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, None);
         assert!(doc["@graph"]
             .as_array()
             .unwrap()
@@ -2481,7 +3078,7 @@ mod tests {
             row("libc6", "2.39", "r0.2", "cortexa57", "MIT")
         );
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let sbom = doc["@graph"]
             .as_array()
             .unwrap()
@@ -2514,7 +3111,7 @@ mod tests {
                 .replace("Avocado Developers <info@avocadolinux.org>", "avocado")
         );
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
 
         let mut ids: Vec<&str> = doc["@graph"]
             .as_array()
@@ -2599,8 +3196,8 @@ mod tests {
             )
         };
         assert_eq!(
-            strip(c.build_document(&scopes, "qemuarm64", None, None)),
-            strip(c.build_document(&scopes, "qemuarm64", None, None))
+            strip(c.build_document(&scopes, "qemuarm64", None, None, None)),
+            strip(c.build_document(&scopes, "qemuarm64", None, None, None))
         );
     }
 
@@ -2773,7 +3370,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let names: Vec<&str> = graph
@@ -2819,7 +3416,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let names: Vec<&str> = graph
@@ -2856,7 +3453,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let sboms: Vec<&serde_json::Value> = graph
@@ -2937,7 +3534,7 @@ mod tests {
 
         // include_sdk=true so the build-host group is in the slice at all.
         let c = cmd(true);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let runtime_sbom = graph
@@ -2992,7 +3589,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
 
         let sbom_positions: Vec<usize> = graph
@@ -3024,7 +3621,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, Some("dev"));
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, Some("dev"), None);
         let names: Vec<&str> = doc["@graph"]
             .as_array()
             .unwrap()
@@ -3058,8 +3655,8 @@ mod tests {
 
         let c = cmd(false);
         let scopes = c.parse_scopes(&dump);
-        let device = c.build_document(&scopes, "qemuarm64", None, None);
-        let runtime = c.build_document(&scopes, "qemuarm64", None, Some("dev"));
+        let device = c.build_document(&scopes, "qemuarm64", None, None, None);
+        let runtime = c.build_document(&scopes, "qemuarm64", None, Some("dev"), None);
 
         let doc_id = |d: &serde_json::Value| {
             d["@graph"]
@@ -3077,7 +3674,7 @@ mod tests {
         // Still byte-stable: the same runtime slice twice is the same document.
         assert_eq!(
             doc_id(&runtime),
-            doc_id(&c.build_document(&scopes, "qemuarm64", None, Some("dev")))
+            doc_id(&c.build_document(&scopes, "qemuarm64", None, Some("dev"), None))
         );
     }
 
@@ -3099,7 +3696,7 @@ mod tests {
         );
 
         let c = cmd(false);
-        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None);
+        let doc = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
         let graph = doc["@graph"].as_array().unwrap();
         let includes_id = graph
             .iter()
@@ -3131,5 +3728,525 @@ mod tests {
         let scopes = cmd(false).parse_scopes(&dump);
         assert!(!scopes.is_empty());
         assert!(!runtime_has_packages(&scopes, "dev"));
+    }
+
+    #[test]
+    fn from_manifest_maps_extensions_by_name_and_skips_entries_without_an_id() {
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"name": "app", "version": "1.0", "image_id": "img-app", "sha256": "sha-app"},
+                {"name": "no-id", "version": "1.0"},
+            ],
+        });
+
+        let images = ImageIds::from_manifest(&manifest, "dev");
+        let app = images.get("ext:dev/app").expect("app was mapped");
+        assert_eq!(app.image_id, "img-app");
+        assert_eq!(app.sha256.as_deref(), Some("sha-app"));
+        assert!(images.get("ext:dev/no-id").is_none());
+        assert!(images.get("ext:other/app").is_none());
+        assert!(images.get("app").is_none());
+    }
+
+    #[test]
+    fn from_manifest_maps_os_bundle_build_ids_onto_rootfs_and_initramfs() {
+        let manifest = serde_json::json!({
+            "os_bundle": {
+                "image_id": "aos-bundle-id",
+                "sha256": "aos-bundle-sha",
+                "os_build_id": "os-build-id",
+                "initramfs_build_id": "initramfs-build-id",
+            },
+        });
+
+        let images = ImageIds::from_manifest(&manifest, "dev");
+        let rootfs = images.get("rootfs").expect("rootfs was mapped");
+        assert_eq!(rootfs.image_id, "os-build-id");
+        assert!(rootfs.sha256.is_none());
+        let initramfs = images.get("initramfs").expect("initramfs was mapped");
+        assert_eq!(initramfs.image_id, "initramfs-build-id");
+        assert!(initramfs.sha256.is_none());
+        assert_ne!(rootfs.image_id, "aos-bundle-id");
+        assert_ne!(initramfs.image_id, "aos-bundle-id");
+    }
+
+    #[test]
+    fn from_manifest_leaves_rootfs_and_initramfs_unmapped_without_an_os_bundle() {
+        let manifest = serde_json::json!({
+            "extensions": [],
+        });
+        let images = ImageIds::from_manifest(&manifest, "dev");
+        assert!(images.get("rootfs").is_none());
+        assert!(images.get("initramfs").is_none());
+    }
+
+    #[test]
+    fn merge_drops_a_shared_scope_the_runtimes_disagree_on() {
+        let bundle = |id: &str| {
+            ImageIds::from_manifest(
+                &serde_json::json!({"os_bundle": {"os_build_id": id, "initramfs_build_id": "same"}}),
+                "x",
+            )
+        };
+        let mut images = bundle("first");
+        assert_eq!(images.merge(bundle("second")), vec!["rootfs".to_string()]);
+        assert!(images.get("rootfs").is_none());
+        assert_eq!(images.get("initramfs").unwrap().image_id, "same");
+
+        // A third runtime agreeing with either side doesn't bring it back.
+        assert!(images.merge(bundle("first")).is_empty());
+        assert!(images.get("rootfs").is_none());
+    }
+
+    #[test]
+    fn manifest_script_output_decodes_one_runtime_per_line_and_drops_the_rest() {
+        let dev = serde_json::json!({"extensions": [{"name": "app", "image_id": "a"}]});
+        let prod = serde_json::json!({"extensions": []});
+        let output = format!(
+            "entrypoint noise before any marker\n\
+             ##MANIFEST\tdev\t{}\n\
+             not a marker at all\n\
+             ##MANIFEST\tprod\t{}\n\
+             ##MANIFEST\tbroken\tnot-valid-base64!!\n",
+            BASE64_STANDARD.encode(dev.to_string()),
+            BASE64_STANDARD.encode(prod.to_string()),
+        );
+
+        let manifests = parse_manifests(&output);
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests["dev"], dev);
+        assert_eq!(manifests["prod"], prod);
+        assert!(!manifests.contains_key("broken"));
+    }
+
+    #[test]
+    fn a_scope_with_an_image_entry_carries_identifiers_one_without_does_not() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"name": "app", "version": "1.0", "image_id": "img-app-id", "sha256": "img-app-sha"},
+            ],
+        });
+        let images = ImageIds::from_manifest(&manifest, "dev");
+
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, Some(&images));
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let ext_scope = graph
+            .iter()
+            .find(|e| e["name"] == "ext:dev/app")
+            .expect("the extension scope element exists");
+        assert_eq!(
+            ext_scope["externalIdentifier"],
+            serde_json::json!([{
+                "type": "ExternalIdentifier",
+                "externalIdentifierType": "other",
+                "identifier": "img-app-id",
+                "issuingAuthority": "https://avocadolinux.org/image-id",
+            }])
+        );
+        assert_eq!(
+            ext_scope["verifiedUsing"],
+            serde_json::json!([{
+                "type": "Hash",
+                "algorithm": "sha256",
+                "hashValue": "img-app-sha",
+            }])
+        );
+
+        let rootfs_scope = graph
+            .iter()
+            .find(|e| e["name"] == "rootfs")
+            .expect("the rootfs scope element exists");
+        assert!(rootfs_scope.get("externalIdentifier").is_none());
+        assert!(rootfs_scope.get("verifiedUsing").is_none());
+    }
+
+    #[test]
+    fn an_image_entry_with_no_sha256_gets_no_verifiedusing() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+
+        let manifest = serde_json::json!({"os_bundle": {"os_build_id": "os-build-id"}});
+        let images = ImageIds::from_manifest(&manifest, "dev");
+
+        let doc = c.build_document(&scopes, "qemuarm64", None, None, Some(&images));
+        let rootfs_scope = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "rootfs")
+            .unwrap();
+        assert_eq!(
+            rootfs_scope["externalIdentifier"][0]["identifier"],
+            "os-build-id"
+        );
+        assert_eq!(
+            rootfs_scope["externalIdentifier"][0]["issuingAuthority"],
+            "https://avocadolinux.org/os-build-id"
+        );
+        assert!(rootfs_scope.get("verifiedUsing").is_none());
+    }
+
+    #[test]
+    fn image_ids_never_move_the_namespace_or_any_spdxid() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"name": "app", "version": "1.0", "image_id": "img-app-id", "sha256": "img-app-sha"},
+            ],
+        });
+        let images = ImageIds::from_manifest(&manifest, "dev");
+
+        let without = c.build_document(&scopes, "qemuarm64", None, None, None);
+        let with = c.build_document(&scopes, "qemuarm64", None, None, Some(&images));
+
+        let strip_image_props = |mut v: serde_json::Value| {
+            if let Some(graph) = v["@graph"].as_array_mut() {
+                for el in graph.iter_mut() {
+                    if let Some(obj) = el.as_object_mut() {
+                        obj.remove("externalIdentifier");
+                        obj.remove("verifiedUsing");
+                    }
+                }
+            }
+            v
+        };
+        assert_eq!(strip_image_props(without), strip_image_props(with));
+    }
+
+    fn dev_local_images() -> ImageIds {
+        let manifest = serde_json::json!({
+            "extensions": [
+                {"name": "app", "version": "1.0", "image_id": "id-app-current", "sha256": "sha-app"},
+                {"name": "other", "version": "1.0", "image_id": "id-other-current", "sha256": "sha-other"},
+            ],
+        });
+        ImageIds::from_manifest(&manifest, "dev")
+    }
+
+    fn merged_app(image_id: &str) -> device::MergedExtension {
+        device::MergedExtension {
+            name: "app".to_string(),
+            version: Some("1.0".to_string()),
+            origin: Some("Dir".to_string()),
+            image_id: Some(image_id.to_string()),
+        }
+    }
+
+    #[test]
+    fn the_kept_scopes_are_exactly_the_base_the_runtime_and_the_merged_extensions() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}\
+             ##SCOPE\text:dev/other\t/runtimes/dev/extensions/other\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+            row_full("app-bin", "1.0", "r0", "cortexa57", "MIT", "(none)", 3000),
+            row_full("other-bin", "1.0", "r0", "cortexa57", "MIT", "(none)", 4000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let local_images = dev_local_images();
+
+        let scanned_scopes: BTreeSet<String> = scopes.iter().map(|s| s.name.clone()).collect();
+        let merged = vec![merged_app("id-app-current")];
+        let state =
+            device::resolve_kept_and_uncovered(&merged, "dev", &local_images, &scanned_scopes);
+
+        assert_eq!(
+            state.kept_scopes,
+            BTreeSet::from([
+                "rootfs".to_string(),
+                "initramfs".to_string(),
+                "includes".to_string(),
+                "runtime:dev".to_string(),
+                "ext:dev/app".to_string(),
+            ])
+        );
+        assert!(state.uncovered.is_empty());
+
+        let kept: Vec<Scope> = scopes
+            .into_iter()
+            .filter(|s| state.kept_scopes.contains(&s.name))
+            .collect();
+        let doc = c.build_document(&kept, "qemuarm64", None, Some("dev"), Some(&local_images));
+        let names: BTreeSet<&str> = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["type"] == "software_Package" && e["software_primaryPurpose"] == "archive"
+            })
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+
+        assert!(names.contains("rootfs"));
+        assert!(names.contains("runtime:dev"));
+        assert!(names.contains("ext:dev/app"));
+        assert!(
+            !names.contains("ext:dev/other"),
+            "an extension present locally but never reported merged must not appear: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_image_id_the_local_build_does_not_recognise_is_dropped_and_uncovered() {
+        let local_images = dev_local_images();
+        let merged = vec![merged_app("id-app-stale")];
+        let scanned_scopes = BTreeSet::from(["ext:dev/app".to_string()]);
+        let state =
+            device::resolve_kept_and_uncovered(&merged, "dev", &local_images, &scanned_scopes);
+
+        assert!(!state.kept_scopes.contains("ext:dev/app"));
+        assert_eq!(state.uncovered.len(), 1);
+        assert_eq!(state.uncovered[0].name, "app");
+    }
+
+    #[test]
+    fn kept_scope_ids_are_identical_to_a_plain_runtime_scoped_document_when_nothing_was_dropped() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+            row_full("app-bin", "1.0", "r0", "cortexa57", "MIT", "(none)", 3000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let local_images = dev_local_images();
+
+        let scanned_scopes: BTreeSet<String> = scopes.iter().map(|s| s.name.clone()).collect();
+        let merged = vec![merged_app("id-app-current")];
+        let state =
+            device::resolve_kept_and_uncovered(&merged, "dev", &local_images, &scanned_scopes);
+        assert!(state.uncovered.is_empty(), "nothing should be dropped here");
+
+        let device_kept: Vec<Scope> = scopes
+            .into_iter()
+            .filter(|s| state.kept_scopes.contains(&s.name))
+            .collect();
+
+        let plain_dump = dump.clone();
+        let plain_scopes = c.parse_scopes(&plain_dump);
+        let plain_kept: Vec<Scope> = plain_scopes
+            .into_iter()
+            .filter(|s| in_runtime(&s.name, "dev"))
+            .collect();
+
+        let device_doc = c.build_document(
+            &device_kept,
+            "qemuarm64",
+            None,
+            Some("dev"),
+            Some(&local_images),
+        );
+        let plain_doc = c.build_document(
+            &plain_kept,
+            "qemuarm64",
+            None,
+            Some("dev"),
+            Some(&local_images),
+        );
+
+        let scope_id = |doc: &serde_json::Value, name: &str| {
+            doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "software_Package" && e["name"] == name)
+                .map(|e| e["spdxId"].as_str().unwrap().to_string())
+        };
+        for name in ["rootfs", "runtime:dev", "ext:dev/app"] {
+            assert_eq!(
+                scope_id(&device_doc, name),
+                scope_id(&plain_doc, name),
+                "scope '{name}' must carry the same spdxId in both documents"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_device_identity_renames_the_first_sbom_and_stays_first() {
+        // A merged extension so build_document emits a second software_Sbom
+        // too, otherwise "stays first" holds trivially.
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\truntime:dev\t/runtimes/dev\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("curl", "8.7.1", "r0.2", "cortexa57", "MIT", "(none)", 2000),
+            row_full("app-bin", "1.0", "r0", "cortexa57", "MIT", "(none)", 3000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let mut doc = c.build_document(&scopes, "qemuarm64", None, Some("dev"), None);
+
+        let ns = format!(
+            "https://avocadolinux.org/spdx/{}/{}",
+            slug_id("qemuarm64"),
+            SbomCommand::namespace_digest(&scopes, Some("dev")),
+        );
+        let creation_id = format!("{ns}/creationinfo/1");
+        let uncovered = vec![device::UncoveredEntry {
+            name: "sideloaded".to_string(),
+            version: None,
+            origin: Some("Loop:/root/sideloaded.raw".to_string()),
+        }];
+
+        attach_device_identity(
+            &mut doc,
+            &ns,
+            &creation_id,
+            "qemuarm64",
+            "192.168.1.50",
+            &uncovered,
+        );
+
+        let graph = doc["@graph"].as_array().unwrap();
+        let first_sbom = graph.iter().find(|e| e["type"] == "software_Sbom").unwrap();
+        assert_eq!(
+            first_sbom["name"],
+            "avocado qemuarm64 device 192.168.1.50 SBOM"
+        );
+        assert_eq!(
+            first_sbom["software_sbomType"],
+            serde_json::json!(["deployed", "runtime"])
+        );
+        assert_ne!(first_sbom["spdxId"].as_str().unwrap(), format!("{ns}/sbom"));
+
+        let device_sbom_id = first_sbom["spdxId"].as_str().unwrap().to_string();
+        let spdx_doc = graph.iter().find(|e| e["type"] == "SpdxDocument").unwrap();
+        assert_eq!(spdx_doc["rootElement"], serde_json::json!([device_sbom_id]));
+
+        let uncovered_node = graph
+            .iter()
+            .find(|e| e["name"] == "sideloaded")
+            .expect("the uncovered entry got its own element");
+        assert_eq!(uncovered_node["software_primaryPurpose"], "archive");
+        assert!(
+            uncovered_node.get("software_packageVersion").is_none(),
+            "no version was known, so none should be asserted"
+        );
+        assert!(uncovered_node["comment"]
+            .as_str()
+            .unwrap()
+            .contains("Loop:/root/sideloaded.raw"));
+        let uncovered_id_str = uncovered_node["spdxId"].as_str().unwrap().to_string();
+        assert!(first_sbom["element"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == &uncovered_id_str));
+        assert!(first_sbom["rootElement"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == &uncovered_id_str));
+
+        assert!(!graph.iter().any(|e| e["type"] == "Relationship"
+            && e["to"]
+                .as_array()
+                .is_some_and(|to| to.iter().any(|v| v == &uncovered_id_str))));
+
+        let sbom_names: Vec<&str> = graph
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            sbom_names.len() >= 2,
+            "fixture should produce more than one software_Sbom: {sbom_names:?}"
+        );
+        assert_eq!(sbom_names[0], "avocado qemuarm64 device 192.168.1.50 SBOM");
+    }
+
+    #[test]
+    fn attach_device_identity_gives_the_spdx_document_a_per_host_id() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+        let c = cmd(false);
+        let scopes = c.parse_scopes(&dump);
+        let ns = format!(
+            "https://avocadolinux.org/spdx/{}/{}",
+            slug_id("qemuarm64"),
+            SbomCommand::namespace_digest(&scopes, Some("dev")),
+        );
+        let creation_id = format!("{ns}/creationinfo/1");
+
+        let doc_id = |host: &str| {
+            let mut doc = c.build_document(&scopes, "qemuarm64", None, Some("dev"), None);
+            attach_device_identity(&mut doc, &ns, &creation_id, "qemuarm64", host, &[]);
+            doc["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "SpdxDocument")
+                .unwrap()["spdxId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let device_doc_id = doc_id("192.168.1.50");
+        assert_ne!(device_doc_id, format!("{ns}/document"));
+        assert!(device_doc_id.contains(&slug_id("192.168.1.50")));
+
+        let other_host_doc_id = doc_id("192.168.1.51");
+        assert_ne!(device_doc_id, other_host_doc_id);
+    }
+
+    #[test]
+    fn uncovered_ids_are_deterministic_not_assigned_in_encounter_order() {
+        let entry = device::UncoveredEntry {
+            name: "app".to_string(),
+            version: Some("1.0".to_string()),
+            origin: Some("HITL".to_string()),
+        };
+        let ns = "https://avocadolinux.org/spdx/qemuarm64/deadbeef";
+        assert_eq!(uncovered_id(ns, &entry), uncovered_id(ns, &entry));
+
+        let different_origin = device::UncoveredEntry {
+            origin: Some("Dir".to_string()),
+            ..entry.clone()
+        };
+        assert_ne!(
+            uncovered_id(ns, &entry),
+            uncovered_id(ns, &different_origin)
+        );
+    }
+
+    #[tokio::test]
+    async fn device_and_include_sdk_are_refused_together() {
+        let c = cmd(true).with_device(Some("root@192.168.1.50".to_string()));
+        let err = c.execute().await.unwrap_err();
+        assert!(
+            err.to_string().contains("--include-sdk"),
+            "error should name the refused combination: {err}"
+        );
     }
 }

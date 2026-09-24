@@ -176,6 +176,9 @@ enum Commands {
         /// controls whether the summary lines accompany it.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
+        /// Describe a running device instead: [user@]host[:port]
+        #[arg(short = 'd', long = "device")]
+        device: Option<String>,
     },
     /// Initialize a new avocado project
     Init {
@@ -3353,6 +3356,7 @@ async fn main() -> Result<()> {
             verbose,
             container_args,
             output,
+            device,
         } => {
             let cmd = SbomCommand::new(
                 config,
@@ -3364,7 +3368,8 @@ async fn main() -> Result<()> {
                 output,
             )
             .with_runs_on(cli.runs_on.clone())
-            .with_sdk_arch(cli.sdk_arch.clone());
+            .with_sdk_arch(cli.sdk_arch.clone())
+            .with_device(device);
             cmd.execute().await?;
             Ok(())
         }
