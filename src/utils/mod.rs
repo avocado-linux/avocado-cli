@@ -1,5 +1,6 @@
 pub mod config;
 pub mod config_edit;
+pub mod config_lint;
 pub mod container;
 pub mod container_dev;
 pub mod device_tree_overlay;
