@@ -48,6 +48,13 @@ impl ConfigShowCommand {
         }
 
         if self.output.is_json() {
+            // Loading printed these to stderr, except under `--output json`,
+            // where the payload carries them instead. Emitted only when
+            // non-empty, so a clean file keeps the byte-identical payload.
+            let warnings = ignored_key_warnings(&self.config_path);
+            if !warnings.is_empty() {
+                payload["warnings"] = json!(warnings);
+            }
             emit_json_object(&payload);
         } else {
             // Human mode prints a YAML-ish summary that mirrors the
@@ -57,6 +64,14 @@ impl ConfigShowCommand {
 
         Ok(())
     }
+}
+
+fn ignored_key_warnings(config_path: &str) -> Vec<String> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str(&content).ok())
+        .map(|doc| crate::utils::config_lint::ignored_keys(&doc))
+        .unwrap_or_default()
 }
 
 /// The original, narrow projection. Kept byte-identical to the

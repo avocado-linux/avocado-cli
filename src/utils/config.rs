@@ -2000,6 +2000,7 @@ impl Config {
         // configs introduce are also resolved.
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        crate::utils::config_lint::warn_ignored_keys_once(path, &content);
         let mut main_config =
             Self::parse_config_value_with_interpolation(&config_path_str, &content, target)?;
 
@@ -3755,6 +3756,7 @@ impl Config {
 
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        crate::utils::config_lint::warn_ignored_keys_once(path, &content);
 
         Self::load_from_yaml_str(&content)
             .with_context(|| format!("Failed to parse YAML config file: {}", path.display()))
