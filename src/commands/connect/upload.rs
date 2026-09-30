@@ -10,7 +10,7 @@ use crate::commands::connect::client::{
     ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, HttpStatus, RuntimeParams,
     UploadPartError,
 };
-use crate::commands::sbom::generate::{in_runtime, runtime_has_packages, SbomCommand};
+use crate::commands::sbom::generate::{in_runtime, runtime_has_packages, ImageIds, SbomCommand};
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{
@@ -308,7 +308,7 @@ impl ConnectUploadCommand {
         // Phase B: Create runtime via API. The SBOM (ENG-2219) is built in
         // this phase rather than one of its own.
         let (runtime, num_artifacts) = run_phase(PHASE_CREATE, async {
-            let sbom = self.build_sbom().await;
+            let sbom = self.build_sbom(manifest).await;
             self.create_runtime_api(
                 connect,
                 version,
@@ -464,11 +464,14 @@ impl ConnectUploadCommand {
     /// contract `read_config_and_lockfile` already has for the lockfile.
     ///
     /// `AVOCADO_UPLOAD_NO_SBOM=1` skips the build outright.
-    async fn build_sbom(&self) -> Option<serde_json::Value> {
+    ///
+    /// `manifest` is discovery's manifest.json, passed through so extension
+    /// scopes carry the `image_id`s this upload is about to publish.
+    async fn build_sbom(&self, manifest: &serde_json::Value) -> Option<serde_json::Value> {
         if std::env::var("AVOCADO_UPLOAD_NO_SBOM").as_deref() == Ok("1") {
             return None;
         }
-        match self.scan_runtime_sbom().await {
+        match self.scan_runtime_sbom(manifest).await {
             Ok(doc) => Some(doc),
             Err(e) => {
                 // Not `print_warning`: that one is suppressed under
@@ -483,7 +486,7 @@ impl ConnectUploadCommand {
     }
 
     /// `avocado sbom`'s document, filtered to this runtime by `in_runtime`.
-    async fn scan_runtime_sbom(&self) -> Result<serde_json::Value> {
+    async fn scan_runtime_sbom(&self, manifest: &serde_json::Value) -> Result<serde_json::Value> {
         let cmd = SbomCommand::new(
             self.config_path.clone(),
             self.target.clone(),
@@ -510,7 +513,14 @@ impl ConnectUploadCommand {
                 self.runtime
             );
         }
-        Ok(cmd.build_document(&kept, &target, snapshot.as_ref(), Some(&self.runtime)))
+        let images = ImageIds::from_manifest(manifest, &self.runtime);
+        Ok(cmd.build_document(
+            &kept,
+            &target,
+            snapshot.as_ref(),
+            Some(&self.runtime),
+            Some(&images),
+        ))
     }
 
     /// Handle the case where the runtime is already in draft status (full dedup).
