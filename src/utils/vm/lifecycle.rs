@@ -260,6 +260,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
         var_seed,
+        uuid: super::state::instance_id(&paths)?,
     };
 
     // The CLI is authoritative for the qemu lifecycle on every platform.

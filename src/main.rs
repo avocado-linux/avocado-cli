@@ -3485,6 +3485,16 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
+            #[cfg(target_os = "linux")]
+            VmCommands::Service { command } => {
+                use commands::vm::service::{ServiceAction, ServiceCommand};
+                let action = match command {
+                    VmServiceCommands::Install => ServiceAction::Install,
+                    VmServiceCommands::Uninstall => ServiceAction::Uninstall,
+                    VmServiceCommands::Status => ServiceAction::Status,
+                };
+                ServiceCommand { action }.execute().await
+            }
             VmCommands::Reset { yes } => {
                 commands::vm::reset::ResetCommand { assume_yes: yes }
                     .execute()
@@ -5033,6 +5043,13 @@ enum VmCommands {
         #[command(subcommand)]
         command: VmConfigCommands,
     },
+    /// Run the VM headless under a systemd user unit (hibernation off),
+    /// so it stays up across logout and reboot.
+    #[cfg(target_os = "linux")]
+    Service {
+        #[command(subcommand)]
+        command: VmServiceCommands,
+    },
     /// Long-lived hibernation supervisor. Internal — spawned by `vm start`,
     /// not for direct use. Owns the user-facing SSH port AND docker
     /// socket, proxies to QEMU's internal hostfwd / SSH tunnel, and
@@ -5107,6 +5124,17 @@ enum ContainerDevCommands {
     /// Garbage-collect this project's Container Dev Mode registry store
     /// (distinct from the top-level `prune`, which removes Docker volumes).
     Prune,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum VmServiceCommands {
+    /// Write ~/.config/systemd/user/avocado-vm.service, enable and start it.
+    Install,
+    /// Stop, disable and remove the unit.
+    Uninstall,
+    /// Show the unit's state, lingering, and `vm status`.
+    Status,
 }
 
 #[derive(Subcommand)]
