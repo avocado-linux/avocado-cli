@@ -5,9 +5,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::commands::sbom::generate::{Component, SbomCommand};
 use crate::utils::{
     config::{
-        get_ext_image_args, get_ext_image_type, get_ext_image_verity, get_post_install, Config,
+        get_ext_image_args, get_ext_image_sbom, get_ext_image_type, get_ext_image_verity,
+        get_post_install, Config,
     },
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
@@ -670,11 +672,54 @@ impl RootfsImageCommand {
             None
         };
 
+        // `image: { sbom: true }` — build the rootfs's own SPDX document and
+        // carry it in the kab's payload. Staged before the container run
+        // because the scan is a container run of its own: it reads the
+        // sysroot's RPM database, which the build about to start does not
+        // touch, so running it first costs a round trip and nothing else.
+        let want_sbom = rootfs_node
+            .map(get_ext_image_sbom)
+            .transpose()
+            .context("rootfs")?
+            == Some(true);
+        if want_sbom && !wrap_kab {
+            return Err(anyhow::anyhow!(
+                "rootfs.image.sbom is set but rootfs.image.type is '{image_type}'. \
+                 The document travels in the KAB payload, and a .raw has nowhere to put it — \
+                 set image.type to `kab`, or run `avocado sbom` for a standalone document."
+            ));
+        }
+        let staged_sbom = if want_sbom {
+            print_info("Generating rootfs SBOM.", OutputLevel::Normal);
+            Some(
+                SbomCommand::for_image_build(
+                    &self.config_path,
+                    self.target.clone(),
+                    self.verbose,
+                    self.container_args.clone(),
+                    self.sdk_arch.clone(),
+                    self.runs_on.clone(),
+                    Some(Arc::clone(&composed)),
+                    crate::utils::container::effective_source_date_epoch(config.source_date_epoch),
+                )
+                .stage_component_sbom("rootfs", Component::Rootfs, None)
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let wrap_section = if wrap_kab {
             let args = image_args
                 .as_deref()
                 .context("rootfs.image.type is `kab` but rootfs.image.args is missing")?;
-            generate_kab_wrap_script("rootfs", "AVOCADO_ROOTFS_IMAGE", args, "$RUNTIME_VERSION")
+            generate_kab_wrap_script(
+                "rootfs",
+                "AVOCADO_ROOTFS_IMAGE",
+                args,
+                "$RUNTIME_VERSION",
+                staged_sbom.as_ref().map(|s| s.container_path.as_str()),
+            )
         } else {
             String::new()
         };
@@ -716,11 +761,18 @@ export AVOCADO_OS_VERSION_ID
         crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
         // Bind-mount the keyset into the container as a single -v arg
-        // appended to whatever the user / config already has.
-        let container_args_with_keyset = if let Some(ref host_path) = kab_keyset_host_path {
+        // appended to whatever the user / config already has. The staged SBOM
+        // rides in the same way.
+        let container_args_with_keyset = if kab_keyset_host_path.is_some() || staged_sbom.is_some()
+        {
             let mut args = merged_container_args.clone().unwrap_or_default();
-            args.push("-v".to_string());
-            args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            if let Some(ref host_path) = kab_keyset_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            }
+            if let Some(ref sbom) = staged_sbom {
+                args.extend(sbom.mount_args.iter().cloned());
+            }
             Some(args)
         } else {
             merged_container_args.clone()

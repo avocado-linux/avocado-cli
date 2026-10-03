@@ -1495,6 +1495,29 @@ pub fn get_ext_image_verity(ext_config: &serde_yaml::Value) -> anyhow::Result<bo
     }
 }
 
+/// Whether this image ships an SPDX SBOM of its own (image.sbom: true).
+///
+/// Only meaningful with `image.type: kab`: the document is written into the
+/// KAB's payload zip as `sbom.json`, alongside `layer.img` and
+/// `descriptor.json`. A `.raw` has nowhere to put it, so the callers refuse
+/// the combination rather than dropping the document silently.
+///
+/// Absent means false, and a present but non-boolean value is an error —
+/// the same treatment as [`get_ext_image_verity`], and for the same reason.
+/// An SBOM is a compliance artifact: `sbom: "true"` or `sbom: yes` (both
+/// strings under serde_yaml 0.9) reading as "off" would ship a kab with no
+/// inventory in it while the author believed one was there.
+pub fn get_ext_image_sbom(ext_config: &serde_yaml::Value) -> anyhow::Result<bool> {
+    match ext_config.get("image").and_then(|v| v.get("sbom")) {
+        None => Ok(false),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(anyhow::anyhow!(
+            "image.sbom must be a boolean (true/false), got {:?}",
+            other
+        )),
+    }
+}
+
 /// Extract image args from extension config (image.args field).
 /// These are passed directly to kabtool (before -k and -z which are appended by CLI).
 pub fn get_ext_image_args(ext_config: &serde_yaml::Value) -> Option<String> {
@@ -6969,6 +6992,95 @@ runtimes:
             let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
             assert!(
                 get_ext_image_verity(&v).is_err(),
+                "{bad} must be rejected, not read as false"
+            );
+        }
+    }
+
+    /// A per-target `image:` override that supplies only `args` must not take
+    /// `sbom` (or `type`) down with it.
+    ///
+    /// This is the shape every multi-target kab in a real project has: one
+    /// base `image:` block carrying `type`/`sbom`, and a `target-<name>:`
+    /// block overriding just the kabtool `--tag`. If the override replaced the
+    /// node instead of merging into it, the qemu builds would quietly stop
+    /// carrying an inventory while the raspberrypi4 build kept one — and
+    /// nothing downstream would report the difference, because a kab with no
+    /// `sbom.json` is exactly what `sbom: false` produces.
+    #[test]
+    fn a_per_target_image_override_keeps_the_sbom_key() {
+        let yaml = r#"
+supported_targets:
+  - raspberrypi4
+  - qemux86-64
+sdk:
+  image: "docker.io/avocadolinux/sdk:2024"
+extensions:
+  kos-layer-core-native:
+    version: 1.0.0
+    image:
+      type: kab
+      sbom: true
+      args: '-b -t kos.layer -v 1.0.0 --tag {{ avocado.target }}'
+    target-qemux86-64:
+      image:
+        args: '-b -t kos.layer -v 1.0.0 --tag qemu-x64'
+"#;
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let composed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+
+        for target in ["raspberrypi4", "qemux86-64"] {
+            let ext = config.resolve_overrides_in_value(
+                composed["extensions"]["kos-layer-core-native"].clone(),
+                target,
+                None,
+                "extensions.kos-layer-core-native",
+            );
+            assert_eq!(
+                super::get_ext_image_type(&ext).as_deref(),
+                Some("kab"),
+                "{target} lost image.type"
+            );
+            assert!(
+                super::get_ext_image_sbom(&ext).unwrap(),
+                "{target} lost image.sbom"
+            );
+        }
+
+        // And the override that prompted all this still wins.
+        let q = config.resolve_overrides_in_value(
+            composed["extensions"]["kos-layer-core-native"].clone(),
+            "qemux86-64",
+            None,
+            "extensions.kos-layer-core-native",
+        );
+        assert!(super::get_ext_image_args(&q)
+            .unwrap()
+            .contains("--tag qemu-x64"));
+    }
+
+    #[test]
+    fn image_sbom_is_strict_bool() {
+        use super::get_ext_image_sbom;
+        let ok: serde_yaml::Value = serde_yaml::from_str("image:\n  sbom: true").unwrap();
+        assert!(get_ext_image_sbom(&ok).unwrap());
+        let off: serde_yaml::Value = serde_yaml::from_str("image:\n  sbom: false").unwrap();
+        assert!(!get_ext_image_sbom(&off).unwrap());
+        let absent: serde_yaml::Value = serde_yaml::from_str("image:\n  type: kab").unwrap();
+        assert!(!get_ext_image_sbom(&absent).unwrap());
+        let no_image: serde_yaml::Value = serde_yaml::from_str("version: '1.0.0'").unwrap();
+        assert!(!get_ext_image_sbom(&no_image).unwrap());
+        // Same strictness as verity, and for the same reason: a kab built
+        // with no inventory in it, by an author who wrote one down, is worse
+        // than a config error.
+        for bad in [
+            "image:\n  sbom: \"true\"",
+            "image:\n  sbom: 1",
+            "image:\n  sbom: yes",
+        ] {
+            let v: serde_yaml::Value = serde_yaml::from_str(bad).unwrap();
+            assert!(
+                get_ext_image_sbom(&v).is_err(),
                 "{bad} must be rejected, not read as false"
             );
         }

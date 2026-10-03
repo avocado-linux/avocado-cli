@@ -622,6 +622,25 @@ pub fn inject_source_date_epoch(
     }
 }
 
+/// The epoch an image build's timestamps actually land on.
+///
+/// `inject_source_date_epoch` leaves the env var unset when the project has
+/// no `source_date_epoch:`, but every step that stamps a time into an image
+/// supplies the same default itself — `mkfs.erofs -T "${SOURCE_DATE_EPOCH:-0}"`
+/// in the rootfs script, `touch -h -d "@${SOURCE_DATE_EPOCH:-0}"` in the
+/// initramfs one, `export SOURCE_DATE_EPOCH={epoch}` from `unwrap_or(0)` in
+/// `ext image`. So the images are reproducible whether or not the key is set,
+/// and 0 is what they were built against when it is not.
+///
+/// Anything else that has to agree with those bytes — the SBOM `image.sbom`
+/// writes into a kab's payload, which is compared across builds exactly as
+/// the layer beside it is — must resolve the epoch through here rather than
+/// reading the key and falling back to the wall clock. `sbom_epoch_matches_
+/// the_shell_default_every_image_script_applies` pins the two together.
+pub fn effective_source_date_epoch(source_date_epoch: Option<u64>) -> u64 {
+    source_date_epoch.unwrap_or(0)
+}
+
 /// Inject the project's kernel command line into a container's env map.
 ///
 /// Read by the SDK's platform lifecycle hooks, which are the only code that

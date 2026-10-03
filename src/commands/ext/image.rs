@@ -561,6 +561,9 @@ impl ExtImageCommand {
         let verity = crate::utils::config::get_ext_image_verity(&ext_config)
             .with_context(|| format!("Extension '{}'", self.extension))?;
 
+        let want_sbom = crate::utils::config::get_ext_image_sbom(&ext_config)
+            .with_context(|| format!("Extension '{}'", self.extension))?;
+
         match image_type.as_str() {
             "raw" | "kab" => {}
             other => {
@@ -570,6 +573,19 @@ impl ExtImageCommand {
                     other
                 ));
             }
+        }
+
+        // Refused rather than quietly dropped: `sbom: true` is a claim the
+        // built artifact carries an inventory, and a `.raw` is a bare
+        // filesystem image with nowhere to put one.
+        if want_sbom && image_type != "kab" {
+            return Err(anyhow::anyhow!(
+                "Extension '{}' sets image.sbom but image.type is '{}'. The document travels \
+                 in the KAB payload, and a .raw has nowhere to put it — set image.type to \
+                 `kab`, or run `avocado sbom` for a standalone document.",
+                self.extension,
+                image_type
+            ));
         }
 
         // If image type is kab, validate keyset file from KAB_KEYSET_FILE env var
@@ -632,7 +648,8 @@ impl ExtImageCommand {
             OutputLevel::Normal,
         );
 
-        let source_date_epoch = config.source_date_epoch.unwrap_or(0);
+        let source_date_epoch =
+            crate::utils::container::effective_source_date_epoch(config.source_date_epoch);
 
         // Get var_files patterns — these files go on the var partition and are excluded from the .raw image
         let var_files = crate::utils::config::get_ext_var_files(&ext_config);
@@ -673,6 +690,47 @@ impl ExtImageCommand {
             );
         }
 
+        // `image: { sbom: true }` — this extension's own SPDX document, built
+        // on the host and bind-mounted in for the wrap step to carry in the
+        // payload. Staged only when the image is actually being built: the
+        // scan is a container round trip of its own, and the kab a skip
+        // delivers already holds the document this one would rebuild.
+        //
+        // After `ext install`/`ext build` by construction — this command runs
+        // last of the three — so the sysroot the scan reads is the one the
+        // image about to be written is made from.
+        let staged_sbom = if want_sbom && !up_to_date {
+            print_info(
+                &format!("Generating SBOM for extension '{}'.", self.extension),
+                OutputLevel::Normal,
+            );
+            Some(
+                crate::commands::sbom::generate::SbomCommand::for_image_build(
+                    &self.config_path,
+                    self.target.clone(),
+                    self.verbose,
+                    self.container_args.clone(),
+                    self.sdk_arch.clone(),
+                    self.runs_on.clone(),
+                    Some(Arc::clone(&composed)),
+                    source_date_epoch,
+                )
+                .stage_component_sbom(
+                    &self.extension,
+                    crate::commands::sbom::generate::Component::Extension(&self.extension),
+                    self.runtime.as_deref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(ref sbom) = staged_sbom {
+            kab_container_args
+                .get_or_insert_with(Vec::new)
+                .extend(sbom.mount_args.iter().cloned());
+        }
+
         let result = up_to_date
             || self
                 .create_image(
@@ -692,6 +750,7 @@ impl ExtImageCommand {
                     image_args.as_deref(),
                     verity,
                     &kab_env_vars,
+                    staged_sbom.as_ref().map(|s| s.container_path.as_str()),
                 )
                 .await?;
 
@@ -906,6 +965,7 @@ impl ExtImageCommand {
         image_args: Option<&str>,
         verity: bool,
         extra_env_vars: &Option<std::collections::HashMap<String, String>>,
+        sbom_path: Option<&str>,
     ) -> Result<bool> {
         // Create the build script
         let mut build_script = self.create_build_script(
@@ -917,6 +977,7 @@ impl ExtImageCommand {
             image_type,
             image_args,
             verity,
+            sbom_path,
         );
         if self.no_stamps {
             build_script = format!(
@@ -965,6 +1026,10 @@ impl ExtImageCommand {
         image_type: &str,
         image_args: Option<&str>,
         verity: bool,
+        // In-container path of the SPDX document to carry in the KAB payload
+        // as `sbom.json`, from `image: { sbom: true }`. The caller bind-mounts
+        // it; this only copies it in and names it in the zip.
+        sbom_path: Option<&str>,
     ) -> String {
         // Build exclude flags for var_files patterns (these go on the var partition, not in the .raw image)
         let var_excludes = var_files
@@ -1089,6 +1154,19 @@ rm -f "${OUTPUT_FILE%.raw}.verity" "${OUTPUT_FILE%.raw}.roothash"
         let kab_wrapping = if image_type == "kab" {
             let kab_args = image_args
                 .unwrap_or(r#"-b -t kos.layer -v "$EXT_VERSION" --tag "$AVOCADO_TARGET""#);
+            // `image: { sbom: true }` — the document the caller staged and
+            // bind-mounted, carried as a third payload entry. Added beside
+            // layer.img rather than written into it, so the layer stays
+            // byte-for-byte what it was: its dm-verity tree and root hash,
+            // computed above, describe the same bytes either way. Entry order
+            // is fixed, since it decides the zip's bytes.
+            let (sbom_copy, sbom_entry) = match sbom_path {
+                Some(path) => (
+                    format!("\n# Carry the SBOM in the payload\ncp \"{path}\" \"$KAB_TMPDIR/sbom.json\"\n"),
+                    " sbom.json",
+                ),
+                None => (String::new(), ""),
+            };
             format!(
                 r#"
 # --- KAB wrapping ---
@@ -1103,9 +1181,9 @@ cp "$OUTPUT_FILE" "$KAB_TMPDIR/layer.img"
 cat > "$KAB_TMPDIR/descriptor.json" << DESCEOF
 {{"kos":{{"build":{{"source":"$EXT_NAME-$EXT_VERSION"}}}}}}
 DESCEOF
-
+{sbom_copy}
 # Create zip archive (store mode — image is already compressed)
-(cd "$KAB_TMPDIR" && zip -Z store tmp.zip layer.img descriptor.json)
+(cd "$KAB_TMPDIR" && zip -Z store tmp.zip layer.img descriptor.json{sbom_entry})
 
 # Run kabtool to sign and package
 KAB_OUTPUT="$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.kab"
@@ -1181,7 +1259,8 @@ mod tests {
             None,
             None,
         );
-        let with = cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, true);
+        let with =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, true, None);
         assert!(
             with.contains("veritysetup format"),
             "verity requested but no veritysetup step"
@@ -1195,7 +1274,7 @@ mod tests {
         let created = with.find("Created extension image").unwrap();
         assert!(with.find("veritysetup format").unwrap() > created);
         let without =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false, None);
         assert!(
             !without.contains("veritysetup"),
             "verity step must be opt-in"
@@ -1217,7 +1296,7 @@ mod tests {
     fn test_create_build_script_erofs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
         let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false, None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1240,8 +1319,17 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_lz4_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs-lz4", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "erofs-lz4",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1260,8 +1348,17 @@ mod tests {
     #[test]
     fn test_create_build_script_erofs_zst_includes_compression() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs-zst", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "erofs-zst",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1281,7 +1378,7 @@ mod tests {
     fn test_create_build_script_erofs_uncompressed_no_z_flag() {
         let cmd = make_cmd("my-ext");
         let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false, None);
 
         assert!(
             script.contains("mkfs.erofs"),
@@ -1296,8 +1393,17 @@ mod tests {
     #[test]
     fn test_create_build_script_squashfs_contains_reproducible_flags() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("mksquashfs"),
@@ -1325,8 +1431,17 @@ mod tests {
     fn test_create_build_script_defaults_to_squashfs() {
         let cmd = make_cmd("my-ext");
         // Passing "squashfs" simulates the default behavior
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("mksquashfs"),
@@ -1349,7 +1464,7 @@ mod tests {
     fn test_pkg_state_excluded_from_erofs_image() {
         let cmd = make_cmd("my-ext");
         let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false, None);
 
         for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
@@ -1362,8 +1477,17 @@ mod tests {
     #[test]
     fn test_pkg_state_excluded_from_squashfs_image() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         for path in ["var/lib/rpm", "var/lib/dnf", "var/cache/dnf"] {
             assert!(
@@ -1380,7 +1504,7 @@ mod tests {
         let cmd = make_cmd("my-ext");
         let var_files = vec!["var/lib/myapp/**".to_string()];
         let script = cmd.create_build_script(
-            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false,
+            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false, None,
         );
 
         assert!(
@@ -1397,7 +1521,7 @@ mod tests {
     fn test_create_build_script_source_date_epoch_default() {
         let cmd = make_cmd("my-ext");
         let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false, None);
 
         assert!(
             script.contains("export SOURCE_DATE_EPOCH=0"),
@@ -1421,6 +1545,7 @@ mod tests {
             "raw",
             None,
             false,
+            None,
         );
 
         assert!(
@@ -1436,8 +1561,17 @@ mod tests {
     #[test]
     fn test_create_build_script_extension_name_and_version() {
         let cmd = make_cmd("test-extension");
-        let script =
-            cmd.create_build_script("2.3.4", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "2.3.4",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("EXT_NAME=\"test-extension\""),
@@ -1452,8 +1586,17 @@ mod tests {
     #[test]
     fn test_create_build_script_output_path() {
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         assert!(
             script.contains("OUTPUT_FILE=\"$OUTPUT_DIR/$EXT_NAME-$EXT_VERSION.raw\""),
@@ -1469,7 +1612,7 @@ mod tests {
             "var/lib/myapp/data".to_string(),
         ];
         let script = cmd.create_build_script(
-            "1.0.0", "sysext", 0, "squashfs", &var_files, "raw", None, false,
+            "1.0.0", "sysext", 0, "squashfs", &var_files, "raw", None, false, None,
         );
 
         assert!(
@@ -1487,7 +1630,7 @@ mod tests {
         let cmd = make_cmd("my-ext");
         let var_files = vec!["var/lib/docker/**".to_string()];
         let script = cmd.create_build_script(
-            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false,
+            "1.0.0", "sysext", 0, "erofs", &var_files, "raw", None, false, None,
         );
 
         assert!(
@@ -1503,8 +1646,17 @@ mod tests {
         // are now always excluded, so the surviving guarantee is the narrower
         // one: nothing beyond them is excluded when no var_files are configured.
         let cmd = make_cmd("my-ext");
-        let script =
-            cmd.create_build_script("1.0.0", "sysext", 0, "squashfs", &[], "raw", None, false);
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "squashfs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
 
         let expected = crate::utils::stamps::package_state_paths();
         assert_eq!(
@@ -1518,5 +1670,84 @@ mod tests {
                 "excludes {path}"
             );
         }
+    }
+
+    /// The other half of
+    /// `sbom_epoch_matches_the_shell_default_every_image_script_applies`:
+    /// the epoch this script bakes in is the one the embedded SBOM is
+    /// stamped with, so a kab's layer and its payload stay comparable
+    /// across builds of an unconfigured project.
+    #[test]
+    fn the_script_epoch_is_the_one_the_sbom_is_stamped_with() {
+        let epoch = crate::utils::container::effective_source_date_epoch(None);
+        let script = make_cmd("my-ext").create_build_script(
+            "1.0.0",
+            "sysext",
+            epoch,
+            "erofs",
+            &[],
+            "raw",
+            None,
+            false,
+            None,
+        );
+        assert!(
+            script.contains(&format!("export SOURCE_DATE_EPOCH={epoch}")),
+            "got: {script}"
+        );
+        assert_eq!(epoch, 0, "an unconfigured project builds against 0");
+    }
+
+    #[test]
+    fn the_sbom_rides_in_the_kab_payload_when_one_was_staged() {
+        let cmd = make_cmd("my-ext");
+        let path = crate::utils::kab_wrap::sbom_mount_path("my-ext");
+        let script = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "erofs",
+            &[],
+            "kab",
+            None,
+            false,
+            Some(&path),
+        );
+        assert!(script.contains(&format!("cp \"{path}\" \"$KAB_TMPDIR/sbom.json\"")));
+        // Entry order decides the zip's bytes, and both builds of one
+        // extension have to produce the same payload.
+        assert!(script.contains("zip -Z store tmp.zip layer.img descriptor.json sbom.json)"));
+
+        // The layer is untouched by any of this: its bytes, and so the
+        // verity tree and root hash computed over them, are the same whether
+        // or not a document travels beside it.
+        let without =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "kab", None, true, None);
+        let with = cmd.create_build_script(
+            "1.0.0",
+            "sysext",
+            0,
+            "erofs",
+            &[],
+            "kab",
+            None,
+            true,
+            Some(&path),
+        );
+        let upto = |s: &str| s[..s.find("# --- KAB wrapping ---").unwrap()].to_string();
+        assert_eq!(upto(&without), upto(&with));
+        assert!(!without.contains("sbom.json"));
+
+        // And the wrap block itself is byte-for-byte what it was before the
+        // option existed, for an extension that did not ask for one. The
+        // option is threaded into the middle of the template, so a stray
+        // newline here would re-sign every kab in every project that leaves
+        // `image.sbom` off.
+        let before = r#"DESCEOF
+
+# Create zip archive (store mode — image is already compressed)
+(cd "$KAB_TMPDIR" && zip -Z store tmp.zip layer.img descriptor.json)
+"#;
+        assert!(without.contains(before), "got: {without}");
     }
 }

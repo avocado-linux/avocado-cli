@@ -143,7 +143,16 @@ impl KernelImageCommand {
             let args = image_args
                 .as_deref()
                 .context("kernel.image.type is `kab` but kernel.image.args is missing")?;
-            generate_kab_wrap_script("kernel", "AVOCADO_KERNEL_IMAGE", args, "$RUNTIME_VERSION")
+            // No SBOM: the kernel kab wraps a binary lifted out of the rootfs
+            // sysroot, not a sysroot of its own, so there is no package set to
+            // describe that the rootfs kab's document does not already carry.
+            generate_kab_wrap_script(
+                "kernel",
+                "AVOCADO_KERNEL_IMAGE",
+                args,
+                "$RUNTIME_VERSION",
+                None,
+            )
         } else {
             String::new()
         };

@@ -349,6 +349,81 @@ fn groups(scopes: &[Scope]) -> Vec<(Group<'_>, Vec<&Scope>)> {
     out
 }
 
+/// One built artifact that can carry an SBOM of its own, inside its kab's
+/// payload. Picks the single scope that document describes, under a name
+/// that does not depend on where the scan found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Component<'a> {
+    Extension(&'a str),
+    Rootfs,
+    Initramfs,
+}
+
+impl Component<'_> {
+    /// Whether `scope`, as `sysroot_scan.rs` named it, is this component's
+    /// own sysroot.
+    ///
+    /// An extension matches under every name the walk can produce for it:
+    /// `$AVOCADO_PREFIX/extensions` is a compat symlink into the active
+    /// runtime's tree and the walk de-duplicates by realpath, so one
+    /// unchanged extension reports as `ext:<name>` on a state volume that has
+    /// never built a runtime and `ext:<runtime>/<name>` on one that has.
+    pub(crate) fn matches(&self, scope: &str) -> bool {
+        match self {
+            Component::Extension(name) => {
+                scope == format!("ext:{name}")
+                    || scope == format!("includes:{name}")
+                    || scope
+                        .strip_prefix("ext:")
+                        .and_then(|rest| rest.split_once('/'))
+                        .is_some_and(|(_, leaf)| leaf == *name)
+            }
+            Component::Rootfs => scope == "rootfs",
+            Component::Initramfs => scope == "initramfs",
+        }
+    }
+
+    /// The scope name inside this component's own document. Fixed rather than
+    /// copied from the scan — see `matches` for why the scanned name cannot
+    /// be carried over.
+    pub(crate) fn scope_name(&self) -> String {
+        match self {
+            Component::Extension(name) => format!("ext:{name}"),
+            Component::Rootfs => "rootfs".to_string(),
+            Component::Initramfs => "initramfs".to_string(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Component::Extension(name) => format!("extension {name}"),
+            Component::Rootfs => "rootfs".to_string(),
+            Component::Initramfs => "initramfs".to_string(),
+        }
+    }
+}
+
+/// What a document claims to describe. Drives its name, its comment and the
+/// namespace its IRIs are minted under: two documents asserting different
+/// coverage must never land on the same ids, or they merge when ingested.
+#[derive(Clone, Copy)]
+pub(crate) enum Coverage<'a> {
+    Device,
+    Runtime(&'a str),
+    /// One component's own sysroot — the document that ships in its kab.
+    Component(Component<'a>),
+}
+
+/// A component's SBOM, written to a host temp file ready to bind-mount.
+/// Passed by file rather than interpolated into the build script: a rootfs
+/// document runs to hundreds of kilobytes.
+pub(crate) struct StagedSbom {
+    /// Dropping this deletes the file, so it must outlive the container run.
+    _dir: tempfile::TempDir,
+    pub(crate) mount_args: Vec<String>,
+    pub(crate) container_path: String,
+}
+
 /// Whether `scope` belongs to `runtime`: itself, `rootfs`, `initramfs`, the
 /// shared `includes` root, and its own extensions. `connect upload` filters a
 /// scan with this — `RuntimeParams` carries no runtime name, so an unfiltered
@@ -705,6 +780,13 @@ pub struct SbomCommand {
     output: OutputFormat,
     sdk_arch: Option<String>,
     composed_config: Option<Arc<ComposedConfig>>,
+    /// The epoch the caller is building the rest of the artifact against, so
+    /// an embedded document is as reproducible as the image it travels in.
+    /// `avocado sbom` leaves it unset and reads `SOURCE_DATE_EPOCH` instead.
+    source_date_epoch: Option<u64>,
+    /// The document goes into an artifact, not onto stdout, so `--verbose`
+    /// needs no suppressing.
+    embedded: bool,
 }
 
 impl SbomCommand {
@@ -729,6 +811,45 @@ impl SbomCommand {
             runs_on: None,
             sdk_arch: None,
             composed_config: None,
+            source_date_epoch: None,
+            embedded: false,
+        }
+    }
+
+    /// A command configured to describe the project an image command is
+    /// building, for `image: { sbom: true }`.
+    ///
+    /// `container_args` are the caller's raw CLI args: `scan` merges the
+    /// config's own, so an already-merged list would pass each one twice.
+    /// `source_date_epoch` is resolved through
+    /// [`crate::utils::container::effective_source_date_epoch`], not read
+    /// from the config key — every image script applies its own `:-0`
+    /// default, so the images are reproducible either way and the document
+    /// has to land on that same 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_image_build(
+        config_path: &str,
+        target: Option<String>,
+        verbose: bool,
+        container_args: Option<Vec<String>>,
+        sdk_arch: Option<String>,
+        runs_on: Option<String>,
+        composed: Option<Arc<ComposedConfig>>,
+        source_date_epoch: u64,
+    ) -> Self {
+        Self {
+            config_path: config_path.to_string(),
+            runs_on,
+            target,
+            output_path: None,
+            include_sdk: false,
+            verbose,
+            container_args,
+            output: OutputFormat::Human,
+            sdk_arch,
+            composed_config: composed,
+            source_date_epoch: Some(source_date_epoch),
+            embedded: true,
         }
     }
 
@@ -826,7 +947,7 @@ impl SbomCommand {
         // packages...` ahead of the JSON and the file will not parse. The
         // document is the output that matters, so the commentary yields —
         // announced on stderr, which is where a note about stdout belongs.
-        let scan_verbose = self.verbose && self.output_path.is_some();
+        let scan_verbose = self.verbose && (self.embedded || self.output_path.is_some());
         if self.verbose && !scan_verbose {
             eprintln!(
                 "[INFO] --verbose is suppressed while the document goes to stdout; it would be \
@@ -916,6 +1037,138 @@ impl SbomCommand {
             .and_then(|lock| lock.get_repo_snapshot(&target).cloned());
 
         Ok((scopes, target, snapshot))
+    }
+
+    /// Build one component's document and stage it on the host, ready to
+    /// bind-mount into the container that wraps the kab. `label` only picks
+    /// the in-container path apart from the other components wrapped in the
+    /// same run.
+    pub(crate) async fn stage_component_sbom(
+        &self,
+        label: &str,
+        component: Component<'_>,
+        runtime: Option<&str>,
+    ) -> Result<StagedSbom> {
+        // Refused for the reason `execute` refuses it: the scan reads this
+        // machine's state volume with no remote branch, so a `--runs-on`
+        // build would sign the remote host's layer together with an inventory
+        // of the local one's sysroots.
+        if let Some(host) = &self.runs_on {
+            anyhow::bail!(
+                "image.sbom is set for {}, but --runs-on {host} would describe this machine's \
+                 sysroots as {host}'s. Build on that host, or drop image.sbom.",
+                component.describe()
+            );
+        }
+
+        let doc = self.component_document(component, runtime).await?;
+
+        let dir = tempfile::Builder::new()
+            .prefix("avocado-sbom-")
+            .tempdir()
+            .context("Failed to create a temporary directory for the SBOM")?;
+        let host_path = dir.path().join(format!("{label}.json"));
+        std::fs::write(&host_path, serde_json::to_vec_pretty(&doc)?)
+            .with_context(|| format!("Failed to write the SBOM to '{}'", host_path.display()))?;
+        // The container does not run as the host user and `tempdir` is 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
+            std::fs::set_permissions(&host_path, std::fs::Permissions::from_mode(0o644)).ok();
+        }
+
+        let container_path = crate::utils::kab_wrap::sbom_mount_path(label);
+        let mount_args = vec![
+            "-v".to_string(),
+            format!("{}:{container_path}:ro", host_path.display()),
+        ];
+        Ok(StagedSbom {
+            _dir: dir,
+            mount_args,
+            container_path,
+        })
+    }
+
+    /// The document that ships inside one component's own artifact: what that
+    /// component installs, and nothing else the project does.
+    ///
+    /// Narrowed from the same scan `avocado sbom` runs rather than from a scan
+    /// of its own, so a kab's document and the project's can never disagree —
+    /// the contract `connect upload` already has for a runtime.
+    ///
+    /// No `ImageIds`. The image id of a kab is the Identifier kabtool stamps
+    /// into its header while wrapping this very document, so a kab cannot
+    /// carry its own; and the manifest they are read from exists only after a
+    /// runtime build, which would make the same component's document differ
+    /// between `avocado build` and a standalone `avocado ext image`.
+    pub(crate) async fn component_document(
+        &self,
+        component: Component<'_>,
+        runtime: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let (scopes, target, snapshot) = self.scan(|m| eprintln!("[WARN] {m}")).await?;
+        let scope = Self::component_scope(scopes, component, runtime)?;
+        Ok(self.build_scoped_document(
+            std::slice::from_ref(&scope),
+            &target,
+            snapshot.as_ref(),
+            Coverage::Component(component),
+            None,
+        ))
+    }
+
+    /// Narrow a scan to `component`'s own sysroot, under the fixed name and
+    /// with the build-host path dropped — see [`Component::matches`] for why
+    /// neither can be carried over from the scan.
+    pub(crate) fn component_scope(
+        scopes: Vec<Scope>,
+        component: Component<'_>,
+        runtime: Option<&str>,
+    ) -> Result<Scope> {
+        let mut found: Vec<Scope> = scopes
+            .into_iter()
+            .filter(|s| component.matches(&s.name))
+            .collect();
+
+        // Two matches means this extension has a sysroot under two runtime
+        // trees on the volume. Picking either would attribute one runtime's
+        // packages to the other's kab.
+        if found.len() > 1 {
+            if let Some(r) = runtime {
+                let prefix = format!("ext:{r}/");
+                if found.iter().any(|s| s.name.starts_with(&prefix)) {
+                    found.retain(|s| s.name.starts_with(&prefix));
+                }
+            }
+        }
+        if found.len() > 1 {
+            let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+            anyhow::bail!(
+                "Cannot tell which sysroot the {} SBOM should describe: {} match. \
+                 Pass --runtime to name the one being built.",
+                component.describe(),
+                names.join(", ")
+            );
+        }
+
+        // An empty scope is described rather than refused; the two cases are
+        // told apart by whether the scan found the sysroot at all. Present and
+        // empty is an ordinary overlay-only extension. Absent means nothing
+        // was installed, and an empty document would be a claim the scan
+        // cannot support.
+        let mut scope = found.pop().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No sysroot was found for the {}, so its SBOM would describe nothing. \
+                 Install it first (`avocado install`), and note that the scan reads the \
+                 state volume of the current directory, not of --config's directory.",
+                component.describe()
+            )
+        })?;
+
+        scope.name = component.scope_name();
+        scope.root = String::new();
+        Ok(scope)
     }
 
     /// Image ids for this document's scopes, read from each runtime's build
@@ -1161,15 +1414,20 @@ impl SbomCommand {
     /// Two devices holding genuinely identical software share a namespace,
     /// which is correct — the documents are then identical too.
     ///
-    /// `runtime` is folded in for the same reason: a runtime-scoped document
-    /// and the device-wide one differ only by scopes the digest skips when
-    /// they are empty, so on a single-runtime project both would otherwise
-    /// land on the same `{ns}/sbom` and `{ns}/document` IRIs while asserting
-    /// different coverage.
-    fn namespace_digest(scopes: &[Scope], runtime: Option<&str>) -> String {
+    /// The coverage is folded in for the same reason: a runtime-scoped
+    /// document and the device-wide one differ only by scopes the digest
+    /// skips when they are empty, so on a single-runtime project both would
+    /// otherwise land on the same `{ns}/sbom` and `{ns}/document` IRIs while
+    /// asserting different coverage. A component document is narrower still
+    /// and is distinguished the same way.
+    fn namespace_digest(scopes: &[Scope], coverage: Coverage<'_>) -> String {
         let mut hasher = Sha256::new();
-        if let Some(r) = runtime {
-            hasher.update(format!("runtime\t{r}\n").as_bytes());
+        match coverage {
+            Coverage::Device => {}
+            Coverage::Runtime(r) => hasher.update(format!("runtime\t{r}\n").as_bytes()),
+            Coverage::Component(c) => {
+                hasher.update(format!("component\t{}\n", c.scope_name()).as_bytes())
+            }
         }
         // Sorted, so the digest does not depend on the order the sysroots were
         // discovered in.
@@ -1205,12 +1463,42 @@ impl SbomCommand {
         runtime: Option<&str>,
         images: Option<&ImageIds>,
     ) -> serde_json::Value {
+        self.build_scoped_document(
+            scopes,
+            target,
+            snapshot,
+            match runtime {
+                Some(r) => Coverage::Runtime(r),
+                None => Coverage::Device,
+            },
+            images,
+        )
+    }
+
+    /// The document itself, for whatever `coverage` `scopes` was filtered to.
+    pub(crate) fn build_scoped_document(
+        &self,
+        scopes: &[Scope],
+        target: &str,
+        snapshot: Option<&RepoSnapshot>,
+        coverage: Coverage<'_>,
+        images: Option<&ImageIds>,
+    ) -> serde_json::Value {
         let ns = format!(
             "https://avocadolinux.org/spdx/{}/{}",
             slug_id(target),
-            Self::namespace_digest(scopes, runtime)
+            Self::namespace_digest(scopes, coverage)
         );
-        let created = created_timestamp(std::env::var("SOURCE_DATE_EPOCH").ok().as_deref());
+        // The caller's epoch wins over the environment: an image command
+        // embedding this builds the rest of the artifact against that epoch,
+        // and a wall-clock `created` would be the one part of the payload
+        // that moved between two builds of identical content.
+        let created = created_timestamp(
+            self.source_date_epoch
+                .map(|e| e.to_string())
+                .or_else(|| std::env::var("SOURCE_DATE_EPOCH").ok())
+                .as_deref(),
+        );
 
         let creation_id = format!("{ns}/creationinfo/1");
         let agent_id = format!("{ns}/agent/avocado");
@@ -1279,7 +1567,15 @@ impl SbomCommand {
         // `includes:etc` exists and contains nothing describes a directory as
         // if it were a shipped artifact. The human summary still lists them, so
         // "scanned and empty" stays visible where it belongs.
-        for scope in scopes.iter().filter(|s| !s.packages.is_empty()) {
+        // A component document keeps its one scope even when empty: it was
+        // named by the caller rather than found by a glob, an overlay-only
+        // extension really does ship no package, and dropping the scope would
+        // leave the document with no `rootElement` at all.
+        let keep_empty = matches!(coverage, Coverage::Component(_));
+        for scope in scopes
+            .iter()
+            .filter(|s| keep_empty || !s.packages.is_empty())
+        {
             let scope_id = format!("{ns}/scope/{}", slug_id(&scope.name));
             let mut scope_element = serde_json::json!({
                 "type": "software_Package",
@@ -1287,8 +1583,20 @@ impl SbomCommand {
                 "creationInfo": creation_id,
                 "name": scope.name,
                 "software_primaryPurpose": "archive",
-                "comment": format!("avocado sysroot at {}", scope.root),
             });
+            // `component_scope` clears the root: the realpath names the active
+            // runtime for an extension found through the compat symlink, so a
+            // shipped document would carry a build-host path that varies with
+            // the state volume rather than with what the kab holds.
+            if !scope.root.is_empty() {
+                scope_element
+                    .as_object_mut()
+                    .expect("json! built an object")
+                    .insert(
+                        "comment".into(),
+                        serde_json::json!(format!("avocado sysroot at {}", scope.root)),
+                    );
+            }
 
             // Not folded into scope_id/ns: those feed namespace_digest, which
             // must stay stable across a rebuild that only moves image bytes.
@@ -1355,17 +1663,19 @@ impl SbomCommand {
             members.sort();
             members.dedup();
 
-            // Non-empty by construction — the loop skips empty scopes — which
-            // matters because `Relationship.to` is min_count=1 and the SPDX
-            // SHACL shapes reject an empty one.
-            graph.push(serde_json::json!({
-                "type": "Relationship",
-                "spdxId": format!("{ns}/rel/contains/{}", slug_id(&scope.name)),
-                "creationInfo": creation_id,
-                "from": scope_id,
-                "relationshipType": "contains",
-                "to": members,
-            }));
+            // `Relationship.to` is min_count=1 and the SPDX SHACL shapes
+            // reject an empty one, so a scope with no members gets no
+            // relationship. Only reachable under `keep_empty`.
+            if !members.is_empty() {
+                graph.push(serde_json::json!({
+                    "type": "Relationship",
+                    "spdxId": format!("{ns}/rel/contains/{}", slug_id(&scope.name)),
+                    "creationInfo": creation_id,
+                    "from": scope_id,
+                    "relationshipType": "contains",
+                    "to": members,
+                }));
+            }
         }
 
         // An extension is not a peer of the runtime carrying it. The project
@@ -1417,9 +1727,10 @@ impl SbomCommand {
             "type": "software_Sbom",
             "spdxId": sbom_id,
             "creationInfo": creation_id,
-            "name": match runtime {
-                Some(r) => format!("avocado {target} runtime {r} SBOM"),
-                None => format!("avocado {target} device SBOM"),
+            "name": match coverage {
+                Coverage::Runtime(r) => format!("avocado {target} runtime {r} SBOM"),
+                Coverage::Component(c) => format!("avocado {target} {} SBOM", c.describe()),
+                Coverage::Device => format!("avocado {target} device SBOM"),
             },
             // "deployed", not "build". A Yocto build emits SPDX for the same
             // packages under `build`; this describes what was installed, which
@@ -1427,14 +1738,21 @@ impl SbomCommand {
             "software_sbomType": ["deployed"],
             // `software_sbomType` says this to a machine; this says it to a
             // person (criterion 4).
-            "comment": match runtime {
-                Some(r) => format!(
+            "comment": match coverage {
+                Coverage::Runtime(r) => format!(
                     "Describes what runtime {r} installs, and so what runs on the device \
                      under it: the transitive closure read from each of its sysroots' RPM \
                      databases, not what avocado.yaml declares. Other runtimes in this \
                      project are not covered."
                 ),
-                None => "Describes what this project installs, and so what runs on the \
+                Coverage::Component(c) => format!(
+                    "Describes the packages this {} ships, and nothing else on the \
+                     device: read from its own sysroot's RPM database, with the base \
+                     system it was seeded from subtracted, not from what avocado.yaml \
+                     declares. Travels inside the artifact it describes.",
+                    c.describe()
+                ),
+                Coverage::Device => "Describes what this project installs, and so what runs on the \
                      device: the transitive closure read from each sysroot's RPM database, \
                      not what avocado.yaml declares."
                     .to_string(),
@@ -1506,8 +1824,15 @@ impl SbomCommand {
         //
         // After the device SBOM and before `SpdxDocument`: existing tests take
         // the first `software_Sbom` in `@graph` as the device one.
-        for (group, members) in groups(scopes) {
-            if let (Group::Runtime(r), Some(scoped)) = (group, runtime) {
+        // Skipped for a component document, whose one scope the element above
+        // already covers: every group here would restate it under a second id
+        // and a consumer counting elements would see it claimed twice.
+        let group_slices = match coverage {
+            Coverage::Component(_) => Vec::new(),
+            _ => groups(scopes),
+        };
+        for (group, members) in group_slices {
+            if let (Group::Runtime(r), Coverage::Runtime(scoped)) = (group, coverage) {
                 if r == scoped {
                     continue;
                 }
@@ -3634,5 +3959,406 @@ mod tests {
             v
         };
         assert_eq!(strip_image_props(without), strip_image_props(with));
+    }
+
+    // ---- component documents: what ships inside one kab (image.sbom) ----
+
+    /// A rootfs plus one extension, named however the caller asks. The scope
+    /// name and realpath are what vary between a scan taken on a volume that
+    /// has built a runtime and one taken on a fresh volume.
+    fn ext_dump(ext_scope: &str, ext_root: &str) -> String {
+        format!(
+            "##SCOPE\trootfs\t{}\n{}\
+             ##SCOPE\t{ext_scope}\t{ext_root}\n{}{}",
+            "/opt/_avocado/qemuarm64/rootfs",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "nginx",
+                "1.27",
+                "r0.0",
+                "cortexa57",
+                "BSD-2-Clause",
+                "(none)",
+                2000
+            ),
+        )
+    }
+
+    fn component_doc(dump: &str, component: Component<'_>) -> serde_json::Value {
+        let c = cmd(false);
+        let scope = SbomCommand::component_scope(c.parse_scopes(dump), component, None)
+            .expect("the component is in the dump");
+        c.build_scoped_document(
+            std::slice::from_ref(&scope),
+            "qemuarm64",
+            None,
+            Coverage::Component(component),
+            None,
+        )
+    }
+
+    #[test]
+    fn an_extension_is_matched_under_every_name_the_walk_can_give_it() {
+        let app = Component::Extension("app");
+        assert!(app.matches("ext:app"), "no runtime tree on the volume");
+        assert!(app.matches("ext:dev/app"), "found under a runtime tree");
+        assert!(
+            app.matches("includes:app"),
+            "legacy-layout remote extension"
+        );
+
+        // Not a prefix match: attributing `app-extra`'s packages to `app`'s
+        // kab is the failure this guards.
+        assert!(!app.matches("ext:app-extra"));
+        assert!(!app.matches("ext:dev/app-extra"));
+        assert!(!app.matches("runtime:app"));
+        assert!(!app.matches("rootfs"));
+
+        assert!(Component::Rootfs.matches("rootfs"));
+        assert!(!Component::Rootfs.matches("initramfs"));
+        assert!(Component::Initramfs.matches("initramfs"));
+    }
+
+    /// The property the feature rests on: a standalone `avocado ext image`
+    /// and the same extension imaged during `avocado build` must put the same
+    /// bytes in the kab. The two scans differ only in the name and realpath
+    /// reported for one sysroot, which is a property of the state volume.
+    #[test]
+    fn a_component_document_is_the_same_wherever_the_scan_found_the_sysroot() {
+        let standalone = component_doc(
+            &ext_dump("ext:app", "/opt/_avocado/qemuarm64/extensions/app"),
+            Component::Extension("app"),
+        );
+        let in_runtime = component_doc(
+            &ext_dump(
+                "ext:dev/app",
+                "/opt/_avocado/qemuarm64/runtimes/dev/extensions/app",
+            ),
+            Component::Extension("app"),
+        );
+        assert_eq!(
+            serde_json::to_string(&standalone).unwrap(),
+            serde_json::to_string(&in_runtime).unwrap(),
+        );
+
+        let json = serde_json::to_string(&in_runtime).unwrap();
+        assert!(
+            !json.contains("runtimes/") && !json.contains("ext:dev"),
+            "a kab must not carry the name of whichever runtime tree it was built under"
+        );
+    }
+
+    #[test]
+    fn a_component_document_describes_that_component_and_nothing_else() {
+        let doc = component_doc(
+            &ext_dump("ext:dev/app", "/runtimes/dev/extensions/app"),
+            Component::Extension("app"),
+        );
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let sboms: Vec<&str> = graph
+            .iter()
+            .filter(|e| e["type"] == "software_Sbom")
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(sboms, vec!["avocado qemuarm64 extension app SBOM"]);
+
+        let scopes: Vec<&str> = graph
+            .iter()
+            .filter(|e| {
+                e["type"] == "software_Package" && e["software_primaryPurpose"] == "archive"
+            })
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec!["ext:app"],
+            "the scanned name is not carried over"
+        );
+
+        let packages: Vec<&str> = graph
+            .iter()
+            .filter(|e| {
+                e["type"] == "software_Package" && e["software_primaryPurpose"] != "archive"
+            })
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(packages, vec!["nginx"], "the seeded base is subtracted");
+    }
+
+    /// A kab cannot carry its own image id: kabtool stamps the Identifier
+    /// while wrapping this document, and the manifest it would be read from
+    /// exists only after a runtime build, so carrying one would also make the
+    /// two build flows disagree.
+    #[test]
+    fn a_component_document_carries_no_image_id() {
+        let dump = ext_dump("ext:app", "/extensions/app");
+        let c = cmd(false);
+        let scope =
+            SbomCommand::component_scope(c.parse_scopes(&dump), Component::Extension("app"), None)
+                .unwrap();
+        let mut images = ImageIds::default();
+        images.merge(ImageIds::from_manifest(
+            &serde_json::json!({
+                "extensions": [
+                    {"name": "app", "image_id": "11111111-1111-1111-1111-111111111111"}
+                ]
+            }),
+            "dev",
+        ));
+        assert!(images.get("ext:dev/app").is_some(), "the fixture resolves");
+
+        let doc = c.build_scoped_document(
+            std::slice::from_ref(&scope),
+            "qemuarm64",
+            None,
+            Coverage::Component(Component::Extension("app")),
+            Some(&images),
+        );
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("externalIdentifier"), "got: {json}");
+        assert!(!json.contains("11111111-1111"), "got: {json}");
+    }
+
+    #[test]
+    fn a_component_and_the_device_document_do_not_collide_on_ids() {
+        let dump = ext_dump("ext:app", "/extensions/app");
+        let c = cmd(false);
+        let device = c.build_document(&c.parse_scopes(&dump), "qemuarm64", None, None, None);
+        let component = component_doc(&dump, Component::Extension("app"));
+
+        let doc_id = |d: &serde_json::Value| {
+            d["@graph"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["type"] == "SpdxDocument")
+                .unwrap()["spdxId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(doc_id(&device), doc_id(&component));
+    }
+
+    #[test]
+    fn rootfs_and_initramfs_each_get_a_document_of_their_own() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\tinitramfs\t/initramfs\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "busybox",
+                "1.36",
+                "r0.0",
+                "cortexa57",
+                "GPL-2.0-only",
+                "(none)",
+                3000
+            ),
+        );
+
+        for (component, expected_pkg, expected_name) in [
+            (Component::Rootfs, "libc6", "avocado qemuarm64 rootfs SBOM"),
+            (
+                Component::Initramfs,
+                "busybox",
+                "avocado qemuarm64 initramfs SBOM",
+            ),
+        ] {
+            let doc = component_doc(&dump, component);
+            let graph = doc["@graph"].as_array().unwrap();
+            let names: Vec<&str> = graph
+                .iter()
+                .filter(|e| e["type"] == "software_Sbom")
+                .filter_map(|e| e["name"].as_str())
+                .collect();
+            assert_eq!(names, vec![expected_name]);
+            let packages: Vec<&str> = graph
+                .iter()
+                .filter(|e| {
+                    e["type"] == "software_Package" && e["software_primaryPurpose"] != "archive"
+                })
+                .filter_map(|e| e["name"].as_str())
+                .collect();
+            assert_eq!(packages, vec![expected_pkg]);
+        }
+    }
+
+    #[test]
+    fn an_extension_under_two_runtimes_is_refused_rather_than_guessed() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\text:dev/app\t/runtimes/dev/extensions/app\n{}\
+             ##SCOPE\text:prod/app\t/runtimes/prod/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full(
+                "nginx",
+                "1.27",
+                "r0.0",
+                "cortexa57",
+                "BSD-2-Clause",
+                "(none)",
+                2000
+            ),
+            row_full(
+                "nginx",
+                "1.29",
+                "r0.0",
+                "cortexa57",
+                "BSD-2-Clause",
+                "(none)",
+                3000
+            ),
+        );
+        let c = cmd(false);
+        let err =
+            SbomCommand::component_scope(c.parse_scopes(&dump), Component::Extension("app"), None)
+                .expect_err("ambiguous");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--runtime"), "got: {msg}");
+        assert!(
+            msg.contains("ext:dev/app") && msg.contains("ext:prod/app"),
+            "got: {msg}"
+        );
+
+        let scope = SbomCommand::component_scope(
+            c.parse_scopes(&dump),
+            Component::Extension("app"),
+            Some("prod"),
+        )
+        .expect("disambiguated");
+        assert_eq!(scope.name, "ext:app");
+        assert_eq!(scope.packages.len(), 1);
+        assert_eq!(scope.packages[0].version, "1.29");
+    }
+
+    /// Most kos layers are content and no packages. Their kabs still carry an
+    /// inventory, and the true one is empty — but it has to be a valid
+    /// document, not a graph with no root.
+    #[test]
+    fn an_overlay_only_component_gets_a_document_saying_it_ships_no_package() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}\
+             ##SCOPE\text:app\t/extensions/app\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+        let doc = component_doc(&dump, Component::Extension("app"));
+        let graph = doc["@graph"].as_array().unwrap();
+
+        let sbom = graph
+            .iter()
+            .find(|e| e["type"] == "software_Sbom")
+            .expect("a document, not an empty graph");
+        let scope_id = graph
+            .iter()
+            .find(|e| e["software_primaryPurpose"] == "archive")
+            .expect("the scope is described even though it is empty")["spdxId"]
+            .clone();
+        assert_eq!(sbom["rootElement"], serde_json::json!([scope_id]));
+        assert_eq!(sbom["element"], serde_json::json!([scope_id]));
+
+        // `Relationship.to` is min_count=1 under the SPDX shapes.
+        assert!(
+            !graph
+                .iter()
+                .any(|e| e["type"] == "Relationship" && e["relationshipType"] == "contains"),
+            "an empty contains would fail SHACL validation"
+        );
+        assert!(!graph
+            .iter()
+            .any(|e| e["type"] == "software_Package" && e["name"] == "libc6"));
+    }
+
+    #[test]
+    fn a_component_that_was_never_installed_is_refused() {
+        let dump = format!(
+            "##SCOPE\trootfs\t/rootfs\n{}",
+            row_full("libc6", "2.39", "r0.2", "cortexa57", "MIT", "(none)", 1000),
+        );
+        let c = cmd(false);
+        let err = SbomCommand::component_scope(
+            c.parse_scopes(&dump),
+            Component::Extension("missing"),
+            None,
+        )
+        .expect_err("absent");
+        assert!(
+            format!("{err:#}").contains("No sysroot was found"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The embedded document and the layer beside it are compared across
+    /// builds together, so both must be stamped with the same epoch. Each
+    /// side reaches it differently — the scripts with a shell `:-0`, the
+    /// document through `effective_source_date_epoch` — and only this holds
+    /// the two spellings together.
+    #[test]
+    fn sbom_epoch_matches_the_shell_default_every_image_script_applies() {
+        use crate::utils::container::effective_source_date_epoch;
+
+        assert_eq!(effective_source_date_epoch(None), 0);
+        assert_eq!(
+            effective_source_date_epoch(Some(1_700_000_000)),
+            1_700_000_000
+        );
+
+        let rootfs = crate::commands::rootfs::image::generate_rootfs_build_script(
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "erofs",
+            None,
+            "",
+            false,
+        );
+        assert_eq!(
+            rootfs.matches(r#"-T "${SOURCE_DATE_EPOCH:-0}""#).count(),
+            2,
+            "both mkfs.erofs branches must default the epoch to 0"
+        );
+
+        let initramfs = crate::commands::initramfs::image::generate_initramfs_build_script(
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "cpio",
+            None,
+            "",
+            false,
+            "auto",
+        );
+        assert!(
+            initramfs.contains(r#"touch -h -d "@${SOURCE_DATE_EPOCH:-0}""#),
+            "the mtime normalization must default the epoch to 0"
+        );
+        // `ext image` resolves it in Rust; pinned by
+        // `the_script_epoch_is_the_one_the_sbom_is_stamped_with` there.
+    }
+
+    #[test]
+    fn source_date_epoch_pins_the_created_timestamp() {
+        let dump = ext_dump("ext:app", "/extensions/app");
+        let mut c = cmd(false);
+        c.source_date_epoch = Some(1_700_000_000);
+        let scope =
+            SbomCommand::component_scope(c.parse_scopes(&dump), Component::Extension("app"), None)
+                .unwrap();
+        let doc = c.build_scoped_document(
+            std::slice::from_ref(&scope),
+            "qemuarm64",
+            None,
+            Coverage::Component(Component::Extension("app")),
+            None,
+        );
+        let created = doc["@graph"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "CreationInfo")
+            .unwrap()["created"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(created, "2023-11-14T22:13:20Z");
     }
 }

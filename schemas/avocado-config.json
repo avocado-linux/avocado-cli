@@ -1247,6 +1247,10 @@
         "verity": {
           "type": "boolean",
           "description": "Whether the image is dm-verity protected. Honored for rootfs and extensions."
+        },
+        "sbom": {
+          "type": "boolean",
+          "description": "Whether to write an SPDX SBOM of this image's own packages into its KAB payload as sbom.json. Requires type: kab. Honored for rootfs, initramfs and extensions; not for the kernel, which has no sysroot of its own."
         }
       },
       "additionalProperties": false
@@ -1391,6 +1395,15 @@
           "description": "Path to install script relative to src_dir, run after kernel compilation with $AVOCADO_RUNTIME_BUILD_DIR set.",
           "examples": [
             "kernel-install.sh"
+          ]
+        },
+        "binary": {
+          "type": "string",
+          "description": "Which kernel binary to stage, as the Yocto KERNEL_IMAGETYPE: the filename prefix ahead of -<kver> in the rootfs sysroot's /boot. Unset prefers an uncompressed variant; set, the named variant must exist or the install fails.",
+          "examples": [
+            "Image",
+            "Image.gz",
+            "bzImage"
           ]
         },
         "image": {

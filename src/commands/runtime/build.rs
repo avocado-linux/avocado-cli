@@ -956,6 +956,55 @@ impl RuntimeBuildCommand {
             Some(env_vars)
         };
 
+        // `image: { sbom: true }` on rootfs / initramfs — build each
+        // component's SPDX document on the host and bind-mount it where the
+        // wrap fragment expects it. Read off the same resolved sections
+        // `create_build_script` read, so the script's `cp` and these mounts
+        // always name the same set. The staged handles live to the end of
+        // this function: dropping one deletes the file the container reads.
+        //
+        // The kernel takes no document; see `create_build_script`.
+        let mut staged_sboms: Vec<crate::commands::sbom::generate::StagedSbom> = Vec::new();
+        for (label, component) in [
+            ("rootfs", crate::commands::sbom::generate::Component::Rootfs),
+            (
+                "initramfs",
+                crate::commands::sbom::generate::Component::Initramfs,
+            ),
+        ] {
+            let section = config.resolve_image_section(parsed, label, target_arch);
+            let on = section
+                .as_ref()
+                .map(crate::utils::config::get_ext_image_sbom)
+                .transpose()
+                .context(label.to_string())?
+                .unwrap_or(false);
+            if !on {
+                continue;
+            }
+            print_info(
+                &format!(
+                    "Generating {label} SBOM for runtime '{}'.",
+                    self.runtime_name
+                ),
+                OutputLevel::Normal,
+            );
+            staged_sboms.push(
+                crate::commands::sbom::generate::SbomCommand::for_image_build(
+                    &self.config_path,
+                    Some(target_arch.to_string()),
+                    self.verbose,
+                    self.container_args.clone(),
+                    self.sdk_arch.clone(),
+                    self.runs_on.clone(),
+                    self.composed_config.clone(),
+                    crate::utils::container::effective_source_date_epoch(config.source_date_epoch),
+                )
+                .stage_component_sbom(label, component, None)
+                .await?,
+            );
+        }
+
         // If any extension in this runtime declares docker_images, add --privileged
         // to container args so dockerd can run inside the SDK container (Docker-in-Docker)
         let build_container_args = {
@@ -988,6 +1037,10 @@ impl RuntimeBuildCommand {
             if let Some(ref keydir) = fit_keydir_host_path {
                 args.push("-v".to_string());
                 args.push(format!("{keydir}:/tmp/fit-keys:ro"));
+                modified = true;
+            }
+            for sbom in &staged_sboms {
+                args.extend(sbom.mount_args.iter().cloned());
                 modified = true;
             }
             if modified {
@@ -1818,40 +1871,80 @@ fi"#
         let default_kab_args =
             r#"-b -t kos.layer -v "$AVOCADO_RUNTIME_VERSION" --tag "$AVOCADO_TARGET""#;
 
+        // `image: { sbom: true }` on rootfs / initramfs. Read here rather
+        // than handed in, because `execute_build_internal` bind-mounts the
+        // documents off the same resolved sections: two readers of one config
+        // key cannot disagree about which components carry a document, where
+        // a path threaded through this sync function could go stale.
+        //
+        // The kernel is not offered the key. Its kab wraps a binary lifted out
+        // of the rootfs sysroot rather than a sysroot of its own, so there is
+        // no package set for a document to describe.
+        let read_sbom = |section: Option<&serde_yaml::Value>| -> Result<bool> {
+            Ok(section
+                .map(crate::utils::config::get_ext_image_sbom)
+                .transpose()?
+                .unwrap_or(false))
+        };
+        let rootfs_sbom = read_sbom(rootfs_section.as_ref()).context("rootfs")?;
+        let initramfs_sbom = read_sbom(initramfs_section.as_ref()).context("initramfs")?;
+        for (component, on, image_type) in [
+            ("rootfs", rootfs_sbom, &rootfs_image_type),
+            ("initramfs", initramfs_sbom, &initramfs_image_type),
+        ] {
+            if on && image_type != "kab" {
+                anyhow::bail!(
+                    "{component}.image.sbom is set but {component}.image.type is \
+                     '{image_type}'. The document travels in the KAB payload, and a .raw has \
+                     nowhere to put it — set image.type to `kab`, or run `avocado sbom` for a \
+                     standalone document."
+                );
+            }
+        }
+
         // No-op when image_type != "kab"; otherwise produce the shared
         // wrap fragment and let it default to `default_kab_args` when
         // the config didn't supply explicit args.
-        let wrap_section =
-            |label: &str, env_var: &str, image_type: &str, image_args: &Option<String>| -> String {
-                if image_type != "kab" {
-                    return String::new();
-                }
-                let args = image_args.as_deref().unwrap_or(default_kab_args);
-                crate::utils::kab_wrap::generate_kab_wrap_script(
-                    label,
-                    env_var,
-                    args,
-                    "$AVOCADO_RUNTIME_VERSION",
-                )
-            };
+        let wrap_section = |label: &str,
+                            env_var: &str,
+                            image_type: &str,
+                            image_args: &Option<String>,
+                            sbom: bool|
+         -> String {
+            if image_type != "kab" {
+                return String::new();
+            }
+            let args = image_args.as_deref().unwrap_or(default_kab_args);
+            let sbom_path = sbom.then(|| crate::utils::kab_wrap::sbom_mount_path(label));
+            crate::utils::kab_wrap::generate_kab_wrap_script(
+                label,
+                env_var,
+                args,
+                "$AVOCADO_RUNTIME_VERSION",
+                sbom_path.as_deref(),
+            )
+        };
 
         let rootfs_kab_wrap = wrap_section(
             "rootfs",
             "AVOCADO_ROOTFS_IMAGE",
             &rootfs_image_type,
             &rootfs_image_args,
+            rootfs_sbom,
         );
         let initramfs_kab_wrap = wrap_section(
             "initramfs",
             "AVOCADO_INITRAMFS_IMAGE",
             &initramfs_image_type,
             &initramfs_image_args,
+            initramfs_sbom,
         );
         let kernel_kab_wrap = wrap_section(
             "kernel",
             "AVOCADO_KERNEL_IMAGE",
             &kernel_image_type,
             &kernel_image_args,
+            false,
         );
 
         let namespace_uuid = crate::utils::update_repo::AVOCADO_IMAGE_NAMESPACE.to_string();
@@ -5023,6 +5116,123 @@ runtimes:
         // operators can reference it in their kab args without
         // worrying about ordering or visibility across image blocks.
         assert!(script.contains("export AVOCADO_OS_VERSION_ID"));
+
+        // No `image.sbom`, so nothing is copied into the payload.
+        assert!(!script.contains("sbom.json"));
+    }
+
+    /// `rootfs.image.sbom: true` puts the document in the rootfs kab's
+    /// payload and nowhere else. The script and the bind-mount in
+    /// `execute_build_internal` read the same config key off the same
+    /// resolved section, so this also pins the path they have to agree on.
+    #[test]
+    fn a_runtime_build_carries_each_components_own_sbom() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+distro:
+  version: "0.1.0"
+
+rootfs:
+  image:
+    type: kab
+    sbom: true
+    args: '-b -t kos.layer.basefs -v 2024.1.0 --tag raspberrypi4'
+  packages:
+    avocado-pkg-rootfs: '*'
+
+initramfs:
+  image:
+    type: kab
+    args: '-b -t kos.layer.initramfs -v 2024.1.0 --tag raspberrypi4'
+
+runtimes:
+  test-runtime:
+    target: "raspberrypi4"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("raspberrypi4".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(
+                &config,
+                &parsed,
+                "raspberrypi4",
+                &[],
+                SysrootImageReuse::default(),
+            )
+            .unwrap();
+
+        let rootfs_path = crate::utils::kab_wrap::sbom_mount_path("rootfs");
+        assert!(script.contains(&format!("cp \"{rootfs_path}\" \"$KAB_TMPDIR/sbom.json\"")));
+        // The initramfs is wrapped in the same run but did not ask for a
+        // document, so its payload is unchanged.
+        assert_eq!(
+            script.matches("sbom.json").count(),
+            2,
+            "one cp and one zip entry, for the rootfs alone"
+        );
+        assert!(!script.contains(&crate::utils::kab_wrap::sbom_mount_path("initramfs")));
+    }
+
+    /// A `.raw` has nowhere to carry the document, so asking for one is a
+    /// config error rather than a silently dropped claim.
+    #[test]
+    fn an_sbom_on_a_raw_component_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+rootfs:
+  image:
+    sbom: true
+  packages:
+    avocado-pkg-rootfs: '*'
+
+runtimes:
+  test-runtime:
+    target: "raspberrypi4"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("raspberrypi4".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let err = cmd
+            .create_build_script(
+                &config,
+                &parsed,
+                "raspberrypi4",
+                &[],
+                SysrootImageReuse::default(),
+            )
+            .expect_err("sbom without a kab to put it in");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rootfs.image.sbom"), "got: {msg}");
+        assert!(msg.contains("image.type"), "got: {msg}");
     }
 
     /// A kab's image_id must be the identifier kabtool stamped into the

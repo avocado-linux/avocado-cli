@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::commands::sbom::generate::{Component, SbomCommand};
 use crate::utils::{
-    config::{get_ext_image_args, get_ext_image_type, get_post_install, Config},
+    config::{
+        get_ext_image_args, get_ext_image_sbom, get_ext_image_type, get_post_install, Config,
+    },
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
     kab_wrap::generate_kab_wrap_script,
@@ -451,6 +454,39 @@ impl InitramfsImageCommand {
             None
         };
 
+        // `image: { sbom: true }` — see rootfs/image.rs for the rationale.
+        let want_sbom = initramfs_node
+            .map(get_ext_image_sbom)
+            .transpose()
+            .context("initramfs")?
+            == Some(true);
+        if want_sbom && !wrap_kab {
+            return Err(anyhow::anyhow!(
+                "initramfs.image.sbom is set but initramfs.image.type is '{image_type}'. \
+                 The document travels in the KAB payload, and a .raw has nowhere to put it — \
+                 set image.type to `kab`, or run `avocado sbom` for a standalone document."
+            ));
+        }
+        let staged_sbom = if want_sbom {
+            print_info("Generating initramfs SBOM.", OutputLevel::Normal);
+            Some(
+                SbomCommand::for_image_build(
+                    &self.config_path,
+                    self.target.clone(),
+                    self.verbose,
+                    self.container_args.clone(),
+                    self.sdk_arch.clone(),
+                    self.runs_on.clone(),
+                    Some(Arc::clone(&composed)),
+                    crate::utils::container::effective_source_date_epoch(config.source_date_epoch),
+                )
+                .stage_component_sbom("initramfs", Component::Initramfs, None)
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let wrap_section = if wrap_kab {
             let args = image_args
                 .as_deref()
@@ -460,6 +496,7 @@ impl InitramfsImageCommand {
                 "AVOCADO_INITRAMFS_IMAGE",
                 args,
                 "$RUNTIME_VERSION",
+                staged_sbom.as_ref().map(|s| s.container_path.as_str()),
             )
         } else {
             String::new()
@@ -495,10 +532,16 @@ export AVOCADO_OS_VERSION_ID
         // carries the same env.
         crate::utils::container::inject_source_date_epoch(&mut env_vars, config.source_date_epoch);
 
-        let container_args_with_keyset = if let Some(ref host_path) = kab_keyset_host_path {
+        let container_args_with_keyset = if kab_keyset_host_path.is_some() || staged_sbom.is_some()
+        {
             let mut args = merged_container_args.clone().unwrap_or_default();
-            args.push("-v".to_string());
-            args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            if let Some(ref host_path) = kab_keyset_host_path {
+                args.push("-v".to_string());
+                args.push(format!("{host_path}:/tmp/kab.keyset:ro"));
+            }
+            if let Some(ref sbom) = staged_sbom {
+                args.extend(sbom.mount_args.iter().cloned());
+            }
             Some(args)
         } else {
             merged_container_args.clone()
