@@ -38,7 +38,30 @@ pub struct BundleUploadCommand {
 impl BundleUploadCommand {
     pub async fn execute(&self) -> Result<()> {
         let (c, org) = connect(self.profile.as_deref(), self.org.as_deref())?;
-        let dir = &self.file;
+        let name = self.name.clone().unwrap_or_else(|| {
+            self.file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        upload_bundle(&c, &org, &self.file, &name, json!({}))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Upload a bundle directory, sending only blobs Connect lacks. `links`
+/// is merged into the create request (e.g. `{"runtime_id": …}`). Returns
+/// the bundle id.
+pub async fn upload_bundle(
+    c: &ConnectClient,
+    org: &str,
+    dir: &std::path::Path,
+    name: &str,
+    links: Value,
+) -> Result<String> {
+    {
         let meta: BundleMeta = serde_json::from_slice(
             &std::fs::read(dir.join("bundle.json")).with_context(|| {
                 format!(
@@ -80,23 +103,21 @@ impl BundleUploadCommand {
             }
             specs.push(spec);
         }
-        let name = self.name.clone().unwrap_or_else(|| {
-            dir.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
+        let mut bundle = json!({
+            "name": name,
+            "target": meta.target,
+            "runtime": meta.runtime,
+            "bundle_json": meta,
+            "blobs": specs,
         });
+        if let (Some(b), Some(l)) = (bundle.as_object_mut(), links.as_object()) {
+            b.extend(l.clone());
+        }
         let created = c
             .json(
                 Method::POST,
                 &format!("/api/orgs/{org}/provision-bundles"),
-                Some(&json!({"bundle": {
-                    "name": name,
-                    "target": meta.target,
-                    "runtime": meta.runtime,
-                    "bundle_json": meta,
-                    "blobs": specs,
-                }})),
+                Some(&json!({ "bundle": bundle })),
             )
             .await?;
         let id = created["data"]["id"]
@@ -182,14 +203,15 @@ impl BundleUploadCommand {
             ),
             OutputLevel::Normal,
         );
-        Ok(())
+        Ok(id)
     }
 }
 
 pub struct ProvisionJobCommand {
     pub vm: String,
     pub rubicon: String,
-    pub bundle: String,
+    pub bundle: Option<String>,
+    pub runtime: Option<String>,
     pub profile: Option<String>,
     pub repository: Option<String>,
     pub pr_url: Option<String>,
@@ -234,7 +256,12 @@ impl ProvisionJobCommand {
                 &format!("/api/orgs/{org}/vms/{}/commands", self.vm),
                 Some(&json!({
                     "command": "provision",
-                    "params": {"address": self.rubicon, "bundle_id": self.bundle, "profile": self.profile},
+                    "params": {
+                        "address": self.rubicon,
+                        "bundle_id": self.bundle,
+                        "runtime_id": self.runtime,
+                        "profile": self.profile,
+                    },
                     "source": source,
                 })),
             )

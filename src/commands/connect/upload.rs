@@ -44,6 +44,7 @@ const PHASE_DISCOVER: &str = "discover";
 const PHASE_CREATE: &str = "create-runtime";
 const PHASE_UPLOAD: &str = "upload-artifacts";
 const PHASE_FINALIZE: &str = "finalize";
+const PHASE_PROVISIONING: &str = "provisioning";
 
 /// Run one phase of the upload, emitting `running` → `success`/`failed` step
 /// events around it (and a `step_error` with the reason on failure) so the
@@ -74,6 +75,8 @@ pub struct ConnectUploadCommand {
     pub file: Option<String>,
     pub profile: Option<String>,
     pub publish: bool,
+    /// Pack the provisioning assets and attach them to the runtime.
+    pub provisionable: bool,
     pub deploy_cohort: Option<String>,
     pub deploy_name: Option<String>,
     pub deploy_tags: Vec<String>,
@@ -264,6 +267,9 @@ impl ConnectUploadCommand {
         emit_task_registered(PHASE_CREATE, "Create runtime");
         emit_task_registered(PHASE_UPLOAD, "Upload artifacts");
         emit_task_registered(PHASE_FINALIZE, "Finalize");
+        if self.provisionable {
+            emit_task_registered(PHASE_PROVISIONING, "Attach provisioning assets");
+        }
 
         // Validate prerequisites (runtime has been built)
         let target = resolve_target_required(self.target.as_deref(), project_config)?;
@@ -339,22 +345,96 @@ impl ConnectUploadCommand {
             emit_step(PHASE_FINALIZE, "skipped");
             self.handle_draft_status(connect, &runtime, num_artifacts)
                 .await?;
-            return Ok(());
+        } else {
+            // Phase C: Stream artifacts from Docker volume and upload with progress
+            let completed_parts = run_phase(
+                PHASE_UPLOAD,
+                self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
+            )
+            .await?;
+
+            // Phase D: Complete and finalize
+            run_phase(
+                PHASE_FINALIZE,
+                self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts),
+            )
+            .await?;
         }
 
-        // Phase C: Stream artifacts from Docker volume and upload with progress
-        let completed_parts = run_phase(
-            PHASE_UPLOAD,
-            self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
-        )
-        .await?;
+        // Phase E (opt-in): make the runtime provisionable. After the
+        // runtime's images, so the bundle references them instead of
+        // re-sending them.
+        if self.provisionable {
+            run_phase(
+                PHASE_PROVISIONING,
+                self.attach_provisioning(connect, project_config, &target, &runtime),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 
-        // Phase D: Complete and finalize
-        run_phase(
-            PHASE_FINALIZE,
-            self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts),
+    /// Pack the provisioning assets (`avocado provision --pack`) and upload
+    /// them as a bundle linked to `runtime`.
+    async fn attach_provisioning(
+        &self,
+        connect: &ConnectClient,
+        project_config: &Config,
+        target: &str,
+        runtime: &client::RuntimeCreateData,
+    ) -> Result<()> {
+        let src_dir = project_config
+            .get_resolved_src_dir(&self.config_path)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        let out = src_dir.join(".avocado/connect-bundle");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out)?;
+        progress("Packing provisioning assets...", OutputLevel::Normal);
+        crate::commands::provision::ProvisionCommand::new(
+            crate::commands::provision::ProvisionConfig {
+                runtime: self.runtime.clone(),
+                config_path: self.config_path.clone(),
+                verbose: false,
+                force: true,
+                target: Some(target.to_string()),
+                target_board: None,
+                provision_profile: None,
+                env_vars: None,
+                out: None,
+                container_args: None,
+                dnf_args: None,
+                no_stamps: false,
+                runs_on: None,
+                nfs_port: None,
+                sdk_arch: None,
+            },
         )
+        .with_pack(Some(out.clone()))
+        .execute()
         .await
+        .context("packing the provisioning assets failed (the runtime itself was uploaded)")?;
+        let bundle_dir = out.join(format!("{}-{target}.bundle", self.runtime));
+        let result = super::hub::upload_bundle(
+            connect,
+            &self.org,
+            &bundle_dir,
+            &format!("{} {}", self.runtime, runtime.version),
+            serde_json::json!({"runtime_id": runtime.id, "project_id": self.project}),
+        )
+        .await;
+        // ponytail: the pack copies every large file out of the volume, even
+        // ones Connect already has; stream only the missing ones if this
+        // local copy ever matters.
+        let _ = std::fs::remove_dir_all(&out);
+        result.context(
+            "uploading the provisioning assets failed (the runtime itself was uploaded)",
+        )?;
+        print_success(
+            &format!("Runtime {} is provisionable", runtime.version),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 
     /// Create a runtime via the Connect API. Returns the runtime data and

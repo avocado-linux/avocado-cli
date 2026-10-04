@@ -773,6 +773,12 @@ enum ConnectCommands {
         /// Publish the runtime immediately after upload (draft → published)
         #[arg(long)]
         publish: bool,
+        /// Also make the runtime provisionable: pack the provisioning
+        /// assets (boot chain, flash tools, var-staging, ...) and attach
+        /// them to the uploaded runtime. Content Connect already has, such
+        /// as the runtime's own images, is not sent again.
+        #[arg(long, conflicts_with = "file")]
+        provisionable: bool,
         /// Deploy after upload: cohort ID to target
         #[arg(long)]
         deploy_cohort: Option<String>,
@@ -3868,6 +3874,7 @@ async fn main() -> Result<()> {
                     vm: a.vm,
                     rubicon: a.rubicon,
                     bundle: a.bundle,
+                    runtime: a.runtime,
                     profile: a.profile,
                     repository: a.repository,
                     pr_url: a.pr_url,
@@ -4371,6 +4378,7 @@ async fn main() -> Result<()> {
                 file,
                 profile,
                 publish,
+                provisionable,
                 deploy_cohort,
                 deploy_name,
                 deploy_tag,
@@ -4396,6 +4404,7 @@ async fn main() -> Result<()> {
                     file,
                     profile: profile.clone(),
                     publish,
+                    provisionable,
                     deploy_cohort,
                     deploy_name,
                     deploy_tags: deploy_tag,
@@ -5276,8 +5285,12 @@ struct ConnectProvisionArgs {
     #[arg(long)]
     pub rubicon: String,
     /// Bundle id
+    #[arg(long, required_unless_present = "runtime", conflicts_with = "runtime")]
+    pub bundle: Option<String>,
+    /// Runtime id: provision its attached provisioning assets (uploaded
+    /// with `connect upload --provisionable`)
     #[arg(long)]
-    pub bundle: String,
+    pub runtime: Option<String>,
     /// Provision profile
     #[arg(long)]
     pub profile: Option<String>,
