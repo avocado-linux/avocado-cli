@@ -367,6 +367,9 @@ pub struct CreateClaimTokenParams {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// `"vm"` for an Avocado VM hub; omitted for ordinary devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

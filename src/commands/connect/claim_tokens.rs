@@ -82,6 +82,7 @@ impl ConnectClaimTokensCreateCommand {
                 max_uses: self.max_uses,
                 expires_at,
                 tags: self.tags.clone(),
+                kind: None,
             },
         };
 

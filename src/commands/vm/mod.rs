@@ -5,9 +5,11 @@
 //! facing flags and pretty-print results.
 
 pub mod config;
+pub mod connect;
 pub mod logs;
 pub mod rebuild;
 pub mod reset;
+pub mod rubicon;
 #[cfg(target_os = "linux")]
 pub mod service;
 pub mod shell;

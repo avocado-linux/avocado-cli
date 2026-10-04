@@ -3485,6 +3485,35 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
+            VmCommands::Connect {
+                org,
+                name,
+                force,
+                status,
+                disconnect,
+                profile,
+            } => {
+                use commands::vm::connect::{ConnectAction, VmConnectCommand};
+                let action = if status {
+                    ConnectAction::Status
+                } else if disconnect {
+                    ConnectAction::Disconnect
+                } else {
+                    ConnectAction::Connect { org, name, force }
+                };
+                VmConnectCommand { action, profile }.execute().await
+            }
+            VmCommands::Rubicon { command } => {
+                use commands::vm::rubicon::{RubiconAction, RubiconCommand};
+                let action = match command {
+                    VmRubiconCommands::Add { address, label } => {
+                        RubiconAction::Add { address, label }
+                    }
+                    VmRubiconCommands::List => RubiconAction::List,
+                    VmRubiconCommands::Remove { address } => RubiconAction::Remove { address },
+                };
+                RubiconCommand { action }.execute().await
+            }
             #[cfg(target_os = "linux")]
             VmCommands::Service { command } => {
                 use commands::vm::service::{ServiceAction, ServiceCommand};
@@ -5043,6 +5072,32 @@ enum VmCommands {
         #[command(subcommand)]
         command: VmConfigCommands,
     },
+    /// Associate this VM with a Connect org (claims it as a VM hub).
+    Connect {
+        /// Organization ID (default: the profile's org).
+        #[arg(long)]
+        org: Option<String>,
+        /// Name for the claim token / VM (default: vm-<hostname>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Claim again even if the VM is already connected.
+        #[arg(long)]
+        force: bool,
+        /// Show the connection state instead of connecting.
+        #[arg(long, conflicts_with_all = ["disconnect", "org", "name", "force"])]
+        status: bool,
+        /// Stop avocado-conn and remove its local credentials.
+        #[arg(long, conflicts_with_all = ["org", "name", "force"])]
+        disconnect: bool,
+        /// Connect profile to use.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Manage the Rubicon USB/IP boards this VM hub drives.
+    Rubicon {
+        #[command(subcommand)]
+        command: VmRubiconCommands,
+    },
     /// Run the VM headless under a systemd user unit (hibernation off),
     /// so it stays up across logout and reboot.
     #[cfg(target_os = "linux")]
@@ -5124,6 +5179,20 @@ enum ContainerDevCommands {
     /// Garbage-collect this project's Container Dev Mode registry store
     /// (distinct from the top-level `prune`, which removes Docker volumes).
     Prune,
+}
+
+#[derive(Subcommand)]
+enum VmRubiconCommands {
+    /// Add a board by address (or update its label).
+    Add {
+        address: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List configured boards with their live state.
+    List,
+    /// Stop managing a board.
+    Remove { address: String },
 }
 
 #[cfg(target_os = "linux")]

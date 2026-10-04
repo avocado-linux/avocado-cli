@@ -300,6 +300,7 @@ impl ConnectInitCommand {
                         max_uses: None,
                         expires_at: Some("2099-12-31T23:59:59Z".to_string()),
                         tags: vec![],
+                        kind: None,
                     },
                 },
             )

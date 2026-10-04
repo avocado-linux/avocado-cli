@@ -377,6 +377,21 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         }
     }
 
+    // Hub: hand the agent the host facts + Rubicon list (config.yaml is the
+    // source of truth). Silent when nothing is configured and the image's
+    // agent predates the hub.
+    if let Err(e) = super::hub::push_configure(&paths, &target).await {
+        let has_rubicons = super::config::VmConfig::load(&paths)
+            .ok()
+            .and_then(|c| super::hub::rubicons(&c).ok())
+            .is_some_and(|r| !r.is_empty());
+        if has_rubicons {
+            crate::utils::output::print_warning_stderr(&format!(
+                "could not configure Rubicons in the VM agent: {e:#}"
+            ));
+        }
+    }
+
     notify_desktop(
         "vm.notify.running",
         serde_json::json!({ "pid": pid, "ssh_port": ssh_port }),
