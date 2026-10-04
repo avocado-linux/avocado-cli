@@ -663,6 +663,47 @@ enum ConnectCommands {
         #[command(subcommand)]
         command: ConnectAuthCommands,
     },
+    /// Provisionable runtime bundles (from `avocado provision --pack`)
+    Bundle {
+        #[command(subcommand)]
+        command: ConnectBundleCommands,
+    },
+    /// Provision a bundle onto the DUT behind a site VM's Rubicon, through
+    /// Connect. Records the job's origin; with --wait, streams the log and
+    /// exits non-zero unless the job passed (for CI).
+    Provision {
+        /// VM id (Connect's VMs page)
+        #[arg(long)]
+        vm: String,
+        /// Rubicon address on that VM
+        #[arg(long)]
+        rubicon: String,
+        /// Bundle id
+        #[arg(long)]
+        bundle: String,
+        /// Provision profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Source repository (e.g. owner/name)
+        #[arg(long)]
+        repository: Option<String>,
+        /// Pull request URL
+        #[arg(long = "pr")]
+        pr_url: Option<String>,
+        /// Commit SHA
+        #[arg(long)]
+        commit: Option<String>,
+        /// CI run URL
+        #[arg(long)]
+        run_url: Option<String>,
+        /// Wait for the result, stream the log, fail unless it passed
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long = "profile-name")]
+        profile_name: Option<String>,
+    },
     /// Initialize connect settings in avocado.yaml (org, project, server key, extensions, claim token, device config)
     Init {
         /// Organization ID (skip interactive prompt)
@@ -3838,6 +3879,53 @@ async fn main() -> Result<()> {
         },
         Commands::Login(args) => args.run().await,
         Commands::Connect { command } => match command {
+            ConnectCommands::Bundle {
+                command:
+                    ConnectBundleCommands::Upload {
+                        file,
+                        name,
+                        org,
+                        profile,
+                    },
+            } => {
+                crate::commands::connect::hub::BundleUploadCommand {
+                    file,
+                    name,
+                    org,
+                    profile,
+                }
+                .execute()
+                .await
+            }
+            ConnectCommands::Provision {
+                vm,
+                rubicon,
+                bundle,
+                profile,
+                repository,
+                pr_url,
+                commit,
+                run_url,
+                wait,
+                org,
+                profile_name,
+            } => {
+                crate::commands::connect::hub::ProvisionJobCommand {
+                    vm,
+                    rubicon,
+                    bundle,
+                    profile,
+                    repository,
+                    pr_url,
+                    commit,
+                    run_url,
+                    wait,
+                    org,
+                    profile_name,
+                }
+                .execute()
+                .await
+            }
             ConnectCommands::Auth { command } => match command {
                 ConnectAuthCommands::Login(args) => args.run().await,
                 ConnectAuthCommands::Logout { profile, output } => {
@@ -5221,6 +5309,20 @@ enum VmRubiconCommands {
     List,
     /// Stop managing a board.
     Remove { address: String },
+}
+
+#[derive(Subcommand)]
+enum ConnectBundleCommands {
+    /// Upload a bundle file to Connect
+    Upload {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 #[cfg(target_os = "linux")]

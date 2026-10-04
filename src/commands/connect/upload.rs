@@ -24,7 +24,7 @@ use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
 
-const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
+pub(crate) const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
 /// Progress line for the upload flow. In `--output json` mode (which the
 /// desktop uses), `print_info` is suppressed, so emit an `output` event the
@@ -1139,7 +1139,7 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
 
 /// Compute whole-file SHA-256 (hex) and per-part SHA-256 checksums (base64) in one pass.
 /// Parts are PART_SIZE (50 MiB) aligned, matching the API's multipart part size.
-fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
+pub(crate) fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut whole_hasher = Sha256::new();

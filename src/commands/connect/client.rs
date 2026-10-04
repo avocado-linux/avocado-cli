@@ -1322,6 +1322,32 @@ impl ConnectClient {
     }
 
     /// Step 3: Complete the runtime upload (finalize all multipart uploads).
+    /// A JSON request to `{api_url}{path}`; returns the response body.
+    pub async fn json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut req = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.api_url))
+            .header("authorization", format!("Bearer {}", self.token));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let res = req
+            .send()
+            .await
+            .with_context(|| format!("{method} {path}"))?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("{method} {path} failed (HTTP {status}): {text}");
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
     pub async fn complete_runtime(
         &self,
         org: &str,
