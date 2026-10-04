@@ -122,7 +122,7 @@ impl VmConnectCommand {
                 target
                     .exec(&format!(
                         "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && rm -f {state_file} && \
-                         echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && \
+                         echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && sync && \
                          systemctl restart avocado-conn",
                         d = hub::CONN_DIR
                     ))

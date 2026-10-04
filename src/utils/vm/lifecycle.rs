@@ -446,6 +446,20 @@ async fn stop_inner(force: bool) -> Result<()> {
     // reconciler to notice the pid is gone.
     notify_desktop("vm.notify.stopping", serde_json::json!({ "pid": pid }));
 
+    // QMP quit is a power cut: flush the guest first. btrfs commits every
+    // 30 s, so without this the last writes (a fresh claim, a config edit)
+    // come back as empty files. Best-effort and bounded: a hibernated or
+    // wedged guest can't answer, and stopping must still work then.
+    if !force && paths.qga_socket().exists() {
+        let _ = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut g = super::qga::QgaClient::connect(&paths.qga_socket()).await?;
+            g.ping().await?;
+            g.execute_with_timeout("guest-fsfreeze-freeze", None, Duration::from_secs(10))
+                .await
+        })
+        .await;
+    }
+
     // Try QMP quit first if the socket is around.
     #[cfg(unix)]
     if paths.qmp_socket().exists() {
