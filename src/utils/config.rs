@@ -1602,6 +1602,11 @@ pub fn get_runtime_var_files(runtime_config: &serde_yaml::Value) -> Vec<VarFileM
         .unwrap_or_default()
 }
 
+/// Whether a (merged) runtime config value is `type: kos`.
+pub fn is_kos_runtime(runtime_config: &serde_yaml::Value) -> bool {
+    runtime_config.get("type").and_then(|t| t.as_str()) == Some("kos")
+}
+
 /// Helper module for deserializing signing keys list
 mod signing_keys_deserializer {
     use serde::{Deserialize, Deserializer};

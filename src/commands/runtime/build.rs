@@ -825,9 +825,7 @@ impl RuntimeBuildCommand {
         // skips signing and behaves exactly like before.
         let is_kos_runtime = merged_runtime
             .as_ref()
-            .and_then(|rt| rt.get("type"))
-            .and_then(|t| t.as_str())
-            == Some("kos");
+            .is_some_and(crate::utils::config::is_kos_runtime);
 
         // The runtime build container needs access to the KAB signing
         // keyset when EITHER of these is true:
@@ -1981,10 +1979,9 @@ export AVOCADO_KERNEL_IMAGE_TYPE="{kernel_image_type}"
 # KAB_KEYSET_FILE-pointed keyset. Idempotent — replaces any existing
 # kos.auth block, preserving every other kos.* field. No-ops when
 # AVOCADO_AMF_KOS != "1" (non-kos runtimes) or the keyset is
-# unavailable. Called twice: once after the manifest is written (so
-# the btrfs image flashed onto fresh devices carries a signature), and
-# again after the os_bundle patch (so the var-staging copy used for
-# OTA upload covers the mutated state).
+# unavailable. Called once after the manifest is written (so the btrfs
+# image flashed onto fresh devices carries a signature), and again
+# after the os_bundle patch, which `type: kos` runtimes skip.
 sign_amf() {{
     AMF_SIGN_PATH="$1" python3 << 'SIGNEOF'
 import json, os, base64, tempfile, subprocess, shutil

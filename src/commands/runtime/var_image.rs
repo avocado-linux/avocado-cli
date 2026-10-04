@@ -12,10 +12,11 @@
 //!
 //! - [`render_ota_tail`] runs at the end of the build script: the stone include
 //!   paths, device-tree overlays, the `avocado-build-<target>` hook, `stone
-//!   bundle`, the `os_bundle` manifest patch and the re-sign after it. All of
-//!   that produces or names OTA payload. It renders into the build script, so it
-//!   inherits `RUNTIME_NAME`, `TARGET_ARCH`, `OUTPUT_DIR`, `VAR_DIR`,
-//!   `AVOCADO_MANIFEST_PATH` and `sign_amf` from it.
+//!   bundle`, the `os_bundle` manifest patch and the re-sign after it (the last
+//!   two not for `type: kos`). All of that produces or names OTA payload. It
+//!   renders into the build script, so it inherits `RUNTIME_NAME`,
+//!   `TARGET_ARCH`, `OUTPUT_DIR`, `VAR_DIR`, `AVOCADO_MANIFEST_PATH` and
+//!   `sign_amf` from it.
 //! - [`render_var_image`] runs at the start of `provision`: Docker priming and
 //!   the var image. Nothing but `provision` reads either. It runs standalone, so
 //!   it emits its own preamble.
@@ -464,7 +465,26 @@ stone bundle \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
 
-# Patch manifest in var-staging to add os_bundle reference (for connect upload)
+{os_bundle_section}"#,
+        device_tree_overlay_section = r.device_tree_overlay_section,
+        os_bundle_section = if crate::utils::config::is_kos_runtime(ctx.merged_runtime) {
+            KOS_NO_OS_BUNDLE.to_string()
+        } else {
+            render_os_bundle_patch()
+        },
+    ))
+}
+
+/// `type: kos` runtimes never update through the OS bundle, so their manifest
+/// names none and the images dir (hence the var image) holds no `.aos`.
+/// `stone bundle` still runs: `provision` flashes from its build dir.
+const KOS_NO_OS_BUNDLE: &str = r#"echo -e "\033[94m[INFO]\033[0m type: kos runtime: os-bundle.aos stays out of the manifest and the images dir."
+"#;
+
+/// The `os_bundle` manifest patch and the re-sign after it.
+fn render_os_bundle_patch() -> String {
+    format!(
+        r#"# Patch manifest in var-staging to add os_bundle reference (for connect upload)
 # The btrfs image for provisioning doesn't need os_bundle — initial flash doesn't OTA.
 # Connect upload reads from var-staging directly, so it sees this update.
 python3 << 'PYEOF'
@@ -539,9 +559,8 @@ PYEOF
 # var-staging manifest that OTA upload / Studio publishing consumes.
 sign_amf "$AVOCADO_MANIFEST_PATH"
 "#,
-        device_tree_overlay_section = r.device_tree_overlay_section,
         link_or_copy = crate::commands::runtime::build::LINK_OR_COPY_PY,
-    ))
+    )
 }
 
 /// The provisioning half: Docker priming and the var image.
@@ -900,14 +919,32 @@ extensions:
         assert!(ota.contains(r#"if [ ! -f "$STONE_VAR_PLACEHOLDER" ]; then"#));
     }
 
+    /// `type: kos` never updates through the OS bundle. `stone bundle` still
+    /// runs, because `provision` flashes from its build dir, but the bundle
+    /// reaches neither the manifest nor the images dir.
+    #[test]
+    fn a_kos_runtime_builds_the_bundle_but_never_ships_it() {
+        let ota = ota_half(&(BASE.to_string() + "    type: kos\n"));
+        assert!(ota.contains("\nstone bundle "));
+        for absent in ["os_bundle", "AVOCADO_IMAGES_DIR", "sign_amf"] {
+            assert!(
+                !ota.contains(absent),
+                "a kos OTA tail must not contain {absent}"
+            );
+        }
+        assert!(ota_half(BASE).contains("Patched manifest with os_bundle reference."));
+    }
+
     #[test]
     fn both_halves_are_valid_bash() {
         let dir = TempDir::new().unwrap();
         let encrypted = BASE.to_string() + "    var:\n      encrypt: true\n";
+        let kos = BASE.to_string() + "    type: kos\n";
         for (name, script) in [
             ("var", var_half(BASE)),
             ("var-encrypted", var_half(&encrypted)),
             ("ota", ota_half(BASE)),
+            ("ota-kos", ota_half(&kos)),
         ] {
             let p = dir.path().join(format!("{name}.sh"));
             std::fs::write(&p, &script).unwrap();

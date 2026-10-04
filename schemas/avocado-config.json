@@ -881,7 +881,7 @@
         },
         "type": {
           "type": "string",
-          "description": "'kos' signs the runtime manifest with the KAB keyset (KAB_KEYSET_FILE); other values have no effect."
+          "description": "'kos' signs the runtime manifest with the KAB keyset (KAB_KEYSET_FILE) and keeps the OS bundle out of it and of the images dir; other values have no effect."
         },
         "extensions": {
           "title": "Extensions",
