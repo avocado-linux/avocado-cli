@@ -47,6 +47,8 @@ pub struct RuntimeProvisionConfig {
 
 pub struct RuntimeProvisionCommand {
     config: RuntimeProvisionConfig,
+    /// `--pack`: write a provisionable bundle here instead of running the hook.
+    pack: Option<PathBuf>,
     #[cfg(unix)]
     signing_service: Option<SigningService>,
     /// Pre-composed configuration to avoid reloading
@@ -57,10 +59,18 @@ impl RuntimeProvisionCommand {
     pub fn new(config: RuntimeProvisionConfig) -> Self {
         Self {
             config,
+            pack: None,
             #[cfg(unix)]
             signing_service: None,
             composed_config: None,
         }
+    }
+
+    /// Pack a provisionable bundle (see `provision_bundle`) instead of
+    /// running the provisioning hook.
+    pub fn with_pack(mut self, out: Option<PathBuf>) -> Self {
+        self.pack = out;
+        self
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -442,6 +452,7 @@ impl RuntimeProvisionCommand {
             None
         };
 
+        let env_snapshot = env_vars.clone();
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -493,7 +504,24 @@ impl RuntimeProvisionCommand {
         )?;
 
         // Create provision script
-        let provision_script = self.create_provision_script(&target_arch, &var_section)?;
+        let mut provision_script = self.create_provision_script(&target_arch, &var_section)?;
+        if self.pack.is_some() {
+            let hook = crate::commands::provision_bundle::hook_call(
+                &self.config.runtime_name,
+                &target_arch,
+            );
+            anyhow::ensure!(
+                provision_script.contains(&hook),
+                "provision script has no hook call to replace"
+            );
+            provision_script = provision_script.replace(
+                &hook,
+                &crate::commands::provision_bundle::pack_tail(
+                    &self.config.runtime_name,
+                    &target_arch,
+                ),
+            );
+        }
 
         if self.config.verbose {
             print_info("Executing provision script.", OutputLevel::Normal);
@@ -538,6 +566,26 @@ impl RuntimeProvisionCommand {
 
         if !provision_result {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
+        }
+
+        if let Some(out) = &self.pack {
+            let out = if out.is_dir() {
+                crate::commands::provision_bundle::default_out(
+                    out,
+                    &self.config.runtime_name,
+                    &target_arch,
+                )
+            } else {
+                out.clone()
+            };
+            return crate::commands::provision_bundle::assemble(
+                &out,
+                &src_dir,
+                std::path::Path::new(&self.config.config_path),
+                &target_arch,
+                &self.config.runtime_name,
+                &env_snapshot,
+            );
         }
 
         // Note: File ownership is automatically handled by bindfs permission translation,
@@ -777,11 +825,13 @@ if [ -d "$(dirname "$PROVISION_VAR_DST")" ]; then
 fi
 
 echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{name}'."
-avocado-provision-{target_arch} {name}
-"#,
+{hook}"#,
             var_section = var_section,
             name = self.config.runtime_name,
-            target_arch = target_arch,
+            hook = crate::commands::provision_bundle::hook_call(
+                &self.config.runtime_name,
+                target_arch
+            ),
         );
 
         Ok(script)

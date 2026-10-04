@@ -465,6 +465,19 @@ enum Commands {
         /// to have run.
         #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
         list: bool,
+        /// Write a provisionable bundle (file, or directory for a default
+        /// name) instead of provisioning: everything the provisioning hook
+        /// reads, plus avocado.yaml/avocado.lock to install the matching SDK.
+        #[arg(long = "pack", conflicts_with_all = ["list", "bundle"])]
+        pack: Option<std::path::PathBuf>,
+        /// Provision from a bundle (path or http(s) URL) made by `--pack`,
+        /// with only the SDK installed: no build tree needed. Unpacks into
+        /// the current directory.
+        #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
+        bundle: Option<String>,
+        /// Expected sha256 of the `--bundle` file.
+        #[arg(long = "bundle-sha256", requires = "bundle")]
+        bundle_sha256: Option<String>,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2481,8 +2494,22 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
             list,
+            pack,
+            bundle,
+            bundle_sha256,
             output,
         } => {
+            if let Some(source) = bundle {
+                return crate::commands::provision_bundle::BundleProvision {
+                    source,
+                    sha256: bundle_sha256,
+                    profile: provision_profile.clone(),
+                    env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                    verbose,
+                }
+                .execute()
+                .await;
+            }
             // `--list` short-circuits the run: instead of provisioning,
             // we read the stone manifest out of the installed SDK
             // volume and return the profiles available for the
@@ -2524,7 +2551,8 @@ async fn main() -> Result<()> {
                     runs_on: cli.runs_on.clone(),
                     nfs_port: cli.nfs_port,
                     sdk_arch: cli.sdk_arch.clone(),
-                });
+                })
+                .with_pack(pack);
             provision_cmd.execute().await?;
             Ok(())
         }
