@@ -452,7 +452,13 @@ impl RuntimeProvisionCommand {
             None
         };
 
-        let env_snapshot = env_vars.clone();
+        // What the hook needs on another machine: the derived env, not the
+        // caller's own --env values (per-device or secret ones must not
+        // ride along into a bundle that Connect stores and replays).
+        let mut env_snapshot = env_vars.clone();
+        for k in self.config.env_vars.iter().flat_map(|m| m.keys()) {
+            env_snapshot.remove(k);
+        }
         let env_vars = if env_vars.is_empty() {
             None
         } else {

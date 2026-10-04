@@ -121,7 +121,8 @@ impl VmConnectCommand {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(cfg);
                 target
                     .exec(&format!(
-                        "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && rm -f {state_file} && \
+                        "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
+                         for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
                          echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && sync && \
                          systemctl restart avocado-conn",
                         d = hub::CONN_DIR
@@ -135,6 +136,9 @@ impl VmConnectCommand {
                         .exec(&format!("cat {state_file} 2>/dev/null || true"))
                         .await?;
                     if let Ok(s) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+                        let _ = target
+                            .exec(&format!("rm -f {d}/*.prev", d = hub::CONN_DIR))
+                            .await;
                         print_success(
                             &format!(
                                 "VM connected as '{name}' (device {})",
@@ -145,8 +149,18 @@ impl VmConnectCommand {
                         return Ok(());
                     }
                 }
+                // Put the previous identity back rather than leave none.
+                let _ = target
+                    .exec(&format!(
+                        "systemctl stop avocado-conn; cd {d} && for f in config.toml claimed_state.json; do \
+                         [ -f $f.prev ] && mv $f.prev $f; done; sync; \
+                         [ -f claimed_state.json ] && systemctl start avocado-conn; true",
+                        d = hub::CONN_DIR
+                    ))
+                    .await;
                 bail!(
-                    "avocado-conn did not claim within 30 s; check `avocado vm shell -- journalctl -u avocado-conn`"
+                    "avocado-conn did not claim within 30 s (previous connection restored, if any); \
+                     check `avocado vm shell -- journalctl -u avocado-conn`"
                 )
             }
         }

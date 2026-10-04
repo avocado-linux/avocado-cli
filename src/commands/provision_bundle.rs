@@ -33,6 +33,8 @@ use crate::utils::output::{print_info, print_success, OutputLevel};
 pub const FORMAT: u32 = 1;
 /// Where the container stages the payload, relative to the project dir.
 pub const PAYLOAD_STAGE: &str = ".avocado/bundle-payload.tar.gz";
+/// The payload's top-level paths (space separated), staged beside it.
+pub const PATHS_STAGE: &str = ".avocado/bundle-paths";
 /// Where `--bundle` unpacks, relative to the working directory.
 const UNPACK_DIR: &str = ".avocado-bundle";
 
@@ -54,6 +56,10 @@ pub struct BundleMeta {
     /// `std::env::consts::ARCH` of the packing host: the SDK path in `env`.
     pub sdk_host_arch: String,
     pub env: HashMap<String, String>,
+    /// Paths under $AVOCADO_PREFIX the payload replaces; cleared before
+    /// unpacking so files from an earlier bundle can't shadow these.
+    #[serde(default)]
+    pub paths: Vec<String>,
     pub payload_sha256: String,
     pub created_at: String,
     pub cli_version: String,
@@ -80,9 +86,20 @@ done
 unset IFS
 if [ -n "$AVOCADO_PROVISION_KERNEL_IMAGE" ]; then
     k="$(dirname "$AVOCADO_PROVISION_KERNEL_IMAGE")"
-    case "$k" in "$P"/*) paths="$paths ${{k#"$P"/}}" ;; esac
+    case "$k" in
+        "$P"/*) paths="$paths ${{k#"$P"/}}" ;;
+        *) echo "[ERROR] kernel image $AVOCADO_PROVISION_KERNEL_IMAGE is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
+    esac
+fi
+if [ -n "$AVOCADO_STONE_MANIFEST" ]; then
+    case "$AVOCADO_STONE_MANIFEST" in
+        "$P"/sdk/*) ;;
+        "$P"/*) paths="$paths ${{AVOCADO_STONE_MANIFEST#"$P"/}}" ;;
+        *) echo "[ERROR] stone manifest $AVOCADO_STONE_MANIFEST is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
+    esac
 fi
 mkdir -p /opt/src/.avocado || exit 1
+echo "$paths" > /opt/src/{PATHS_STAGE} || exit 1
 echo "[INFO] Packing provisioning payload: $paths"
 tar czf /opt/src/{PAYLOAD_STAGE} --exclude="output/runtimes/{runtime}/stone/_build" $paths || exit 1
 "#
@@ -136,12 +153,18 @@ pub fn assemble(
     }
     let mut env = env.clone();
     env.retain(|k, _| !HOST_ONLY_ENV.contains(&k.as_str()));
+    let paths: Vec<String> = std::fs::read_to_string(src_dir.join(PATHS_STAGE))
+        .context("payload path list missing")?
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     let meta = BundleMeta {
         format: FORMAT,
         target: target.into(),
         runtime: runtime.into(),
         sdk_host_arch: std::env::consts::ARCH.into(),
         env,
+        paths,
         payload_sha256: sha256_file(&payload)?,
         created_at: chrono::Utc::now().to_rfc3339(),
         cli_version: env!("AVOCADO_CLI_VERSION").into(),
@@ -162,6 +185,7 @@ pub fn assemble(
     }
     std::fs::rename(&tmp, out)?;
     let _ = std::fs::remove_file(&payload);
+    let _ = std::fs::remove_file(src_dir.join(PATHS_STAGE));
     print_success(
         &format!(
             "Bundle written: {} ({} MiB, sha256 {})",
@@ -182,6 +206,15 @@ pub fn localize_env(meta: &BundleMeta) -> HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.clone(), v.replace(&from, &to)))
         .collect()
+}
+
+/// A relative path below the prefix that is safe to `rm -rf` in quotes.
+fn safe_rel(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-+/".contains(c))
 }
 
 fn sdk_arch_dir(arch: &str) -> &str {
@@ -258,7 +291,7 @@ impl BundleProvision {
         // so later bundles for the same target skip the download.
         let exe = std::env::current_exe()?;
         let st = std::process::Command::new(exe)
-            .args(["sdk", "install", "--no-tui", "-t", &meta.target])
+            .args(["sdk", "install", "--no-tui", "--target", &meta.target])
             .status()
             .context("run avocado sdk install")?;
         if !st.success() {
@@ -285,11 +318,17 @@ impl BundleProvision {
             env.insert("AVOCADO_VERBOSE".into(), "1".into());
         }
         let rt = &meta.runtime;
+        let mut clear = format!("rm -rf \"output/runtimes/{rt}/stone\" || exit 1\n");
+        for p in &meta.paths {
+            if !safe_rel(p) {
+                bail!("bundle path {p:?} is not a plain relative path");
+            }
+            clear.push_str(&format!("rm -rf '{p}' || exit 1\n"));
+        }
         let script = format!(
             r#"
 cd "$AVOCADO_PREFIX" || exit 1
-rm -rf "output/runtimes/{rt}/stone" || exit 1
-tar xzf /opt/src/{UNPACK_DIR}/payload.tar.gz || exit 1
+{clear}tar xzf /opt/src/{UNPACK_DIR}/payload.tar.gz || exit 1
 {hook}"#,
             hook = hook_call(rt, &meta.target),
         );
@@ -339,6 +378,7 @@ mod tests {
                 "AVOCADO_STONE_INCLUDE_PATHS".into(),
                 format!("/opt/_avocado/t/sdk/{arch}/stone:/opt/_avocado/t/includes/bsp/stone"),
             )]),
+            paths: vec![],
             payload_sha256: String::new(),
             created_at: String::new(),
             cli_version: String::new(),
@@ -361,6 +401,15 @@ mod tests {
         assert!(!tail.contains(&hook_call("dev", "jetson-orin-nano")));
         assert!(tail.contains(PAYLOAD_STAGE));
         assert!(tail.contains("|| exit 1"));
+    }
+
+    #[test]
+    fn only_plain_relative_paths_are_cleared() {
+        assert!(safe_rel("output/runtimes/dev/stone"));
+        assert!(safe_rel("kernel/6.18.35-yocto-standard"));
+        for bad in ["", "/etc", "../x", "a/../b", "a//b", "a b", "a'b", "a;rm"] {
+            assert!(!safe_rel(bad), "{bad:?}");
+        }
     }
 
     #[test]

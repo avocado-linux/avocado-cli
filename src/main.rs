@@ -671,39 +671,7 @@ enum ConnectCommands {
     /// Provision a bundle onto the DUT behind a site VM's Rubicon, through
     /// Connect. Records the job's origin; with --wait, streams the log and
     /// exits non-zero unless the job passed (for CI).
-    Provision {
-        /// VM id (Connect's VMs page)
-        #[arg(long)]
-        vm: String,
-        /// Rubicon address on that VM
-        #[arg(long)]
-        rubicon: String,
-        /// Bundle id
-        #[arg(long)]
-        bundle: String,
-        /// Provision profile
-        #[arg(long)]
-        profile: Option<String>,
-        /// Source repository (e.g. owner/name)
-        #[arg(long)]
-        repository: Option<String>,
-        /// Pull request URL
-        #[arg(long = "pr")]
-        pr_url: Option<String>,
-        /// Commit SHA
-        #[arg(long)]
-        commit: Option<String>,
-        /// CI run URL
-        #[arg(long)]
-        run_url: Option<String>,
-        /// Wait for the result, stream the log, fail unless it passed
-        #[arg(long)]
-        wait: bool,
-        #[arg(long)]
-        org: Option<String>,
-        #[arg(long = "profile-name")]
-        profile_name: Option<String>,
-    },
+    Provision(Box<ConnectProvisionArgs>),
     /// Initialize connect settings in avocado.yaml (org, project, server key, extensions, claim token, device config)
     Init {
         /// Organization ID (skip interactive prompt)
@@ -3897,31 +3865,20 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
-            ConnectCommands::Provision {
-                vm,
-                rubicon,
-                bundle,
-                profile,
-                repository,
-                pr_url,
-                commit,
-                run_url,
-                wait,
-                org,
-                profile_name,
-            } => {
+            ConnectCommands::Provision(a) => {
+                let a = *a;
                 crate::commands::connect::hub::ProvisionJobCommand {
-                    vm,
-                    rubicon,
-                    bundle,
-                    profile,
-                    repository,
-                    pr_url,
-                    commit,
-                    run_url,
-                    wait,
-                    org,
-                    profile_name,
+                    vm: a.vm,
+                    rubicon: a.rubicon,
+                    bundle: a.bundle,
+                    profile: a.profile,
+                    repository: a.repository,
+                    pr_url: a.pr_url,
+                    commit: a.commit,
+                    run_url: a.run_url,
+                    wait: a.wait,
+                    org: a.org,
+                    profile_name: a.profile_name,
                 }
                 .execute()
                 .await
@@ -5309,6 +5266,43 @@ enum VmRubiconCommands {
     List,
     /// Stop managing a board.
     Remove { address: String },
+}
+
+/// `avocado connect provision` (boxed: the derived parser's frames grow
+/// with each variant's size, and debug test threads have 2 MiB of stack).
+#[derive(clap::Args)]
+struct ConnectProvisionArgs {
+    /// VM id (Connect's VMs page)
+    #[arg(long)]
+    pub vm: String,
+    /// Rubicon address on that VM
+    #[arg(long)]
+    pub rubicon: String,
+    /// Bundle id
+    #[arg(long)]
+    pub bundle: String,
+    /// Provision profile
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Source repository (e.g. owner/name)
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Pull request URL
+    #[arg(long = "pr")]
+    pub pr_url: Option<String>,
+    /// Commit SHA
+    #[arg(long)]
+    pub commit: Option<String>,
+    /// CI run URL
+    #[arg(long)]
+    pub run_url: Option<String>,
+    /// Wait for the result, stream the log, fail unless it passed
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long)]
+    pub org: Option<String>,
+    #[arg(long = "profile-name")]
+    pub profile_name: Option<String>,
 }
 
 #[derive(Subcommand)]

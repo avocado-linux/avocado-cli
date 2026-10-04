@@ -1321,7 +1321,6 @@ impl ConnectClient {
         Ok(etag)
     }
 
-    /// Step 3: Complete the runtime upload (finalize all multipart uploads).
     /// A JSON request to `{api_url}{path}`; returns the response body.
     pub async fn json(
         &self,
@@ -1348,6 +1347,7 @@ impl ConnectClient {
         Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
+    /// Step 3: Complete the runtime upload (finalize all multipart uploads).
     pub async fn complete_runtime(
         &self,
         org: &str,
