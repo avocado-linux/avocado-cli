@@ -8,7 +8,8 @@
 //! <runtime>-<target>.bundle/
 //!   bundle.json       target, runtime, env, avocado.yaml/lock, the provision
 //!                     script to replay, and a manifest of files by sha256
-//!   blobs/<sha256>    each distinct large file (>= 1 MiB) once, plus a
+//!   blobs/<sha256>    each distinct large file (>= 1 MiB) and every runtime
+//!                     image (`lib/avocado/images/*`) once, plus a
 //!                     deterministic tar.gz of the small files under each
 //!                     top-level path (so per-build metadata in var-staging
 //!                     doesn't re-key the static BSP and flash tools)
@@ -173,9 +174,14 @@ echo "$paths" > "$OUT/paths" || exit 1
 # Never bundled: the build scratch dir, and the rendered var image (the
 # replay renders it from var-staging).
 SKIP="-path output/runtimes/{runtime}/stone/_build -o -path output/runtimes/{runtime}/stone/avocado-image-var-{target}.btrfs"
+# Own blobs: anything large, and every runtime image whatever its size (they
+# are the files `connect upload` stores as OTA artifacts, so both uploads
+# reuse each other's content).
+BLOB="-size +{small_max}c -o -path runtimes/{runtime}/var-staging/lib/avocado/images/*"
+set -f  # $BLOB holds a find pattern: don't let the shell glob it
 echo "[INFO] Packing provisioning bundle from: $paths"
 : > "$OUT/files.tsv" || exit 1
-find $paths \( $SKIP \) -prune -o -type f -size +{small_max}c -print | LC_ALL=C sort | while IFS= read -r f; do
+find $paths \( $SKIP \) -prune -o -type f \( $BLOB \) -print | LC_ALL=C sort | while IFS= read -r f; do
     h=$(sha256sum "$f" | cut -d' ' -f1) || exit 1
     [ -e "$OUT/blobs/$h" ] || cp "$f" "$OUT/blobs/$h" || exit 1
     printf '%s\t%s\t%s\t%s\n' "$h" "$(stat -c %s "$f")" "$(stat -c %a "$f")" "$f" >> "$OUT/files.tsv" || exit 1
@@ -184,13 +190,14 @@ done || exit 1
 # top-level path, byte-identical for identical content so each deduplicates.
 : > "$OUT/small.tsv" || exit 1
 for p in $paths; do
-    find "$p" \( $SKIP \) -prune -o -type f -size +{small_max}c -o -print | LC_ALL=C sort > "$OUT/small.list" || exit 1
+    find "$p" \( $SKIP \) -prune -o -type f \( $BLOB \) -o -print | LC_ALL=C sort > "$OUT/small.list" || exit 1
     tar --no-recursion --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
         -cf - -T "$OUT/small.list" | gzip -n > "$OUT/small.tar.gz" || exit 1
     h=$(sha256sum "$OUT/small.tar.gz" | cut -d' ' -f1) || exit 1
     printf '%s\t%s\t%s\n' "$h" "$(stat -c %s "$OUT/small.tar.gz")" "$p" >> "$OUT/small.tsv" || exit 1
     mv "$OUT/small.tar.gz" "$OUT/blobs/$h" || exit 1
 done
+set +f
 "#,
         small_max = LARGE_FILE - 1,
     )
