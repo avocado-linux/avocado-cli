@@ -465,19 +465,18 @@ enum Commands {
         /// to have run.
         #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
         list: bool,
-        /// Write a provisionable bundle (file, or directory for a default
-        /// name) instead of provisioning: everything the provisioning hook
-        /// reads, plus avocado.yaml/avocado.lock to install the matching SDK.
+        /// Write a provisionable bundle directory (bundle.json + content-
+        /// addressed blobs) instead of provisioning: everything the
+        /// provisioning hook needs, deduplicated. Given an existing
+        /// directory, writes `<runtime>-<target>.bundle` inside it.
         #[arg(long = "pack", conflicts_with_all = ["list", "bundle"])]
         pack: Option<std::path::PathBuf>,
-        /// Provision from a bundle (path or http(s) URL) made by `--pack`,
-        /// with only the SDK installed: no build tree needed. Unpacks into
-        /// the current directory.
+        /// Provision from a bundle with only the SDK installed (no build
+        /// tree): a bundle directory made by `--pack`, or a job's spec.json
+        /// (bundle.json + blob URLs). Blobs are cached by sha256 under
+        /// `.avocado-bundle/` in the current directory.
         #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
         bundle: Option<String>,
-        /// Expected sha256 of the `--bundle` file.
-        #[arg(long = "bundle-sha256", requires = "bundle")]
-        bundle_sha256: Option<String>,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2505,13 +2504,11 @@ async fn main() -> Result<()> {
             list,
             pack,
             bundle,
-            bundle_sha256,
             output,
         } => {
             if let Some(source) = bundle {
                 return crate::commands::provision_bundle::BundleProvision {
                     source,
-                    sha256: bundle_sha256,
                     profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     verbose,

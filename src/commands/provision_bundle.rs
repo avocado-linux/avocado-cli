@@ -1,21 +1,29 @@
-//! Provisionable runtime bundles.
+//! Provisionable runtime bundles, content-addressed.
 //!
-//! `avocado provision --pack <out>` runs provisioning up to, not including,
+//! `avocado provision --pack <dir>` runs provisioning up to, not including,
 //! the SDK's `avocado-provision-<target>` hook and saves what that hook
-//! reads instead. `avocado provision --bundle <file|url>` replays it on
-//! another machine (an on-site VM hub) with only the SDK installed: no
-//! build tree, no extension sysroots.
-//!
-//! Layout (an uncompressed tar; the payload inside is already gzipped):
+//! needs as a bundle directory:
 //!
 //! ```text
-//! bundle.json       format, target, runtime, the hook's env snapshot, payload sha256
-//! avocado.yaml      so `avocado sdk install` gets the matching SDK
-//! avocado.lock
-//! payload.tar.gz    paths under $AVOCADO_PREFIX the hook reads:
-//!                   output/runtimes/<rt>/stone (sans _build), the var image,
-//!                   stone include dirs (except the SDK's own), the pinned kernel
+//! <runtime>-<target>.bundle/
+//!   bundle.json       target, runtime, env, avocado.yaml/lock, the provision
+//!                     script to replay, and a manifest of files by sha256
+//!   blobs/<sha256>    each distinct large file (>= 1 MiB) once, plus a
+//!                     deterministic tar.gz of the small files under each
+//!                     top-level path (so per-build metadata in var-staging
+//!                     doesn't re-key the static BSP and flash tools)
 //! ```
+//!
+//! The rendered var image is not shipped: `var-staging` is (captured after
+//! Docker priming), and the replay renders the image from it. Its large
+//! files are the runtime's images (`lib/avocado/images/<image_id>.raw`),
+//! the same bytes `avocado connect upload` stores as OTA artifacts, so
+//! Connect stores each once whichever upload brings it first.
+//!
+//! `avocado provision --bundle <spec.json | bundle dir>` replays it on
+//! another machine (an on-site VM hub) with only the SDK installed: no build
+//! tree, no extension sysroots. Blobs are cached by sha256; a repeat job
+//! fetches nothing.
 //!
 //! ponytail: the SDK itself is not bundled (installed from the lock, needs
 //! the package feed); bundle prebuilt SDKs for offline sites later.
@@ -23,20 +31,20 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
-pub const FORMAT: u32 = 1;
-/// Where the container stages the payload, relative to the project dir.
-pub const PAYLOAD_STAGE: &str = ".avocado/bundle-payload.tar.gz";
-/// The payload's top-level paths (space separated), staged beside it.
-pub const PATHS_STAGE: &str = ".avocado/bundle-paths";
-/// Where `--bundle` unpacks, relative to the working directory.
-const UNPACK_DIR: &str = ".avocado-bundle";
+pub const FORMAT: u32 = 2;
+/// Files at least this big are stored as their own blob.
+pub const LARGE_FILE: u64 = 1 << 20;
+/// Where the container stages a pack, relative to the project dir.
+pub const STAGE_DIR: &str = ".avocado/bundle-stage";
+/// Where `--bundle` keeps blobs and its working files, relative to the cwd.
+const WORK_DIR: &str = ".avocado-bundle";
 
 /// Env vars that describe the packing host, not the bundle.
 const HOST_ONLY_ENV: &[&str] = &[
@@ -48,6 +56,30 @@ const HOST_ONLY_ENV: &[&str] = &[
     "AVOCADO_VERBOSE",
 ];
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileEntry {
+    /// Relative to `$AVOCADO_PREFIX`.
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    /// Octal permission bits, as `stat -c %a` prints them.
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlobRef {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// The small files, symlinks and directories under one top-level path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SmallArchive {
+    pub root: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct BundleMeta {
     pub format: u32,
@@ -56,24 +88,61 @@ pub struct BundleMeta {
     /// `std::env::consts::ARCH` of the packing host: the SDK path in `env`.
     pub sdk_host_arch: String,
     pub env: HashMap<String, String>,
-    /// Paths under $AVOCADO_PREFIX the payload replaces; cleared before
-    /// unpacking so files from an earlier bundle can't shadow these.
-    #[serde(default)]
-    pub paths: Vec<String>,
-    pub payload_sha256: String,
+    pub avocado_yaml: String,
+    pub avocado_lock: String,
+    /// What `avocado provision` would run after its build half: render var
+    /// from var-staging, refresh it into stone/, run the hook.
+    pub provision_script: String,
+    /// Top-level paths under $AVOCADO_PREFIX the bundle replaces; cleared
+    /// before restoring so an earlier bundle's files can't shadow these.
+    pub clear: Vec<String>,
+    pub files: Vec<FileEntry>,
+    pub small_files: Vec<SmallArchive>,
     pub created_at: String,
     pub cli_version: String,
 }
 
+impl BundleMeta {
+    /// Every distinct blob the bundle needs (large files, then the small
+    /// files archive), each once.
+    pub fn blobs(&self) -> Vec<BlobRef> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for b in self
+            .files
+            .iter()
+            .map(|f| BlobRef {
+                sha256: f.sha256.clone(),
+                size: f.size,
+            })
+            .chain(self.small_files.iter().map(|a| BlobRef {
+                sha256: a.sha256.clone(),
+                size: a.size,
+            }))
+        {
+            if seen.insert(b.sha256.clone()) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.blobs().iter().map(|b| b.size).sum()
+    }
+}
+
 /// The shell that replaces the hook call when packing. Runs in the SDK
-/// container after the var image is rendered. Fails closed: the runtime
+/// container after the var section ran (var-staging holds the primed Docker
+/// images). Stages `files.tsv` (large files by sha256), `blobs/`, and the
+/// small-files archive under /opt/src/STAGE_DIR. Fails closed: the runtime
 /// shell has no `set -e`.
 pub fn pack_tail(runtime: &str, target: &str) -> String {
     format!(
         r#"
 P="$AVOCADO_PREFIX"
 cd "$P" || exit 1
-paths="output/runtimes/{runtime}/stone runtimes/{runtime}/avocado-image-var-{target}.btrfs"
+paths="output/runtimes/{runtime}/stone runtimes/{runtime}/var-staging"
 IFS=':'
 for inc in $AVOCADO_STONE_INCLUDE_PATHS; do
     [ -n "$inc" ] || continue
@@ -98,11 +167,32 @@ if [ -n "$AVOCADO_STONE_MANIFEST" ]; then
         *) echo "[ERROR] stone manifest $AVOCADO_STONE_MANIFEST is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
     esac
 fi
-mkdir -p /opt/src/.avocado || exit 1
-echo "$paths" > /opt/src/{PATHS_STAGE} || exit 1
-echo "[INFO] Packing provisioning payload: $paths"
-tar czf /opt/src/{PAYLOAD_STAGE} --exclude="output/runtimes/{runtime}/stone/_build" $paths || exit 1
-"#
+OUT=/opt/src/{STAGE_DIR}
+rm -rf "$OUT" && mkdir -p "$OUT/blobs" || exit 1
+echo "$paths" > "$OUT/paths" || exit 1
+# Never bundled: the build scratch dir, and the rendered var image (the
+# replay renders it from var-staging).
+SKIP="-path output/runtimes/{runtime}/stone/_build -o -path output/runtimes/{runtime}/stone/avocado-image-var-{target}.btrfs"
+echo "[INFO] Packing provisioning bundle from: $paths"
+: > "$OUT/files.tsv" || exit 1
+find $paths \( $SKIP \) -prune -o -type f -size +{small_max}c -print | LC_ALL=C sort | while IFS= read -r f; do
+    h=$(sha256sum "$f" | cut -d' ' -f1) || exit 1
+    [ -e "$OUT/blobs/$h" ] || cp "$f" "$OUT/blobs/$h" || exit 1
+    printf '%s\t%s\t%s\t%s\n' "$h" "$(stat -c %s "$f")" "$(stat -c %a "$f")" "$f" >> "$OUT/files.tsv" || exit 1
+done || exit 1
+# Everything else (small files, symlinks, directories), one archive per
+# top-level path, byte-identical for identical content so each deduplicates.
+: > "$OUT/small.tsv" || exit 1
+for p in $paths; do
+    find "$p" \( $SKIP \) -prune -o -type f -size +{small_max}c -o -print | LC_ALL=C sort > "$OUT/small.list" || exit 1
+    tar --no-recursion --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+        -cf - -T "$OUT/small.list" | gzip -n > "$OUT/small.tar.gz" || exit 1
+    h=$(sha256sum "$OUT/small.tar.gz" | cut -d' ' -f1) || exit 1
+    printf '%s\t%s\t%s\n' "$h" "$(stat -c %s "$OUT/small.tar.gz")" "$p" >> "$OUT/small.tsv" || exit 1
+    mv "$OUT/small.tar.gz" "$OUT/blobs/$h" || exit 1
+done
+"#,
+        small_max = LARGE_FILE - 1,
     )
 }
 
@@ -115,7 +205,7 @@ pub fn hook_call(runtime: &str, target: &str) -> String {
     )
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -134,68 +224,121 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex)
 }
 
-/// Write the bundle after the container staged the payload.
-pub fn assemble(
-    out: &Path,
-    src_dir: &Path,
-    config_path: &Path,
-    target: &str,
-    runtime: &str,
-    env: &HashMap<String, String>,
-) -> Result<()> {
-    let payload = src_dir.join(PAYLOAD_STAGE);
-    let lock = src_dir.join("avocado.lock");
+/// Parse the container's `files.tsv` (sha, size, mode, path per line).
+pub fn parse_files_tsv(tsv: &str) -> Result<Vec<FileEntry>> {
+    tsv.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut c = l.splitn(4, '\t');
+            let (Some(sha), Some(size), Some(mode), Some(path)) =
+                (c.next(), c.next(), c.next(), c.next())
+            else {
+                bail!("malformed files.tsv line: {l:?}");
+            };
+            Ok(FileEntry {
+                path: path.to_string(),
+                sha256: sha.to_string(),
+                size: size.parse()?,
+                mode: mode.to_string(),
+            })
+        })
+        .collect()
+}
+
+pub struct PackInputs<'a> {
+    pub src_dir: &'a Path,
+    pub config_path: &'a Path,
+    pub target: &'a str,
+    pub runtime: &'a str,
+    pub env: &'a HashMap<String, String>,
+    pub provision_script: String,
+}
+
+/// Turn the container's staging into `<out>/<runtime>-<target>.bundle/`.
+pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
+    let stage = p.src_dir.join(STAGE_DIR);
+    let lock = p.src_dir.join("avocado.lock");
     if !lock.exists() {
         bail!(
             "{} not found: run `avocado install` before packing",
             lock.display()
         );
     }
-    let mut env = env.clone();
+    let mut env = p.env.clone();
     env.retain(|k, _| !HOST_ONLY_ENV.contains(&k.as_str()));
-    let paths: Vec<String> = std::fs::read_to_string(src_dir.join(PATHS_STAGE))
-        .context("payload path list missing")?
-        .split_whitespace()
-        .map(String::from)
-        .collect();
+    let files = parse_files_tsv(&std::fs::read_to_string(stage.join("files.tsv"))?)?;
+    let small_files = parse_files_tsv(
+        &std::fs::read_to_string(stage.join("small.tsv"))?
+            .lines()
+            .map(|l| {
+                // sha, size, root → the 4-column shape (mode unused)
+                let mut c = l.splitn(3, '\t');
+                format!(
+                    "{}\t{}\t-\t{}\n",
+                    c.next().unwrap_or(""),
+                    c.next().unwrap_or(""),
+                    c.next().unwrap_or("")
+                )
+            })
+            .collect::<String>(),
+    )?
+    .into_iter()
+    .map(|f| SmallArchive {
+        root: f.path,
+        sha256: f.sha256,
+        size: f.size,
+    })
+    .collect();
     let meta = BundleMeta {
         format: FORMAT,
-        target: target.into(),
-        runtime: runtime.into(),
+        target: p.target.into(),
+        runtime: p.runtime.into(),
         sdk_host_arch: std::env::consts::ARCH.into(),
         env,
-        paths,
-        payload_sha256: sha256_file(&payload)?,
+        avocado_yaml: std::fs::read_to_string(p.config_path)?,
+        avocado_lock: std::fs::read_to_string(&lock)?,
+        provision_script: p.provision_script,
+        clear: std::fs::read_to_string(stage.join("paths"))?
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
+        files,
+        small_files,
         created_at: chrono::Utc::now().to_rfc3339(),
         cli_version: env!("AVOCADO_CLI_VERSION").into(),
     };
-    let tmp = out.with_extension("partial");
-    {
-        let mut b = tar::Builder::new(std::fs::File::create(&tmp)?);
-        let json = serde_json::to_vec_pretty(&meta)?;
-        let mut h = tar::Header::new_gnu();
-        h.set_size(json.len() as u64);
-        h.set_mode(0o644);
-        h.set_cksum();
-        b.append_data(&mut h, "bundle.json", json.as_slice())?;
-        b.append_path_with_name(config_path, "avocado.yaml")?;
-        b.append_path_with_name(&lock, "avocado.lock")?;
-        b.append_path_with_name(&payload, "payload.tar.gz")?;
-        b.into_inner()?.flush()?;
+    let dir = if out.is_dir() {
+        out.join(format!("{}-{}.bundle", p.runtime, p.target))
+    } else {
+        out.to_path_buf()
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("bundle.json"), serde_json::to_vec_pretty(&meta)?)?;
+    let blobs = dir.join("blobs");
+    if std::fs::rename(stage.join("blobs"), &blobs).is_err() {
+        // Different filesystem: copy, then drop the staging copy.
+        std::fs::create_dir_all(&blobs)?;
+        for e in std::fs::read_dir(stage.join("blobs"))? {
+            let e = e?;
+            std::fs::copy(e.path(), blobs.join(e.file_name()))?;
+        }
     }
-    std::fs::rename(&tmp, out)?;
-    let _ = std::fs::remove_file(&payload);
-    let _ = std::fs::remove_file(src_dir.join(PATHS_STAGE));
+    let _ = std::fs::remove_dir_all(&stage);
+    let file_bytes: u64 = meta.files.iter().map(|f| f.size).sum();
     print_success(
         &format!(
-            "Bundle written: {} ({} MiB, sha256 {})",
-            out.display(),
-            std::fs::metadata(out)?.len() >> 20,
-            sha256_file(out)?
+            "Bundle written: {} ({} files referenced, {} MiB in {} distinct blobs; \
+             {} MiB of large files before dedupe)",
+            dir.display(),
+            meta.files.len(),
+            meta.total_bytes() >> 20,
+            meta.blobs().len(),
+            file_bytes >> 20,
         ),
         OutputLevel::Normal,
     );
-    Ok(())
+    Ok(dir)
 }
 
 /// Rewrite the packing host's SDK path (`…/sdk/<arch>/…`) to this host's.
@@ -217,6 +360,18 @@ fn safe_rel(p: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-+/".contains(c))
 }
 
+/// A manifest file path: relative, no `..`, nothing that breaks the TSV.
+fn plain_rel(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && p.split('/').all(|c| !c.is_empty() && c != "..")
+        && !p.chars().any(|c| c.is_control())
+}
+
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn sdk_arch_dir(arch: &str) -> &str {
     match arch {
         "aarch64" | "arm64" => "aarch64",
@@ -224,26 +379,50 @@ fn sdk_arch_dir(arch: &str) -> &str {
     }
 }
 
-async fn fetch(src: &str, dest: &Path) -> Result<()> {
+/// What a job hands `--bundle`: the bundle.json plus where each blob is.
+#[derive(Debug, Deserialize)]
+pub struct BundleSpec {
+    pub bundle_json: BundleMeta,
+    pub blobs: Vec<SpecBlob>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpecBlob {
+    pub sha256: String,
+    pub url: String,
+}
+
+/// Put blob `sha` into the cache from `src` (URL or local file), verified.
+async fn fetch_blob(src: &str, sha: &str, cache: &Path) -> Result<()> {
+    let dest = cache.join(sha);
+    if dest.exists() {
+        return Ok(());
+    }
+    let tmp = cache.join(format!(".{sha}.part"));
     if src.starts_with("http://") || src.starts_with("https://") {
-        print_info("Downloading bundle…", OutputLevel::Normal);
-        let mut res = reqwest::get(src).await.context("bundle download")?;
+        let mut res = reqwest::get(src).await.context("blob download")?;
         if !res.status().is_success() {
-            bail!("bundle download failed: HTTP {}", res.status());
+            bail!("blob {sha} download failed: HTTP {}", res.status());
         }
-        let mut f = std::fs::File::create(dest)?;
+        let mut f = std::fs::File::create(&tmp)?;
         while let Some(chunk) = res.chunk().await? {
             f.write_all(&chunk)?;
         }
     } else {
-        std::fs::copy(src, dest).with_context(|| format!("copy {src}"))?;
+        std::fs::copy(src, &tmp).with_context(|| format!("copy {src}"))?;
     }
+    let got = sha256_file(&tmp)?;
+    if got != sha {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("blob {sha} is corrupt (got sha256 {got})");
+    }
+    std::fs::rename(&tmp, &dest)?;
     Ok(())
 }
 
 pub struct BundleProvision {
+    /// A spec.json from a job, or a local bundle directory from `--pack`.
     pub source: String,
-    pub sha256: Option<String>,
     pub profile: Option<String>,
     pub env_vars: Option<HashMap<String, String>>,
     pub verbose: bool,
@@ -251,34 +430,49 @@ pub struct BundleProvision {
 
 impl BundleProvision {
     pub async fn execute(&self) -> Result<()> {
-        let cwd = std::env::current_dir()?;
-        let dir = cwd.join(UNPACK_DIR);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        let file = dir.join("bundle.tar");
-        fetch(&self.source, &file).await?;
-        if let Some(want) = &self.sha256 {
-            let got = sha256_file(&file)?;
-            if !got.eq_ignore_ascii_case(want) {
-                bail!("bundle sha256 mismatch: expected {want}, got {got}");
-            }
-        }
-        tar::Archive::new(std::fs::File::open(&file)?)
-            .unpack(&dir)
-            .context("unpack bundle")?;
-        let meta: BundleMeta = serde_json::from_slice(&std::fs::read(dir.join("bundle.json"))?)
-            .context("bundle.json")?;
+        let src = Path::new(&self.source);
+        let (meta, locations): (BundleMeta, HashMap<String, String>) = if src.is_dir() {
+            let meta: BundleMeta = serde_json::from_slice(&std::fs::read(src.join("bundle.json"))?)
+                .context("bundle.json")?;
+            let loc = meta
+                .blobs()
+                .into_iter()
+                .map(|b| {
+                    let p = src
+                        .join("blobs")
+                        .join(&b.sha256)
+                        .to_string_lossy()
+                        .into_owned();
+                    (b.sha256, p)
+                })
+                .collect();
+            (meta, loc)
+        } else {
+            let spec: BundleSpec = serde_json::from_slice(&std::fs::read(src)?)
+                .with_context(|| format!("{} is not a bundle spec", src.display()))?;
+            let loc = spec.blobs.into_iter().map(|b| (b.sha256, b.url)).collect();
+            (spec.bundle_json, loc)
+        };
         if meta.format != FORMAT {
             bail!(
                 "unsupported bundle format {} (this CLI reads {FORMAT})",
                 meta.format
             );
         }
-        if sha256_file(&dir.join("payload.tar.gz"))? != meta.payload_sha256 {
-            bail!("bundle payload is corrupt (sha256 mismatch)");
+        for f in &meta.files {
+            if !plain_rel(&f.path)
+                || !is_sha256(&f.sha256)
+                || !f.mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+            {
+                bail!("bundle manifest entry {:?} is not valid", f.path);
+            }
         }
-        std::fs::copy(dir.join("avocado.yaml"), cwd.join("avocado.yaml"))?;
-        std::fs::copy(dir.join("avocado.lock"), cwd.join("avocado.lock"))?;
+        if meta.small_files.iter().any(|a| !is_sha256(&a.sha256)) {
+            bail!("bundle small-file archive entry is not valid");
+        }
+        if let Some(bad) = meta.clear.iter().find(|p| !safe_rel(p)) {
+            bail!("bundle path {bad:?} is not a plain relative path");
+        }
         print_info(
             &format!(
                 "Bundle: runtime '{}' for {} (packed {} by avocado {})",
@@ -286,6 +480,50 @@ impl BundleProvision {
             ),
             OutputLevel::Normal,
         );
+
+        // Blob cache: fetch only what isn't here yet, keep only what this
+        // bundle uses (bounds the disk to one bundle's worth).
+        let cwd = std::env::current_dir()?;
+        let work = cwd.join(WORK_DIR);
+        let cache = work.join("blobs");
+        std::fs::create_dir_all(&cache)?;
+        let needed = meta.blobs();
+        let (mut fetched, mut fetched_bytes) = (0, 0u64);
+        for b in &needed {
+            if cache.join(&b.sha256).exists() {
+                continue;
+            }
+            let loc = locations
+                .get(&b.sha256)
+                .with_context(|| format!("no location for blob {}", b.sha256))?;
+            fetch_blob(loc, &b.sha256, &cache).await?;
+            fetched += 1;
+            fetched_bytes += b.size;
+        }
+        print_info(
+            &format!(
+                "Blobs: {} needed, {fetched} fetched ({} MiB), {} cached",
+                needed.len(),
+                fetched_bytes >> 20,
+                needed.len() - fetched
+            ),
+            OutputLevel::Normal,
+        );
+        let keep: HashSet<&str> = needed.iter().map(|b| b.sha256.as_str()).collect();
+        for e in std::fs::read_dir(&cache)?.flatten() {
+            if !keep.contains(&*e.file_name().to_string_lossy()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+
+        std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
+        std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
+        let tsv: String = meta
+            .files
+            .iter()
+            .map(|f| format!("{}\t{}\t{}\n", f.sha256, f.mode, f.path))
+            .collect();
+        std::fs::write(work.join("files.tsv"), tsv)?;
 
         // The SDK matching the bundled lock. Reuses this directory's volume,
         // so later bundles for the same target skip the download.
@@ -317,20 +555,26 @@ impl BundleProvision {
         if self.verbose {
             env.insert("AVOCADO_VERBOSE".into(), "1".into());
         }
-        let rt = &meta.runtime;
-        let mut clear = format!("rm -rf \"output/runtimes/{rt}/stone\" || exit 1\n");
-        for p in &meta.paths {
-            if !safe_rel(p) {
-                bail!("bundle path {p:?} is not a plain relative path");
-            }
-            clear.push_str(&format!("rm -rf '{p}' || exit 1\n"));
-        }
+        let clear: String = meta
+            .clear
+            .iter()
+            .map(|p| format!("rm -rf '{p}' || exit 1\n"))
+            .collect();
+        let small: String = meta
+            .small_files
+            .iter()
+            .map(|a| format!("tar xzf \"$B/blobs/{}\" || exit 1\n", a.sha256))
+            .collect();
         let script = format!(
             r#"
 cd "$AVOCADO_PREFIX" || exit 1
-{clear}tar xzf /opt/src/{UNPACK_DIR}/payload.tar.gz || exit 1
-{hook}"#,
-            hook = hook_call(rt, &meta.target),
+B=/opt/src/{WORK_DIR}
+{clear}{small}while IFS=$'\t' read -r h mode path; do
+    mkdir -p "$(dirname "$path")" && cp "$B/blobs/$h" "$path" && chmod "$mode" "$path" || exit 1
+done < "$B/files.tsv" || exit 1
+echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
+{provision}"#,
+            provision = meta.provision_script,
         );
         let ok = SdkContainer::new()
             .run_in_container(RunConfig {
@@ -347,26 +591,26 @@ cd "$AVOCADO_PREFIX" || exit 1
             })
             .await
             .context("Failed to provision from bundle")?;
-        let _ = std::fs::remove_file(&file);
         if !ok {
-            bail!("Failed to provision runtime '{rt}' from bundle");
+            bail!("Failed to provision runtime '{}' from bundle", meta.runtime);
         }
         print_success(
-            &format!("Successfully provisioned runtime '{rt}' from bundle"),
+            &format!(
+                "Successfully provisioned runtime '{}' from bundle",
+                meta.runtime
+            ),
             OutputLevel::Normal,
         );
         Ok(())
     }
 }
 
-/// Default output name for `--pack` when given a directory.
-pub fn default_out(dir: &Path, runtime: &str, target: &str) -> PathBuf {
-    dir.join(format!("{runtime}-{target}.avocado-bundle.tar"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn meta(arch: &str) -> BundleMeta {
         BundleMeta {
@@ -378,11 +622,58 @@ mod tests {
                 "AVOCADO_STONE_INCLUDE_PATHS".into(),
                 format!("/opt/_avocado/t/sdk/{arch}/stone:/opt/_avocado/t/includes/bsp/stone"),
             )]),
-            paths: vec![],
-            payload_sha256: String::new(),
+            avocado_yaml: String::new(),
+            avocado_lock: String::new(),
+            provision_script: String::new(),
+            clear: vec![],
+            files: vec![
+                FileEntry {
+                    path: "output/runtimes/dev/stone/rootfs.erofs".into(),
+                    sha256: A.into(),
+                    size: 10,
+                    mode: "644".into(),
+                },
+                FileEntry {
+                    path: "runtimes/dev/var-staging/lib/avocado/images/x.raw".into(),
+                    sha256: A.into(),
+                    size: 10,
+                    mode: "644".into(),
+                },
+                FileEntry {
+                    path: "output/runtimes/dev/stone/esp.img".into(),
+                    sha256: B.into(),
+                    size: 5,
+                    mode: "644".into(),
+                },
+            ],
+            small_files: vec![SmallArchive {
+                root: "output/runtimes/dev/stone".into(),
+                sha256: "c".repeat(64),
+                size: 1,
+            }],
             created_at: String::new(),
             cli_version: String::new(),
         }
+    }
+
+    #[test]
+    fn identical_files_are_one_blob() {
+        let m = meta("x86_64");
+        let blobs = m.blobs();
+        assert_eq!(blobs.len(), 3, "A once, B once, the small-files archive");
+        assert_eq!(m.total_bytes(), 10 + 5 + 1);
+    }
+
+    #[test]
+    fn files_tsv_round_trip() {
+        let f = parse_files_tsv(&format!(
+            "{A}\t10\t755\tkernel/6.18/Image\n{B}\t5\t644\ta b/c\n"
+        ))
+        .unwrap();
+        assert_eq!(f[0].path, "kernel/6.18/Image");
+        assert_eq!(f[0].mode, "755");
+        assert_eq!(f[1].path, "a b/c");
+        assert!(parse_files_tsv("nope").is_err());
     }
 
     #[test]
@@ -396,28 +687,61 @@ mod tests {
     }
 
     #[test]
-    fn pack_tail_replaces_exactly_the_hook_call() {
-        let tail = pack_tail("dev", "jetson-orin-nano");
-        assert!(!tail.contains(&hook_call("dev", "jetson-orin-nano")));
-        assert!(tail.contains(PAYLOAD_STAGE));
-        assert!(tail.contains("|| exit 1"));
-    }
-
-    #[test]
-    fn only_plain_relative_paths_are_cleared() {
+    fn manifest_paths_are_validated() {
+        assert!(plain_rel("runtimes/dev/var-staging/lib/docker/a b"));
+        for bad in ["", "/etc/x", "../x", "a/../b", "a\tb", "a\nb"] {
+            assert!(!plain_rel(bad), "{bad:?}");
+        }
         assert!(safe_rel("output/runtimes/dev/stone"));
-        assert!(safe_rel("kernel/6.18.35-yocto-standard"));
-        for bad in ["", "/etc", "../x", "a/../b", "a//b", "a b", "a'b", "a;rm"] {
+        for bad in ["", "/etc", "../x", "a//b", "a b", "a'b", "a;rm"] {
             assert!(!safe_rel(bad), "{bad:?}");
         }
     }
 
     #[test]
-    fn pack_tail_is_valid_sh() {
+    fn pack_tail_is_valid_sh_and_fails_closed() {
+        let tail = pack_tail("dev", "jetson-orin-nano");
+        assert!(!tail.contains(&hook_call("dev", "jetson-orin-nano")));
+        assert!(tail.contains("|| exit 1"));
         let st = std::process::Command::new("sh")
-            .args(["-n", "-c", &pack_tail("dev", "jetson-orin-nano")])
+            .args(["-n", "-c", &tail])
             .status()
             .unwrap();
         assert!(st.success());
+    }
+
+    /// The pack's split must be exact: every regular file is large xor small.
+    #[test]
+    fn large_and_small_partition_the_tree() {
+        let dir = std::env::temp_dir().join(format!("bundle-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t/sub")).unwrap();
+        std::fs::write(dir.join("t/big"), vec![0u8; LARGE_FILE as usize]).unwrap();
+        std::fs::write(dir.join("t/sub/small"), vec![0u8; LARGE_FILE as usize - 1]).unwrap();
+        let run = |extra: &str| {
+            let out = std::process::Command::new("sh")
+                .current_dir(&dir)
+                .args([
+                    "-c",
+                    &format!("find t -type f -size +{}c {extra} | sort", LARGE_FILE - 1),
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run("-print"), "t/big\n");
+        let small = std::process::Command::new("sh")
+            .current_dir(&dir)
+            .args([
+                "-c",
+                &format!("find t -type f -size +{}c -o -print | sort", LARGE_FILE - 1),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(small.stdout).unwrap(),
+            "t\nt/sub\nt/sub/small\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

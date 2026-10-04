@@ -498,16 +498,25 @@ impl RuntimeProvisionCommand {
         // provisioning tail, and it is provisioning's to run.
         // Bound above, before the kernel cmdline export.
         let merged_runtime = merged_runtime.clone().unwrap_or_default();
-        let var_section = crate::commands::runtime::var_image::render_var_image(
-            &crate::commands::runtime::var_image::VarImageContext {
-                runtime_name: &self.config.runtime_name,
-                target_arch: &target_arch,
-                config,
-                parsed,
-                merged_runtime: &merged_runtime,
-                ext_list: &resolved_extensions,
-            },
-        )?;
+        let var_ctx = crate::commands::runtime::var_image::VarImageContext {
+            runtime_name: &self.config.runtime_name,
+            target_arch: &target_arch,
+            config,
+            parsed,
+            merged_runtime: &merged_runtime,
+            ext_list: &resolved_extensions,
+        };
+        let var_section = crate::commands::runtime::var_image::render_var_image(&var_ctx)?;
+        // --pack: what a bundle replays after restoring its files. Built by
+        // the same function as the script below, minus Docker priming
+        // (var-staging is captured after priming).
+        let replay_script = match self.pack {
+            Some(_) => Some(self.create_provision_script(
+                &target_arch,
+                &crate::commands::runtime::var_image::render_var_image_from_staging(&var_ctx)?,
+            )?),
+            None => None,
+        };
 
         // Create provision script
         let mut provision_script = self.create_provision_script(&target_arch, &var_section)?;
@@ -574,24 +583,19 @@ impl RuntimeProvisionCommand {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
         }
 
-        if let Some(out) = &self.pack {
-            let out = if out.is_dir() {
-                crate::commands::provision_bundle::default_out(
-                    out,
-                    &self.config.runtime_name,
-                    &target_arch,
-                )
-            } else {
-                out.clone()
-            };
-            return crate::commands::provision_bundle::assemble(
-                &out,
-                &src_dir,
-                std::path::Path::new(&self.config.config_path),
-                &target_arch,
-                &self.config.runtime_name,
-                &env_snapshot,
-            );
+        if let (Some(out), Some(provision_script)) = (&self.pack, replay_script) {
+            crate::commands::provision_bundle::assemble(
+                out,
+                crate::commands::provision_bundle::PackInputs {
+                    src_dir: &src_dir,
+                    config_path: std::path::Path::new(&self.config.config_path),
+                    target: &target_arch,
+                    runtime: &self.config.runtime_name,
+                    env: &env_snapshot,
+                    provision_script,
+                },
+            )?;
+            return Ok(());
         }
 
         // Note: File ownership is automatically handled by bindfs permission translation,

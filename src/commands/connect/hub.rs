@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::commands::connect::client::{self, ConnectClient};
 use crate::commands::connect::upload::{compute_sha256_with_parts, PART_SIZE};
+use crate::commands::provision_bundle::BundleMeta;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
 fn connect(profile: Option<&str>, org: Option<&str>) -> Result<(ConnectClient, String)> {
@@ -27,6 +28,7 @@ fn connect(profile: Option<&str>, org: Option<&str>) -> Result<(ConnectClient, S
 }
 
 pub struct BundleUploadCommand {
+    /// A bundle directory from `avocado provision --pack`.
     pub file: PathBuf,
     pub name: Option<String>,
     pub org: Option<String>,
@@ -36,30 +38,50 @@ pub struct BundleUploadCommand {
 impl BundleUploadCommand {
     pub async fn execute(&self) -> Result<()> {
         let (c, org) = connect(self.profile.as_deref(), self.org.as_deref())?;
-        let size = std::fs::metadata(&self.file)?.len();
-        // bundle.json gives target/runtime for Connect's listing.
-        let meta: Value = {
-            let mut ar = tar::Archive::new(std::fs::File::open(&self.file)?);
-            let mut found = Value::Null;
-            for e in ar.entries()? {
-                let mut e = e?;
-                if e.path()?.as_os_str() == "bundle.json" {
-                    let mut s = String::new();
-                    e.read_to_string(&mut s)?;
-                    found = serde_json::from_str(&s)?;
-                    break;
+        let dir = &self.file;
+        let meta: BundleMeta = serde_json::from_slice(
+            &std::fs::read(dir.join("bundle.json")).with_context(|| {
+                format!(
+                    "{} is not a bundle directory (make one with `avocado provision --pack`)",
+                    dir.display()
+                )
+            })?,
+        )?;
+        let blobs = meta.blobs();
+        let total: u64 = blobs.iter().map(|b| b.size).sum();
+
+        // Content Connect already has (from any runtime or bundle upload in
+        // this org) is referenced, not sent again.
+        let missing: std::collections::HashSet<String> = c
+            .json(
+                Method::POST,
+                &format!("/api/orgs/{org}/blobs/missing"),
+                Some(&json!({"sha256": blobs.iter().map(|b| &b.sha256).collect::<Vec<_>>()})),
+            )
+            .await?["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let mut specs = Vec::new();
+        for b in &blobs {
+            let mut spec = json!({"sha256": b.sha256, "size_bytes": b.size});
+            if missing.contains(&b.sha256) {
+                let path = dir.join("blobs").join(&b.sha256);
+                let (sha, parts) = compute_sha256_with_parts(&path)?;
+                if sha != b.sha256 {
+                    bail!(
+                        "blob {} on disk does not match its name (sha256 {sha})",
+                        b.sha256
+                    );
                 }
+                spec["part_checksums"] = json!(parts);
             }
-            found
-        };
-        if meta.is_null() {
-            bail!("{} is not a provisioning bundle (no bundle.json); make one with `avocado provision --pack`", self.file.display());
+            specs.push(spec);
         }
-        print_info("Hashing bundle…", OutputLevel::Normal);
-        let (sha256, part_checksums) = compute_sha256_with_parts(&self.file)?;
         let name = self.name.clone().unwrap_or_else(|| {
-            self.file
-                .file_name()
+            dir.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned()
@@ -70,13 +92,10 @@ impl BundleUploadCommand {
                 &format!("/api/orgs/{org}/provision-bundles"),
                 Some(&json!({"bundle": {
                     "name": name,
-                    "size_bytes": size,
-                    "sha256": sha256,
-                    "target": meta["target"],
-                    "runtime": meta["runtime"],
+                    "target": meta.target,
+                    "runtime": meta.runtime,
                     "bundle_json": meta,
-                    "part_size": PART_SIZE,
-                    "part_checksums": part_checksums,
+                    "blobs": specs,
                 }})),
             )
             .await?;
@@ -84,59 +103,83 @@ impl BundleUploadCommand {
             .as_str()
             .context("no bundle id in response")?
             .to_string();
-        let mut parts: Vec<Value> = created["data"]["upload"]["parts"]
+        let uploads = created["data"]["uploads"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let mut f = std::fs::File::open(&self.file)?;
-        let mut done = Vec::new();
-        let total = parts.len();
-        for i in 0..total {
-            let n = parts[i]["part_number"].as_u64().context("part_number")?;
-            let off = (n - 1) * PART_SIZE;
-            let mut buf = vec![0u8; PART_SIZE.min(size - off) as usize];
-            f.seek(SeekFrom::Start(off))?;
-            f.read_exact(&mut buf)?;
-            let sum = BASE64_STANDARD.encode(Sha256::digest(&buf));
-            let mut tries = 0;
-            let etag = loop {
-                let url = parts[i]["upload_url"]
-                    .as_str()
-                    .context("upload_url")?
-                    .to_string();
-                match c.upload_part(&url, buf.clone(), &sum).await {
-                    Ok(e) => break e,
-                    Err(e) if tries < 3 => {
-                        tries += 1;
-                        eprintln!("  part {n}: {e}; refreshing URLs and retrying");
-                        let fresh = c
-                            .json(
-                                Method::GET,
-                                &format!("/api/orgs/{org}/provision-bundles/{id}/upload-urls"),
-                                None,
-                            )
-                            .await?;
-                        if let Some(p) = fresh["data"]["parts"].as_array() {
-                            parts = p.clone();
+        let mut completed = Vec::new();
+        for u in &uploads {
+            let sha = u["sha256"]
+                .as_str()
+                .context("upload without sha256")?
+                .to_string();
+            let path = dir.join("blobs").join(&sha);
+            let size = std::fs::metadata(&path)?.len();
+            let mut f = std::fs::File::open(&path)?;
+            let mut parts: Vec<Value> = u["parts"].as_array().cloned().unwrap_or_default();
+            let mut done = Vec::new();
+            for i in 0..parts.len() {
+                let n = parts[i]["part_number"].as_u64().context("part_number")?;
+                let off = (n - 1) * PART_SIZE;
+                let mut buf = vec![0u8; PART_SIZE.min(size - off) as usize];
+                f.seek(SeekFrom::Start(off))?;
+                f.read_exact(&mut buf)?;
+                let sum = BASE64_STANDARD.encode(Sha256::digest(&buf));
+                let mut tries = 0;
+                let etag = loop {
+                    let url = parts[i]["upload_url"]
+                        .as_str()
+                        .context("upload_url")?
+                        .to_string();
+                    match c.upload_part(&url, buf.clone(), &sum).await {
+                        Ok(e) => break e,
+                        Err(e) if tries < 3 => {
+                            tries += 1;
+                            eprintln!(
+                                "  {}: part {n}: {e}; refreshing URLs and retrying",
+                                &sha[..12]
+                            );
+                            let fresh = c
+                                .json(
+                                    Method::GET,
+                                    &format!("/api/orgs/{org}/provision-bundles/{id}/upload-urls?sha256={sha}"),
+                                    None,
+                                )
+                                .await?;
+                            if let Some(p) = fresh["data"]["parts"].as_array() {
+                                parts = p.clone();
+                            }
                         }
+                        Err(e) => bail!("blob {sha} part {n} failed: {e}"),
                     }
-                    Err(e) => bail!("part {n} failed: {e}"),
-                }
-            };
-            done.push(json!({"part_number": n, "etag": etag, "checksum_sha256": sum}));
+                };
+                done.push(json!({"part_number": n, "etag": etag, "checksum_sha256": sum}));
+            }
             print_info(
-                &format!("  uploaded part {}/{total}", i + 1),
+                &format!("  uploaded {} ({} MiB)", &sha[..12], size >> 20),
                 OutputLevel::Normal,
             );
+            completed.push(json!({"sha256": sha, "parts": done}));
         }
         c.json(
             Method::POST,
             &format!("/api/orgs/{org}/provision-bundles/{id}/complete"),
-            Some(&json!({"parts": done})),
+            Some(&json!({"blobs": completed})),
         )
         .await?;
+        let up: u64 = blobs
+            .iter()
+            .filter(|b| missing.contains(&b.sha256))
+            .map(|b| b.size)
+            .sum();
         print_success(
-            &format!("Bundle '{name}' uploaded (id {id})"),
+            &format!(
+                "Bundle '{name}' uploaded (id {id}): {} blobs, {} MiB total; {} MiB already in Connect, {} MiB sent",
+                blobs.len(),
+                total >> 20,
+                (total - up) >> 20,
+                up >> 20
+            ),
             OutputLevel::Normal,
         );
         Ok(())
