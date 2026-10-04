@@ -16,7 +16,7 @@ use crate::commands::connect::upload::{compute_sha256_with_parts, PART_SIZE};
 use crate::commands::provision_bundle::BundleMeta;
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
-fn connect(profile: Option<&str>, org: Option<&str>) -> Result<(ConnectClient, String)> {
+pub(crate) fn connect(profile: Option<&str>, org: Option<&str>) -> Result<(ConnectClient, String)> {
     let config = client::load_config()?
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
     let (_, p) = config.resolve_profile(profile, org)?;

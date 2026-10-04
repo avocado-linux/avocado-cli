@@ -14,6 +14,7 @@ pub mod load;
 pub mod profiles;
 pub mod provision;
 pub mod provision_bundle;
+pub mod provision_remote;
 pub mod prune;
 pub mod rootfs;
 pub mod runtime;

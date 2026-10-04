@@ -477,6 +477,9 @@ enum Commands {
         /// `.avocado-bundle/` in the current directory.
         #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
         bundle: Option<String>,
+        /// Remote provisioning through an avocado-vm hub (--rubicon ...).
+        #[command(flatten)]
+        remote: Box<ProvisionRemoteArgs>,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2510,8 +2513,20 @@ async fn main() -> Result<()> {
             list,
             pack,
             bundle,
+            remote,
             output,
         } => {
+            let ProvisionRemoteArgs {
+                rubicon,
+                via,
+                vm,
+                connect_profile,
+            } = *remote;
+            if rubicon.is_some() && (list || pack.is_some() || bundle.is_some() || out.is_some()) {
+                anyhow::bail!(
+                    "--rubicon cannot be combined with --list, --pack, --bundle or --out"
+                );
+            }
             if let Some(source) = bundle {
                 return crate::commands::provision_bundle::BundleProvision {
                     source,
@@ -2544,6 +2559,11 @@ async fn main() -> Result<()> {
             );
             // No JSON-implies-force coercion here either (see the `Install`
             // arm above for why both of its reasons are gone).
+            let src_dir = std::path::Path::new(&config)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .canonicalize()?;
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -2565,6 +2585,18 @@ async fn main() -> Result<()> {
                     sdk_arch: cli.sdk_arch.clone(),
                 })
                 .with_pack(pack);
+            if let Some(rubicon) = rubicon {
+                return crate::commands::provision_remote::RemoteProvision {
+                    rubicon,
+                    via,
+                    vm,
+                    connect_profile,
+                    provision_profile,
+                    src_dir,
+                }
+                .execute(provision_cmd)
+                .await;
+            }
             provision_cmd.execute().await?;
             Ok(())
         }
@@ -5313,6 +5345,27 @@ struct ConnectProvisionArgs {
     pub org: Option<String>,
     #[arg(long = "profile-name")]
     pub profile_name: Option<String>,
+}
+
+/// `avocado provision --rubicon ...` (boxed: the derived parser's frames
+/// grow with each variant's size, and debug test threads have 2 MiB).
+#[derive(clap::Args)]
+struct ProvisionRemoteArgs {
+    /// Provision the device behind this Rubicon (label, name or
+    /// address) through the avocado-vm that drives it: this machine's
+    /// VM if it has the board, otherwise through Connect. Syncs what the
+    /// hub lacks, runs there, streams the log back.
+    #[arg(long)]
+    pub rubicon: Option<String>,
+    /// With --rubicon: force the hub (auto: local VM first, then Connect).
+    #[arg(long, value_enum, default_value_t = crate::commands::provision_remote::Via::Auto, requires = "rubicon")]
+    pub via: crate::commands::provision_remote::Via,
+    /// With --rubicon via Connect: the VM, when several know the board.
+    #[arg(long, requires = "rubicon")]
+    pub vm: Option<String>,
+    /// With --rubicon via Connect: Connect profile to use.
+    #[arg(long, requires = "rubicon")]
+    pub connect_profile: Option<String>,
 }
 
 #[derive(Subcommand)]
