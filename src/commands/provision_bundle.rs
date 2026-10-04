@@ -92,7 +92,10 @@ tar czf /opt/src/{PAYLOAD_STAGE} --exclude="output/runtimes/{runtime}/stone/_bui
 /// The hook invocation `pack_tail` replaces (kept in one place so the two
 /// can't drift: provision.rs builds its script with this).
 pub fn hook_call(runtime: &str, target: &str) -> String {
-    format!("avocado-provision-{target} {runtime}\n")
+    format!(
+        "echo -e \"\\033[94m[INFO]\\033[0m Running SDK lifecycle hook 'avocado-provision' for '{runtime}'.\"\n\
+         avocado-provision-{target} {runtime}\n"
+    )
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -287,7 +290,6 @@ impl BundleProvision {
 cd "$AVOCADO_PREFIX" || exit 1
 rm -rf "output/runtimes/{rt}/stone" || exit 1
 tar xzf /opt/src/{UNPACK_DIR}/payload.tar.gz || exit 1
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{rt}' from the bundle."
 {hook}"#,
             hook = hook_call(rt, &meta.target),
         );

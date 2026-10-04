@@ -824,7 +824,6 @@ if [ -d "$(dirname "$PROVISION_VAR_DST")" ]; then
         || {{ echo -e "\033[91m[ERROR]\033[0m could not refresh $PROVISION_VAR_DST" >&2; exit 1; }}
 fi
 
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{name}'."
 {hook}"#,
             var_section = var_section,
             name = self.config.runtime_name,
