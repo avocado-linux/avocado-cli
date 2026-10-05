@@ -3487,6 +3487,7 @@ async fn main() -> Result<()> {
                 RubiconCommands::Run { profile, board } => A::Run { board, profile },
                 RubiconCommands::Console { board, read_only } => A::Console { board, read_only },
                 RubiconCommands::Logs { board, follow } => A::Logs { board, follow },
+                RubiconCommands::Claim { board } => A::Claim { board },
                 RubiconCommands::Update {
                     board,
                     file,
@@ -5387,6 +5388,9 @@ enum RubiconCommands {
         #[arg(long)]
         read_only: bool,
     },
+    /// Claim a board for the Connect org: someone presses its SW2 within
+    /// the minute. Claimed, the board accepts actions only with tokens.
+    Claim { board: Option<String> },
     /// Put new firmware on a board (MCUboot test boot; the board keeps it
     /// only if it comes back healthy, else it rolls back by itself).
     Update {

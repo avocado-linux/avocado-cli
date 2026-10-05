@@ -43,6 +43,10 @@ pub enum RubiconAction {
         board: Option<String>,
         follow: bool,
     },
+    /// Claim a board for the Connect org (someone presses its SW2).
+    Claim {
+        board: Option<String>,
+    },
     /// New firmware: a signed image file, or a released version.
     Update {
         board: Option<String>,
@@ -128,7 +132,10 @@ impl RubiconCommand {
             RubiconAction::Run { board, profile } => self.run(board, profile).await,
             RubiconAction::Console { board, read_only } => {
                 let b = self.board(board).await?;
-                self.console(&b, !read_only, true, true)
+                let token =
+                    remote::local_token(&b, "rubicon_console", self.connect_profile.as_deref())
+                        .await?;
+                self.console(&b, !read_only, true, true, token)
             }
             RubiconAction::Update {
                 board,
@@ -149,11 +156,59 @@ impl RubiconCommand {
                 }
                 self.update_all(&fw).await
             }
+            RubiconAction::Claim { board } => {
+                let b = self.board(board).await?;
+                self.claim(&b).await
+            }
             RubiconAction::Logs { board, follow } => {
                 let b = self.board(board).await?;
-                self.console(&b, false, true, *follow)
+                let token = if *follow {
+                    remote::local_token(&b, "rubicon_console", self.connect_profile.as_deref())
+                        .await?
+                } else {
+                    None
+                };
+                self.console(&b, false, true, *follow, token)
             }
         }
+    }
+
+    /// Hand the board the org's key: through Connect it fills the key in;
+    /// through this machine's VM the key comes from Connect here. Either
+    /// way someone presses SW2 on the board within the next minute.
+    async fn claim(&self, b: &Board) -> Result<()> {
+        let params = match &b.hub {
+            Hub::Local => {
+                let (c, org) =
+                    crate::commands::connect::hub::connect(self.connect_profile.as_deref(), None)?;
+                let info = c
+                    .json(
+                        reqwest::Method::GET,
+                        &format!("/api/orgs/{org}/rubicon-claim"),
+                        None,
+                    )
+                    .await
+                    .context("the org's claim key (org admins only)")?;
+                json!({"address": b.address, "org": info["data"]["org_id"],
+                       "public_key": info["data"]["public_key"]})
+            }
+            Hub::Connect { .. } => json!({"address": b.address}),
+        };
+        eprintln!(
+            "Press SW2 on {} now (the LED blinks blue for 60 s).",
+            b.describe()
+        );
+        let r = remote::run_command(b, "rubicon_claim", params, self.connect_profile.as_deref())
+            .await?;
+        remote::report(&r, &format!("claim of {}", b.describe()))?;
+        print_success(
+            &format!(
+                "{} is claimed: actions now need tokens from Connect",
+                b.describe()
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 
     async fn update(&self, b: &Board, fw: &Firmware) -> Result<()> {
@@ -315,7 +370,14 @@ impl RubiconCommand {
 
     /// The board's serial console through this machine's VM: interactive
     /// (`write`), or its history and then (`follow`) what it prints.
-    fn console(&self, b: &Board, write: bool, history: bool, follow: bool) -> Result<()> {
+    fn console(
+        &self,
+        b: &Board,
+        write: bool,
+        history: bool,
+        follow: bool,
+        token: Option<String>,
+    ) -> Result<()> {
         if !matches!(b.hub, Hub::Local) {
             bail!(
                 "the console of {} is only reachable from that VM's host for now \
@@ -336,6 +398,9 @@ impl RubiconCommand {
         }
         if let Some(baud) = baud {
             cmd.push_str(&format!(" --baud {baud}"));
+        }
+        if let Some(t) = token {
+            cmd.push_str(&format!(" --token {}", sh_quote(&t)));
         }
         let target = lifecycle::ssh_target_for_running()?;
         let mut ssh = Command::new("ssh");
@@ -490,6 +555,11 @@ fn state(b: &Board) -> String {
     if i["online"] != true {
         return format!("offline ({})", i["error"].as_str().unwrap_or("connecting"));
     }
+    let mode = if i["claimed"] == true {
+        "claimed"
+    } else {
+        "dev mode"
+    };
     // Protocol 2 boards report their generic outputs.
     let io = if i["io"].is_object() {
         &i["io"]
@@ -502,7 +572,7 @@ fn state(b: &Board) -> String {
             .map(|(k, v)| format!("{k} {}", if v == true { "on" } else { "off" }))
             .collect();
         return format!(
-            "online  fw {}  {}",
+            "online  {mode}  fw {}  {}",
             i["fw"].as_str().unwrap_or("?"),
             outs.join(", ")
         );
@@ -582,7 +652,7 @@ mod tests {
             info: json!({"online": true, "fw": "0.2", "io": {"power": true, "ssr1": false}}),
             ..local.clone()
         };
-        assert_eq!(state(&p2), "online  fw 0.2  power on, ssr1 off");
+        assert_eq!(state(&p2), "online  dev mode  fw 0.2  power on, ssr1 off");
         let off = Board {
             info: json!({"online": false, "error": "no route"}),
             ..local
