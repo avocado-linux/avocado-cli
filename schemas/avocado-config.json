@@ -2416,6 +2416,14 @@
           ],
           "additionalProperties": false,
           "description": "Wait until the DUT's serial console prints one of these markers."
+        },
+        "sd_mux": {
+          "type": "string",
+          "enum": [
+            "host",
+            "dut"
+          ],
+          "description": "Hand the card in an SDWire3 on the board's USB port to the hub (host: a disk there, AVOCADO_SD_MUX_DEVICE for the provision that follows) or to the DUT (dut)."
         }
       },
       "minProperties": 1,

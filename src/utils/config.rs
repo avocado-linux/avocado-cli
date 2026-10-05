@@ -1035,6 +1035,17 @@ pub enum RubiconStep {
     WaitUsb(RubiconWaitUsb),
     /// Wait until the DUT's serial console prints one of these markers.
     ConsoleExpect(RubiconConsoleExpect),
+    /// Hand the card in an SDWire3 on the board's USB port to the hub
+    /// (`host`: a disk there, `AVOCADO_SD_MUX_DEVICE` for the provision
+    /// that follows) or to the DUT (`dut`).
+    SdMux(RubiconSdMux),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconSdMux {
+    Host,
+    Dut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -14909,6 +14920,32 @@ provision:
 
     fn out(o: &[(&str, RubiconSwitch)]) -> RubiconStep {
         RubiconStep::Out(o.iter().map(|(k, v)| (k.to_string(), *v)).collect())
+    }
+
+    #[test]
+    fn sd_mux_steps_parse_and_reach_the_hub_as_it_reads_them() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    write:\n      - sd_mux: host\n      - sd_mux: dut\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        let steps = c.rubicon_steps("write").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                RubiconStep::SdMux(RubiconSdMux::Host),
+                RubiconStep::SdMux(RubiconSdMux::Dut)
+            ]
+        );
+        // The bundle carries them as the agent parses them.
+        assert_eq!(
+            serde_json::to_value(&steps).unwrap(),
+            serde_json::json!([{"sd_mux": "host"}, {"sd_mux": "dut"}])
+        );
+        assert!(serde_yaml::from_str::<Config>(
+            "rubicon:\n  run:\n    w:\n      - sd_mux: sideways\n"
+        )
+        .is_err());
     }
 
     #[test]
