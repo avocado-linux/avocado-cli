@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn rubicon_run_profiles_lint_clean_and_typos_warn() {
         let ok: Yaml = serde_yaml::from_str(
-            "rubicon:\n  run:\n    enter:\n      - power: \"off\"\n      - wait_ms: 500\n\
+            "rubicon:\n  run:\n    enter:\n      - out: { power: \"off\" }\n      - pulse: { ssr3: 200 }\n      - run: other\n      - wait_ms: 500\n\
              \x20     - hold_usb: [\"0955:*\"]\n      - wait_usb: { id: \"0955:7523\", timeout_s: 30 }\n\
              \x20     - console_expect: { markers: [\"login:\"], timeout_s: 9 }\n\
              provision:\n  tegraflash:\n    rubicon: { before: enter }\n",

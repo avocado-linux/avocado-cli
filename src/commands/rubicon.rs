@@ -195,19 +195,7 @@ impl RubiconCommand {
         let config = self.project().context(
             "`avocado rubicon run` reads run profiles from the project: no avocado.yaml here",
         )?;
-        let run = config.rubicon.as_ref().map(|r| &r.run);
-        let steps = run.and_then(|r| r.get(profile)).with_context(|| {
-            let mut known: Vec<&str> = run.into_iter().flatten().map(|(k, _)| k.as_str()).collect();
-            known.sort_unstable();
-            format!(
-                "no run profile {profile:?} under rubicon.run (defined: {})",
-                if known.is_empty() {
-                    "none".into()
-                } else {
-                    known.join(", ")
-                }
-            )
-        })?;
+        let steps = config.rubicon_steps(profile)?;
         let b = self.board(board).await?;
         let params = json!({"address": b.address, "name": profile, "steps": steps});
         let r =

@@ -1011,16 +1011,21 @@ pub struct RubiconConsole {
     pub baud: Option<u32>,
 }
 
-/// One step of a Rubicon run profile. The board itself only switches the
-/// DUT's power and recovery strap; waits, USB and the console are handled
-/// by the hub that drives it.
+/// One step of a Rubicon run profile. A Rubicon has generic outputs
+/// (`power`, `ssr1`…, `od1`…; which ones depends on the board) and knows
+/// nothing of the DUT: what each output is wired to on a target is what
+/// that target's run profiles say. Waits, USB and the console are handled
+/// by the hub that drives the board.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RubiconStep {
-    /// DUT power relay: `on`, `off` or `cycle` (off 3 s, then on).
-    Power(RubiconPower),
-    /// DUT recovery strap: `on` (asserted) or `off`.
-    Recovery(RubiconSwitch),
+    /// Switch outputs: `out: { power: "on", ssr1: "off" }`.
+    Out(BTreeMap<String, RubiconSwitch>),
+    /// Turn outputs on for this many ms, then off (a button press):
+    /// `pulse: { ssr3: 200 }`.
+    Pulse(BTreeMap<String, u64>),
+    /// Another run profile's steps, here.
+    Run(String),
     WaitMs(u64),
     /// Keep the board's exported USB devices matching these ids
     /// (`vvvv:pppp`, or `vvvv:*` for any product) attached to the hub for
@@ -1030,14 +1035,6 @@ pub enum RubiconStep {
     WaitUsb(RubiconWaitUsb),
     /// Wait until the DUT's serial console prints one of these markers.
     ConsoleExpect(RubiconConsoleExpect),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RubiconPower {
-    On,
-    Off,
-    Cycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -1063,6 +1060,12 @@ pub struct RubiconConsoleExpect {
 
 /// The provision profiles' key and its serde alias, as written in YAML.
 const PROVISION_KEYS: [&str; 2] = ["provision_profiles", "provision"];
+
+/// A Rubicon output name: lowercase letters, then digits (`power`, `ssr2`).
+fn valid_output(s: &str) -> bool {
+    let digits = s.trim_start_matches(|c: char| c.is_ascii_lowercase());
+    !s.is_empty() && digits.len() < s.len() && digits.chars().all(|c| c.is_ascii_digit())
+}
 
 /// A USB id pattern from a run profile: `vvvv:pppp` or `vvvv:*`, hex.
 fn valid_usb_id(s: &str, allow_any_pid: bool) -> bool {
@@ -4014,15 +4017,6 @@ impl Config {
         self.runtimes = Some(map);
     }
 
-    /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
-    /// resolves to a definition in the corresponding top-level map.
-    ///
-    /// Also verifies `default_runtime` (when set) references a defined runtime.
-    ///
-    /// Run at config-load to catch typos before they surface as confusing
-    /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
-    /// runtime overrides and unset fields skip this check; only `Named(...)`
-    /// refs are validated here.
     /// Check Rubicon run profiles and the provision profiles' references to
     /// them. Runs on the composed config, where extensions' run profiles are
     /// merged in; step names and shapes are already checked by serde.
@@ -4041,24 +4035,30 @@ impl Config {
                          hold_usb also takes vvvv:*)"
                     );
                 }
+                let outputs: Vec<&String> = match step {
+                    RubiconStep::Out(o) => o.keys().collect(),
+                    RubiconStep::Pulse(p) => p.keys().collect(),
+                    _ => vec![],
+                };
+                if let Some(o) = outputs.into_iter().find(|o| !valid_output(o)) {
+                    anyhow::bail!(
+                        "rubicon.run.{name}: bad output name {o:?} (outputs are named like \
+                         power, ssr1, od1)"
+                    );
+                }
             }
+            // References resolve and do not loop.
+            self.rubicon_steps(name)?;
         }
         for (profile, cfg) in self.provision_profiles.iter().flatten() {
             let Some(r) = &cfg.rubicon else { continue };
             for (when, name) in [("before", &r.before), ("after", &r.after)] {
                 let Some(name) = name else { continue };
                 if !run.is_some_and(|m| m.contains_key(name)) {
-                    let mut known: Vec<&str> =
-                        run.into_iter().flatten().map(|(k, _)| k.as_str()).collect();
-                    known.sort_unstable();
                     anyhow::bail!(
                         "provision.{profile}.rubicon.{when}: no run profile {name:?} under \
                          rubicon.run (defined: {})",
-                        if known.is_empty() {
-                            "none".into()
-                        } else {
-                            known.join(", ")
-                        }
+                        self.rubicon_run_names()
                     );
                 }
             }
@@ -4066,6 +4066,70 @@ impl Config {
         Ok(())
     }
 
+    fn rubicon_run_names(&self) -> String {
+        let mut known: Vec<&str> = self
+            .rubicon
+            .iter()
+            .flat_map(|r| r.run.keys().map(String::as_str))
+            .collect();
+        known.sort_unstable();
+        if known.is_empty() {
+            "none".into()
+        } else {
+            known.join(", ")
+        }
+    }
+
+    /// Run profile `name` as the hub runs it: `run:` steps replaced by the
+    /// steps of the run profile they name, recursively.
+    pub fn rubicon_steps(&self, name: &str) -> Result<Vec<RubiconStep>> {
+        fn expand(
+            c: &Config,
+            name: &str,
+            stack: &mut Vec<String>,
+            out: &mut Vec<RubiconStep>,
+        ) -> Result<()> {
+            if stack.iter().any(|n| n == name) {
+                anyhow::bail!("rubicon.run: {} -> {name} loops", stack.join(" -> "));
+            }
+            let steps = c
+                .rubicon
+                .as_ref()
+                .and_then(|r| r.run.get(name))
+                .with_context(|| {
+                    let from = stack
+                        .last()
+                        .map(|f| format!(" (from rubicon.run.{f})"))
+                        .unwrap_or_default();
+                    format!(
+                        "no run profile {name:?}{from} under rubicon.run (defined: {})",
+                        c.rubicon_run_names()
+                    )
+                })?;
+            stack.push(name.to_string());
+            for step in steps {
+                match step {
+                    RubiconStep::Run(inner) => expand(c, inner, stack, out)?,
+                    s => out.push(s.clone()),
+                }
+            }
+            stack.pop();
+            Ok(())
+        }
+        let mut out = Vec::new();
+        expand(self, name, &mut Vec::new(), &mut out)?;
+        Ok(out)
+    }
+
+    /// Validate that every named ref in `runtimes.<r>.{kernel,rootfs,initramfs}`
+    /// resolves to a definition in the corresponding top-level map.
+    ///
+    /// Also verifies `default_runtime` (when set) references a defined runtime.
+    ///
+    /// Run at config-load to catch typos before they surface as confusing
+    /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
+    /// runtime overrides and unset fields skip this check; only `Named(...)`
+    /// refs are validated here.
     pub fn validate_runtime_refs(&self) -> Result<()> {
         if let Some(default_rt) = self.default_runtime.as_deref() {
             let defined = self
@@ -14799,10 +14863,10 @@ extensions:
 rubicon:
   run:
     enter-recovery:
-      - power: "off"
-      - recovery: "on"
+      - out: { power: "off" }
+      - out: { ssr1: "on" }
       - wait_ms: 500
-      - power: "on"
+      - out: { power: "on" }
       - hold_usb: ["0955:*", "1d6b:0104"]
       - wait_usb: { id: "0955:7523", timeout_s: 30 }
     boot-check:
@@ -14825,6 +14889,51 @@ provision:
         config
     }
 
+    fn out(o: &[(&str, RubiconSwitch)]) -> RubiconStep {
+        RubiconStep::Out(o.iter().map(|(k, v)| (k.to_string(), *v)).collect())
+    }
+
+    #[test]
+    fn run_steps_expand_in_place_and_loops_and_typos_fail() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    off:\n      - out: { power: \"off\" }\n\
+             \x20   cycle:\n      - run: off\n      - wait_ms: 3000\n      - out: { power: \"on\" }\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            c.rubicon_steps("cycle").unwrap(),
+            vec![
+                out(&[("power", RubiconSwitch::Off)]),
+                RubiconStep::WaitMs(3000),
+                out(&[("power", RubiconSwitch::On)]),
+            ]
+        );
+        let looped: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    a: [ { run: b } ]\n    b: [ { run: a } ]\n",
+        )
+        .unwrap();
+        assert!(looped
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("loops"));
+        let missing: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    a: [ { run: nope } ]\n").unwrap();
+        let e = missing.validate_rubicon().unwrap_err().to_string();
+        assert!(
+            e.contains("\"nope\"") && e.contains("from rubicon.run.a"),
+            "{e}"
+        );
+        for bad in ["Power", "2", "ssr-1", "ssr1x"] {
+            let c: Config = serde_yaml::from_str(&format!(
+                "rubicon:\n  run:\n    a: [ {{ out: {{ {bad:?}: \"on\" }} }} ]\n"
+            ))
+            .unwrap();
+            assert!(c.validate_rubicon().is_err(), "{bad}");
+        }
+    }
+
     fn steps(c: &Config, name: &str) -> Vec<RubiconStep> {
         c.rubicon.as_ref().unwrap().run[name].clone()
     }
@@ -14834,7 +14943,7 @@ provision:
         let c = merge("default_target: x\n", BSP);
         assert_eq!(
             steps(&c, "enter-recovery")[0],
-            RubiconStep::Power(RubiconPower::Off)
+            out(&[("power", RubiconSwitch::Off)])
         );
         assert_eq!(
             steps(&c, "enter-recovery")[5],
@@ -14855,12 +14964,12 @@ provision:
         // The project writes `provision:` too; merging must not add a second,
         // `provision_profiles:` key (a duplicate field for serde).
         let c = merge(
-            "rubicon:\n  run:\n    enter-recovery:\n      - power: cycle\nprovision:\n  usb: {}\n",
+            "rubicon:\n  run:\n    enter-recovery:\n      - pulse: { power: 3000 }\nprovision:\n  usb: {}\n",
             BSP,
         );
         assert_eq!(
             steps(&c, "enter-recovery"),
-            vec![RubiconStep::Power(RubiconPower::Cycle)]
+            vec![RubiconStep::Pulse(BTreeMap::from([("power".into(), 3000)]))]
         );
         assert_eq!(
             steps(&c, "boot-check").len(),
@@ -14892,9 +15001,10 @@ provision:
     #[test]
     fn typos_and_bad_values_are_rejected() {
         for bad in [
-            "rubicon:\n  run:\n    x:\n      - powr: \"on\"\n",
-            "rubicon:\n  run:\n    x:\n      - power: \"of\"\n",
-            "rubicon:\n  run:\n    x:\n      - recovery: cycle\n",
+            "rubicon:\n  run:\n    x:\n      - outt: { power: \"on\" }\n",
+            "rubicon:\n  run:\n    x:\n      - out: { power: \"of\" }\n",
+            "rubicon:\n  run:\n    x:\n      - power: \"off\"\n",
+            "rubicon:\n  run:\n    x:\n      - pulse: { ssr1: soon }\n",
             "rubicon:\n  run:\n    x:\n      - wait_usb: { id: \"0955:7523\", timeout: 3 }\n",
             "rubicon:\n  sequences: {}\n",
             "provision:\n  p:\n    rubicon: { befor: x }\n",

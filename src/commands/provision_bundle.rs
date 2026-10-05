@@ -130,12 +130,12 @@ pub fn bundle_rubicon(config: &Config, default_profile: Option<String>) -> Optio
     if profiles.is_empty() {
         return None;
     }
-    let defined = config.rubicon.as_ref().map(|r| &r.run);
+    // Flattened (`run:` steps expanded): the hub runs plain steps.
     let run = profiles
         .values()
         .flat_map(|r| [&r.before, &r.after])
         .flatten()
-        .filter_map(|name| Some((name.clone(), defined?.get(name)?.clone())))
+        .filter_map(|name| Some((name.clone(), config.rubicon_steps(name).ok()?)))
         .collect();
     Some(BundleRubicon {
         default_profile,
@@ -674,7 +674,8 @@ mod tests {
             r#"
 rubicon:
   run:
-    enter: [ { power: "cycle" } ]
+    off: [ { out: { power: "off" } } ]
+    enter: [ { run: off }, { out: { ssr1: "on" } } ]
     check: [ { wait_ms: 5 } ]
     unused: [ { wait_ms: 1 } ]
 provision:
@@ -690,9 +691,10 @@ provision:
         assert_eq!(r.run.keys().collect::<Vec<_>>(), ["check", "enter"]);
         // The hub reads it as JSON: steps are single-key objects.
         let json = serde_json::to_value(&r).unwrap();
+        // `run:` is expanded for the hub.
         assert_eq!(
-            json["run"]["enter"][0],
-            serde_json::json!({"power": "cycle"})
+            json["run"]["enter"],
+            serde_json::json!([{"out": {"power": "off"}}, {"out": {"ssr1": "on"}}])
         );
 
         let none: Config = serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();

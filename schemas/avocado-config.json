@@ -2334,20 +2334,35 @@
       "description": "Exactly one of these keys per step.",
       "type": "object",
       "properties": {
-        "power": {
-          "enum": [
-            "on",
-            "off",
-            "cycle"
-          ],
-          "description": "Switch the DUT power relay (cycle: off 3 s, then on)."
+        "out": {
+          "type": "object",
+          "description": "Switch Rubicon outputs (power, ssr1…, od1…) on or off. What each is wired to is the target's business.",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-z]+[0-9]*$"
+          },
+          "additionalProperties": {
+            "enum": [
+              "on",
+              "off"
+            ]
+          }
         },
-        "recovery": {
-          "enum": [
-            "on",
-            "off"
-          ],
-          "description": "Assert or release the DUT's recovery strap."
+        "pulse": {
+          "type": "object",
+          "description": "Turn outputs on for this many milliseconds, then off (a button press).",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-z]+[0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "run": {
+          "type": "string",
+          "description": "Run another run profile's steps here."
         },
         "wait_ms": {
           "type": "integer",
