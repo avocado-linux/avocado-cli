@@ -1036,7 +1036,7 @@ pub enum RubiconStep {
     /// Wait until the DUT's serial console prints one of these markers.
     ConsoleExpect(RubiconConsoleExpect),
     /// Hand the card in an SDWire3 on the board's USB port to the hub
-    /// (`host`: a disk there, `AVOCADO_SD_MUX_DEVICE` for the provision
+    /// (`host`: a disk there, `AVOCADO_PROVISION_DEVICE` for the provision
     /// that follows) or to the DUT (`dut`).
     SdMux(RubiconSdMux),
 }
