@@ -43,6 +43,13 @@ pub enum RubiconAction {
         board: Option<String>,
         follow: bool,
     },
+    /// New firmware: a signed image file, or a released version.
+    Update {
+        board: Option<String>,
+        file: Option<std::path::PathBuf>,
+        version: Option<String>,
+        all: bool,
+    },
 }
 
 pub struct RubiconCommand {
@@ -123,11 +130,102 @@ impl RubiconCommand {
                 let b = self.board(board).await?;
                 self.console(&b, !read_only, true, true)
             }
+            RubiconAction::Update {
+                board,
+                file,
+                version,
+                all,
+            } => {
+                let fw = firmware(file.as_deref(), version.as_deref()).await?;
+                eprintln!(
+                    "firmware {} ({}, {} KiB)",
+                    fw.version,
+                    &fw.sha256[..12],
+                    fw.bytes.len() >> 10
+                );
+                if !*all {
+                    let b = self.board(board).await?;
+                    return self.update(&b, &fw).await;
+                }
+                self.update_all(&fw).await
+            }
             RubiconAction::Logs { board, follow } => {
                 let b = self.board(board).await?;
                 self.console(&b, false, true, *follow)
             }
         }
+    }
+
+    async fn update(&self, b: &Board, fw: &Firmware) -> Result<()> {
+        let params = match &b.hub {
+            Hub::Local => {
+                // In the VM's workspace share: the guest reads it in place.
+                let paths = crate::utils::vm::state::VmPaths::resolve()?;
+                let ws = crate::utils::vm::share::read_recorded_workspace(&paths)?
+                    .map(Ok)
+                    .unwrap_or_else(|| crate::utils::vm::share::resolve_workspace(None))?;
+                let dir = ws.join(".avocado/hub-firmware");
+                std::fs::create_dir_all(&dir)?;
+                let host = dir.join(format!("{}.bin", fw.sha256));
+                std::fs::write(&host, &fw.bytes)?;
+                let vm = crate::utils::vm::share::translate_to_vm(&host, &ws)?;
+                json!({"address": b.address, "firmware": {
+                    "url": vm.to_string_lossy(), "sha256": fw.sha256, "version": fw.version}})
+            }
+            Hub::Connect { .. } => {
+                let id = upload_firmware(self.connect_profile.as_deref(), fw).await?;
+                json!({"address": b.address, "firmware_id": id})
+            }
+        };
+        let r = remote::run_command(b, "rubicon_update", params, self.connect_profile.as_deref())
+            .await?;
+        let res = &r["result"];
+        remote::report(&r, &format!("update of {}", b.describe()))?;
+        print_success(
+            &format!(
+                "{} updated: {} -> {}",
+                b.describe(),
+                res["from"].as_str().unwrap_or("?"),
+                res["to"].as_str().unwrap_or("?")
+            ),
+            OutputLevel::Normal,
+        );
+        Ok(())
+    }
+
+    /// Every reachable, online board; three at a time. One board failing
+    /// does not stop the others; any failure fails the command.
+    async fn update_all(&self, fw: &Firmware) -> Result<()> {
+        use futures_util::StreamExt;
+        let boards: Vec<Board> = self
+            .all_boards()
+            .await?
+            .into_iter()
+            .filter(|b| b.info["online"] == true)
+            .collect();
+        if boards.is_empty() {
+            bail!("no online Rubicons to update");
+        }
+        let results: Vec<(String, Result<()>)> = futures_util::stream::iter(boards)
+            .map(|b| async move { (b.describe(), self.update(&b, fw).await) })
+            .buffer_unordered(3)
+            .collect()
+            .await;
+        println!("\n{:<60} RESULT", "BOARD");
+        let mut failed = 0;
+        for (who, r) in &results {
+            match r {
+                Ok(()) => println!("{who:<60} updated"),
+                Err(e) => {
+                    failed += 1;
+                    println!("{who:<60} FAILED: {e:#}");
+                }
+            }
+        }
+        if failed > 0 {
+            bail!("{failed} of {} Rubicons not updated", results.len());
+        }
+        Ok(())
     }
 
     /// A board of this machine's VM (adding, removing and labelling edit
@@ -139,6 +237,36 @@ impl RubiconCommand {
     }
 
     async fn list(&self) -> Result<()> {
+        let boards = self.all_boards().await?;
+        if boards.is_empty() {
+            println!(
+                "No Rubicons. Add one to this machine's VM with `avocado rubicon add <address>`."
+            );
+            return Ok(());
+        }
+        println!(
+            "{:<18} {:<16} {:<16} {:<20} STATE",
+            "NAME", "LABEL", "ADDRESS", "HUB"
+        );
+        for b in &boards {
+            println!(
+                "{:<18} {:<16} {:<16} {:<20} {}",
+                b.name.as_deref().unwrap_or("-"),
+                b.label.as_deref().unwrap_or("-"),
+                b.address,
+                match &b.hub {
+                    Hub::Local => "this machine".to_string(),
+                    Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+                },
+                state(b)
+            );
+        }
+        Ok(())
+    }
+
+    /// Every board reachable from here, each once (this machine's VM is also
+    /// one of the org's VMs in Connect).
+    async fn all_boards(&self) -> Result<Vec<Board>> {
         let mut boards = Vec::new();
         if self.via != Via::Connect {
             boards.extend(remote::local_boards().await?);
@@ -165,30 +293,7 @@ impl RubiconCommand {
             Some(n) => seen.insert(n.clone()),
             None => true,
         });
-        if boards.is_empty() {
-            println!(
-                "No Rubicons. Add one to this machine's VM with `avocado rubicon add <address>`."
-            );
-            return Ok(());
-        }
-        println!(
-            "{:<18} {:<16} {:<16} {:<20} STATE",
-            "NAME", "LABEL", "ADDRESS", "HUB"
-        );
-        for b in &boards {
-            println!(
-                "{:<18} {:<16} {:<16} {:<20} {}",
-                b.name.as_deref().unwrap_or("-"),
-                b.label.as_deref().unwrap_or("-"),
-                b.address,
-                match &b.hub {
-                    Hub::Local => "this machine".to_string(),
-                    Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
-                },
-                state(b)
-            );
-        }
-        Ok(())
+        Ok(boards)
     }
 
     async fn run(&self, board: &Option<String>, profile: &str) -> Result<()> {
@@ -256,6 +361,120 @@ impl RubiconCommand {
         }
         Ok(())
     }
+}
+
+/// A signed Rubicon image.
+pub struct Firmware {
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    /// As the board reports it in `hello` (`0.1.0+83`).
+    pub version: String,
+}
+
+/// The version in an MCUboot image header (`major.minor.revision+build`).
+pub fn mcuboot_version(image: &[u8]) -> Result<String> {
+    let le32 = |o: usize| {
+        image
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    if le32(0) != Some(0x96f3_b83d) {
+        bail!("not an MCUboot image (no image header magic); use the signed .bin");
+    }
+    let rev = u16::from_le_bytes([image[22], image[23]]);
+    Ok(format!(
+        "{}.{}.{rev}+{}",
+        image[20],
+        image[21],
+        le32(24).unwrap()
+    ))
+}
+
+/// Where released images are fetched from:
+/// `<base>/v<version>/rubicon-micro-<version>.signed.bin` and `SHA256SUMS`
+/// beside it, `<version>` in dotted form (`0.1.0.83`).
+const RELEASES: &str = "https://github.com/avocado-linux/rubicon-micro/releases/download";
+
+async fn firmware(file: Option<&std::path::Path>, version: Option<&str>) -> Result<Firmware> {
+    use sha2::{Digest, Sha256};
+    let bytes = match (file, version) {
+        (Some(f), None) => std::fs::read(f).with_context(|| format!("read {}", f.display()))?,
+        (None, Some(v)) => {
+            let v = v.trim_start_matches('v').replace('+', ".");
+            let base =
+                std::env::var("AVOCADO_RUBICON_RELEASES").unwrap_or_else(|_| RELEASES.into());
+            let asset = format!("rubicon-micro-{v}.signed.bin");
+            let get = |url: String| async move {
+                let r = reqwest::get(&url).await?.error_for_status()?;
+                anyhow::Ok(r.bytes().await?.to_vec())
+            };
+            let sums = String::from_utf8_lossy(&get(format!("{base}/v{v}/SHA256SUMS")).await?)
+                .into_owned();
+            let want = sums
+                .lines()
+                .find_map(|l| {
+                    let mut c = l.split_whitespace();
+                    let (h, n) = (c.next()?, c.next()?);
+                    (n.trim_start_matches('*') == asset).then(|| h.to_lowercase())
+                })
+                .with_context(|| format!("{asset} is not in release v{v}'s SHA256SUMS"))?;
+            let bytes = get(format!("{base}/v{v}/{asset}")).await?;
+            let got = crate::utils::signing_keys::hex::encode(&Sha256::digest(&bytes));
+            if got != want {
+                bail!("{asset}: sha256 {got}, the release says {want}");
+            }
+            bytes
+        }
+        _ => bail!("give exactly one of --file or --version"),
+    };
+    Ok(Firmware {
+        version: mcuboot_version(&bytes)?,
+        sha256: crate::utils::signing_keys::hex::encode(&Sha256::digest(&bytes)),
+        bytes,
+    })
+}
+
+/// Register the image in Connect, sending its bytes only if the org lacks them.
+async fn upload_firmware(profile: Option<&str>, fw: &Firmware) -> Result<String> {
+    use reqwest::Method;
+    let (c, org) = crate::commands::connect::hub::connect(profile, None)?;
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &fw.bytes)?;
+    let (_, parts) = crate::commands::connect::upload::compute_sha256_with_parts(tmp.path())?;
+    let created = c
+        .json(
+            Method::POST,
+            &format!("/api/orgs/{org}/rubicon-firmwares"),
+            Some(
+                &json!({"firmware": {"version": fw.version, "sha256": fw.sha256,
+                                      "size_bytes": fw.bytes.len(), "part_checksums": parts}}),
+            ),
+        )
+        .await?;
+    let id = created["data"]["id"]
+        .as_str()
+        .context("no firmware id")?
+        .to_string();
+    if let Some(upload) = created["data"]["upload"].as_object() {
+        let parts = upload["parts"].as_array().cloned().unwrap_or_default();
+        let done = crate::commands::connect::hub::upload_parts(
+            &c,
+            tmp.path(),
+            parts,
+            &format!("/api/orgs/{org}/rubicon-firmwares/{id}/upload-urls"),
+        )
+        .await?;
+        c.json(
+            Method::POST,
+            &format!("/api/orgs/{org}/rubicon-firmwares/{id}/complete"),
+            Some(&json!({"parts": done})),
+        )
+        .await?;
+        eprintln!("firmware {} uploaded to Connect", fw.version);
+    } else {
+        eprintln!("firmware {} already in Connect", fw.version);
+    }
+    Ok(id)
 }
 
 fn sh_quote(s: &str) -> String {
@@ -369,6 +588,16 @@ mod tests {
             ..local
         };
         assert_eq!(state(&off), "offline (no route)");
+    }
+
+    #[test]
+    fn reads_the_mcuboot_header_version() {
+        let mut img = vec![0u8; 64];
+        img[..4].copy_from_slice(&0x96f3_b83du32.to_le_bytes());
+        img[21] = 1;
+        img[24..28].copy_from_slice(&83u32.to_le_bytes());
+        assert_eq!(mcuboot_version(&img).unwrap(), "0.1.0+83");
+        assert!(mcuboot_version(&[0u8; 64]).is_err());
     }
 
     #[test]
