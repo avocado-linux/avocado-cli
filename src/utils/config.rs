@@ -424,6 +424,24 @@ impl ExtensionSource {
     /// - Wildcard suffix: "provision_profiles.*" matches "provision_profiles.tegraflash", "provision_profiles.usb", etc.
     ///
     /// Returns true if the path matches at least one include pattern.
+    /// The config sections merged from this extension besides its own
+    /// `extensions.<name>`: its `include:` list, else the same default for
+    /// every source type, so switching between package/path/git doesn't
+    /// change the composed config hash. Provision profiles are in the
+    /// default because a BSP's profiles carry what its board needs to be
+    /// provisioned (e.g. the Rubicon run profiles to use); the project's
+    /// own profile of the same name still wins whole.
+    pub fn include_patterns(&self) -> Vec<String> {
+        let (ExtensionSource::Path { include, .. }
+        | ExtensionSource::Git { include, .. }
+        | ExtensionSource::Package { include, .. }) = self;
+        include.clone().unwrap_or_else(|| {
+            ["sdk.packages.*", "sdk.compile.*", "provision_profiles.*"]
+                .map(String::from)
+                .to_vec()
+        })
+    }
+
     pub fn matches_include_pattern(config_path: &str, patterns: &[String]) -> bool {
         for pattern in patterns {
             if pattern.ends_with(".*") {
@@ -955,6 +973,94 @@ pub struct ProvisionProfileConfig {
     /// Defaults to `.avocado/provision-{profile}.state` when not specified.
     /// The state file is copied into the container before provisioning and copied back after.
     pub state_file: Option<String>,
+    /// Rubicon run profiles (`rubicon.run.<name>`) a hub runs around this
+    /// profile when provisioning through a Rubicon (`--rubicon`).
+    pub rubicon: Option<ProvisionRubicon>,
+}
+
+/// The Rubicon run profiles a provision profile uses, by name.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionRubicon {
+    /// Run before provisioning: bring the DUT into its provisioning mode.
+    pub before: Option<String>,
+    /// Run after a successful provision: e.g. check that the DUT boots.
+    pub after: Option<String>,
+}
+
+/// Project-level Rubicon settings.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RubiconConfig {
+    /// Named run profiles: steps a hub runs against one Rubicon and its DUT.
+    /// Extensions (BSPs) contribute them; a project's own entry of the same
+    /// name replaces the extension's whole. Steps are single-key maps
+    /// (`- power: "off"`), not YAML tags.
+    #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
+    pub run: BTreeMap<String, Vec<RubiconStep>>,
+}
+
+/// One step of a Rubicon run profile. The board itself only switches the
+/// DUT's power and recovery strap; waits, USB and the console are handled
+/// by the hub that drives it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RubiconStep {
+    /// DUT power relay: `on`, `off` or `cycle` (off 3 s, then on).
+    Power(RubiconPower),
+    /// DUT recovery strap: `on` (asserted) or `off`.
+    Recovery(RubiconSwitch),
+    WaitMs(u64),
+    /// Keep the board's exported USB devices matching these ids
+    /// (`vvvv:pppp`, or `vvvv:*` for any product) attached to the hub for
+    /// the rest of the job, re-attaching them as the DUT re-enumerates.
+    HoldUsb(Vec<String>),
+    /// Wait until a held device with this id is attached.
+    WaitUsb(RubiconWaitUsb),
+    /// Wait until the DUT's serial console prints one of these markers.
+    ConsoleExpect(RubiconConsoleExpect),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconPower {
+    On,
+    Off,
+    Cycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconSwitch {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RubiconWaitUsb {
+    pub id: String,
+    pub timeout_s: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RubiconConsoleExpect {
+    pub markers: Vec<String>,
+    pub timeout_s: u64,
+}
+
+/// The provision profiles' key and its serde alias, as written in YAML.
+const PROVISION_KEYS: [&str; 2] = ["provision_profiles", "provision"];
+
+/// A USB id pattern from a run profile: `vvvv:pppp` or `vvvv:*`, hex.
+fn valid_usb_id(s: &str, allow_any_pid: bool) -> bool {
+    let hex4 = |p: &str| p.len() == 4 && p.chars().all(|c| c.is_ascii_hexdigit());
+    match s.split_once(':') {
+        Some((v, "*")) => allow_any_pid && hex4(v),
+        Some((v, p)) => hex4(v) && hex4(p),
+        None => false,
+    }
 }
 
 /// Distribution configuration
@@ -1621,6 +1727,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "signing_keys_deserializer::deserialize")]
     pub signing_keys: Option<HashMap<String, String>>,
     pub connect: Option<ConnectConfig>,
+    /// Rubicon settings: named run profiles a hub runs against a Rubicon.
+    pub rubicon: Option<RubiconConfig>,
     /// Top-level kernel definition(s). Accepts either a singleton `KernelConfig`
     /// (today's grammar — synthesized as the implicit `default` entry) or a
     /// `name → KernelConfig` map (new named-reference grammar). Applies to any
@@ -2159,6 +2267,7 @@ impl Config {
         // could not trip because no in-scope target had opted in, and /var came
         // up plaintext from config asking for encryption.
         config.validate_runtime_refs()?;
+        config.validate_rubicon()?;
 
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
@@ -2354,6 +2463,7 @@ impl Config {
                 provision_profiles: None,
                 signing_keys: None,
                 connect: None,
+                rubicon: None,
                 kernel: None,
                 permissions: None,
             });
@@ -2585,20 +2695,7 @@ impl Config {
                 }
             }
 
-            // Get include patterns from the extension source.
-            // Default to merging sdk.packages and sdk.compile sections for all source types
-            // so that switching between package/path/git doesn't change the composed config hash.
-            let include_patterns: Vec<String> = match &source {
-                ExtensionSource::Path { include, .. }
-                | ExtensionSource::Git { include, .. }
-                | ExtensionSource::Package { include, .. } => {
-                    if let Some(patterns) = include {
-                        patterns.clone()
-                    } else {
-                        vec!["sdk.packages.*".to_string(), "sdk.compile.*".to_string()]
-                    }
-                }
-            };
+            let include_patterns = source.include_patterns();
             let include_patterns = include_patterns.as_slice();
 
             // Find compile dependencies to auto-include from the extension's own section
@@ -2942,23 +3039,62 @@ impl Config {
             }
         }
 
-        // Merge provision sections based on include patterns
-        if let Some(external_provision) = external_config
-            .get("provision_profiles")
-            .and_then(|p| p.as_mapping())
-        {
+        // Merge provision sections based on include patterns. `provision` is
+        // the serde alias of `provision_profiles` and either may be written,
+        // in the extension or the project; patterns may use either name.
+        for ext_key in PROVISION_KEYS {
+            let Some(external_provision) =
+                external_config.get(ext_key).and_then(|p| p.as_mapping())
+            else {
+                continue;
+            };
             for (profile_key, profile_value) in external_provision {
-                if let Some(profile_name) = profile_key.as_str() {
-                    let config_path = format!("provision_profiles.{profile_name}");
-                    if ExtensionSource::matches_include_pattern(&config_path, include_patterns) {
-                        Self::ensure_provision_section(main_config);
-                        if let Some(main_provision) = main_config
-                            .get_mut("provision_profiles")
-                            .and_then(|p| p.as_mapping_mut())
-                        {
-                            // Only add if not already present (main takes precedence)
-                            if !main_provision.contains_key(profile_key) {
-                                main_provision.insert(profile_key.clone(), profile_value.clone());
+                let Some(profile_name) = profile_key.as_str() else {
+                    continue;
+                };
+                let included = PROVISION_KEYS.iter().any(|k| {
+                    ExtensionSource::matches_include_pattern(
+                        &format!("{k}.{profile_name}"),
+                        include_patterns,
+                    )
+                });
+                if !included {
+                    continue;
+                }
+                let main_key = Self::ensure_provision_section(main_config);
+                if let Some(main_provision) = main_config
+                    .get_mut(main_key)
+                    .and_then(|p| p.as_mapping_mut())
+                {
+                    // Only add if not already present (main takes precedence)
+                    if !main_provision.contains_key(profile_key) {
+                        main_provision.insert(profile_key.clone(), profile_value.clone());
+                    }
+                }
+            }
+        }
+
+        // Rubicon run profiles always merge, by name, main first: they are
+        // inert until a provision profile names one, and a project replaces
+        // an extension's run profile by defining the same name.
+        if let Some(external_run) = external_config
+            .get("rubicon")
+            .and_then(|r| r.get("run"))
+            .and_then(|r| r.as_mapping())
+        {
+            let main_map = main_config.as_mapping_mut();
+            if let Some(main_map) = main_map {
+                let rubicon = main_map
+                    .entry(serde_yaml::Value::String("rubicon".into()))
+                    .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                if let Some(rubicon) = rubicon.as_mapping_mut() {
+                    let run = rubicon
+                        .entry(serde_yaml::Value::String("run".into()))
+                        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                    if let Some(run) = run.as_mapping_mut() {
+                        for (name, steps) in external_run {
+                            if !run.contains_key(name) {
+                                run.insert(name.clone(), steps.clone());
                             }
                         }
                     }
@@ -3132,16 +3268,20 @@ impl Config {
         None
     }
 
-    /// Ensure the provision section exists in the config.
-    fn ensure_provision_section(config: &mut serde_yaml::Value) {
+    /// Ensure the provision section exists in the config and return its key:
+    /// whichever of `provision_profiles` / `provision` the config already
+    /// uses (adding the other would be a duplicate field), else the former.
+    fn ensure_provision_section(config: &mut serde_yaml::Value) -> &'static str {
+        let key = PROVISION_KEYS
+            .into_iter()
+            .find(|k| config.get(k).is_some())
+            .unwrap_or(PROVISION_KEYS[0]);
         if let Some(main_map) = config.as_mapping_mut() {
-            if !main_map.contains_key(serde_yaml::Value::String("provision_profiles".to_string())) {
-                main_map.insert(
-                    serde_yaml::Value::String("provision_profiles".to_string()),
-                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-                );
-            }
+            main_map
+                .entry(serde_yaml::Value::String(key.to_string()))
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
         }
+        key
     }
 
     /// Get possible base extension names by stripping common target suffixes.
@@ -3872,6 +4012,49 @@ impl Config {
     /// downstream "no kernel pinned" / "no rootfs sysroot" errors. Inline
     /// runtime overrides and unset fields skip this check; only `Named(...)`
     /// refs are validated here.
+    /// Check Rubicon run profiles and the provision profiles' references to
+    /// them. Runs on the composed config, where extensions' run profiles are
+    /// merged in; step names and shapes are already checked by serde.
+    pub fn validate_rubicon(&self) -> Result<()> {
+        let run = self.rubicon.as_ref().map(|r| &r.run);
+        for (name, steps) in run.into_iter().flatten() {
+            for step in steps {
+                let bad = match step {
+                    RubiconStep::HoldUsb(ids) => ids.iter().find(|i| !valid_usb_id(i, true)),
+                    RubiconStep::WaitUsb(w) => (!valid_usb_id(&w.id, false)).then_some(&w.id),
+                    _ => None,
+                };
+                if let Some(id) = bad {
+                    anyhow::bail!(
+                        "rubicon.run.{name}: bad USB id {id:?} (want vvvv:pppp in hex; \
+                         hold_usb also takes vvvv:*)"
+                    );
+                }
+            }
+        }
+        for (profile, cfg) in self.provision_profiles.iter().flatten() {
+            let Some(r) = &cfg.rubicon else { continue };
+            for (when, name) in [("before", &r.before), ("after", &r.after)] {
+                let Some(name) = name else { continue };
+                if !run.is_some_and(|m| m.contains_key(name)) {
+                    let mut known: Vec<&str> =
+                        run.into_iter().flatten().map(|(k, _)| k.as_str()).collect();
+                    known.sort_unstable();
+                    anyhow::bail!(
+                        "provision.{profile}.rubicon.{when}: no run profile {name:?} under \
+                         rubicon.run (defined: {})",
+                        if known.is_empty() {
+                            "none".into()
+                        } else {
+                            known.join(", ")
+                        }
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_runtime_refs(&self) -> Result<()> {
         if let Some(default_rt) = self.default_runtime.as_deref() {
             let defined = self
@@ -11841,17 +12024,7 @@ extensions:
             let mut main_config: serde_yaml::Value =
                 serde_yaml::from_str(main_config_content).unwrap();
 
-            let include_patterns: Vec<String> = match source {
-                ExtensionSource::Path { include, .. }
-                | ExtensionSource::Git { include, .. }
-                | ExtensionSource::Package { include, .. } => {
-                    if let Some(patterns) = include {
-                        patterns.clone()
-                    } else {
-                        vec!["sdk.packages.*".to_string(), "sdk.compile.*".to_string()]
-                    }
-                }
-            };
+            let include_patterns = source.include_patterns();
 
             Config::merge_external_config(
                 &mut main_config,
@@ -14602,5 +14775,141 @@ mod kernel_cmdline_tests {
     fn absent_kernel_block_yields_nothing() {
         let c = cfg("default_target: qemuarm64\n");
         assert_eq!(c.effective_kernel_cmdline(Some("rt")), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod rubicon_config_tests {
+    use super::*;
+
+    const BSP: &str = r#"
+extensions:
+  bsp: {}
+rubicon:
+  run:
+    enter-recovery:
+      - power: "off"
+      - recovery: "on"
+      - wait_ms: 500
+      - power: "on"
+      - hold_usb: ["0955:*", "1d6b:0104"]
+      - wait_usb: { id: "0955:7523", timeout_s: 30 }
+    boot-check:
+      - console_expect: { markers: ["login:"], timeout_s: 300 }
+provision:
+  tegraflash:
+    rubicon: { before: enter-recovery, after: boot-check }
+"#;
+
+    fn merge(main: &str, ext: &str) -> Config {
+        let mut main: serde_yaml::Value = serde_yaml::from_str(main).unwrap();
+        let ext: serde_yaml::Value = serde_yaml::from_str(ext).unwrap();
+        let source = ExtensionSource::Path {
+            path: ".".into(),
+            include: None,
+        };
+        Config::merge_external_config(&mut main, &ext, "bsp", &source.include_patterns(), &[]);
+        let config: Config = serde_yaml::from_value(main).expect("composed config deserializes");
+        config.validate_rubicon().expect("valid");
+        config
+    }
+
+    fn steps(c: &Config, name: &str) -> Vec<RubiconStep> {
+        c.rubicon.as_ref().unwrap().run[name].clone()
+    }
+
+    #[test]
+    fn bsp_run_profiles_and_their_provision_profile_reach_the_project() {
+        let c = merge("default_target: x\n", BSP);
+        assert_eq!(
+            steps(&c, "enter-recovery")[0],
+            RubiconStep::Power(RubiconPower::Off)
+        );
+        assert_eq!(
+            steps(&c, "enter-recovery")[5],
+            RubiconStep::WaitUsb(RubiconWaitUsb {
+                id: "0955:7523".into(),
+                timeout_s: 30
+            })
+        );
+        let tf = c.get_provision_profile("tegraflash").unwrap();
+        assert_eq!(
+            tf.rubicon.as_ref().unwrap().before.as_deref(),
+            Some("enter-recovery")
+        );
+    }
+
+    #[test]
+    fn the_project_replaces_a_run_profile_whole_and_keeps_its_own_provision_key() {
+        // The project writes `provision:` too; merging must not add a second,
+        // `provision_profiles:` key (a duplicate field for serde).
+        let c = merge(
+            "rubicon:\n  run:\n    enter-recovery:\n      - power: cycle\nprovision:\n  usb: {}\n",
+            BSP,
+        );
+        assert_eq!(
+            steps(&c, "enter-recovery"),
+            vec![RubiconStep::Power(RubiconPower::Cycle)]
+        );
+        assert_eq!(
+            steps(&c, "boot-check").len(),
+            1,
+            "other BSP run profiles still merge"
+        );
+        let profiles = c.provision_profiles.as_ref().unwrap();
+        assert!(profiles.contains_key("usb") && profiles.contains_key("tegraflash"));
+    }
+
+    #[test]
+    fn an_extension_profile_under_either_key_merges() {
+        let ext = BSP.replace("\nprovision:\n", "\nprovision_profiles:\n");
+        let c = merge("provision:\n  usb: {}\n", &ext);
+        assert!(c.get_provision_profile("tegraflash").is_some());
+        // An explicit include list naming the alias works too.
+        let mut main: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let ext: serde_yaml::Value = serde_yaml::from_str(BSP).unwrap();
+        Config::merge_external_config(
+            &mut main,
+            &ext,
+            "bsp",
+            &["provision.tegraflash".into()],
+            &[],
+        );
+        assert!(main["provision_profiles"]["tegraflash"].is_mapping());
+    }
+
+    #[test]
+    fn typos_and_bad_values_are_rejected() {
+        for bad in [
+            "rubicon:\n  run:\n    x:\n      - powr: \"on\"\n",
+            "rubicon:\n  run:\n    x:\n      - power: \"of\"\n",
+            "rubicon:\n  run:\n    x:\n      - recovery: cycle\n",
+            "rubicon:\n  run:\n    x:\n      - wait_usb: { id: \"0955:7523\", timeout: 3 }\n",
+            "rubicon:\n  sequences: {}\n",
+            "provision:\n  p:\n    rubicon: { befor: x }\n",
+        ] {
+            assert!(serde_yaml::from_str::<Config>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn undefined_references_and_bad_usb_ids_fail_validation() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    a: []\nprovision:\n  p:\n    rubicon: { before: a, after: b }\n",
+        )
+        .unwrap();
+        let e = c.validate_rubicon().unwrap_err().to_string();
+        assert!(
+            e.contains("provision.p.rubicon.after") && e.contains("\"b\"") && e.contains("a"),
+            "{e}"
+        );
+
+        for id in ["0955", "955:7523", "0955:*"] {
+            let c: Config = serde_yaml::from_str(&format!(
+                "rubicon:\n  run:\n    a:\n      - wait_usb: {{ id: \"{id}\", timeout_s: 1 }}\n"
+            ))
+            .unwrap();
+            assert!(c.validate_rubicon().is_err(), "{id}");
+        }
     }
 }
