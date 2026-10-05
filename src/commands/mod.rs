@@ -17,6 +17,7 @@ pub mod provision_bundle;
 pub mod provision_remote;
 pub mod prune;
 pub mod rootfs;
+pub mod rubicon;
 pub mod runtime;
 pub mod save;
 pub mod sbom;

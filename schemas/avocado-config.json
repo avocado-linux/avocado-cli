@@ -2309,6 +2309,22 @@
               "$ref": "#/definitions/rubiconStep"
             }
           }
+        },
+        "default": {
+          "type": "string",
+          "description": "The board `provision --rubicon` and `avocado rubicon` use when none is named (firmware name, label or address)."
+        },
+        "console": {
+          "type": "object",
+          "description": "The DUT's serial console.",
+          "properties": {
+            "baud": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Console rate (default 115200)."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

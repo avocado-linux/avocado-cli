@@ -550,6 +550,10 @@ mod tests {
                 serde_fields::<ProvisionRubicon>(),
             ),
             (
+                "/definitions/rubiconConfig/properties/console",
+                serde_fields::<RubiconConsole>(),
+            ),
+            (
                 "/definitions/containerDevConfig",
                 serde_fields::<ContainerDevConfig>(),
             ),

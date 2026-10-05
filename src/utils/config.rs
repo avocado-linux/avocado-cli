@@ -998,6 +998,17 @@ pub struct RubiconConfig {
     /// (`- power: "off"`), not YAML tags.
     #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
     pub run: BTreeMap<String, Vec<RubiconStep>>,
+    /// The board `--rubicon` and `avocado rubicon` use when none is named
+    /// (name, label or address).
+    pub default: Option<String>,
+    pub console: Option<RubiconConsole>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RubiconConsole {
+    /// The DUT's serial console rate (default 115200).
+    pub baud: Option<u32>,
 }
 
 /// One step of a Rubicon run profile. The board itself only switches the
