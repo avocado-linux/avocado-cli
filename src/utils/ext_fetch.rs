@@ -837,17 +837,18 @@ echo "Successfully fetched extension '{ext_name}' from git"
 "#
             )
         } else {
-            // Full clone
+            // Fetch by ref directly to handle branches, tags, and commit SHAs,
+            // and fail loudly if the ref can't be found.
             format!(
                 r#"
 set -e
 rm -rf "{container_install_path}"
-git clone --depth 1 --branch {ref_arg} "{url}" "{container_install_path}" || \
-git clone --depth 1 "{url}" "{container_install_path}"
+mkdir -p "{container_install_path}"
 cd "{container_install_path}"
-if [ "{ref_arg}" != "HEAD" ]; then
-    git checkout {ref_arg} 2>/dev/null || true
-fi
+git init
+git remote add origin "{url}"
+git fetch --depth 1 origin {ref_arg}
+git checkout FETCH_HEAD
 echo "Successfully fetched extension '{ext_name}' from git"
 "#
             )
