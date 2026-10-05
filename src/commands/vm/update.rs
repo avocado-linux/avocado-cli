@@ -280,9 +280,21 @@ impl UpdateCommand {
 
         // Stop the VM if running. We hold the staging dir open across
         // this so a crash here leaves staging in place for retry.
+        // A VM under `vm service` is stopped and started through systemd: a
+        // plain restart would leave it outside the unit, with the unit's
+        // settings gone (idle hibernation back on, which freezes a hub mid-job).
+        let under_service = was_running && crate::commands::vm::service::service_active();
         if was_running {
             println!("avocado vm update: stopping VM…");
-            crate::utils::vm::lifecycle::stop(false).await.ok();
+            if under_service {
+                crate::commands::vm::service::systemctl(&[
+                    "stop",
+                    crate::commands::vm::service::UNIT_NAME,
+                ])
+                .ok();
+            } else {
+                crate::utils::vm::lifecycle::stop(false).await.ok();
+            }
         }
 
         // Commit all staged files into install_dir.
@@ -355,7 +367,13 @@ impl UpdateCommand {
 
         stage.cleanup();
 
-        if was_running {
+        if under_service {
+            println!("avocado vm update: restarting VM (service)…");
+            crate::commands::vm::service::systemctl(&[
+                "start",
+                crate::commands::vm::service::UNIT_NAME,
+            ])?;
+        } else if was_running {
             println!("avocado vm update: restarting VM…");
             // Minimal start opts — None for cpus/memory means lifecycle::start
             // reads `runtime.*` from ~/.avocado/vm/config.yaml (or falls back

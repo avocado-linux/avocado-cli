@@ -75,7 +75,7 @@ WantedBy=default.target
     )
 }
 
-fn systemctl(args: &[&str]) -> Result<()> {
+pub(crate) fn systemctl(args: &[&str]) -> Result<()> {
     let st = Command::new("systemctl")
         .arg("--user")
         .args(args)
@@ -87,7 +87,7 @@ fn systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn service_active() -> bool {
+pub(crate) fn service_active() -> bool {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", UNIT_NAME])
         .status()
