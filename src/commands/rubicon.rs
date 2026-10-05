@@ -155,6 +155,11 @@ impl RubiconCommand {
         }
         // This machine's VM is also one of the org's VMs: show each board
         // once, as seen from here.
+        if self.via != Via::Connect {
+            if let Some(me) = remote::local_instance() {
+                boards.retain(|b| b.vm_instance.as_deref() != Some(me.as_str()));
+            }
+        }
         let mut seen = HashSet::new();
         boards.retain(|b| match &b.name {
             Some(n) => seen.insert(n.clone()),
@@ -341,6 +346,7 @@ mod tests {
             label: None,
             hub: Hub::Local,
             info: json!({"online": true, "fw": "0.1", "dut": {"power": true, "recovery": false}}),
+            vm_instance: None,
         };
         assert_eq!(state(&local), "online  fw 0.1  power on  recovery off");
         let connect = Board {

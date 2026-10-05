@@ -60,6 +60,9 @@ pub struct Board {
     pub label: Option<String>,
     pub hub: Hub,
     pub info: Value,
+    /// Connect boards: the instance id of the VM that reported it (this
+    /// machine's own VM shows up in Connect too).
+    pub vm_instance: Option<String>,
 }
 
 impl Board {
@@ -136,9 +139,18 @@ pub async fn local_boards() -> Result<Vec<Board>> {
                 address: r.address,
                 hub: Hub::Local,
                 info,
+                vm_instance: None,
             }
         })
         .collect())
+}
+
+/// This machine's VM's instance id, if it has one (read, never created).
+pub fn local_instance() -> Option<String> {
+    let paths = VmPaths::resolve().ok()?;
+    std::fs::read_to_string(paths.instance_id_file())
+        .ok()
+        .map(|s| s.trim().to_lowercase())
 }
 
 /// The boards of the org's VMs, as Connect sees them.
@@ -166,6 +178,7 @@ pub async fn connect_boards(profile: Option<&str>, vm: Option<&str>) -> Result<V
                     vm_name: vm_name.clone(),
                 },
                 info: r.clone(),
+                vm_instance: s(&v["vm"]["instance_id"]),
             });
         }
     }
@@ -495,6 +508,7 @@ mod tests {
             label: label.map(String::from),
             hub,
             info: Value::Null,
+            vm_instance: None,
         }
     }
 
