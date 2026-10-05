@@ -271,6 +271,23 @@ fn state(b: &Board) -> String {
     if i["online"] != true {
         return format!("offline ({})", i["error"].as_str().unwrap_or("connecting"));
     }
+    // Protocol 2 boards report their generic outputs.
+    let io = if i["io"].is_object() {
+        &i["io"]
+    } else {
+        &i["state"]["io"]
+    };
+    if let Some(io) = io.as_object().filter(|o| !o.is_empty()) {
+        let outs: Vec<String> = io
+            .iter()
+            .map(|(k, v)| format!("{k} {}", if v == true { "on" } else { "off" }))
+            .collect();
+        return format!(
+            "online  fw {}  {}",
+            i["fw"].as_str().unwrap_or("?"),
+            outs.join(", ")
+        );
+    }
     let dut = |k: &str| {
         let v = if i["dut"].is_object() {
             &i["dut"][k]
@@ -342,6 +359,11 @@ mod tests {
             ..local.clone()
         };
         assert_eq!(state(&connect), "online  fw 0.1  power on  recovery ?");
+        let p2 = Board {
+            info: json!({"online": true, "fw": "0.2", "io": {"power": true, "ssr1": false}}),
+            ..local.clone()
+        };
+        assert_eq!(state(&p2), "online  fw 0.2  power on, ssr1 off");
         let off = Board {
             info: json!({"online": false, "error": "no route"}),
             ..local
