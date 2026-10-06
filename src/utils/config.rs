@@ -1035,6 +1035,10 @@ pub enum RubiconStep {
     /// Turn outputs on for this many ms, then off (a button press):
     /// `pulse: { ssr3: 200 }`.
     Pulse(BTreeMap<String, u64>),
+    /// Set servo / linear-actuator outputs to a pulse width in us
+    /// (`servo: { sv1: 1800 }`, about 1000-2000 for a hobby servo); 0 stops
+    /// the pulses so it goes limp.
+    Servo(BTreeMap<String, u32>),
     /// Another run profile's steps, here.
     Run(String),
     WaitMs(u64),
@@ -4085,9 +4089,20 @@ impl Config {
                          hold_usb also takes vvvv:*)"
                     );
                 }
+                if let RubiconStep::Servo(sv) = step {
+                    if let Some((n, us)) = sv
+                        .iter()
+                        .find(|(_, us)| **us != 0 && !(400..=2600).contains(*us))
+                    {
+                        anyhow::bail!(
+                            "rubicon.run.{name}: servo {n} {us} us (want 400-2600, or 0 for off)"
+                        );
+                    }
+                }
                 let outputs: Vec<&String> = match step {
                     RubiconStep::Out(o) => o.keys().collect(),
                     RubiconStep::Pulse(p) => p.keys().collect(),
+                    RubiconStep::Servo(s) => s.keys().collect(),
                     _ => vec![],
                 };
                 if let Some(o) = outputs.into_iter().find(|o| !valid_output(o)) {
@@ -15000,6 +15015,23 @@ provision:
             serde_json::json!([{"console_send": "\u{1b}[B boot\r"}])
         );
         assert_eq!(c.rubicon.as_ref().unwrap().wiring["ssr1"], "REC button");
+        // Servo widths reach the hub as numbers; out of range fails early.
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    p: [ { servo: { sv1: 1800, sv2: 0 } } ]\n")
+                .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("p").unwrap()).unwrap(),
+            serde_json::json!([{"servo": {"sv1": 1800, "sv2": 0}}])
+        );
+        let far: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    p: [ { servo: { sv1: 3000 } } ]\n")
+                .unwrap();
+        assert!(far
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("400-2600"));
         // The console settings reach the hub as it reads them (consoles.rs).
         let c: Config =
             serde_yaml::from_str("rubicon:\n  console: { baud: 1500000, port: 2 }\n").unwrap();
