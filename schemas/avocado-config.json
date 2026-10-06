@@ -2325,6 +2325,16 @@
             }
           },
           "additionalProperties": false
+        },
+        "wiring": {
+          "type": "object",
+          "description": "What each of the Rubicon's pins is wired to on this target (ssr1: \"REC button\"), shown beside the pin by `avocado rubicon show` and in a hub's job log. Extensions contribute it with their run profiles; the project wins per pin.",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false
@@ -2416,6 +2426,10 @@
           ],
           "additionalProperties": false,
           "description": "Wait until the DUT's serial console prints one of these markers."
+        },
+        "console_send": {
+          "type": "string",
+          "description": "Type this on the DUT's serial console, as is: write the line ending (\"boot\\r\") and any escape sequence (\"\\u001b[B\", down arrow)."
         },
         "sd_mux": {
           "type": "string",

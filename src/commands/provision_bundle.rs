@@ -137,6 +137,9 @@ pub struct BundleRubicon {
     pub default_profile: Option<String>,
     pub profiles: BTreeMap<String, ProvisionRubicon>,
     pub run: BTreeMap<String, Vec<RubiconStep>>,
+    /// `rubicon.wiring`: what the board's pins are wired to, for the log.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wiring: BTreeMap<String, String>,
 }
 
 /// The run profiles the config's provision profiles reference, by profile.
@@ -165,6 +168,11 @@ pub fn bundle_rubicon(
         default_profile,
         profiles,
         run,
+        wiring: config
+            .rubicon
+            .as_ref()
+            .map(|r| r.wiring.clone())
+            .unwrap_or_default(),
     }))
 }
 

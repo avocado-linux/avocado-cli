@@ -1002,6 +1002,12 @@ pub struct RubiconConfig {
     /// (name, label or address).
     pub default: Option<String>,
     pub console: Option<RubiconConsole>,
+    /// What each of the Rubicon's pins is wired to on this target
+    /// (`ssr1: "REC button"`, `in1: "power LED"`): shown beside the pin by
+    /// `avocado rubicon show` and in a hub's job log. Extensions (BSPs)
+    /// contribute it with their run profiles; the project wins per pin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wiring: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -1035,6 +1041,9 @@ pub enum RubiconStep {
     WaitUsb(RubiconWaitUsb),
     /// Wait until the DUT's serial console prints one of these markers.
     ConsoleExpect(RubiconConsoleExpect),
+    /// Type this on the DUT's serial console, as is: write the line ending
+    /// (`"boot\r"`) and any escape sequence (`"\e[B"`, down arrow).
+    ConsoleSend(String),
     /// Hand the card in an SDWire3 on the board's USB port to the hub
     /// (`host`: a disk there, `AVOCADO_PROVISION_DEVICE` for the provision
     /// that follows) or to the DUT (`dut`).
@@ -1076,6 +1085,14 @@ const PROVISION_KEYS: [&str; 2] = ["provision_profiles", "provision"];
 fn valid_output(s: &str) -> bool {
     let digits = s.trim_start_matches(|c: char| c.is_ascii_lowercase());
     !s.is_empty() && digits.len() < s.len() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A Rubicon pin name for `rubicon.wiring`: an output, an input or a bus
+/// (`power`, `ssr1`, `ain1`, `uart`, `i2c1`).
+fn valid_pin(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// A USB id pattern from a run profile: `vvvv:pppp` or `vvvv:*`, hex.
@@ -3101,12 +3118,17 @@ impl Config {
 
         // Rubicon run profiles always merge, by name, main first: they are
         // inert until a provision profile names one, and a project replaces
-        // an extension's run profile by defining the same name.
-        if let Some(external_run) = external_config
-            .get("rubicon")
-            .and_then(|r| r.get("run"))
-            .and_then(|r| r.as_mapping())
-        {
+        // an extension's run profile by defining the same name. The wiring
+        // that goes with them merges the same way, per pin.
+        for (key, external_run) in ["run", "wiring"].into_iter().filter_map(|k| {
+            Some((
+                k,
+                external_config
+                    .get("rubicon")
+                    .and_then(|r| r.get(k))
+                    .and_then(|r| r.as_mapping())?,
+            ))
+        }) {
             let main_map = main_config.as_mapping_mut();
             if let Some(main_map) = main_map {
                 let rubicon = main_map
@@ -3114,7 +3136,7 @@ impl Config {
                     .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
                 if let Some(rubicon) = rubicon.as_mapping_mut() {
                     let run = rubicon
-                        .entry(serde_yaml::Value::String("run".into()))
+                        .entry(serde_yaml::Value::String(key.into()))
                         .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
                     if let Some(run) = run.as_mapping_mut() {
                         for (name, steps) in external_run {
@@ -4032,6 +4054,18 @@ impl Config {
     /// them. Runs on the composed config, where extensions' run profiles are
     /// merged in; step names and shapes are already checked by serde.
     pub fn validate_rubicon(&self) -> Result<()> {
+        let wiring = self.rubicon.as_ref().map(|r| &r.wiring);
+        if let Some(pin) = wiring
+            .into_iter()
+            .flatten()
+            .map(|(p, _)| p)
+            .find(|p| !valid_pin(p))
+        {
+            anyhow::bail!(
+                "rubicon.wiring: bad pin name {pin:?} (pins are named like power, ssr1, in1, \
+                 ain1, la0, uart2, i2c1)"
+            );
+        }
         let run = self.rubicon.as_ref().map(|r| &r.run);
         for (name, steps) in run.into_iter().flatten() {
             for step in steps {
@@ -14949,6 +14983,27 @@ provision:
     }
 
     #[test]
+    fn console_send_and_wiring_parse_and_bad_pins_fail() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  wiring: { ssr1: REC button, i2c1: carrier EEPROM }\n  run:\n    \
+             stop:\n      - console_send: \"\\e[B boot\\r\"\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("stop").unwrap()).unwrap(),
+            serde_json::json!([{"console_send": "\u{1b}[B boot\r"}])
+        );
+        assert_eq!(c.rubicon.as_ref().unwrap().wiring["ssr1"], "REC button");
+        let bad: Config = serde_yaml::from_str("rubicon:\n  wiring: { SSR 1: x }\n").unwrap();
+        assert!(bad
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("bad pin name"));
+    }
+
+    #[test]
     fn run_steps_expand_in_place_and_loops_and_typos_fail() {
         let c: Config = serde_yaml::from_str(
             "rubicon:\n  run:\n    off:\n      - out: { power: \"off\" }\n\
@@ -15035,6 +15090,19 @@ provision:
         );
         let profiles = c.provision_profiles.as_ref().unwrap();
         assert!(profiles.contains_key("usb") && profiles.contains_key("tegraflash"));
+    }
+
+    #[test]
+    fn wiring_merges_per_pin_with_the_project_winning() {
+        let c = merge(
+            "rubicon:\n  wiring: { ssr1: my REC lead }\n",
+            "rubicon:\n  wiring: { ssr1: REC button, power: DC jack }\n",
+        );
+        let w = &c.rubicon.as_ref().unwrap().wiring;
+        assert_eq!(
+            (w["ssr1"].as_str(), w["power"].as_str()),
+            ("my REC lead", "DC jack")
+        );
     }
 
     #[test]

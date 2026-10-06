@@ -95,7 +95,8 @@ impl RubiconCommand {
             RubiconAction::List => self.list().await,
             RubiconAction::Show { board } => {
                 let b = self.board(board).await?;
-                show(&b);
+                let wiring = self.project().and_then(|c| Some(c.rubicon?.wiring));
+                show(&b, &wiring.unwrap_or_default());
                 Ok(())
             }
             // Boards are added to this machine's VM; Connect learns of them
@@ -357,7 +358,13 @@ impl RubiconCommand {
         )?;
         let steps = config.rubicon_steps(profile)?;
         let b = self.board(board).await?;
-        let params = json!({"address": b.address, "name": profile, "steps": steps});
+        let wiring = config
+            .rubicon
+            .as_ref()
+            .map(|r| r.wiring.clone())
+            .unwrap_or_default();
+        let params =
+            json!({"address": b.address, "name": profile, "steps": steps, "wiring": wiring});
         let r =
             remote::run_command(&b, "rubicon_run", params, self.connect_profile.as_deref()).await?;
         remote::report(&r, &format!("{profile} on {}", b.describe()))?;
@@ -601,9 +608,13 @@ fn state(b: &Board) -> String {
     )
 }
 
-fn show(b: &Board) {
+fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
     println!("{}", b.describe());
     println!("  state:    {}", state(b));
+    // The project's wiring, by pin: what this board drives on its DUT.
+    for (pin, what) in wiring {
+        println!("  {:<9} {what}", format!("{pin}:"));
+    }
     if let Some(m) = b.info["model"].as_str().filter(|m| !m.is_empty()) {
         println!("  model:    {m}");
     }
