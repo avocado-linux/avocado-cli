@@ -363,8 +363,9 @@ impl RubiconCommand {
             .as_ref()
             .map(|r| r.wiring.clone())
             .unwrap_or_default();
-        let params =
-            json!({"address": b.address, "name": profile, "steps": steps, "wiring": wiring});
+        let console = config.rubicon.as_ref().and_then(|r| r.console.clone());
+        let params = json!({"address": b.address, "name": profile, "steps": steps,
+                            "wiring": wiring, "console": console});
         let r =
             remote::run_command(&b, "rubicon_run", params, self.connect_profile.as_deref()).await?;
         remote::report(&r, &format!("{profile} on {}", b.describe()))?;
@@ -392,7 +393,11 @@ impl RubiconCommand {
                 b.describe()
             );
         }
-        let baud = self.project().and_then(|c| c.rubicon?.console?.baud);
+        let console = self.project().and_then(|c| c.rubicon?.console);
+        let (baud, port) = (
+            console.as_ref().and_then(|c| c.baud),
+            console.as_ref().and_then(|c| c.port),
+        );
         let mut cmd = format!("avocado-vm-agent console {}", sh_quote(&b.address));
         for (on, flag) in [
             (write, " --write"),
@@ -405,6 +410,9 @@ impl RubiconCommand {
         }
         if let Some(baud) = baud {
             cmd.push_str(&format!(" --baud {baud}"));
+        }
+        if let Some(port) = port {
+            cmd.push_str(&format!(" --port {port}"));
         }
         if let Some(t) = token {
             cmd.push_str(&format!(" --token {}", sh_quote(&t)));

@@ -1014,7 +1014,12 @@ pub struct RubiconConfig {
 #[serde(deny_unknown_fields)]
 pub struct RubiconConsole {
     /// The DUT's serial console rate (default 115200).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub baud: Option<u32>,
+    /// Which UART of a multi-port USB serial adapter is the console
+    /// (0, the default, is the first: FT4232H port A).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u32>,
 }
 
 /// One step of a Rubicon run profile. A Rubicon has generic outputs
@@ -14995,6 +15000,13 @@ provision:
             serde_json::json!([{"console_send": "\u{1b}[B boot\r"}])
         );
         assert_eq!(c.rubicon.as_ref().unwrap().wiring["ssr1"], "REC button");
+        // The console settings reach the hub as it reads them (consoles.rs).
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  console: { baud: 1500000, port: 2 }\n").unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon.unwrap().console).unwrap(),
+            serde_json::json!({"baud": 1500000, "port": 2})
+        );
         let bad: Config = serde_yaml::from_str("rubicon:\n  wiring: { SSR 1: x }\n").unwrap();
         assert!(bad
             .validate_rubicon()

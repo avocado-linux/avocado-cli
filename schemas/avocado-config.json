@@ -2322,6 +2322,11 @@
               "type": "integer",
               "minimum": 1,
               "description": "Console rate (default 115200)."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Which UART of a multi-port USB serial adapter is the console (0, the default, is the first: FT4232H port A)."
             }
           },
           "additionalProperties": false

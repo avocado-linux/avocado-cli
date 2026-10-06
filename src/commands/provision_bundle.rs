@@ -140,6 +140,9 @@ pub struct BundleRubicon {
     /// `rubicon.wiring`: what the board's pins are wired to, for the log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wiring: BTreeMap<String, String>,
+    /// `rubicon.console`: the rate and port the hub reads the console at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<crate::utils::config::RubiconConsole>,
 }
 
 /// The run profiles the config's provision profiles reference, by profile.
@@ -173,6 +176,7 @@ pub fn bundle_rubicon(
             .as_ref()
             .map(|r| r.wiring.clone())
             .unwrap_or_default(),
+        console: config.rubicon.as_ref().and_then(|r| r.console.clone()),
     }))
 }
 
