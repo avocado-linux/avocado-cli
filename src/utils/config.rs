@@ -1057,6 +1057,17 @@ pub enum RubiconStep {
     /// (`host`: a disk there, `AVOCADO_PROVISION_DEVICE` for the provision
     /// that follows) or to the DUT (`dut`).
     SdMux(RubiconSdMux),
+    /// The Rubicon's mode: `transfer` (its whole USB/IP buffer pool, for
+    /// flashing; provision jobs switch to it themselves) or `monitor` (part
+    /// of the pool lent to on-board analysis while a DUT runs).
+    Mode(RubiconMode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconMode {
+    Transfer,
+    Monitor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -15015,6 +15026,16 @@ provision:
             serde_json::json!([{"console_send": "\u{1b}[B boot\r"}])
         );
         assert_eq!(c.rubicon.as_ref().unwrap().wiring["ssr1"], "REC button");
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    w: [ { mode: monitor } ]\n").unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("w").unwrap()).unwrap(),
+            serde_json::json!([{"mode": "monitor"}])
+        );
+        assert!(
+            serde_yaml::from_str::<Config>("rubicon:\n  run:\n    w: [ { mode: idle } ]\n")
+                .is_err()
+        );
         // Servo widths reach the hub as numbers; out of range fails early.
         let c: Config =
             serde_yaml::from_str("rubicon:\n  run:\n    p: [ { servo: { sv1: 1800, sv2: 0 } } ]\n")
