@@ -26,8 +26,16 @@
 //! tree, no extension sysroots. Blobs are cached by sha256; a repeat job
 //! fetches nothing.
 //!
+//! Extensions whose source is a path on the build site travel in the bundle
+//! too (`ext_sources`, one deterministic tar.gz each), and its avocado.yaml
+//! points them at the copies: a hub has none of the build site's paths, and
+//! `sdk install` there merges each extension's config before anything else.
+//!
 //! ponytail: the SDK itself is not bundled (installed from the lock, needs
-//! the package feed); bundle prebuilt SDKs for offline sites later.
+//! the package feed); bundle prebuilt SDKs for offline sites later. Git
+//! sources are still fetched by the hub (public repos only); private git
+//! and private feeds need the same carry-or-credential answer
+//! (docs/bundles.md).
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +84,14 @@ pub struct BlobRef {
 
 /// The small files, symlinks and directories under one top-level path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtSourceArchive {
+    /// The extension's name (resolved: no templates).
+    pub name: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SmallArchive {
     pub root: String,
     pub sha256: String,
@@ -106,6 +122,10 @@ pub struct BundleMeta {
     /// provision profile names a Rubicon run profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rubicon: Option<BundleRubicon>,
+    /// Path-sourced extensions, each a tar.gz of its directory; the bundled
+    /// avocado.yaml points them at `.avocado-bundle/ext/<name>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ext_sources: Vec<ExtSourceArchive>,
 }
 
 /// The Rubicon side of a bundle, resolved from the composed config at pack
@@ -162,6 +182,10 @@ impl BundleMeta {
                 size: f.size,
             })
             .chain(self.small_files.iter().map(|a| BlobRef {
+                sha256: a.sha256.clone(),
+                size: a.size,
+            }))
+            .chain(self.ext_sources.iter().map(|a| BlobRef {
                 sha256: a.sha256.clone(),
                 size: a.size,
             }))
@@ -346,13 +370,15 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         size: f.size,
     })
     .collect();
+    let (ext_sources, avocado_yaml) =
+        pack_ext_sources(p.config_path, p.target, &stage.join("blobs"))?;
     let meta = BundleMeta {
         format: FORMAT,
         target: p.target.into(),
         runtime: p.runtime.into(),
         sdk_host_arch: std::env::consts::ARCH.into(),
         env,
-        avocado_yaml: std::fs::read_to_string(p.config_path)?,
+        avocado_yaml,
         avocado_lock: std::fs::read_to_string(&lock)?,
         provision_script: p.provision_script,
         clear: std::fs::read_to_string(stage.join("paths"))?
@@ -369,6 +395,7 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
                 .ok()
                 .and_then(|m| crate::commands::profiles::stone_default_profile(&m)),
         )?,
+        ext_sources,
     };
     let dir = if out.is_dir() {
         out.join(format!("{}-{}.bundle", p.runtime, p.target))
@@ -402,6 +429,141 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         OutputLevel::Normal,
     );
     Ok(dir)
+}
+
+/// Archive each path-sourced extension's directory into `blobs` and return
+/// them with the config text the bundle carries, its path sources pointing
+/// at the copies a hub unpacks (`.avocado-bundle/ext/<name>`).
+pub fn pack_ext_sources(
+    config_path: &Path,
+    target: &str,
+    blobs: &Path,
+) -> Result<(Vec<ExtSourceArchive>, String)> {
+    use crate::utils::config::ExtensionSource;
+
+    let text = std::fs::read_to_string(config_path)?;
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let found = Config::discover_remote_extensions(&config_path.to_string_lossy(), Some(target))?;
+    // Source path as written -> the bundle-local path it becomes.
+    let mut moved: HashMap<String, String> = HashMap::new();
+    let mut out = Vec::new();
+    for (name, source) in found {
+        let ExtensionSource::Path { path, .. } = source else {
+            continue;
+        };
+        if !plain_name(&name) {
+            bail!("extension name {name:?} cannot name a bundle directory");
+        }
+        let dir = base.join(&path);
+        let archive = tar_dir(&dir)
+            .with_context(|| format!("archive extension '{name}' from {}", dir.display()))?;
+        let sha256 = hex_sha256(&archive);
+        std::fs::create_dir_all(blobs)?;
+        std::fs::write(blobs.join(&sha256), &archive)?;
+        moved.insert(path, format!("{WORK_DIR}/ext/{name}"));
+        out.push(ExtSourceArchive {
+            name,
+            sha256,
+            size: archive.len() as u64,
+        });
+    }
+    if moved.is_empty() {
+        return Ok((out, text));
+    }
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    if let Some(exts) = doc.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
+        for (_, ext) in exts.iter_mut() {
+            let Some(src) = ext.get_mut("source").and_then(|s| s.as_mapping_mut()) else {
+                continue;
+            };
+            let is_path = src.get("type").and_then(|t| t.as_str()) == Some("path");
+            let to = src
+                .get("path")
+                .and_then(|p| p.as_str())
+                .and_then(|p| moved.get(p))
+                .cloned();
+            if let (true, Some(to)) = (is_path, to) {
+                src.insert("path".into(), to.into());
+            }
+        }
+    }
+    Ok((out, serde_yaml::to_string(&doc)?))
+}
+
+/// A directory as a reproducible tar.gz: sorted, owner 0, mtime 0, the mode
+/// kept; `.git` and `.avocado*` (build state) left out.
+fn tar_dir(dir: &Path) -> Result<Vec<u8>> {
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut t = tar::Builder::new(gz);
+    t.follow_symlinks(false);
+    let walk = walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && !n.starts_with(".avocado")
+        });
+    for e in walk {
+        let e = e?;
+        let rel = e.path().strip_prefix(dir)?;
+        let md = e.path().symlink_metadata()?;
+        let mut h = tar::Header::new_gnu();
+        h.set_mtime(0);
+        h.set_uid(0);
+        h.set_gid(0);
+        #[cfg(unix)]
+        h.set_mode(std::os::unix::fs::PermissionsExt::mode(&md.permissions()) & 0o7777);
+        #[cfg(not(unix))]
+        h.set_mode(if md.is_dir() { 0o755 } else { 0o644 });
+        if md.is_dir() {
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            t.append_data(&mut h, rel, std::io::empty())?;
+        } else if md.file_type().is_symlink() {
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            t.append_link(&mut h, rel, std::fs::read_link(e.path())?)?;
+        } else {
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(md.len());
+            t.append_data(&mut h, rel, std::fs::File::open(e.path())?)?;
+        }
+    }
+    Ok(t.into_inner()?.finish()?)
+}
+
+fn hex_sha256(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// An extension name usable as one directory name.
+fn plain_name(n: &str) -> bool {
+    !n.is_empty() && n != "." && n != ".." && !n.contains(['/', '\\', '\0'])
+}
+
+/// Unpack the bundle's path-sourced extensions where its avocado.yaml
+/// expects them (`<cwd>/.avocado-bundle/ext/<name>`), before `sdk install`.
+fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()> {
+    for a in &meta.ext_sources {
+        if !plain_name(&a.name) || !is_sha256(&a.sha256) {
+            bail!("bundle extension source {:?} is not valid", a.name);
+        }
+        let dir = cwd.join(WORK_DIR).join("ext").join(&a.name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let f = std::fs::File::open(cache.join(&a.sha256))?;
+        tar::Archive::new(flate2::read::GzDecoder::new(f))
+            .unpack(&dir)
+            .with_context(|| format!("unpack extension '{}'", a.name))?;
+    }
+    Ok(())
 }
 
 /// Rewrite the packing host's SDK path (`…/sdk/<arch>/…`) to this host's.
@@ -579,6 +741,7 @@ impl BundleProvision {
             }
         }
 
+        unpack_ext_sources(&meta, &cwd, &cache)?;
         std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
         std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
         let tsv: String = meta
@@ -673,6 +836,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn path_extensions_travel_in_the_bundle_and_unpack_where_its_config_points() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext = tmp.path().join("bsp");
+        std::fs::create_dir_all(ext.join("stone")).unwrap();
+        std::fs::write(ext.join("avocado.yaml"), "rubicon:\n  run: {}\n").unwrap();
+        std::fs::write(ext.join("stone/x.json"), "{}").unwrap();
+        std::fs::create_dir_all(ext.join(".git")).unwrap();
+        std::fs::write(ext.join(".git/HEAD"), "ref").unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = project.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "default_target: t\nextensions:\n  bsp-{{ avocado.target }}:\n    source:\n      type: path\n      path: ../bsp\n  pkg:\n    source:\n      type: package\n      version: '*'\n",
+        )
+        .unwrap();
+        let blobs = tmp.path().join("blobs");
+        let (a, yaml) = pack_ext_sources(&cfg, "t", &blobs).unwrap();
+        assert_eq!(a.len(), 1, "only the path source is carried");
+        assert_eq!(a[0].name, "bsp-t");
+        // Deterministic: packing again gives the same blob.
+        let (b, _) = pack_ext_sources(&cfg, "t", &blobs).unwrap();
+        assert_eq!(a[0].sha256, b[0].sha256);
+        assert!(yaml.contains(".avocado-bundle/ext/bsp-t"), "{yaml}");
+        assert!(!yaml.contains("../bsp"), "{yaml}");
+
+        let meta = BundleMeta {
+            format: FORMAT,
+            target: "t".into(),
+            runtime: "r".into(),
+            sdk_host_arch: "x86_64".into(),
+            env: HashMap::new(),
+            avocado_yaml: yaml,
+            avocado_lock: String::new(),
+            provision_script: String::new(),
+            clear: vec![],
+            files: vec![],
+            small_files: vec![],
+            created_at: String::new(),
+            cli_version: String::new(),
+            rubicon: None,
+            ext_sources: a,
+        };
+        assert!(meta
+            .blobs()
+            .iter()
+            .any(|x| x.sha256 == meta.ext_sources[0].sha256));
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        unpack_ext_sources(&meta, &hub, &blobs).unwrap();
+        let got = hub.join(".avocado-bundle/ext/bsp-t");
+        assert!(got.join("avocado.yaml").is_file());
+        assert!(got.join("stone/x.json").is_file());
+        assert!(!got.join(".git").exists(), "repo metadata stays home");
+    }
+
+    #[test]
+    fn bundles_without_extension_sources_still_parse() {
+        let old = r#"{"format":2,"target":"t","runtime":"r","sdk_host_arch":"x86_64","env":{},
+            "avocado_yaml":"","avocado_lock":"","provision_script":"","clear":[],"files":[],
+            "small_files":[],"created_at":"","cli_version":""}"#;
+        let m: BundleMeta = serde_json::from_str(old).unwrap();
+        assert!(m.ext_sources.is_empty());
+        assert!(!serde_json::to_string(&m).unwrap().contains("ext_sources"));
+    }
+
+    #[test]
     fn bundle_rubicon_carries_only_referenced_run_profiles() {
         let config: Config = serde_yaml::from_str(
             r#"
@@ -762,6 +992,7 @@ provision:
             created_at: String::new(),
             cli_version: String::new(),
             rubicon: None,
+            ext_sources: vec![],
         }
     }
 
