@@ -772,13 +772,19 @@ impl RuntimeBuildCommand {
             "/opt/_avocado/{target_arch}/runtimes/{}/rekeyed",
             self.runtime_name
         );
+        // Then the rootfs dm-verity tree (rootfs.image.verity), which shadows
+        // the zero placeholder the BSP installs under the same name.
+        let rootfs_verity_dir = format!(
+            "/opt/_avocado/{target_arch}/runtimes/{}/rootfs-verity",
+            self.runtime_name
+        );
         let stone_paths = match config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             target_arch,
             &self.config_path,
         )? {
-            Some(configured) => format!("{rekeyed_dir}:{configured}"),
-            None => rekeyed_dir,
+            Some(configured) => format!("{rekeyed_dir}:{rootfs_verity_dir}:{configured}"),
+            None => format!("{rekeyed_dir}:{rootfs_verity_dir}"),
         };
         env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
 
@@ -2626,6 +2632,10 @@ rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
 # no-op because dnf still considers the package installed.
 rm -rf "$OUTPUT_DIR/rekeyed"
 mkdir -p "$OUTPUT_DIR/rekeyed"
+# The rootfs dm-verity tree's directory (rootfs/image.rs): emptied or
+# refilled only by the rootfs section, which a current image skips, so not
+# cleared here; it must exist before stone is handed it as an include path.
+mkdir -p "$OUTPUT_DIR/rootfs-verity"
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -4056,12 +4066,15 @@ runtimes:
         // It is a dnf install root: the CLI does not own what is in it and
         // cannot put back what it removes -- a reinstall is a no-op, because
         // dnf still considers the package installed.
+        // ROOTFS_OUTPUT is in $OUTPUT_DIR too: a removal spelled through it
+        // (the rootfs hash tree's, once) is the same hazard.
         for line in script.lines().filter(|l| l.trim_start().starts_with("rm ")) {
-            if !line.contains("$OUTPUT_DIR") {
+            if !line.contains("$OUTPUT_DIR") && !line.contains("ROOTFS_OUTPUT") {
                 continue;
             }
             assert!(
                 line.contains("$OUTPUT_DIR/rekeyed")
+                    || line.contains("$OUTPUT_DIR/rootfs-verity")
                     || line.contains("$OUTPUT_DIR/fitImage")
                     || line.contains("$RUNTIME_EXT_DIR"),
                 "removes a path the build does not own from the runtime install root: {line}"
