@@ -45,19 +45,6 @@ pub(crate) fn classify_upload_part_error(status: u16, body: &str) -> UploadPartE
     }
 }
 
-/// Lets a caller branch on a failed request's status instead of on message
-/// text, which the server is free to reword (ENG-2219).
-#[derive(Debug)]
-pub struct HttpStatus(pub reqwest::StatusCode);
-
-impl std::fmt::Display for HttpStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HTTP {}", self.0)
-    }
-}
-
-impl std::error::Error for HttpStatus {}
-
 const CONFIG_FILE: &str = "credentials.json";
 
 // ---------------------------------------------------------------------------
@@ -418,6 +405,8 @@ pub struct UpdateDeploymentParams {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct RuntimeListItem {
+    #[serde(default)]
+    pub sbom_state: Option<String>,
     pub id: String,
     pub version: String,
     #[serde(default)]
@@ -456,10 +445,6 @@ pub struct RuntimeParams {
     pub config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lockfile: Option<serde_json::Value>,
-    /// The runtime's SPDX 3.0.1 SBOM (ENG-2219). Skipped when absent, so a
-    /// server that does not read it yet sees today's request unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sbom: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -470,6 +455,18 @@ pub struct ArtifactParam {
     pub part_size: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub part_checksums: Vec<String>,
+    /// Absent, never `null`, when the image has no SBOM: a server that does
+    /// not read it sees today's request unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sbom: Option<SbomDeclaration>,
+}
+
+/// What the create request says about the SBOM fragment the CLI will PUT for
+/// an image. `digest` is sha256 hex over the exact bytes sent.
+#[derive(Debug, Clone, Serialize)]
+pub struct SbomDeclaration {
+    pub digest: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +499,8 @@ struct CreateRuntimeResponse {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct RuntimeCreateData {
+    #[serde(default)]
+    pub sbom: Option<serde_json::Value>,
     pub id: String,
     pub version: String,
     pub status: String,
@@ -516,6 +515,11 @@ pub struct ArtifactUploadSpec {
     pub upload_id: Option<String>,
     #[serde(default)]
     pub parts: Vec<PartSpec>,
+    /// Present only when the artifact declared an SBOM and the server has no
+    /// indexed fragment for the image. Independent of `parts`: an image whose
+    /// bytes are already stored can still be owed its fragment.
+    #[serde(default)]
+    pub sbom_upload_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -545,9 +549,12 @@ struct UploadUrlsResponse {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct UploadUrlsData {
-    image_id: String,
-    parts: Vec<PartSpec>,
+pub struct UploadUrlsData {
+    pub image_id: String,
+    #[serde(default)]
+    pub parts: Vec<PartSpec>,
+    #[serde(default)]
+    pub sbom_upload_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,8 +1227,7 @@ impl ConnectClient {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            return Err(anyhow::Error::new(HttpStatus(status))
-                .context(format!("Failed to create runtime (HTTP {status}): {body}")));
+            anyhow::bail!("Failed to create runtime (HTTP {status}): {body}");
         }
 
         let resp: CreateRuntimeResponse = res.json().await?;
@@ -1385,15 +1391,40 @@ impl ConnectClient {
         Ok(resp.data)
     }
 
+    /// PUT an image's SBOM fragment to its presigned URL. Same expiry
+    /// classification as `upload_part`, so a caller can refresh and retry.
+    pub async fn upload_sbom_fragment(
+        &self,
+        presigned_url: &str,
+        body: Vec<u8>,
+    ) -> Result<(), UploadPartError> {
+        let res = self
+            .http
+            .put(presigned_url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                UploadPartError::Other(anyhow::anyhow!("Failed to upload SBOM fragment: {e}"))
+            })?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            return Err(classify_upload_part_error(status.as_u16(), &body));
+        }
+        Ok(())
+    }
+
     /// Re-fetch presigned URLs for an artifact (crash recovery).
-    #[allow(dead_code)]
     pub async fn get_upload_urls(
         &self,
         org: &str,
         project_id: &str,
         runtime_id: &str,
         image_id: &str,
-    ) -> Result<Vec<PartSpec>> {
+    ) -> Result<UploadUrlsData> {
         let url = format!(
             "{}/api/orgs/{}/projects/{}/runtimes/{}/artifacts/{}/upload-urls",
             self.api_url, org, project_id, runtime_id, image_id
@@ -1414,7 +1445,7 @@ impl ConnectClient {
         }
 
         let resp: UploadUrlsResponse = res.json().await?;
-        Ok(resp.data.parts)
+        Ok(resp.data)
     }
 
     /// Fetch the org's TUF server signing public key.
@@ -2275,6 +2306,7 @@ mod tests {
             sha256: "abc".to_string(),
             part_size: 52_428_800,
             part_checksums: vec!["checksum1==".to_string(), "checksum2==".to_string()],
+            sbom: None,
         };
         let json = serde_json::to_value(&param).unwrap();
         assert_eq!(json["part_checksums"].as_array().unwrap().len(), 2);
@@ -2289,6 +2321,7 @@ mod tests {
             sha256: "abc".to_string(),
             part_size: 52_428_800,
             part_checksums: vec![],
+            sbom: None,
         };
         let json = serde_json::to_value(&param).unwrap();
         assert!(json.get("part_checksums").is_none());

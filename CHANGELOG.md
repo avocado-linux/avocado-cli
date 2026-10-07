@@ -9,11 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **SBOM extension scopes carry a stable image id.** (ENG-2199)
-  `ext:<runtime>/<name>` scope elements now carry `externalIdentifier`/
-  `verifiedUsing` from the runtime's build manifest, and `rootfs`/
-  `initramfs` carry `os_build_id`/`initramfs_build_id` once `runtime
-  var-image` has run — so a device-reported image can be joined back onto
-  the scope that describes it. `spdxId`s and the namespace are unchanged.
+  `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
+  runtime's build manifest, and `rootfs`/`initramfs` carry
+  `os_build_id`/`initramfs_build_id` once `runtime var-image` has run.
+- `avocado connect upload --no-sbom` skips SBOM generation.
+- `avocado connect runtimes list` gains an `SBOM` column: `indexed`,
+  `pending`, `failed` or `none`, and `?` against a server that does not report
+  it. `--output json` carries it as `sbom_state`.
+
+### Changed
+- **`avocado connect upload` sends the runtime's SBOM through the same upload
+  path as its images, one per uploaded image, instead of inline in the create
+  request.** A server that does not accept SBOMs is unaffected, and a failed
+  SBOM upload never fails the runtime upload. `--output json` reports each one
+  as an `sbom_fragment` event.
+- `avocado sbom` keeps every distinct build of a package, so two builds with the
+  same name, version and release in one image are both listed. The document
+  namespace now covers each package's RPM header, so the namespace and every
+  package `spdxId` differ from rc.5 for the same image.
+
+### Removed
+- `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ## [1.0.0-rc.5] - 2026-09-17
 
@@ -28,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ext install` show the live checklist without `--force`; `-f` on `sdk
   install` and `runtime install` is hidden but still parses. `avocado install
   --force` (reseed every extension) is unchanged. (#275)
+
 
 ### Fixed
 - **`avocado build` no longer deletes the i.MX bootloader it then validates

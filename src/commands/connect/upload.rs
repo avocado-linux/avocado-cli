@@ -7,10 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::commands::connect::client::{
     self, ArtifactParam, ArtifactUploadSpec, BlobParts, CompleteRuntimeRequest, CompletedPart,
-    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, HttpStatus, RuntimeParams,
+    ConnectClient, ContainerDiscoveryResult, CreateRuntimeRequest, RuntimeParams, SbomDeclaration,
     UploadPartError,
 };
-use crate::commands::sbom::generate::{in_runtime, runtime_has_packages, ImageIds, SbomCommand};
+use crate::commands::sbom::generate::{Fragment, SbomCommand};
 use crate::utils::config::{load_config, Config};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{
@@ -23,6 +23,10 @@ use crate::utils::output_format::{
 use crate::utils::prerequisites::{check_prerequisites, TaskPrerequisites};
 use crate::utils::stamps::StampRequirement;
 use crate::utils::target::resolve_target_required;
+
+const LEGACY_SBOM_MESSAGE: &str = "SBOMs not uploaded: this Connect does not accept them";
+
+const SBOM_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
@@ -63,6 +67,54 @@ async fn run_phase<T>(name: &str, fut: impl std::future::Future<Output = Result<
     }
 }
 
+/// Structured "no SBOM was sent" outcome for `--output json` readers.
+fn emit_sbom_skipped(reason: &str) {
+    if is_json_output_active() {
+        emit_json_event(&serde_json::json!({"event": "sbom_skipped", "reason": reason}));
+    }
+}
+
+fn sbom_summary(runtime: &client::RuntimeCreateData, uploaded: usize, indexed: usize) -> String {
+    if runtime.sbom.is_none() {
+        LEGACY_SBOM_MESSAGE.to_string()
+    } else {
+        format!("{uploaded} SBOM fragment(s) uploaded, {indexed} image(s) already indexed")
+    }
+}
+
+async fn put_fragment_with_refresh<Put, PutFuture, Refresh, RefreshFuture>(
+    url: String,
+    mut put: Put,
+    refresh: Refresh,
+    limit: std::time::Duration,
+) -> Result<()>
+where
+    Put: FnMut(String) -> PutFuture,
+    PutFuture: std::future::Future<Output = std::result::Result<(), UploadPartError>>,
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: std::future::Future<Output = Result<client::UploadUrlsData>>,
+{
+    // The client sets no request timeout, and this runs before the image
+    // parts: a stalled SBOM endpoint must not hold the upload.
+    let attempt = async move {
+        match put(url).await {
+            Ok(()) => return Ok(()),
+            Err(UploadPartError::UrlExpired { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let refreshed = refresh()
+            .await
+            .context("Failed to refresh the expired SBOM upload URL")?;
+        let url = refreshed
+            .sbom_upload_url
+            .context("The refreshed upload URLs carry no SBOM URL")?;
+        put(url).await.map_err(Into::into)
+    };
+    tokio::time::timeout(limit, attempt)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {}s", limit.as_secs())))
+}
+
 pub struct ConnectUploadCommand {
     pub org: String,
     pub project: String,
@@ -72,6 +124,7 @@ pub struct ConnectUploadCommand {
     pub config_path: String,
     pub target: Option<String>,
     pub file: Option<String>,
+    pub no_sbom: bool,
     pub profile: Option<String>,
     pub publish: bool,
     pub deploy_cohort: Option<String>,
@@ -140,6 +193,7 @@ impl ConnectUploadCommand {
             load_config(&self.config_path).context("Failed to load avocado.yaml")?;
 
         if self.file.is_some() {
+            self.warn_sbom_skipped(if self.no_sbom { "no_sbom" } else { "file" });
             // --file path: host-side artifacts (unchanged legacy flow)
             return self.execute_host_path(&connect, &project_config).await;
         }
@@ -207,6 +261,8 @@ impl ConnectUploadCommand {
                 version,
                 build_id,
                 &manifest,
+                // No SBOM: `--file` may point at a tarball built elsewhere,
+                // so this machine's sysroots would be a false claim about it.
                 &artifact_infos
                     .iter()
                     .map(|a| ArtifactParam {
@@ -215,6 +271,7 @@ impl ConnectUploadCommand {
                         sha256: a.sha256.clone(),
                         part_size: PART_SIZE,
                         part_checksums: a.part_checksums.clone(),
+                        sbom: None,
                     })
                     .collect::<Vec<_>>(),
                 delegation.as_ref().map(|d| {
@@ -224,9 +281,6 @@ impl ConnectUploadCommand {
                         &d.content_keyid,
                     )
                 }),
-                // `--file` may point at a tarball built elsewhere, so this
-                // machine's sysroots would be a false claim about it.
-                None,
             )
             .await?;
 
@@ -305,10 +359,12 @@ impl ConnectUploadCommand {
             None
         };
 
-        // Phase B: Create runtime via API. The SBOM (ENG-2219) is built in
-        // this phase rather than one of its own.
+        // Phase B: Create runtime via API. The SBOM fragments are built in
+        // this phase rather than one of its own, since the request declares
+        // them.
+        let mut fragments = Vec::new();
         let (runtime, num_artifacts) = run_phase(PHASE_CREATE, async {
-            let sbom = self.build_sbom(manifest).await;
+            fragments = self.build_sbom_fragments(manifest).await;
             self.create_runtime_api(
                 connect,
                 version,
@@ -323,14 +379,20 @@ impl ConnectUploadCommand {
                         sha256: a.sha256.clone(),
                         part_size: PART_SIZE,
                         part_checksums: a.part_checksums.clone(),
+                        sbom: declare_sbom(&fragments, &a.image_id),
                     })
                     .collect::<Vec<_>>(),
                 delegation_refs,
-                sbom,
             )
             .await
         })
         .await?;
+
+        // Before the parts, and before the draft return: a fully deduped
+        // runtime never calls complete, and this is its only chance to
+        // backfill a fragment the server is still missing.
+        self.upload_sbom_fragments(connect, &runtime, &fragments)
+            .await;
 
         if runtime.status == "draft" {
             // Nothing to upload (all artifacts already present) — mark the
@@ -359,7 +421,6 @@ impl ConnectUploadCommand {
 
     /// Create a runtime via the Connect API. Returns the runtime data and
     /// artifact count.
-    #[allow(clippy::too_many_arguments)]
     async fn create_runtime_api(
         &self,
         connect: &ConnectClient,
@@ -368,7 +429,6 @@ impl ConnectUploadCommand {
         manifest: &serde_json::Value,
         artifacts: &[ArtifactParam],
         delegation: Option<(&String, &String, &String)>,
-        sbom: Option<serde_json::Value>,
     ) -> Result<(client::RuntimeCreateData, usize)> {
         progress(
             &format!("Creating runtime {version}..."),
@@ -388,30 +448,13 @@ impl ConnectUploadCommand {
                 content_keyid: delegation.map(|(_, _, kid)| kid.clone()),
                 config,
                 lockfile,
-                sbom,
             },
         };
 
-        match connect
+        let runtime = connect
             .create_runtime(&self.org, &self.project, &create_req)
-            .await
-        {
-            Ok(runtime) => Ok((runtime, num_artifacts)),
-            // The server rejecting the SBOM must never fail the upload.
-            Err(e) if create_req.runtime.sbom.is_some() && sbom_may_be_at_fault(&e) => {
-                print_warning_above(&format!(
-                    "Connect did not accept the runtime with an SBOM attached ({e:#}); retrying \
-                     without it."
-                ));
-                let mut retry_req = create_req;
-                retry_req.runtime.sbom = None;
-                let runtime = connect
-                    .create_runtime(&self.org, &self.project, &retry_req)
-                    .await?;
-                Ok((runtime, num_artifacts))
-            }
-            Err(e) => Err(e),
-        }
+            .await?;
+        Ok((runtime, num_artifacts))
     }
 
     /// Read `avocado.yaml` (converted YAML→JSON) and the lock file
@@ -459,20 +502,35 @@ impl ConnectUploadCommand {
         Ok((Some(config_json), lockfile_json))
     }
 
-    /// The runtime's SBOM, or `None` on any failure — a document Connect
-    /// cannot ingest yet is worth less than the upload it would block, the
-    /// contract `read_config_and_lockfile` already has for the lockfile.
+    /// One SBOM fragment per uploaded image, or none on any failure: a
+    /// document Connect cannot ingest is worth less than the upload it would
+    /// block, the contract `read_config_and_lockfile` already has for the
+    /// lockfile.
     ///
-    /// `AVOCADO_UPLOAD_NO_SBOM=1` skips the build outright.
-    ///
-    /// `manifest` is discovery's manifest.json, passed through so extension
-    /// scopes carry the `image_id`s this upload is about to publish.
-    async fn build_sbom(&self, manifest: &serde_json::Value) -> Option<serde_json::Value> {
-        if std::env::var("AVOCADO_UPLOAD_NO_SBOM").as_deref() == Ok("1") {
-            return None;
+    /// `--no-sbom` skips the build outright.
+    async fn build_sbom_fragments(&self, manifest: &serde_json::Value) -> Vec<Fragment> {
+        if self.no_sbom {
+            self.warn_sbom_skipped("no_sbom");
+            return Vec::new();
         }
-        match self.scan_runtime_sbom(manifest).await {
-            Ok(doc) => Some(doc),
+        match self.scan_sbom_fragments(manifest).await {
+            Ok(fragments) => {
+                if fragments.is_empty() {
+                    self.warn_sbom_skipped("no_packages");
+                }
+                for f in &fragments {
+                    progress(
+                        &format!(
+                            "  SBOM {} ({} package(s), {})",
+                            f.artifact_name,
+                            f.package_count,
+                            format_bytes(f.bytes.len() as u64)
+                        ),
+                        OutputLevel::Normal,
+                    );
+                }
+                fragments
+            }
             Err(e) => {
                 // Not `print_warning`: that one is suppressed under
                 // `--output json`, hiding the skipped check from the reader
@@ -480,13 +538,23 @@ impl ConnectUploadCommand {
                 print_warning_above(&format!(
                     "Could not build the runtime's SBOM ({e:#}); uploading without it."
                 ));
-                None
+                emit_sbom_skipped("scan_failed");
+                Vec::new()
             }
         }
     }
 
-    /// `avocado sbom`'s document, filtered to this runtime by `in_runtime`.
-    async fn scan_runtime_sbom(&self, manifest: &serde_json::Value) -> Result<serde_json::Value> {
+    fn warn_sbom_skipped(&self, reason: &str) {
+        let message = match reason {
+            "no_sbom" => "SBOM skipped (--no-sbom); no SBOM will be stored for this runtime.",
+            "file" => "This tarball or artifact directory carries no SBOM; no SBOM will be stored for this runtime.",
+            _ => "No SBOM fragments were built; no SBOM will be stored for this runtime.",
+        };
+        print_warning_above(message);
+        emit_sbom_skipped(reason);
+    }
+
+    async fn scan_sbom_fragments(&self, manifest: &serde_json::Value) -> Result<Vec<Fragment>> {
         let cmd = SbomCommand::new(
             self.config_path.clone(),
             self.target.clone(),
@@ -497,30 +565,97 @@ impl ConnectUploadCommand {
             OutputFormat::Human,
         );
         let (scopes, target, snapshot) = cmd.scan(print_warning_above).await?;
-        let kept: Vec<_> = scopes
-            .into_iter()
-            .filter(|s| in_runtime(&s.name, &self.runtime))
-            .collect();
-        // `in_runtime` keeps `rootfs` and `initramfs` whatever the runtime is,
-        // so a slice holding nothing this runtime installs is still non-empty
-        // and still builds. Refused rather than sent: a document named for the
-        // runtime and carrying none of its packages reads as a runtime that
-        // installs nothing on top of the base.
-        if !runtime_has_packages(&kept, &self.runtime) {
-            anyhow::bail!(
-                "No installed package was found for runtime '{}'; its SBOM would name the \
-                 runtime and describe only the base system.",
-                self.runtime
-            );
-        }
-        let images = ImageIds::from_manifest(manifest, &self.runtime);
-        Ok(cmd.build_document(
-            &kept,
+        Ok(cmd.build_fragments(
+            &scopes,
+            manifest,
             &target,
             snapshot.as_ref(),
-            Some(&self.runtime),
-            Some(&images),
+            &self.runtime,
+            &mut print_warning_above,
         ))
+    }
+
+    /// PUT every fragment the create response returned a URL for. Never
+    /// fails the upload: a fragment that does not arrive is reported by
+    /// Connect as unindexed, and here as a warning.
+    async fn upload_sbom_fragments(
+        &self,
+        connect: &ConnectClient,
+        runtime: &client::RuntimeCreateData,
+        fragments: &[Fragment],
+    ) {
+        if fragments.is_empty() {
+            return;
+        }
+        if runtime.sbom.is_none() {
+            progress(&sbom_summary(runtime, 0, 0), OutputLevel::Verbose);
+            emit_sbom_skipped("unsupported");
+            return;
+        }
+        let json_mode = is_json_output_active();
+        let mut uploaded = 0usize;
+        let mut indexed = 0usize;
+
+        for fragment in fragments {
+            let spec = runtime
+                .artifacts
+                .iter()
+                .find(|s| s.image_id == fragment.image_id);
+            let Some(url) = spec.and_then(|s| s.sbom_upload_url.clone()) else {
+                indexed += 1;
+                if json_mode {
+                    emit_sbom_fragment_event(&fragment.image_id, "skipped");
+                }
+                continue;
+            };
+
+            let status = match self
+                .put_sbom_fragment(connect, runtime, fragment, url)
+                .await
+            {
+                Ok(()) => {
+                    uploaded += 1;
+                    "uploaded"
+                }
+                Err(e) => {
+                    print_warning_above(&format!(
+                        "Could not upload the SBOM fragment for {} ({e:#}); Connect will report \
+                         the image as unindexed.",
+                        fragment.artifact_name
+                    ));
+                    "failed"
+                }
+            };
+            if json_mode {
+                emit_sbom_fragment_event(&fragment.image_id, status);
+            }
+        }
+
+        progress(
+            &sbom_summary(runtime, uploaded, indexed),
+            OutputLevel::Normal,
+        );
+    }
+
+    /// One PUT, plus one more after a URL refresh if the first came back
+    /// expired. Anything else is the caller's warning.
+    async fn put_sbom_fragment(
+        &self,
+        connect: &ConnectClient,
+        runtime: &client::RuntimeCreateData,
+        fragment: &Fragment,
+        url: String,
+    ) -> Result<()> {
+        put_fragment_with_refresh(
+            url,
+            |url| {
+                let bytes = fragment.bytes.clone();
+                async move { connect.upload_sbom_fragment(&url, bytes).await }
+            },
+            || connect.get_upload_urls(&self.org, &self.project, &runtime.id, &fragment.image_id),
+            SBOM_PUT_TIMEOUT,
+        )
+        .await
     }
 
     /// Handle the case where the runtime is already in draft status (full dedup).
@@ -1309,7 +1444,8 @@ async fn upload_artifacts(
                                     "Failed to refresh upload URLs for artifact '{}'",
                                     spec.image_id
                                 )
-                            })?;
+                            })?
+                            .parts;
                         // Don't increment attempt — expiry is not a transient failure.
                     }
                     Err(e) if attempt < 2 => {
@@ -1527,28 +1663,23 @@ fn read_delegation_info(artifacts_dir: &Path) -> Option<DelegationInfo> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Whether the SBOM in the body is a plausible cause of `e`, and so whether
-/// dropping it and retrying this non-idempotent POST is worth a second call.
-///
-/// Not any 4xx: 401, 403, 409 and 422 are ordinary outcomes of this API that
-/// a smaller body does not fix, and blaming the SBOM for them prints a
-/// misleading warning and burns a second request on the same failure — 429
-/// worst of all, retried with no backoff. 400 and 413 are the two that mean
-/// this body was refused; 413 is the likeliest, since ~400 packages of SPDX
-/// is megabytes into a body that is otherwise kilobytes.
-///
-/// A body refused mid-write has no status at all: a proxy over its size cap
-/// can close the connection instead of answering, which reqwest surfaces as
-/// a request/body error. Those count too. Decode and timeout errors do not —
-/// the server may well have created the runtime by then.
-fn sbom_may_be_at_fault(e: &anyhow::Error) -> bool {
-    match e.downcast_ref::<HttpStatus>() {
-        Some(s) => matches!(s.0.as_u16(), 400 | 413),
-        None => e
-            .chain()
-            .filter_map(|c| c.downcast_ref::<reqwest::Error>())
-            .any(|r| r.is_request() || r.is_body()),
-    }
+/// The declaration for `image_id`'s fragment, if one was built.
+fn declare_sbom(fragments: &[Fragment], image_id: &str) -> Option<SbomDeclaration> {
+    fragments
+        .iter()
+        .find(|f| f.image_id == image_id)
+        .map(|f| SbomDeclaration {
+            digest: f.digest.clone(),
+            size_bytes: f.bytes.len() as u64,
+        })
+}
+
+fn emit_sbom_fragment_event(image_id: &str, status: &str) {
+    emit_json_event(&serde_json::json!({
+        "event": "sbom_fragment",
+        "image_id": image_id,
+        "status": status,
+    }));
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1638,57 +1769,250 @@ mod tests {
         assert_eq!(parts[0], expected);
     }
 
+    fn upload_command() -> ConnectUploadCommand {
+        ConnectUploadCommand {
+            org: "org".into(),
+            project: "project".into(),
+            runtime: "dev".into(),
+            version: "1".into(),
+            description: None,
+            config_path: "missing.yaml".into(),
+            target: None,
+            file: None,
+            no_sbom: true,
+            profile: None,
+            publish: false,
+            deploy_cohort: None,
+            deploy_name: None,
+            deploy_tags: vec![],
+            deploy_activate: false,
+            output: OutputFormat::Human,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sbom_skips_scan_and_omits_declarations() {
+        let fragments = upload_command()
+            .build_sbom_fragments(&serde_json::json!({}))
+            .await;
+        assert!(fragments.is_empty());
+        for id in ["os", "ext"] {
+            let value = serde_json::to_value(artifact(id, declare_sbom(&fragments, id))).unwrap();
+            assert!(value.get("sbom").is_none());
+        }
+    }
+
+    #[test]
+    fn old_servers_are_not_reported_as_indexed() {
+        let old: client::RuntimeCreateData = serde_json::from_value(serde_json::json!({
+            "id": "r", "version": "1", "status": "draft"
+        }))
+        .unwrap();
+        assert!(old.sbom.is_none());
+        assert_eq!(sbom_summary(&old, 0, 4), LEGACY_SBOM_MESSAGE);
+        let current: client::RuntimeCreateData = serde_json::from_value(serde_json::json!({
+            "id": "r", "version": "1", "status": "draft", "sbom": {"state": "indexed", "images": []}
+        }))
+        .unwrap();
+        assert_eq!(
+            sbom_summary(&current, 0, 4),
+            "0 SBOM fragment(s) uploaded, 4 image(s) already indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_fragment_urls_refresh_and_retry_exactly_once() {
+        use std::cell::RefCell;
+        for (status, body) in [
+            (400, "<Code>ExpiredToken</Code>"),
+            (403, "<Code>RequestExpired</Code>"),
+            (403, "<Message>Request has expired</Message>"),
+        ] {
+            for retry_expires in [false, true] {
+                let puts = RefCell::new(Vec::new());
+                let refreshes = std::cell::Cell::new(0);
+                let result = put_fragment_with_refresh(
+                    "old".into(),
+                    |url| {
+                        puts.borrow_mut().push(url);
+                        std::future::ready(if puts.borrow().len() == 1 || retry_expires {
+                            Err(client::classify_upload_part_error(status, body))
+                        } else {
+                            Ok(())
+                        })
+                    },
+                    || {
+                        refreshes.set(refreshes.get() + 1);
+                        std::future::ready(Ok(client::UploadUrlsData {
+                            image_id: "image".into(),
+                            parts: vec![],
+                            sbom_upload_url: Some("new".into()),
+                        }))
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+                assert_eq!(result.is_err(), retry_expires);
+                assert_eq!(*puts.borrow(), ["old", "new"]);
+                assert_eq!(refreshes.get(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fragment_refresh_without_a_url_is_a_failure() {
+        let puts = std::cell::Cell::new(0);
+        let result = put_fragment_with_refresh(
+            "old".into(),
+            |_| {
+                puts.set(puts.get() + 1);
+                std::future::ready(Err(client::classify_upload_part_error(
+                    403,
+                    "Request has expired",
+                )))
+            },
+            || {
+                std::future::ready(Ok(client::UploadUrlsData {
+                    image_id: "image".into(),
+                    parts: vec![],
+                    sbom_upload_url: None,
+                }))
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(puts.get(), 1);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "The refreshed upload URLs carry no SBOM URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_fragment_put_times_out_instead_of_holding_the_upload() {
+        let result = put_fragment_with_refresh(
+            "url".into(),
+            |_| std::future::pending(),
+            || async { panic!("must not refresh") },
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_fragment_errors_never_refresh() {
+        let result = put_fragment_with_refresh(
+            "old".into(),
+            |_| {
+                std::future::ready(Err(client::classify_upload_part_error(
+                    403,
+                    "<Code>SignatureDoesNotMatch</Code>",
+                )))
+            },
+            || async { panic!("must not refresh") },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    fn artifact(image_id: &str, sbom: Option<SbomDeclaration>) -> ArtifactParam {
+        ArtifactParam {
+            image_id: image_id.to_string(),
+            size_bytes: 4096,
+            sha256: "ab".repeat(32),
+            part_size: PART_SIZE,
+            part_checksums: vec!["cs".to_string()],
+            sbom,
+        }
+    }
+
     #[test]
     fn a_runtime_with_no_sbom_sends_no_sbom_key() {
-        // A server that does not read `sbom` yet must see today's request
-        // unchanged when the build produced `None`.
+        // A server that predates fragments must see today's request
+        // unchanged: no `sbom` on the runtime, and none on any artifact.
         let params = RuntimeParams {
             version: "1.0.0".to_string(),
             build_id: None,
             description: None,
             manifest: None,
-            artifacts: Vec::new(),
+            artifacts: vec![artifact("2098d8e0", None), artifact("c524b388", None)],
             delegated_targets_json: None,
             content_key_hex: None,
             content_keyid: None,
             config: None,
             lockfile: None,
-            sbom: None,
         };
         let value = serde_json::to_value(&params).unwrap();
         assert!(
             value.as_object().unwrap().get("sbom").is_none(),
             "got: {value}"
         );
+        for a in value["artifacts"].as_array().unwrap() {
+            assert!(a.as_object().unwrap().get("sbom").is_none(), "got: {a}");
+        }
     }
 
     #[test]
-    fn only_a_refused_body_blames_the_sbom() {
-        let with_status = |code: u16| {
-            anyhow::Error::new(HttpStatus(reqwest::StatusCode::from_u16(code).unwrap()))
-                .context("Failed to create runtime")
-        };
-        for code in [400, 413] {
-            assert!(sbom_may_be_at_fault(&with_status(code)), "{code}");
-        }
-        // Ordinary outcomes of this API: an expired token, a version already
-        // taken, a rejected field, a rate limit. A smaller body fixes none.
-        for code in [401, 403, 409, 422, 429] {
-            assert!(!sbom_may_be_at_fault(&with_status(code)), "{code}");
-        }
+    fn a_declared_fragment_is_a_digest_and_a_size_and_nothing_else() {
+        let fragments = vec![Fragment {
+            image_id: "2098d8e0".to_string(),
+            artifact_name: "bsp".to_string(),
+            bytes: b"{\"@graph\":[]}".to_vec(),
+            digest: "d1".repeat(32),
+            package_count: 0,
+        }];
+        let declared =
+            serde_json::to_value(artifact("2098d8e0", declare_sbom(&fragments, "2098d8e0")))
+                .unwrap();
+        assert_eq!(
+            declared["sbom"],
+            serde_json::json!({ "digest": "d1".repeat(32), "size_bytes": 13 })
+        );
+        assert!(declare_sbom(&fragments, "c524b388").is_none());
     }
 
-    #[tokio::test]
-    async fn a_body_refused_without_a_status_still_blames_the_sbom() {
-        // A proxy over its size cap can close the connection instead of
-        // answering 413, which reaches us as a transport error carrying no
-        // HttpStatus at all.
-        let e = reqwest::Client::new()
-            .post("http://127.0.0.1:1/")
-            .send()
-            .await
-            .unwrap_err();
-        let e = anyhow::Error::new(e).context("Failed to create runtime");
-        assert!(sbom_may_be_at_fault(&e), "{e:#}");
+    #[test]
+    fn an_upload_spec_parses_with_and_without_an_sbom_url() {
+        let with: ArtifactUploadSpec = serde_json::from_value(serde_json::json!({
+            "image_id": "2098d8e0",
+            "upload_id": "u1",
+            "parts": [{ "part_number": 1, "upload_url": "https://s3/part" }],
+            "sbom_upload_url": "https://s3/2098d8e0.spdx.json?X-Amz-Signature=x",
+        }))
+        .unwrap();
+        assert_eq!(
+            with.sbom_upload_url.as_deref(),
+            Some("https://s3/2098d8e0.spdx.json?X-Amz-Signature=x")
+        );
+
+        // A server that predates fragments, and an image already indexed,
+        // both omit the key. Neither is an error.
+        let without: ArtifactUploadSpec = serde_json::from_value(serde_json::json!({
+            "image_id": "c524b388",
+            "upload_id": null,
+            "parts": [],
+        }))
+        .unwrap();
+        assert!(without.sbom_upload_url.is_none());
+        assert!(without.parts.is_empty());
+
+        let refreshed: client::UploadUrlsData = serde_json::from_value(serde_json::json!({
+            "image_id": "2098d8e0",
+            "parts": [],
+            "sbom_upload_url": "https://s3/fresh",
+        }))
+        .unwrap();
+        assert_eq!(
+            refreshed.sbom_upload_url.as_deref(),
+            Some("https://s3/fresh")
+        );
+        let refreshed_legacy: client::UploadUrlsData = serde_json::from_value(serde_json::json!({
+            "image_id": "2098d8e0",
+            "parts": [{ "part_number": 1, "upload_url": "https://s3/part" }],
+        }))
+        .unwrap();
+        assert!(refreshed_legacy.sbom_upload_url.is_none());
     }
 }

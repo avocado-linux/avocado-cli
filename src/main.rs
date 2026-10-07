@@ -746,6 +746,9 @@ enum ConnectCommands {
         /// Path to pre-built tarball or artifact directory (skips export from Docker volume)
         #[arg(long)]
         file: Option<String>,
+        /// Skip SBOM generation; no SBOM is stored for the runtime
+        #[arg(long)]
+        no_sbom: bool,
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
@@ -4260,6 +4263,7 @@ async fn main() -> Result<()> {
                 config,
                 target,
                 file,
+                no_sbom,
                 profile,
                 publish,
                 deploy_cohort,
@@ -4285,6 +4289,7 @@ async fn main() -> Result<()> {
                     config_path: config,
                     target: target.or(cli.target),
                     file,
+                    no_sbom,
                     profile: profile.clone(),
                     publish,
                     deploy_cohort,
