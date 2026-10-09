@@ -4408,14 +4408,13 @@ extern "C" fn remove_feed_dirs() {
 }
 
 /// Where the feeds dir goes. It is a docker bind source, so under the avocado-vm
-/// it must be in the shared workspace, and the project always is. `$TMPDIR` on
-/// macOS is not. Elsewhere `$TMPDIR` is kept, so credentials stay out of the
-/// project tree.
-fn feeds_dir_parent(vm_routing: bool, project_root: &Path) -> Result<PathBuf> {
-    if vm_routing {
-        Ok(std::path::absolute(project_root.join(".avocado"))?)
-    } else {
-        Ok(std::env::temp_dir())
+/// it must be in the shared workspace. `$TMPDIR` on macOS is not. It is not in
+/// the project either: `avocado save` archives `.avocado/` and the source tree,
+/// and the `.repo` files can hold feed passwords. Elsewhere `$TMPDIR` is kept.
+fn feeds_dir_parent(vm_workspace: Option<&Path>) -> PathBuf {
+    match vm_workspace {
+        Some(ws) => ws.join(".avocado").join("tmp"),
+        None => std::env::temp_dir(),
     }
 }
 
@@ -4478,10 +4477,7 @@ async fn invocation_feeds(
         // `sdk install`.
         record_feed_set_in_lock(target, Some(&set), project_root);
         // No minting here: it is per stage, and this cell is per target.
-        let parent = feeds_dir_parent(
-            crate::utils::container::is_vm_routing_active(),
-            project_root,
-        )?;
+        let parent = feeds_dir_parent(crate::utils::container::vm_workspace().as_deref());
         std::fs::create_dir_all(&parent)
             .with_context(|| format!("creating {}", parent.display()))?;
         sweep_abandoned_feed_dirs(&parent);
@@ -14680,18 +14676,19 @@ mod invocation_feeds_tests {
     use super::*;
 
     /// The feeds dir is a docker bind source, so under the avocado-vm it must sit
-    /// in the project (inside the VM share). Elsewhere it stays in `$TMPDIR`.
+    /// in the VM workspace, outside the project. Elsewhere it stays in `$TMPDIR`.
     #[test]
-    fn feeds_dir_parent_is_project_only_under_vm() {
-        let root = Path::new("/work/proj");
+    fn feeds_dir_parent_is_vm_workspace_only_under_vm() {
         assert_eq!(
-            feeds_dir_parent(true, root).unwrap(),
-            Path::new("/work/proj/.avocado")
+            feeds_dir_parent(Some(Path::new("/Users/me"))),
+            Path::new("/Users/me/.avocado/tmp")
         );
-        assert_eq!(feeds_dir_parent(false, root).unwrap(), std::env::temp_dir());
+        assert_eq!(feeds_dir_parent(None), std::env::temp_dir());
     }
 
     /// Only dirs of a dead process go. Ours, a live one's, and old unnamed ones stay.
+    /// Unix only: elsewhere `pid_is_alive` always says alive, so nothing is swept.
+    #[cfg(unix)]
     #[test]
     fn sweep_removes_only_dead_process_feed_dirs() {
         let dir = tempfile::tempdir().unwrap();
