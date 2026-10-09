@@ -55,6 +55,20 @@ pub const CONTAINER_FEEDS_DIR: &str = "/run/avocado-feeds";
 /// reaches the developer's machine rather than the container itself.
 pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 
+/// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
+/// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
+/// user-net address for this machine instead.
+pub fn host_gateway_add_host(vm_routing: bool) -> String {
+    if vm_routing {
+        format!(
+            "{HOST_GATEWAY_ALIAS}:{}",
+            crate::utils::container_dev::tls::VM_HOST_IP
+        )
+    } else {
+        format!("{HOST_GATEWAY_ALIAS}:host-gateway")
+    }
+}
+
 /// The User-Agent every feed request carries. Version always; when a Connect
 /// profile is logged in, a non-secret per-token key id so usage attributes to
 /// an account (fast, per-machine counters at the edge; roll-up to org via
@@ -1213,6 +1227,11 @@ impl ResolvedFeedSet {
                         host.display()
                     );
                 }
+                check_in_vm_share(
+                    &feed.name,
+                    host,
+                    crate::utils::container::vm_workspace().as_deref(),
+                )?;
                 // The outer mount is read-only, so docker cannot create this
                 // mountpoint itself; it has to exist in the tempdir already.
                 // At the root, not under the stage dir: a path feed's bind is the
@@ -1233,7 +1252,9 @@ impl ResolvedFeedSet {
                     crate::utils::output::OutputLevel::Normal,
                 );
                 if add_hosts.is_empty() {
-                    add_hosts.push(format!("{HOST_GATEWAY_ALIAS}:host-gateway"));
+                    add_hosts.push(host_gateway_add_host(
+                        crate::utils::container::is_vm_routing_active(),
+                    ));
                 }
             }
         }
@@ -1254,6 +1275,16 @@ impl ResolvedFeedSet {
             fingerprint,
         })
     }
+}
+
+/// Under the avocado-vm, docker only sees the shared workspace. A `path:` feed
+/// outside it mounts empty and fails with a cryptic error, so fail here instead.
+fn check_in_vm_share(feed: &str, host: &Path, vm_workspace: Option<&Path>) -> Result<()> {
+    if let Some(ws) = vm_workspace {
+        crate::utils::vm::share::translate_to_vm(host, ws)
+            .with_context(|| format!("repos.{feed}: the avocado-vm cannot see this feed"))?;
+    }
+    Ok(())
 }
 
 /// Relative to the project root, and always absolute: these paths become
@@ -1408,6 +1439,17 @@ mod tests {
 
     fn load(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("yaml parses")
+    }
+
+    /// Under the avocado-vm, docker's `host-gateway` is the VM, so the alias
+    /// must point at QEMU's address for this machine instead.
+    #[test]
+    fn host_gateway_points_at_qemu_host_under_vm() {
+        assert_eq!(
+            host_gateway_add_host(false),
+            "host.docker.internal:host-gateway"
+        );
+        assert_eq!(host_gateway_add_host(true), "host.docker.internal:10.0.2.2");
     }
 
     const BASE: &str = r#"
@@ -1815,6 +1857,22 @@ distro:
             "https://v.example/2026/next/qemux86-64"
         );
         assert!(set.distro_priority_base.is_none());
+    }
+
+    /// A `path:` feed outside the VM workspace fails before docker runs.
+    #[test]
+    fn path_feed_outside_vm_workspace_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The recorded workspace is canonical (`share::resolve_workspace`).
+        let ws = tmp.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = ws.join("feed");
+        fs::create_dir(&inside).unwrap();
+        let err = check_in_vm_share("f", outside.path(), Some(&ws)).unwrap_err();
+        assert!(format!("{err:#}").contains("repos.f: the avocado-vm cannot see this feed"));
+        assert!(format!("{err:#}").contains("AVOCADO_VM_WORKSPACE"));
+        check_in_vm_share("f", &inside, Some(&ws)).unwrap();
+        check_in_vm_share("f", outside.path(), None).unwrap();
     }
 
     #[test]

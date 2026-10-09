@@ -4384,6 +4384,62 @@ type FeedCell = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<InvocationFe
 static INVOCATION_FEEDS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedCell>>> =
     std::sync::OnceLock::new();
 
+/// Feeds dirs are named `avocado-feeds-<pid>-<random>`, so a later run can tell
+/// which ones a dead process left behind.
+const FEED_DIR_PREFIX: &str = "avocado-feeds-";
+
+/// Feeds dirs this process made. `InvocationFeeds` sits in a static, and Rust
+/// never drops statics, so the `TempDir` never removes itself. The `.repo` files
+/// in it can hold feed passwords, so they are removed at exit here.
+static FEED_DIRS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static FEED_DIRS_ATEXIT: std::sync::Once = std::sync::Once::new();
+
+/// Registered with libc `atexit`, which also runs for `std::process::exit`
+/// (the Ctrl-C reaper exits that way). A signal that kills the process skips
+/// it; [`sweep_abandoned_feed_dirs`] covers that on the next run.
+extern "C" fn remove_feed_dirs() {
+    // `try_lock`: another thread could hold it while the process exits, and
+    // waiting here would hang the exit. A missed dir is swept next run.
+    if let Ok(dirs) = FEED_DIRS.try_lock() {
+        for d in dirs.iter() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// Where the feeds dir goes. It is a docker bind source, so under the avocado-vm
+/// it must be in the shared workspace. `$TMPDIR` on macOS is not. It is not in
+/// the project either: `avocado save` archives `.avocado/` and the source tree,
+/// and the `.repo` files can hold feed passwords. Elsewhere `$TMPDIR` is kept.
+fn feeds_dir_parent(vm_workspace: Option<&Path>) -> PathBuf {
+    match vm_workspace {
+        Some(ws) => ws.join(".avocado").join("tmp"),
+        None => std::env::temp_dir(),
+    }
+}
+
+/// Remove feeds dirs whose process is gone: a run killed by a signal skips
+/// `atexit`. Dirs from older CLIs have no pid after the prefix and stay.
+fn sweep_abandoned_feed_dirs(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(FEED_DIR_PREFIX))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() as i32 && !crate::utils::container::pid_is_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Get this invocation's feed set for `target`, resolving it once.
 ///
 /// One set per target per invocation, and the first caller's set is the one that
@@ -4421,12 +4477,22 @@ async fn invocation_feeds(
         // `sdk install`.
         record_feed_set_in_lock(target, Some(&set), project_root);
         // No minting here: it is per stage, and this cell is per target.
+        let parent = feeds_dir_parent(crate::utils::container::vm_workspace().as_deref());
+        std::fs::create_dir_all(&parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        sweep_abandoned_feed_dirs(&parent);
         let root = std::sync::Arc::new(
             tempfile::Builder::new()
-                .prefix("avocado-feeds-")
-                .tempdir()
+                .prefix(&format!("{FEED_DIR_PREFIX}{}-", std::process::id()))
+                .tempdir_in(&parent)
                 .context("creating the invocation's feeds directory")?,
         );
+        if let Ok(mut dirs) = FEED_DIRS.lock() {
+            dirs.push(root.path().to_path_buf());
+        }
+        FEED_DIRS_ATEXIT.call_once(|| unsafe {
+            libc::atexit(remove_feed_dirs);
+        });
         Ok(std::sync::Arc::new(InvocationFeeds {
             set: tokio::sync::Mutex::new(set),
             root,
@@ -14602,5 +14668,96 @@ mod kernel_cmdline_tests {
     fn absent_kernel_block_yields_nothing() {
         let c = cfg("default_target: qemuarm64\n");
         assert_eq!(c.effective_kernel_cmdline(Some("rt")), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod invocation_feeds_tests {
+    use super::*;
+
+    /// The feeds dir is a docker bind source, so under the avocado-vm it must sit
+    /// in the VM workspace, outside the project. Elsewhere it stays in `$TMPDIR`.
+    #[test]
+    fn feeds_dir_parent_is_vm_workspace_only_under_vm() {
+        assert_eq!(
+            feeds_dir_parent(Some(Path::new("/Users/me"))),
+            Path::new("/Users/me/.avocado/tmp")
+        );
+        assert_eq!(feeds_dir_parent(None), std::env::temp_dir());
+    }
+
+    /// Only dirs of a dead process go. Ours, a live one's, and old unnamed ones stay.
+    /// Unix only: elsewhere `pid_is_alive` always says alive, so nothing is swept.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_dead_process_feed_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let ours = std::process::id();
+        // A concurrent run: another process that is still alive.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other = live.id();
+        for n in [
+            format!("avocado-feeds-{dead}-abc"),
+            format!("avocado-feeds-{ours}-abc"),
+            format!("avocado-feeds-{other}-abc"),
+            "avocado-feeds-Xy12Zq".to_string(),
+        ] {
+            std::fs::create_dir(dir.path().join(n)).unwrap();
+        }
+        sweep_abandoned_feed_dirs(dir.path());
+        assert!(!dir
+            .path()
+            .join(format!("avocado-feeds-{dead}-abc"))
+            .exists());
+        assert!(dir
+            .path()
+            .join(format!("avocado-feeds-{ours}-abc"))
+            .exists());
+        assert!(dir
+            .path()
+            .join(format!("avocado-feeds-{other}-abc"))
+            .exists());
+        assert!(dir.path().join("avocado-feeds-Xy12Zq").exists());
+        let _ = live.kill();
+        let _ = live.wait();
+    }
+
+    /// The exit handler removes every recorded dir.
+    #[test]
+    fn remove_feed_dirs_removes_recorded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let feeds = dir.path().join("avocado-feeds-1-x");
+        std::fs::create_dir_all(feeds.join("rootfs")).unwrap();
+        std::fs::write(feeds.join("rootfs/a.repo"), "password=x").unwrap();
+        FEED_DIRS.lock().unwrap().push(feeds.clone());
+        remove_feed_dirs();
+        assert!(!feeds.exists());
+    }
+
+    /// The dir is named with our pid, and recorded for removal at exit.
+    #[tokio::test]
+    async fn feeds_dir_is_named_with_pid_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let c: Config = serde_yaml::from_str(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [web]\nrepos:\n  web:\n    url: https://example.com/r\n",
+        )
+        .unwrap();
+        let set =
+            crate::utils::feeds::ResolvedFeedSet::resolve(&c, "feeds-dir-test", dir.path(), None)
+                .unwrap()
+                .unwrap();
+        let feeds = invocation_feeds("feeds-dir-test", set, dir.path())
+            .await
+            .unwrap();
+        let path = feeds.root.path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(&format!("avocado-feeds-{}-", std::process::id())));
+        assert!(FEED_DIRS.lock().unwrap().iter().any(|d| d == path));
     }
 }

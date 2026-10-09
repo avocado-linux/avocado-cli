@@ -126,35 +126,30 @@ async fn ensure_workspace_mounted_if_routed() {
     }
 }
 
-/// When `DOCKER_HOST` is the avocado-vm's forwarded socket (set by
-/// `utils::vm::route`), bind mounts in `docker run` resolve inside the VM,
-/// not on the host. Translate host paths under the recorded workspace root
-/// to their `/run/workspace/…` in-VM equivalent. Pass-through if VM routing
-/// isn't active or the path lies outside the workspace.
+/// The workspace root the avocado-vm shares, when docker runs inside it
+/// (`DOCKER_HOST` is the VM's forwarded socket, set by `utils::vm::route`).
+/// `None` when VM routing is not active.
+pub(crate) fn vm_workspace() -> Option<PathBuf> {
+    if !is_vm_routing_active() {
+        return None;
+    }
+    let paths = crate::utils::vm::state::VmPaths::resolve().ok()?;
+    crate::utils::vm::share::read_recorded_workspace(&paths)
+        .ok()
+        .flatten()
+}
+
+/// When docker runs inside the avocado-vm, bind mounts in `docker run`
+/// resolve inside the VM, not on the host. Translate host paths under the
+/// recorded workspace root to their `/run/workspace/…` in-VM equivalent.
+/// Pass-through if VM routing isn't active or the path lies outside the
+/// workspace.
 ///
 /// Used for every `-v <host>:/container` argument we generate.
 fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
-    let host = match std::env::var("DOCKER_HOST") {
-        Ok(h) => h,
-        Err(_) => return src_path.to_path_buf(),
-    };
-    let paths = match crate::utils::vm::state::VmPaths::resolve() {
-        Ok(p) => p,
-        Err(_) => return src_path.to_path_buf(),
-    };
-    // VM routing is in effect iff DOCKER_HOST is our forwarded local socket.
-    let expected = format!("unix://{}", paths.docker_socket().display());
-    if host != expected {
-        return src_path.to_path_buf();
-    }
-    let workspace = match crate::utils::vm::share::read_recorded_workspace(&paths) {
-        Ok(Some(w)) => w,
-        _ => return src_path.to_path_buf(),
-    };
-    match crate::utils::vm::share::translate_to_vm(src_path, &workspace) {
-        Ok(p) => p,
-        Err(_) => src_path.to_path_buf(),
-    }
+    vm_workspace()
+        .and_then(|ws| crate::utils::vm::share::translate_to_vm(src_path, &ws).ok())
+        .unwrap_or_else(|| src_path.to_path_buf())
 }
 
 /// Ensure QEMU binfmt_misc is registered for cross-architecture container emulation.
@@ -1105,7 +1100,7 @@ impl SdkContainer {
 /// Whether a pid is still running. `kill(pid, 0)` is the portable probe: it
 /// signals nothing and only reports whether the process exists.
 #[cfg(unix)]
-fn pid_is_alive(pid: i32) -> bool {
+pub(crate) fn pid_is_alive(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
@@ -1120,7 +1115,7 @@ fn pid_is_alive(pid: i32) -> bool {
 /// No cheap equivalent probe here, so never reap: a stale container costs
 /// memory, reaping a live one breaks a running build.
 #[cfg(not(unix))]
-fn pid_is_alive(_pid: i32) -> bool {
+pub(crate) fn pid_is_alive(_pid: i32) -> bool {
     true
 }
 
@@ -2147,9 +2142,8 @@ impl SdkContainer {
             .as_deref()
             .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
         {
-            add_hosts.push(format!(
-                "{}:host-gateway",
-                crate::utils::feeds::HOST_GATEWAY_ALIAS
+            add_hosts.push(crate::utils::feeds::host_gateway_add_host(
+                is_vm_routing_active(),
             ));
         }
         add_hosts.sort();
