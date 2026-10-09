@@ -2252,7 +2252,13 @@ fn package_files_digest(root: &Path, patterns: &[&str]) -> Result<String> {
 
     if !globs.is_empty() {
         let mut matched = vec![false; globs.len()];
-        for entry in walkdir::WalkDir::new(root).sort_by_file_name() {
+        // `.avocado/` is the CLI's scratch space, not extension source. Its
+        // per-run feeds dir would otherwise move the digest on every run.
+        let walk = walkdir::WalkDir::new(root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| !(e.depth() == 1 && e.file_name() == ".avocado"));
+        for entry in walk {
             let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
             let Ok(rel) = entry.path().strip_prefix(root) else {
                 continue;
@@ -5830,6 +5836,20 @@ extensions:
         let a = ext_build_hash_at(root, uncompiled).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn x() {}").unwrap();
         assert_eq!(a, ext_build_hash_at(root, uncompiled).unwrap());
+    }
+
+    /// `.avocado/` is the CLI's own scratch space (feed `.repo` dirs, the lock,
+    /// the canonical feed document). A `**` pattern must not hash it, or every
+    /// run's feeds dir moves the digest and the extension rebuilds each time.
+    #[test]
+    fn package_files_digest_ignores_cli_scratch_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("top.sh"), "1").unwrap();
+        let before = package_files_digest(root, &["**"]).unwrap();
+        std::fs::create_dir_all(root.join(".avocado/avocado-feeds-1-x")).unwrap();
+        std::fs::write(root.join(".avocado/avocado-feeds-1-x/a.repo"), "r").unwrap();
+        assert_eq!(before, package_files_digest(root, &["**"]).unwrap());
     }
 
     /// `package_files` patterns expand like the packaging script's

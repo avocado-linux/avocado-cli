@@ -31,6 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
+### Fixed
+- **`repos:` feeds work on macOS with the avocado-vm.** The per-run feeds
+  directory was made in `$TMPDIR`, which the VM does not share, so a `path:`
+  feed failed with a read-only mount error and a `url:` feed was not seen by
+  dnf. Under the VM it is now made in `<project>/.avocado/`. Other hosts keep
+  `$TMPDIR`.
+- A loopback feed URL (`localhost`, `127.0.0.1`) under the avocado-vm now
+  reaches the Mac. `host.docker.internal` maps to the QEMU host address
+  `10.0.2.2` and not to `host-gateway`, which is the VM.
+- The feeds directory is removed when the CLI exits, including on Ctrl-C.
+  Before, it stayed after every run, with any feed passwords in its `.repo`
+  files. A later run removes directories that a killed run left.
+- A `path:` feed outside the avocado-vm workspace now fails early with a
+  message that says to set `AVOCADO_VM_WORKSPACE`.
+- `package_files` globs such as `**` no longer read the CLI's `.avocado/`
+  directory, so its contents do not cause an extension to rebuild.
+
 ## [1.0.0-rc.5] - 2026-09-17
 
 ### Changed
