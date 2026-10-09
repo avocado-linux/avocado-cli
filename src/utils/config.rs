@@ -14696,9 +14696,16 @@ mod invocation_feeds_tests {
         let dead = child.id();
         child.wait().unwrap();
         let ours = std::process::id();
+        // A concurrent run: another process that is still alive.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let other = live.id();
         for n in [
             format!("avocado-feeds-{dead}-abc"),
             format!("avocado-feeds-{ours}-abc"),
+            format!("avocado-feeds-{other}-abc"),
             "avocado-feeds-Xy12Zq".to_string(),
         ] {
             std::fs::create_dir(dir.path().join(n)).unwrap();
@@ -14712,7 +14719,25 @@ mod invocation_feeds_tests {
             .path()
             .join(format!("avocado-feeds-{ours}-abc"))
             .exists());
+        assert!(dir
+            .path()
+            .join(format!("avocado-feeds-{other}-abc"))
+            .exists());
         assert!(dir.path().join("avocado-feeds-Xy12Zq").exists());
+        let _ = live.kill();
+        let _ = live.wait();
+    }
+
+    /// The exit handler removes every recorded dir.
+    #[test]
+    fn remove_feed_dirs_removes_recorded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let feeds = dir.path().join("avocado-feeds-1-x");
+        std::fs::create_dir_all(feeds.join("rootfs")).unwrap();
+        std::fs::write(feeds.join("rootfs/a.repo"), "password=x").unwrap();
+        FEED_DIRS.lock().unwrap().push(feeds.clone());
+        remove_feed_dirs();
+        assert!(!feeds.exists());
     }
 
     /// The dir is named with our pid, and recorded for removal at exit.

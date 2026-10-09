@@ -40,10 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A loopback feed URL (`localhost`, `127.0.0.1`) under the avocado-vm now
   reaches the Mac. `host.docker.internal` maps to the QEMU host address
   `10.0.2.2` and not to `host-gateway`, which is the VM.
-- The feeds directory is removed when the CLI exits, including on Ctrl-C.
-  Before, it stayed after every run, with any feed passwords in its `.repo`
-  files. The next run that uses feeds removes directories that a killed run
-  left.
+- The feeds directory is removed when the CLI exits. Before, it stayed after
+  every run, with any feed passwords in its `.repo` files. Ctrl-C removes it
+  only when a session container is running. Interactive commands (`sdk dnf`,
+  `ext dnf`, `runtime dnf`) have none. The next run that uses feeds removes
+  directories that an interrupted or killed run left.
 - A `path:` feed outside the avocado-vm workspace now fails early with a
   message that says to set `AVOCADO_VM_WORKSPACE`.
 
