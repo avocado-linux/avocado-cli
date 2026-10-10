@@ -208,6 +208,11 @@ impl SdkInstallCommand {
         let kernel_feeds = config
             .materialize_feeds(&target, FeedStage::Rootfs, &self.config_path)
             .await?;
+        // The target-dev dnf reads the target reposdir, which the sdk-stage set
+        // leaves empty: sdk-stage feeds are written for the host dnf confs.
+        let target_dev_feeds = config
+            .materialize_feeds(&target, FeedStage::SdkTarget, &self.config_path)
+            .await?;
 
         // Use the container helper to run the installation
         let container_helper =
@@ -286,6 +291,10 @@ impl SdkInstallCommand {
                 tui_context: self.tui_context.clone(),
             };
             let kver = resolve_and_pin_kernel_version(&mut resolve_params).await?;
+            // The kernel is picked from the rootfs feeds, so the target-sysroot
+            // compiles against the kernel the image ships. The excludes are for
+            // the target-dev dnf, so they must cover every kernel it can see.
+            resolve_params.feeds = target_dev_feeds.as_ref();
             match kver.as_deref() {
                 Some(k) => off_kernel_dnf_excludes(&resolve_params, k).await?,
                 None => Vec::new(),
@@ -306,6 +315,7 @@ impl SdkInstallCommand {
                 runs_on_context.as_ref(),
                 &target,
                 &off_kernel_excludes,
+                target_dev_feeds.as_ref(),
             )
             .await;
 
@@ -342,6 +352,7 @@ impl SdkInstallCommand {
         runs_on_context: Option<&RunsOnContext>,
         target: &str,
         off_kernel_excludes: &[String],
+        target_dev_feeds: Option<&crate::utils::feeds::FeedMaterialization>,
     ) -> Result<()> {
         let composed = &bootstrap.composed;
         let config = &composed.config;
@@ -551,11 +562,6 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         let initramfs_feeds = config
             .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
             .await?;
-        // The target-dev dnf reads the target reposdir, which the sdk-stage set
-        // leaves empty: sdk-stage feeds are written for the host dnf confs.
-        let target_dev_feeds = config
-            .materialize_feeds(target, FeedStage::SdkTarget, &self.config_path)
-            .await?;
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -624,7 +630,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     // dnf runs with -y, so nothing here can prompt: no PTY, ever.
                     interactive: false,
                     repo_url: repo_url.map(|s| s.to_string()),
-                    feeds: target_dev_feeds.clone(),
+                    feeds: target_dev_feeds.cloned(),
                     repo_release: repo_release.map(|s| s.to_string()),
                     container_args: merged_container_args.cloned(),
                     dnf_args: self.dnf_args.clone(),
