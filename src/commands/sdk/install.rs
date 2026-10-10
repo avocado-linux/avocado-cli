@@ -551,6 +551,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         let initramfs_feeds = config
             .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
             .await?;
+        // The target-dev dnf reads the target reposdir, which the sdk-stage set
+        // leaves empty: sdk-stage feeds are written for the host dnf confs.
+        let target_dev_feeds = config
+            .materialize_feeds(target, FeedStage::SdkTarget, &self.config_path)
+            .await?;
         let mut rootfs_params = SysrootInstallParams {
             sysroot_type: SysrootType::Rootfs,
             config,
@@ -619,7 +624,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     // dnf runs with -y, so nothing here can prompt: no PTY, ever.
                     interactive: false,
                     repo_url: repo_url.map(|s| s.to_string()),
-                    feeds: feeds.cloned(),
+                    feeds: target_dev_feeds.clone(),
                     repo_release: repo_release.map(|s| s.to_string()),
                     container_args: merged_container_args.cloned(),
                     dnf_args: self.dnf_args.clone(),
