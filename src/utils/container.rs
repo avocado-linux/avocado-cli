@@ -443,6 +443,27 @@ pub fn get_container_platform(sdk_arch: Option<&str>) -> Result<String> {
     }
 }
 
+/// A hub job's USB view: the avocado-vm agent sets `AVOCADO_USB_VIEW` to a
+/// directory holding only the job's board's USB buses (`dev/`) and their
+/// `/sys/bus/usb/devices` entries (`sys/`), so the job's tools cannot reach
+/// another board on the same hub. Mounted over the container's; nothing
+/// anywhere else.
+fn usb_view_args() -> Vec<String> {
+    usb_view_args_for(std::env::var("AVOCADO_USB_VIEW").ok().as_deref())
+}
+
+fn usb_view_args_for(dir: Option<&str>) -> Vec<String> {
+    match dir {
+        Some(d) if Path::new(d).join("dev").is_dir() && Path::new(d).join("sys").is_dir() => vec![
+            "-v".to_string(),
+            format!("{d}/dev:/dev/bus/usb"),
+            "-v".to_string(),
+            format!("{d}/sys:/sys/bus/usb/devices"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
@@ -2214,6 +2235,7 @@ impl SdkContainer {
                 container_cmd.extend(Self::parse_container_arg(arg));
             }
         }
+        container_cmd.extend(usb_view_args());
 
         // Add the container image
         container_cmd.push(config.container_image.to_string());
@@ -2761,6 +2783,7 @@ impl SdkContainer {
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
         }
+        extra_args.extend(usb_view_args());
 
         Ok((full_command, env_vars, extra_args))
     }
@@ -3997,6 +4020,26 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_usb_view_mounts_over_the_containers_usb_only_when_set_and_present() {
+        assert!(usb_view_args_for(None).is_empty());
+        assert!(usb_view_args_for(Some("/nonexistent/view")).is_empty());
+        let d = std::env::temp_dir().join(format!("usb-view-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("dev")).unwrap();
+        std::fs::create_dir_all(d.join("sys")).unwrap();
+        let d = d.to_str().unwrap();
+        assert_eq!(
+            usb_view_args_for(Some(d)),
+            vec![
+                "-v".to_string(),
+                format!("{d}/dev:/dev/bus/usb"),
+                "-v".to_string(),
+                format!("{d}/sys:/sys/bus/usb/devices"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.
     /// The rootfs script reads `${SOURCE_DATE_EPOCH:-0}` for `mkfs.erofs -T` but
