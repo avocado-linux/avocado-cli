@@ -480,6 +480,12 @@ enum Commands {
         /// `.avocado-bundle/` in the current directory.
         #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
         bundle: Option<String>,
+        /// With `--bundle`: run this command in the bundle's SDK container
+        /// (USB passed through, as for the provision) instead of
+        /// provisioning, e.g. `-- boardctl --target thor-jetson-devkit recovery`.
+        /// A hub's `with_usb` run-profile step uses it.
+        #[arg(last = true, requires = "bundle")]
+        exec: Vec<String>,
         /// Remote provisioning through an avocado-vm hub (--rubicon ...).
         #[command(flatten)]
         remote: Box<ProvisionRemoteArgs>,
@@ -2519,6 +2525,7 @@ async fn main() -> Result<()> {
             list,
             pack,
             bundle,
+            exec,
             remote,
             output,
         } => {
@@ -2539,6 +2546,7 @@ async fn main() -> Result<()> {
                     profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
                     verbose,
+                    exec,
                 }
                 .execute()
                 .await;

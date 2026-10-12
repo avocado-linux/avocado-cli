@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use reqwest::Method;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -451,6 +452,10 @@ impl RemoteProvision {
         };
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out)?;
+        // The caller's --env values (per-run choices such as a provisioning
+        // profile's ERASE_* options) are not packed into the bundle, which
+        // is stored and replayed; they ride with the job instead.
+        let job_env = provision.env_vars().cloned().unwrap_or_default();
         print_info("Packing the provision for the hub...", OutputLevel::Normal);
         provision.with_pack(Some(out.clone())).execute().await?;
         let bundle = std::fs::read_dir(&out)?
@@ -462,7 +467,8 @@ impl RemoteProvision {
             Hub::Local => {
                 let token =
                     local_token(&board, "provision", self.connect_profile.as_deref()).await?;
-                self.run_local(&bundle, &board.address, token).await
+                self.run_local(&bundle, &board.address, token, &job_env)
+                    .await
             }
             Hub::Connect { vm, vm_name } => {
                 let (c, org) = connect(self.connect_profile.as_deref(), None)?;
@@ -501,7 +507,13 @@ impl RemoteProvision {
     }
 
     /// Hand the job to this machine's VM agent and follow it to the end.
-    async fn run_local(&self, bundle: &Path, address: &str, token: Option<String>) -> Result<()> {
+    async fn run_local(
+        &self,
+        bundle: &Path,
+        address: &str,
+        token: Option<String>,
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
         let paths = VmPaths::resolve()?;
         let ws = share::read_recorded_workspace(&paths)?
             .map(Ok)
@@ -535,6 +547,7 @@ impl RemoteProvision {
                 "profile": self.provision_profile,
                 "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
                 "rubicon_token": token,
+                "env": env,
             },
         });
         let r = follow_local(req).await?;
