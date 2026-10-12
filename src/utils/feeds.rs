@@ -141,15 +141,28 @@ pub enum FeedStage {
     Runtime,
     Ext,
     Initramfs,
+    /// The target sysroot that `sdk install` fills with compile dependencies.
+    /// Not a `stages:` value: it takes the `sdk` scope, but its dnf reads the
+    /// target reposdir, so its `.repo` files need their own directory. Writing
+    /// them into `sdk/target` instead would show every feed twice, under one
+    /// repoid, to the combined conf that reads both scope dirs.
+    #[serde(skip)]
+    SdkTarget,
 }
 
 impl FeedStage {
     /// `sdk`-stage feeds land in the host reposdir (seen by the bootstrap and
     /// combined dnf confs); every other stage's dnf reads the target reposdir.
-    // ponytail: sdk-stage feeds are host-only; a feed for the target sysroot
-    // during `sdk install` would need both dirs and a distinct repoid.
     fn is_host(self) -> bool {
         matches!(self, FeedStage::Sdk)
+    }
+
+    /// The `stages:` value that decides which feeds this stage sees.
+    fn scope(self) -> FeedStage {
+        match self {
+            FeedStage::SdkTarget => FeedStage::Sdk,
+            s => s,
+        }
     }
 
     /// The stage's subdirectory under the invocation's feeds root. Stages share
@@ -163,6 +176,7 @@ impl FeedStage {
             FeedStage::Runtime => "runtime",
             FeedStage::Ext => "ext",
             FeedStage::Initramfs => "initramfs",
+            FeedStage::SdkTarget => "sdk-target",
         }
     }
 }
@@ -175,6 +189,8 @@ impl std::fmt::Display for FeedStage {
             FeedStage::Runtime => "runtime",
             FeedStage::Ext => "ext",
             FeedStage::Initramfs => "initramfs",
+            // Its `stages:` scope, which is what messages and projections want.
+            FeedStage::SdkTarget => "sdk",
         };
         f.write_str(s)
     }
@@ -275,7 +291,7 @@ pub struct ResolvedFeed {
 
 impl ResolvedFeed {
     fn applies_to(&self, stage: FeedStage) -> bool {
-        self.stages.is_empty() || self.stages.contains(&stage)
+        self.stages.is_empty() || self.stages.contains(&stage.scope())
     }
 
     fn repo_file(&self, ca_in_container: Option<&str>) -> String {
@@ -1925,6 +1941,30 @@ distro:
             .0
             .join("sdk/host/avocado-feed-v.repo")
             .exists());
+    }
+
+    /// The target sysroot `sdk install` fills reads the target reposdir, so an
+    /// sdk-scoped feed must land there too, in its own stage dir.
+    #[test]
+    fn sdk_target_stage_writes_sdk_feeds_to_the_target_reposdir() {
+        let c = load(&format!(
+            "{BASE}  feeds: [s, r]\nrepos:\n  s:\n    url: https://s\n    stages: [sdk]\n  r:\n    url: https://r\n    stages: [rootfs]\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        let m = set.materialize(FeedStage::SdkTarget).unwrap();
+        let root = &m.mounts[0].0;
+        assert!(root.join("sdk-target/target/avocado-feed-s.repo").is_file());
+        assert!(!root.join("sdk-target/target/avocado-feed-r.repo").exists());
+        assert!(m.env.contains(&(
+            "AVOCADO_FEEDS_DIR".into(),
+            format!("{CONTAINER_FEEDS_DIR}/sdk-target")
+        )));
+        assert_eq!(
+            set.stage_projection_json(FeedStage::SdkTarget).unwrap(),
+            set.stage_projection_json(FeedStage::Sdk).unwrap()
+        );
     }
 
     #[test]
