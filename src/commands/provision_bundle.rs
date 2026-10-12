@@ -32,10 +32,11 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::utils::config::{Config, ProvisionRubicon, RubiconStep};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
@@ -101,6 +102,46 @@ pub struct BundleMeta {
     pub small_files: Vec<SmallArchive>,
     pub created_at: String,
     pub cli_version: String,
+    /// What a hub runs on the Rubicon around this provision; absent when no
+    /// provision profile names a Rubicon run profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubicon: Option<BundleRubicon>,
+}
+
+/// The Rubicon side of a bundle, resolved from the composed config at pack
+/// time so the hub needs no config of its own: a job's profile (else
+/// `default_profile`) picks an entry of `profiles`, whose names index `run`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct BundleRubicon {
+    /// Stone's default provision profile, used when the job names none.
+    pub default_profile: Option<String>,
+    pub profiles: BTreeMap<String, ProvisionRubicon>,
+    pub run: BTreeMap<String, Vec<RubiconStep>>,
+}
+
+/// The run profiles the config's provision profiles reference, by profile.
+pub fn bundle_rubicon(config: &Config, default_profile: Option<String>) -> Option<BundleRubicon> {
+    let profiles: BTreeMap<String, ProvisionRubicon> = config
+        .provision_profiles
+        .iter()
+        .flatten()
+        .filter_map(|(name, p)| Some((name.clone(), p.rubicon.clone()?)))
+        .collect();
+    if profiles.is_empty() {
+        return None;
+    }
+    // Flattened (`run:` steps expanded): the hub runs plain steps.
+    let run = profiles
+        .values()
+        .flat_map(|r| [&r.before, &r.after])
+        .flatten()
+        .filter_map(|name| Some((name.clone(), config.rubicon_steps(name).ok()?)))
+        .collect();
+    Some(BundleRubicon {
+        default_profile,
+        profiles,
+        run,
+    })
 }
 
 impl BundleMeta {
@@ -171,6 +212,10 @@ fi
 OUT=/opt/src/{STAGE_DIR}
 rm -rf "$OUT" && mkdir -p "$OUT/blobs" || exit 1
 echo "$paths" > "$OUT/paths" || exit 1
+# The stone manifest names the default provision profile (for the bundle's
+# Rubicon run profiles); not bundled itself when it comes with the SDK.
+m="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-{target}.json}}"
+if [ -f "$m" ]; then cp "$m" "$OUT/stone-manifest.json" || exit 1; fi
 # Never bundled: the build scratch dir, and the rendered var image (the
 # replay renders it from var-staging).
 SKIP="-path output/runtimes/{runtime}/stone/_build -o -path output/runtimes/{runtime}/stone/avocado-image-var-{target}.btrfs"
@@ -259,6 +304,7 @@ pub struct PackInputs<'a> {
     pub runtime: &'a str,
     pub env: &'a HashMap<String, String>,
     pub provision_script: String,
+    pub config: &'a Config,
 }
 
 /// Turn the container's staging into `<out>/<runtime>-<target>.bundle/`.
@@ -313,6 +359,12 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         small_files,
         created_at: chrono::Utc::now().to_rfc3339(),
         cli_version: env!("AVOCADO_CLI_VERSION").into(),
+        rubicon: bundle_rubicon(
+            p.config,
+            std::fs::read_to_string(stage.join("stone-manifest.json"))
+                .ok()
+                .and_then(|m| crate::commands::profiles::stone_default_profile(&m)),
+        ),
     };
     let dir = if out.is_dir() {
         out.join(format!("{}-{}.bundle", p.runtime, p.target))
@@ -616,6 +668,49 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
 mod tests {
     use super::*;
 
+    #[test]
+    fn bundle_rubicon_carries_only_referenced_run_profiles() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+rubicon:
+  run:
+    off: [ { out: { power: "off" } } ]
+    enter: [ { run: off }, { out: { ssr1: "on" } } ]
+    check: [ { wait_ms: 5 } ]
+    unused: [ { wait_ms: 1 } ]
+provision:
+  tegraflash:
+    rubicon: { before: enter, after: check }
+  noop: {}
+"#,
+        )
+        .unwrap();
+        let r = bundle_rubicon(&config, Some("tegraflash".into())).unwrap();
+        assert_eq!(r.default_profile.as_deref(), Some("tegraflash"));
+        assert_eq!(r.profiles.keys().collect::<Vec<_>>(), ["tegraflash"]);
+        assert_eq!(r.run.keys().collect::<Vec<_>>(), ["check", "enter"]);
+        // The hub reads it as JSON: steps are single-key objects.
+        let json = serde_json::to_value(&r).unwrap();
+        // `run:` is expanded for the hub.
+        assert_eq!(
+            json["run"]["enter"],
+            serde_json::json!([{"out": {"power": "off"}}, {"out": {"ssr1": "on"}}])
+        );
+
+        let none: Config = serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();
+        assert!(bundle_rubicon(&none, None).is_none());
+    }
+
+    #[test]
+    fn stone_default_profile_reads_the_manifest() {
+        let m = r#"{"runtime":{"provision_default":"tegraflash"},"provision":{"profiles":{}}}"#;
+        assert_eq!(
+            crate::commands::profiles::stone_default_profile(m).as_deref(),
+            Some("tegraflash")
+        );
+        assert_eq!(crate::commands::profiles::stone_default_profile("{}"), None);
+    }
+
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -660,6 +755,7 @@ mod tests {
             }],
             created_at: String::new(),
             cli_version: String::new(),
+            rubicon: None,
         }
     }
 

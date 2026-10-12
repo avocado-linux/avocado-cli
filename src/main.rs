@@ -224,6 +224,9 @@ enum Commands {
         #[command(subcommand)]
         command: VmCommands,
     },
+    /// Rubicon boards: list them (this machine's VM and the org's VMs),
+    /// run a run profile, watch or use a DUT's serial console.
+    Rubicon(Box<RubiconArgs>),
     /// Container Dev Mode: iterate on containers running on a device.
     Container {
         #[command(subcommand)]
@@ -2569,6 +2572,7 @@ async fn main() -> Result<()> {
                 .canonicalize()?;
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
+            let config_path = config.clone();
             let provision_cmd =
                 ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
                     runtime,
@@ -2596,6 +2600,7 @@ async fn main() -> Result<()> {
                     connect_profile,
                     provision_profile,
                     src_dir,
+                    config_path,
                 }
                 .execute(provision_cmd)
                 .await;
@@ -3467,6 +3472,35 @@ async fn main() -> Result<()> {
                 ContainerDevCommands::Prune => DevPruneCommand.execute().await,
             },
         },
+        Commands::Rubicon(args) => {
+            use commands::rubicon::{RubiconAction as A, RubiconCommand};
+            let RubiconArgs {
+                command,
+                config,
+                via,
+                vm,
+                connect_profile,
+            } = *args;
+            let action = match command {
+                RubiconCommands::List => A::List,
+                RubiconCommands::Show { board } => A::Show { board },
+                RubiconCommands::Add { address, label } => A::Add { address, label },
+                RubiconCommands::Remove { board } => A::Remove { board },
+                RubiconCommands::Label { board, label } => A::Label { board, label },
+                RubiconCommands::Run { profile, board } => A::Run { board, profile },
+                RubiconCommands::Console { board, read_only } => A::Console { board, read_only },
+                RubiconCommands::Logs { board, follow } => A::Logs { board, follow },
+            };
+            RubiconCommand {
+                action,
+                config_path: config,
+                via,
+                vm,
+                connect_profile,
+            }
+            .execute()
+            .await
+        }
         Commands::Vm { command } => match command {
             VmCommands::Start {
                 vm_source,
@@ -5297,6 +5331,65 @@ enum ContainerDevCommands {
     Prune,
 }
 
+#[derive(clap::Args)]
+struct RubiconArgs {
+    #[command(subcommand)]
+    command: RubiconCommands,
+    /// Project config (run profiles, `rubicon.default`, console rate).
+    #[arg(short = 'C', long, default_value = "avocado.yaml", global = true)]
+    config: String,
+    /// Where to look for boards (auto: this machine's VM, then Connect).
+    #[arg(long, value_enum, default_value_t = crate::commands::provision_remote::Via::Auto, global = true)]
+    via: crate::commands::provision_remote::Via,
+    /// Connect only: the VM, when several know a board.
+    #[arg(long, global = true)]
+    vm: Option<String>,
+    /// Connect profile to use.
+    #[arg(long, global = true)]
+    connect_profile: Option<String>,
+}
+
+/// A board is named by its firmware name, label or address; omitted, the
+/// project's `rubicon.default`.
+#[derive(Subcommand)]
+enum RubiconCommands {
+    /// Boards reachable from here, with their state.
+    List,
+    /// One board in detail.
+    Show { board: Option<String> },
+    /// Add a board to this machine's VM by address.
+    Add {
+        address: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a board from this machine's VM.
+    Remove { board: String },
+    /// Set a board's label on this machine's VM.
+    Label { board: String, label: String },
+    /// Run one of the project's run profiles (`rubicon.run.<name>`) on a board.
+    Run {
+        /// The run profile.
+        profile: String,
+        #[arg(long)]
+        board: Option<String>,
+    },
+    /// Interactive serial console of a board's DUT (Ctrl-] leaves).
+    Console {
+        board: Option<String>,
+        /// Watch only; never send input.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// What a board's DUT console printed recently.
+    Logs {
+        board: Option<String>,
+        /// Keep printing as it prints.
+        #[arg(short, long)]
+        follow: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum VmRubiconCommands {
     /// Add a board by address (or update its label).
@@ -5359,8 +5452,9 @@ struct ProvisionRemoteArgs {
     /// Provision the device behind this Rubicon (label, name or
     /// address) through the avocado-vm that drives it: this machine's
     /// VM if it has the board, otherwise through Connect. Syncs what the
-    /// hub lacks, runs there, streams the log back.
-    #[arg(long)]
+    /// hub lacks, runs there, streams the log back. Without a value:
+    /// the project's `rubicon.default`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
     pub rubicon: Option<String>,
     /// With --rubicon: force the hub (auto: local VM first, then Connect).
     #[arg(long, value_enum, default_value_t = crate::commands::provision_remote::Via::Auto, requires = "rubicon")]
