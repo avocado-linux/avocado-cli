@@ -599,7 +599,21 @@ fi
 export AVOCADO_MANIFEST_PATH="$MANIFEST_FILE"
 {docker_section}
 
+# The build linked the OS bundle into var-staging for Connect upload; it is
+# OTA payload, and a provisioned device already runs that OS. Keep it out of
+# the var image (it is the size of the rootfs, initramfs and kernel again)
+# and put it back afterwards.
+OS_BUNDLE_ID=$(python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("os_bundle") or {{}}).get("image_id", ""))' "$MANIFEST_FILE")
+OS_BUNDLE_ASIDE=""
+if [ -n "$OS_BUNDLE_ID" ] && [ -f "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" ]; then
+    OS_BUNDLE_ASIDE="$OUTPUT_DIR/os-bundle-aside.raw"
+    mv "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" "$OS_BUNDLE_ASIDE" || exit 1
+fi
+
 VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+# mkfs.btrfs writes into an existing file without shrinking it, so a var
+# image left by an earlier, larger provision would keep that size.
+rm -f "$VAR_IMAGE"
 VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
 VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
 echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
@@ -640,6 +654,9 @@ if [ "{var_luks_room}" = "1" ]; then
 fi
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
+if [ -n "$OS_BUNDLE_ASIDE" ]; then
+    mv "$OS_BUNDLE_ASIDE" "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" || exit 1
+fi
 
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
@@ -729,7 +746,8 @@ runtimes:
         for needle in [
             "$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH",
             "stone bundle",
-            "os_bundle",
+            // The patch; the var half only reads the key to leave the bundle out.
+            "os_bundle = dict(",
             "sign_amf \"$AVOCADO_MANIFEST_PATH\"",
         ] {
             assert!(ota.contains(needle), "OTA half must contain {needle}");
@@ -912,6 +930,64 @@ extensions:
         // Guarded on absence: a provision in the same project leaves a REAL
         // var image here, and truncating it back would unmount /var on boot.
         assert!(ota.contains(r#"if [ ! -f "$STONE_VAR_PLACEHOLDER" ]; then"#));
+    }
+
+    /// The OS bundle in var-staging is OTA payload: the var image is built
+    /// without it, and var-staging has it back afterwards for Connect upload.
+    #[test]
+    fn the_var_image_leaves_the_os_bundle_out() {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path();
+        let lib = prefix.join("runtimes/test-runtime/var-staging/lib/avocado");
+        std::fs::create_dir_all(lib.join("images")).unwrap();
+        std::fs::create_dir_all(lib.join("runtimes/b1")).unwrap();
+        std::os::unix::fs::symlink("runtimes/b1", lib.join("active")).unwrap();
+        std::fs::write(
+            lib.join("runtimes/b1/manifest.json"),
+            r#"{"os_bundle": {"image_id": "aos1", "sha256": "x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(lib.join("images/aos1.raw"), "bundle").unwrap();
+        std::fs::write(lib.join("images/ext1.raw"), "ext").unwrap();
+        // mkfs.btrfs stand-in: record what it would pack, write the image.
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mkfs = bin.join("mkfs.btrfs");
+        std::fs::write(
+            &mkfs,
+            "#!/bin/sh\nls \"$AVOCADO_IMAGES_DIR\" > \"$OUTPUT_DIR/packed\"\n\
+             while [ $# -gt 1 ]; do shift; done; echo img >> \"$1\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mkfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A larger image from an earlier provision must not keep its size.
+        let image = prefix.join("runtimes/test-runtime/avocado-image-var-x86_64.btrfs");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let script = prefix.join("var.sh");
+        std::fs::write(&script, var_half(BASE)).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", prefix)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        let packed = std::fs::read_to_string(prefix.join("runtimes/test-runtime/packed"))
+            .unwrap_or_else(|_| panic!("mkfs never ran: {}", String::from_utf8_lossy(&out.stderr)));
+        assert_eq!(packed.trim(), "ext1.raw");
+        assert!(lib.join("images/aos1.raw").is_file(), "bundle not put back");
+        assert!(!prefix
+            .join("runtimes/test-runtime/os-bundle-aside.raw")
+            .exists());
+        // Like mkfs.btrfs, the stand-in writes into whatever file is there.
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().len(),
+            4,
+            "stale image reused"
+        );
     }
 
     #[test]
