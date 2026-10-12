@@ -1053,6 +1053,10 @@
         "recovery": {
           "type": "string",
           "description": "Name of a registry HMAC secret ('avocado signing-keys create <name> --algorithm hmac-sha256') that is the master for an operator recovery keyslot, enrolled per device with 'avocado var-key enroll'. Requires 'encrypt: true'."
+        },
+        "initial_os_rollback": {
+          "type": "boolean",
+          "description": "Whether the provisioned var image carries the OS bundle. Defaults to true. The bundle lets 'runtime activate' roll the device back to this OS after an OS update; false saves its size and gives that rollback up."
         }
       },
       "additionalProperties": false
