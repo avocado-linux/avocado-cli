@@ -459,6 +459,7 @@ impl RuntimeProvisionCommand {
         for k in self.config.env_vars.iter().flat_map(|m| m.keys()) {
             env_snapshot.remove(k);
         }
+        crate::commands::provision_bundle::carry_feed(&mut env_snapshot, config.get_repo_url());
         let env_vars = if env_vars.is_empty() {
             None
         } else {

@@ -1002,13 +1002,24 @@ pub struct RubiconConfig {
     /// (name, label or address).
     pub default: Option<String>,
     pub console: Option<RubiconConsole>,
+    /// What each of the Rubicon's pins is wired to on this target
+    /// (`ssr1: "REC button"`, `in1: "power LED"`): shown beside the pin by
+    /// `avocado rubicon show` and in a hub's job log. Extensions (BSPs)
+    /// contribute it with their run profiles; the project wins per pin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wiring: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RubiconConsole {
     /// The DUT's serial console rate (default 115200).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub baud: Option<u32>,
+    /// Which UART of a multi-port USB serial adapter is the console
+    /// (0, the default, is the first: FT4232H port A).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u32>,
 }
 
 /// One step of a Rubicon run profile. A Rubicon has generic outputs
@@ -1024,17 +1035,65 @@ pub enum RubiconStep {
     /// Turn outputs on for this many ms, then off (a button press):
     /// `pulse: { ssr3: 200 }`.
     Pulse(BTreeMap<String, u64>),
+    /// Set servo / linear-actuator outputs to a pulse width in us
+    /// (`servo: { sv1: 1800 }`, about 1000-2000 for a hobby servo); 0 stops
+    /// the pulses so it goes limp.
+    Servo(BTreeMap<String, u32>),
     /// Another run profile's steps, here.
     Run(String),
     WaitMs(u64),
     /// Keep the board's exported USB devices matching these ids
-    /// (`vvvv:pppp`, or `vvvv:*` for any product) attached to the hub for
-    /// the rest of the job, re-attaching them as the DUT re-enumerates.
+    /// (`vvvv:pppp`, `vvvv:*` for any product, or `*` for every device on
+    /// the board's USB port) attached to the hub for the rest of the job,
+    /// re-attaching them as the DUT re-enumerates. `*` suits a port wired
+    /// to the DUT alone: a DUT that re-enumerates under ids nobody listed
+    /// (a flashing gadget, a vendor tool) stays held.
     HoldUsb(Vec<String>),
     /// Wait until a held device with this id is attached.
     WaitUsb(RubiconWaitUsb),
     /// Wait until the DUT's serial console prints one of these markers.
     ConsoleExpect(RubiconConsoleExpect),
+    /// Type this on the DUT's serial console, as is: write the line ending
+    /// (`"boot\r"`) and any escape sequence (`"\e[B"`, down arrow).
+    ConsoleSend(String),
+    /// Hand the card in an SDWire3 on the board's USB port to the hub
+    /// (`host`: a disk there, `AVOCADO_PROVISION_DEVICE` for the provision
+    /// that follows) or to the DUT (`dut`).
+    SdMux(RubiconSdMux),
+    /// The Rubicon's mode: `transfer` (its whole USB/IP buffer pool, for
+    /// flashing; provision jobs switch to it themselves) or `monitor` (part
+    /// of the pool lent to on-board analysis while a DUT runs).
+    Mode(RubiconMode),
+    /// Attach the board's USB device `id` to the hub, run `run` in the
+    /// job's SDK container with it, then let it go (the console pauses
+    /// meanwhile): `with_usb: { id: "0955:7045", run: [boardctl, --target,
+    /// thor-jetson-devkit, recovery] }` presses a Jetson devkit's buttons
+    /// through its debug MCU. Provision jobs only.
+    WithUsb(RubiconWithUsb),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RubiconWithUsb {
+    pub id: String,
+    pub run: Vec<String>,
+    /// Seconds the command may take (the hub's default: 120).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconMode {
+    Transfer,
+    Monitor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubiconSdMux {
+    Host,
+    Dut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -1067,9 +1126,20 @@ fn valid_output(s: &str) -> bool {
     !s.is_empty() && digits.len() < s.len() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// A Rubicon pin name for `rubicon.wiring`: an output, an input or a bus
+/// (`power`, `ssr1`, `ain1`, `uart`, `i2c1`).
+fn valid_pin(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
 /// A USB id pattern from a run profile: `vvvv:pppp` or `vvvv:*`, hex.
 fn valid_usb_id(s: &str, allow_any_pid: bool) -> bool {
     let hex4 = |p: &str| p.len() == 4 && p.chars().all(|c| c.is_ascii_hexdigit());
+    if s == "*" {
+        return allow_any_pid;
+    }
     match s.split_once(':') {
         Some((v, "*")) => allow_any_pid && hex4(v),
         Some((v, p)) => hex4(v) && hex4(p),
@@ -3090,12 +3160,17 @@ impl Config {
 
         // Rubicon run profiles always merge, by name, main first: they are
         // inert until a provision profile names one, and a project replaces
-        // an extension's run profile by defining the same name.
-        if let Some(external_run) = external_config
-            .get("rubicon")
-            .and_then(|r| r.get("run"))
-            .and_then(|r| r.as_mapping())
-        {
+        // an extension's run profile by defining the same name. The wiring
+        // that goes with them merges the same way, per pin.
+        for (key, external_run) in ["run", "wiring"].into_iter().filter_map(|k| {
+            Some((
+                k,
+                external_config
+                    .get("rubicon")
+                    .and_then(|r| r.get(k))
+                    .and_then(|r| r.as_mapping())?,
+            ))
+        }) {
             let main_map = main_config.as_mapping_mut();
             if let Some(main_map) = main_map {
                 let rubicon = main_map
@@ -3103,7 +3178,7 @@ impl Config {
                     .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
                 if let Some(rubicon) = rubicon.as_mapping_mut() {
                     let run = rubicon
-                        .entry(serde_yaml::Value::String("run".into()))
+                        .entry(serde_yaml::Value::String(key.into()))
                         .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
                     if let Some(run) = run.as_mapping_mut() {
                         for (name, steps) in external_run {
@@ -4021,23 +4096,52 @@ impl Config {
     /// them. Runs on the composed config, where extensions' run profiles are
     /// merged in; step names and shapes are already checked by serde.
     pub fn validate_rubicon(&self) -> Result<()> {
+        let wiring = self.rubicon.as_ref().map(|r| &r.wiring);
+        if let Some(pin) = wiring
+            .into_iter()
+            .flatten()
+            .map(|(p, _)| p)
+            .find(|p| !valid_pin(p))
+        {
+            anyhow::bail!(
+                "rubicon.wiring: bad pin name {pin:?} (pins are named like power, ssr1, in1, \
+                 ain1, la0, uart2, i2c1)"
+            );
+        }
         let run = self.rubicon.as_ref().map(|r| &r.run);
         for (name, steps) in run.into_iter().flatten() {
             for step in steps {
                 let bad = match step {
                     RubiconStep::HoldUsb(ids) => ids.iter().find(|i| !valid_usb_id(i, true)),
                     RubiconStep::WaitUsb(w) => (!valid_usb_id(&w.id, false)).then_some(&w.id),
+                    RubiconStep::WithUsb(w) => (!valid_usb_id(&w.id, false)).then_some(&w.id),
                     _ => None,
                 };
                 if let Some(id) = bad {
                     anyhow::bail!(
                         "rubicon.run.{name}: bad USB id {id:?} (want vvvv:pppp in hex; \
-                         hold_usb also takes vvvv:*)"
+                         hold_usb also takes vvvv:* and *)"
                     );
+                }
+                if let RubiconStep::WithUsb(w) = step {
+                    if w.run.first().is_none_or(|c| c.is_empty()) {
+                        anyhow::bail!("rubicon.run.{name}: with_usb needs a command to run");
+                    }
+                }
+                if let RubiconStep::Servo(sv) = step {
+                    if let Some((n, us)) = sv
+                        .iter()
+                        .find(|(_, us)| **us != 0 && !(400..=2600).contains(*us))
+                    {
+                        anyhow::bail!(
+                            "rubicon.run.{name}: servo {n} {us} us (want 400-2600, or 0 for off)"
+                        );
+                    }
                 }
                 let outputs: Vec<&String> = match step {
                     RubiconStep::Out(o) => o.keys().collect(),
                     RubiconStep::Pulse(p) => p.keys().collect(),
+                    RubiconStep::Servo(s) => s.keys().collect(),
                     _ => vec![],
                 };
                 if let Some(o) = outputs.into_iter().find(|o| !valid_output(o)) {
@@ -15069,6 +15173,129 @@ provision:
     }
 
     #[test]
+    fn with_usb_steps_parse_check_and_reach_the_hub_as_it_reads_them() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    rec:\n      - with_usb: { id: \"0955:7045\", run: [boardctl, --target, thor-jetson-devkit, recovery] }\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("rec").unwrap()).unwrap(),
+            serde_json::json!([{"with_usb": {"id": "0955:7045",
+                "run": ["boardctl", "--target", "thor-jetson-devkit", "recovery"]}}])
+        );
+        for (yaml, why) in [
+            ("{ id: \"0955:*\", run: [boardctl] }", "bad USB id"),
+            ("{ id: \"0955:7045\", run: [] }", "needs a command"),
+        ] {
+            let c: Config = serde_yaml::from_str(&format!(
+                "rubicon:\n  run:\n    rec:\n      - with_usb: {yaml}\n"
+            ))
+            .unwrap();
+            let e = c.validate_rubicon().unwrap_err().to_string();
+            assert!(e.contains(why), "{e}");
+        }
+    }
+
+    #[test]
+    fn sd_mux_steps_parse_and_reach_the_hub_as_it_reads_them() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    write:\n      - sd_mux: host\n      - sd_mux: dut\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        let steps = c.rubicon_steps("write").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                RubiconStep::SdMux(RubiconSdMux::Host),
+                RubiconStep::SdMux(RubiconSdMux::Dut)
+            ]
+        );
+        // The bundle carries them as the agent parses them.
+        assert_eq!(
+            serde_json::to_value(&steps).unwrap(),
+            serde_json::json!([{"sd_mux": "host"}, {"sd_mux": "dut"}])
+        );
+        assert!(serde_yaml::from_str::<Config>(
+            "rubicon:\n  run:\n    w:\n      - sd_mux: sideways\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn console_send_and_wiring_parse_and_bad_pins_fail() {
+        let c: Config = serde_yaml::from_str(
+            "rubicon:\n  wiring: { ssr1: REC button, i2c1: carrier EEPROM }\n  run:\n    \
+             stop:\n      - console_send: \"\\e[B boot\\r\"\n",
+        )
+        .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("stop").unwrap()).unwrap(),
+            serde_json::json!([{"console_send": "\u{1b}[B boot\r"}])
+        );
+        assert_eq!(c.rubicon.as_ref().unwrap().wiring["ssr1"], "REC button");
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    w: [ { mode: monitor } ]\n").unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("w").unwrap()).unwrap(),
+            serde_json::json!([{"mode": "monitor"}])
+        );
+        assert!(
+            serde_yaml::from_str::<Config>("rubicon:\n  run:\n    w: [ { mode: idle } ]\n")
+                .is_err()
+        );
+        // Servo widths reach the hub as numbers; out of range fails early.
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    p: [ { servo: { sv1: 1800, sv2: 0 } } ]\n")
+                .unwrap();
+        c.validate_rubicon().unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon_steps("p").unwrap()).unwrap(),
+            serde_json::json!([{"servo": {"sv1": 1800, "sv2": 0}}])
+        );
+        let far: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    p: [ { servo: { sv1: 3000 } } ]\n")
+                .unwrap();
+        assert!(far
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("400-2600"));
+        // The console settings reach the hub as it reads them (consoles.rs).
+        let c: Config =
+            serde_yaml::from_str("rubicon:\n  console: { baud: 1500000, port: 2 }\n").unwrap();
+        assert_eq!(
+            serde_json::to_value(c.rubicon.unwrap().console).unwrap(),
+            serde_json::json!({"baud": 1500000, "port": 2})
+        );
+        let bad: Config = serde_yaml::from_str("rubicon:\n  wiring: { SSR 1: x }\n").unwrap();
+        assert!(bad
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("bad pin name"));
+    }
+
+    #[test]
+    fn hold_usb_takes_a_wildcard_for_the_whole_port_and_wait_usb_does_not() {
+        let any: Config =
+            serde_yaml::from_str("rubicon:\n  run:\n    p: [ { hold_usb: [\"*\"] } ]\n").unwrap();
+        any.validate_rubicon()
+            .expect("* holds every device on the port");
+        let wait: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    p: [ { wait_usb: { id: \"*\", timeout_s: 5 } } ]\n",
+        )
+        .unwrap();
+        assert!(wait
+            .validate_rubicon()
+            .unwrap_err()
+            .to_string()
+            .contains("bad USB id"));
+    }
+
+    #[test]
     fn run_steps_expand_in_place_and_loops_and_typos_fail() {
         let c: Config = serde_yaml::from_str(
             "rubicon:\n  run:\n    off:\n      - out: { power: \"off\" }\n\
@@ -15155,6 +15382,19 @@ provision:
         );
         let profiles = c.provision_profiles.as_ref().unwrap();
         assert!(profiles.contains_key("usb") && profiles.contains_key("tegraflash"));
+    }
+
+    #[test]
+    fn wiring_merges_per_pin_with_the_project_winning() {
+        let c = merge(
+            "rubicon:\n  wiring: { ssr1: my REC lead }\n",
+            "rubicon:\n  wiring: { ssr1: REC button, power: DC jack }\n",
+        );
+        let w = &c.rubicon.as_ref().unwrap().wiring;
+        assert_eq!(
+            (w["ssr1"].as_str(), w["power"].as_str()),
+            ("my REC lead", "DC jack")
+        );
     }
 
     #[test]

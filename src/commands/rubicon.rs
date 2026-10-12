@@ -95,7 +95,8 @@ impl RubiconCommand {
             RubiconAction::List => self.list().await,
             RubiconAction::Show { board } => {
                 let b = self.board(board).await?;
-                show(&b);
+                let wiring = self.project().and_then(|c| Some(c.rubicon?.wiring));
+                show(&b, &wiring.unwrap_or_default());
                 Ok(())
             }
             // Boards are added to this machine's VM; Connect learns of them
@@ -357,7 +358,14 @@ impl RubiconCommand {
         )?;
         let steps = config.rubicon_steps(profile)?;
         let b = self.board(board).await?;
-        let params = json!({"address": b.address, "name": profile, "steps": steps});
+        let wiring = config
+            .rubicon
+            .as_ref()
+            .map(|r| r.wiring.clone())
+            .unwrap_or_default();
+        let console = config.rubicon.as_ref().and_then(|r| r.console.clone());
+        let params = json!({"address": b.address, "name": profile, "steps": steps,
+                            "wiring": wiring, "console": console});
         let r =
             remote::run_command(&b, "rubicon_run", params, self.connect_profile.as_deref()).await?;
         remote::report(&r, &format!("{profile} on {}", b.describe()))?;
@@ -385,7 +393,11 @@ impl RubiconCommand {
                 b.describe()
             );
         }
-        let baud = self.project().and_then(|c| c.rubicon?.console?.baud);
+        let console = self.project().and_then(|c| c.rubicon?.console);
+        let (baud, port) = (
+            console.as_ref().and_then(|c| c.baud),
+            console.as_ref().and_then(|c| c.port),
+        );
         let mut cmd = format!("avocado-vm-agent console {}", sh_quote(&b.address));
         for (on, flag) in [
             (write, " --write"),
@@ -398,6 +410,9 @@ impl RubiconCommand {
         }
         if let Some(baud) = baud {
             cmd.push_str(&format!(" --baud {baud}"));
+        }
+        if let Some(port) = port {
+            cmd.push_str(&format!(" --port {port}"));
         }
         if let Some(t) = token {
             cmd.push_str(&format!(" --token {}", sh_quote(&t)));
@@ -542,7 +557,7 @@ async fn upload_firmware(profile: Option<&str>, fw: &Firmware) -> Result<String>
     Ok(id)
 }
 
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -601,9 +616,13 @@ fn state(b: &Board) -> String {
     )
 }
 
-fn show(b: &Board) {
+fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
     println!("{}", b.describe());
     println!("  state:    {}", state(b));
+    // The project's wiring, by pin: what this board drives on its DUT.
+    for (pin, what) in wiring {
+        println!("  {:<9} {what}", format!("{pin}:"));
+    }
     if let Some(m) = b.info["model"].as_str().filter(|m| !m.is_empty()) {
         println!("  model:    {m}");
     }
