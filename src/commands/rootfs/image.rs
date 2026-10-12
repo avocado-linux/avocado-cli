@@ -330,9 +330,14 @@ pub fn generate_rootfs_build_script(
     let post = resolve_install_hooks(post_install, DEFAULT_ROOTFS_POST_INSTALL);
     let post_install_block = render_hook_block("post_install", &post);
     // rootfs.image.verity: dm-verity hash tree over the finished rootfs image.
-    // With verity off nothing is written: a machine whose stone manifest names
-    // the hash image ships a zero placeholder in avocado-img-bootfiles, and a
-    // real tree written here simply replaces it.
+    // The tree and root hash go to $OUTPUT_DIR/rootfs-verity, a directory this
+    // section owns and stone searches ahead of $OUTPUT_DIR (runtime build).
+    // Never beside the image: $OUTPUT_DIR is the runtime's dnf install root,
+    // where a machine whose stone manifest names the hash image installs a
+    // zero placeholder (avocado-img-bootfiles) under that very name. Written
+    // there, a tree overwrote the package's file; removed there for verity
+    // off, it took the placeholder too, and every verity-off build of such a
+    // machine failed in stone.
     // Same producer as extensions (fixed zero salt, reproducible root hash),
     // but the consumer is different: the kernel mounts the rootfs from
     // root=/dev/mapper/root set up by systemd-veritysetup-generator from the
@@ -343,9 +348,11 @@ pub fn generate_rootfs_build_script(
     let verity_step = if verity {
         r#"
     echo "Computing dm-verity hash tree for the rootfs..."
-    ROOTFS_VERITY="${ROOTFS_OUTPUT%.*}.verity"
-    ROOTFS_ROOTHASH_FILE="${ROOTFS_OUTPUT%.*}.roothash"
-    rm -f "$ROOTFS_VERITY" "$ROOTFS_ROOTHASH_FILE"
+    rm -rf "$OUTPUT_DIR/rootfs-verity"
+    mkdir -p "$OUTPUT_DIR/rootfs-verity"
+    ROOTFS_VERITY_BASE="$OUTPUT_DIR/rootfs-verity/$(basename "${ROOTFS_OUTPUT%.*}")"
+    ROOTFS_VERITY="$ROOTFS_VERITY_BASE.verity"
+    ROOTFS_ROOTHASH_FILE="$ROOTFS_VERITY_BASE.roothash"
     veritysetup format \
         --salt=0000000000000000000000000000000000000000000000000000000000000000 \
         --uuid=00000000-0000-0000-0000-000000000000 \
@@ -361,10 +368,11 @@ pub fn generate_rootfs_build_script(
     echo "rootfs dm-verity root hash: $AVOCADO_ROOTFS_ROOTHASH"
 "#
     } else {
-        // Verity off: drop any tree from an earlier verity-on build so stone
-        // ships the placeholder from avocado-img-bootfiles, not a stale tree.
+        // Verity off: drop a tree from an earlier verity-on build, so stone
+        // falls through to the placeholder avocado-img-bootfiles installed.
         r#"
-    rm -f "${ROOTFS_OUTPUT%.*}.verity" "${ROOTFS_OUTPUT%.*}.roothash"
+    rm -rf "$OUTPUT_DIR/rootfs-verity"
+    mkdir -p "$OUTPUT_DIR/rootfs-verity"
 "#
     };
     format!(
@@ -936,6 +944,17 @@ mod tests {
         );
         let without = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
         assert!(!without.contains("veritysetup"));
+        // The tree lives in a directory the build owns, never beside the image
+        // in the runtime's install root, where the BSP's placeholder of the
+        // same name lives: verity off must not remove it.
+        assert!(with.contains("ROOTFS_VERITY_BASE=\"$OUTPUT_DIR/rootfs-verity/"));
+        for script in [&with, &without] {
+            assert!(script.contains("rm -rf \"$OUTPUT_DIR/rootfs-verity\""));
+            assert!(
+                !script.contains("${ROOTFS_OUTPUT%.*}.verity"),
+                "the hash tree must not be written or removed beside the rootfs image"
+            );
+        }
         for script in [&with, &without] {
             let ok = std::process::Command::new("sh")
                 .arg("-n")
