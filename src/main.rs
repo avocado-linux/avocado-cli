@@ -3498,6 +3498,7 @@ async fn main() -> Result<()> {
                 RubiconCommands::Run { profile, board } => A::Run { board, profile },
                 RubiconCommands::Console { board, read_only } => A::Console { board, read_only },
                 RubiconCommands::Logs { board, follow } => A::Logs { board, follow },
+                RubiconCommands::Cancel { job, board } => A::Cancel { board, job },
                 RubiconCommands::Claim { board } => A::Claim { board },
                 RubiconCommands::Update {
                     board,
@@ -5424,6 +5425,14 @@ enum RubiconCommands {
         /// Keep printing as it prints.
         #[arg(short, long)]
         follow: bool,
+    },
+    /// Cancel a job on a board's hub: waiting, it leaves the queue; running,
+    /// it is stopped and the board cleaned up. The job id (or its start) is
+    /// in `avocado rubicon list`.
+    Cancel {
+        job: String,
+        #[arg(long)]
+        board: Option<String>,
     },
 }
 
