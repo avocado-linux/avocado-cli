@@ -499,12 +499,12 @@ impl RuntimeProvisionCommand {
         // Bound above, before the kernel cmdline export.
         let merged_runtime = merged_runtime.clone().unwrap_or_default();
         let var_ctx = crate::commands::runtime::var_image::VarImageContext {
-                runtime_name: &self.config.runtime_name,
-                target_arch: &target_arch,
-                config,
-                parsed,
-                merged_runtime: &merged_runtime,
-                ext_list: &resolved_extensions,
+            runtime_name: &self.config.runtime_name,
+            target_arch: &target_arch,
+            config,
+            parsed,
+            merged_runtime: &merged_runtime,
+            ext_list: &resolved_extensions,
         };
         let var_section = crate::commands::runtime::var_image::render_var_image(&var_ctx)?;
         // --pack: what a bundle replays after restoring its files. Built by
@@ -593,6 +593,7 @@ impl RuntimeProvisionCommand {
                     runtime: &self.config.runtime_name,
                     env: &env_snapshot,
                     provision_script,
+                    config,
                 },
             )?;
             return Ok(());
