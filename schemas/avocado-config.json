@@ -2322,9 +2322,24 @@
               "type": "integer",
               "minimum": 1,
               "description": "Console rate (default 115200)."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Which UART of a multi-port USB serial adapter is the console (0, the default, is the first: FT4232H port A)."
             }
           },
           "additionalProperties": false
+        },
+        "wiring": {
+          "type": "object",
+          "description": "What each of the Rubicon's pins is wired to on this target (ssr1: \"REC button\"), shown beside the pin by `avocado rubicon show` and in a hub's job log. Extensions contribute it with their run profiles; the project wins per pin.",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false
@@ -2358,6 +2373,15 @@
           "additionalProperties": {
             "type": "integer",
             "minimum": 1
+          }
+        },
+        "servo": {
+          "type": "object",
+          "description": "Set servo / linear-actuator outputs to a pulse width in us (servo: { sv1: 1800 }, about 1000-2000 for a hobby servo); 0 stops the pulses.",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2600
           }
         },
         "run": {
@@ -2416,6 +2440,26 @@
           ],
           "additionalProperties": false,
           "description": "Wait until the DUT's serial console prints one of these markers."
+        },
+        "console_send": {
+          "type": "string",
+          "description": "Type this on the DUT's serial console, as is: write the line ending (\"boot\\r\") and any escape sequence (\"\\u001b[B\", down arrow)."
+        },
+        "sd_mux": {
+          "type": "string",
+          "enum": [
+            "host",
+            "dut"
+          ],
+          "description": "Hand the card in an SDWire3 on the board's USB port to the hub (host: a disk there, AVOCADO_PROVISION_DEVICE for the provision that follows) or to the DUT (dut)."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "transfer",
+            "monitor"
+          ],
+          "description": "The Rubicon's mode: transfer (its whole USB/IP buffer pool, for flashing; provision jobs switch to it themselves) or monitor (part of the pool lent to on-board analysis while a DUT runs)."
         }
       },
       "minProperties": 1,
