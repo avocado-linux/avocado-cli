@@ -51,6 +51,23 @@ struct Rendered {
     post_creation_section: String,
     device_tree_overlay_section: String,
     var_luks_room: &'static str,
+    keep_initial_os_rollback: &'static str,
+}
+
+/// `runtimes.<r>.var.initial_os_rollback`: whether the provisioned var image carries
+/// the OS bundle (default true). Anything but a boolean is an error, not a
+/// silent default.
+fn keep_initial_os_rollback(merged_runtime: &serde_yaml::Value) -> Result<bool> {
+    match merged_runtime
+        .get("var")
+        .and_then(|v| v.get("initial_os_rollback"))
+    {
+        None => Ok(true),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => {
+            anyhow::bail!("var.initial_os_rollback must be true or false, got {other:?}")
+        }
+    }
 }
 
 fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
@@ -318,6 +335,11 @@ echo "Docker image priming complete.""#,
         post_creation_section,
         device_tree_overlay_section,
         var_luks_room: if var_encrypt(target_arch) { "1" } else { "0" },
+        keep_initial_os_rollback: if keep_initial_os_rollback(merged_runtime)? {
+            "1"
+        } else {
+            "0"
+        },
     })
 }
 
@@ -618,7 +640,22 @@ fi
 export AVOCADO_MANIFEST_PATH="$MANIFEST_FILE"
 {docker_section}
 
+# The build linked the OS bundle into var-staging for Connect upload. In the
+# var image it is what `runtime activate` uses to roll the device back to
+# this OS after an OS update. `var.initial_os_rollback: false` leaves it out (it is the
+# size of the rootfs, initramfs and kernel again); the signed manifest still
+# names it, so that rollback then fails with the bundle not found.
+OS_BUNDLE_ID=$(python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("os_bundle") or {{}}).get("image_id", ""))' "$MANIFEST_FILE")
+OS_BUNDLE_ASIDE=""
+if [ "{keep_initial_os_rollback}" = "0" ] && [ -n "$OS_BUNDLE_ID" ] && [ -f "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" ]; then
+    OS_BUNDLE_ASIDE="$OUTPUT_DIR/os-bundle-aside.raw"
+    mv "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" "$OS_BUNDLE_ASIDE" || exit 1
+fi
+
 VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+# mkfs.btrfs writes into an existing file without shrinking it, so a var
+# image left by an earlier, larger provision would keep that size.
+rm -f "$VAR_IMAGE"
 VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
 VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
 echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
@@ -659,6 +696,9 @@ if [ "{var_luks_room}" = "1" ]; then
 fi
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
+if [ -n "$OS_BUNDLE_ASIDE" ]; then
+    mv "$OS_BUNDLE_ASIDE" "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" || exit 1
+fi
 
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
@@ -674,6 +714,7 @@ echo "Built var image: ${{FINAL_MB}}MB"
         global_compress_flag = r.global_compress_flag,
         post_creation_section = r.post_creation_section,
         var_luks_room = r.var_luks_room,
+        keep_initial_os_rollback = r.keep_initial_os_rollback,
     ))
 }
 
@@ -748,7 +789,8 @@ runtimes:
         for needle in [
             "$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH",
             "stone bundle",
-            "os_bundle",
+            // The patch; the var half only reads the key to leave the bundle out.
+            "os_bundle = dict(",
             "sign_amf \"$AVOCADO_MANIFEST_PATH\"",
         ] {
             assert!(ota.contains(needle), "OTA half must contain {needle}");
@@ -1098,6 +1140,80 @@ stone() {
         let (code, out, err, _) = run(Some("ID=avocado\n"), None, None);
         assert_eq!(code, Some(0), "{err}");
         assert!(out.contains("TAIL-DONE"));
+    }
+
+    /// The var image carries the OS bundle (the factory rollback) unless the
+    /// runtime sets `var.initial_os_rollback: false`; either way var-staging still has
+    /// it afterwards for Connect upload, and a stale image is not reused.
+    #[test]
+    fn the_var_image_carries_the_initial_os_rollback_unless_the_runtime_opts_out() {
+        assert_eq!(packed_images(BASE), "aos1.raw\next1.raw");
+        let opted_out = format!("{BASE}    var:\n      initial_os_rollback: false\n");
+        assert_eq!(packed_images(&opted_out), "ext1.raw");
+    }
+
+    #[test]
+    fn var_initial_os_rollback_must_be_a_boolean() {
+        let v: serde_yaml::Value =
+            serde_yaml::from_str("var:\n  initial_os_rollback: \"no\"\n").unwrap();
+        assert!(keep_initial_os_rollback(&v).is_err());
+    }
+
+    /// Runs the var half against a stand-in mkfs.btrfs; returns the images it
+    /// would have packed.
+    fn packed_images(config: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path();
+        let lib = prefix.join("runtimes/test-runtime/var-staging/lib/avocado");
+        std::fs::create_dir_all(lib.join("images")).unwrap();
+        std::fs::create_dir_all(lib.join("runtimes/b1")).unwrap();
+        std::os::unix::fs::symlink("runtimes/b1", lib.join("active")).unwrap();
+        std::fs::write(
+            lib.join("runtimes/b1/manifest.json"),
+            r#"{"os_bundle": {"image_id": "aos1", "sha256": "x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(lib.join("images/aos1.raw"), "bundle").unwrap();
+        std::fs::write(lib.join("images/ext1.raw"), "ext").unwrap();
+        // mkfs.btrfs stand-in: record what it would pack, write the image.
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mkfs = bin.join("mkfs.btrfs");
+        std::fs::write(
+            &mkfs,
+            "#!/bin/sh\nls \"$AVOCADO_IMAGES_DIR\" > \"$OUTPUT_DIR/packed\"\n\
+             while [ $# -gt 1 ]; do shift; done; echo img >> \"$1\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mkfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A larger image from an earlier provision must not keep its size.
+        let image = prefix.join("runtimes/test-runtime/avocado-image-var-x86_64.btrfs");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let script = prefix.join("var.sh");
+        std::fs::write(&script, var_half(config)).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", prefix)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        let packed = std::fs::read_to_string(prefix.join("runtimes/test-runtime/packed"))
+            .unwrap_or_else(|_| panic!("mkfs never ran: {}", String::from_utf8_lossy(&out.stderr)));
+        assert!(lib.join("images/aos1.raw").is_file(), "bundle not put back");
+        assert!(!prefix
+            .join("runtimes/test-runtime/os-bundle-aside.raw")
+            .exists());
+        // Like mkfs.btrfs, the stand-in writes into whatever file is there.
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().len(),
+            4,
+            "stale image reused"
+        );
+        packed.trim().to_string()
     }
 
     #[test]

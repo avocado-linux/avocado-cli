@@ -1128,6 +1128,12 @@ pub struct VarConfig {
     /// slot; requires `recovery`).
     #[serde(default)]
     pub hardware: Option<String>,
+    /// Whether the provisioned var image carries the OS bundle (default
+    /// true). It is what `runtime activate` rolls the device back to this OS
+    /// with after an OS update; false saves its size (rootfs, initramfs and
+    /// kernel again) and gives that rollback up. OTA is unaffected.
+    #[serde(default)]
+    pub initial_os_rollback: Option<bool>,
 }
 
 /// Accepted values of `runtimes.<r>.var.hardware`.
