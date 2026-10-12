@@ -53,6 +53,52 @@ impl BundleUploadCommand {
 /// Upload a bundle directory, sending only blobs Connect lacks. `links`
 /// is merged into the create request (e.g. `{"runtime_id": …}`). Returns
 /// the bundle id.
+/// Upload one blob's multipart `parts` (`[{part_number, upload_url}]`) from
+/// `path`, re-signing through `refresh` (a GET returning `data.parts`) when a
+/// part fails. Returns the completed parts for the `complete` call.
+pub(crate) async fn upload_parts(
+    c: &ConnectClient,
+    path: &std::path::Path,
+    mut parts: Vec<Value>,
+    refresh: &str,
+) -> Result<Vec<Value>> {
+    let size = std::fs::metadata(path)?.len();
+    let mut f = std::fs::File::open(path)?;
+    let mut done = Vec::new();
+    for i in 0..parts.len() {
+        let n = parts[i]["part_number"].as_u64().context("part_number")?;
+        let off = (n - 1) * PART_SIZE;
+        let mut buf = vec![0u8; PART_SIZE.min(size - off) as usize];
+        f.seek(SeekFrom::Start(off))?;
+        f.read_exact(&mut buf)?;
+        let sum = BASE64_STANDARD.encode(Sha256::digest(&buf));
+        let mut tries = 0;
+        let etag = loop {
+            let url = parts[i]["upload_url"]
+                .as_str()
+                .context("upload_url")?
+                .to_string();
+            match c.upload_part(&url, buf.clone(), &sum).await {
+                Ok(e) => break e,
+                Err(e) if tries < 3 => {
+                    tries += 1;
+                    eprintln!(
+                        "  {}: part {n}: {e}; refreshing URLs and retrying",
+                        path.display()
+                    );
+                    let fresh = c.json(Method::GET, refresh, None).await?;
+                    if let Some(p) = fresh["data"]["parts"].as_array() {
+                        parts = p.clone();
+                    }
+                }
+                Err(e) => bail!("{} part {n} failed: {e}", path.display()),
+            }
+        };
+        done.push(json!({"part_number": n, "etag": etag, "checksum_sha256": sum}));
+    }
+    Ok(done)
+}
+
 pub async fn upload_bundle(
     c: &ConnectClient,
     org: &str,
@@ -135,46 +181,14 @@ pub async fn upload_bundle(
                 .to_string();
             let path = dir.join("blobs").join(&sha);
             let size = std::fs::metadata(&path)?.len();
-            let mut f = std::fs::File::open(&path)?;
-            let mut parts: Vec<Value> = u["parts"].as_array().cloned().unwrap_or_default();
-            let mut done = Vec::new();
-            for i in 0..parts.len() {
-                let n = parts[i]["part_number"].as_u64().context("part_number")?;
-                let off = (n - 1) * PART_SIZE;
-                let mut buf = vec![0u8; PART_SIZE.min(size - off) as usize];
-                f.seek(SeekFrom::Start(off))?;
-                f.read_exact(&mut buf)?;
-                let sum = BASE64_STANDARD.encode(Sha256::digest(&buf));
-                let mut tries = 0;
-                let etag = loop {
-                    let url = parts[i]["upload_url"]
-                        .as_str()
-                        .context("upload_url")?
-                        .to_string();
-                    match c.upload_part(&url, buf.clone(), &sum).await {
-                        Ok(e) => break e,
-                        Err(e) if tries < 3 => {
-                            tries += 1;
-                            eprintln!(
-                                "  {}: part {n}: {e}; refreshing URLs and retrying",
-                                &sha[..12]
-                            );
-                            let fresh = c
-                                .json(
-                                    Method::GET,
-                                    &format!("/api/orgs/{org}/provision-bundles/{id}/upload-urls?sha256={sha}"),
-                                    None,
-                                )
-                                .await?;
-                            if let Some(p) = fresh["data"]["parts"].as_array() {
-                                parts = p.clone();
-                            }
-                        }
-                        Err(e) => bail!("blob {sha} part {n} failed: {e}"),
-                    }
-                };
-                done.push(json!({"part_number": n, "etag": etag, "checksum_sha256": sum}));
-            }
+            let parts: Vec<Value> = u["parts"].as_array().cloned().unwrap_or_default();
+            let done = upload_parts(
+                c,
+                &path,
+                parts,
+                &format!("/api/orgs/{org}/provision-bundles/{id}/upload-urls?sha256={sha}"),
+            )
+            .await?;
             print_info(
                 &format!("  uploaded {} ({} MiB)", &sha[..12], size >> 20),
                 OutputLevel::Normal,
