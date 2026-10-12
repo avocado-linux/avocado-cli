@@ -1,19 +1,21 @@
-//! `avocado provision --rubicon <board>`: provision on a remote device
-//! through the avocado-vm hub that drives that Rubicon.
-//!
-//! The provision is packed here (the normal provision path, stopping at the
-//! hook; see `provision_bundle`), the bundle is brought to the hub, and the
-//! hub's job runner does the rest on the LAN next to the board: recovery,
-//! USB/IP attach, the provisioning hook, the boot check. The job's log
-//! streams back here and its result is this command's exit code.
+//! Reaching a Rubicon through the avocado-vm hub that drives it, for
+//! `avocado provision --rubicon <board>` and `avocado rubicon …`.
 //!
 //! Which hub:
-//! - local: this machine's avocado-vm is running and has the board in its
-//!   Rubicon list. The bundle is packed into the VM's workspace share, so
-//!   nothing is copied; the job goes to the agent over SSH.
+//! - local: this machine's avocado-vm has the board in its Rubicon list.
+//!   Commands go to the agent over SSH; a provision's bundle is packed into
+//!   the VM's workspace share, so nothing is copied.
 //! - connect: otherwise, the org's VMs (as Connect sees them) are searched
-//!   for the board. Only blobs Connect lacks are uploaded, then the job is
-//!   queued for that VM. Works from anywhere.
+//!   for the board. Commands are queued through Connect; a provision
+//!   uploads only the blobs Connect lacks. Works from anywhere.
+//!
+//! A board is named by its firmware name, its label or its address. A name
+//! that matches several boards is an error listing them: never the first.
+//!
+//! The provision itself is packed here (the normal provision path,
+//! stopping at the hook; see `provision_bundle`) and run by the hub's job
+//! runner next to the board. Its log streams back here and its result is
+//! this command's exit code.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -22,7 +24,9 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::commands::connect::client::ConnectClient;
 use crate::commands::connect::hub::{connect, upload_bundle, ProvisionJobCommand};
 use crate::commands::provision::ProvisionCommand;
 use crate::commands::provision_bundle::BundleMeta;
@@ -39,18 +43,52 @@ pub enum Via {
     Connect,
 }
 
-pub struct RemoteProvision {
-    pub rubicon: String,
-    pub via: Via,
-    /// Connect only: which VM, when several know a board by this name.
-    pub vm: Option<String>,
-    pub connect_profile: Option<String>,
-    pub provision_profile: Option<String>,
-    /// Project directory (where `--pack` stages into).
-    pub src_dir: PathBuf,
+#[derive(Clone, Debug, PartialEq)]
+pub enum Hub {
+    /// This machine's avocado-vm.
+    Local,
+    /// A VM in the Connect org.
+    Connect { vm: String, vm_name: String },
 }
 
-/// Does `wanted` name this board (label, hello name, or address)?
+/// A Rubicon as one hub reports it. `info` is that hub's record of it (the
+/// agent's inventory entry, or Connect's Rubicon row).
+#[derive(Clone, Debug)]
+pub struct Board {
+    pub address: String,
+    pub name: Option<String>,
+    pub label: Option<String>,
+    pub hub: Hub,
+    pub info: Value,
+    /// Connect boards: the instance id of the VM that reported it (this
+    /// machine's own VM shows up in Connect too).
+    pub vm_instance: Option<String>,
+}
+
+impl Board {
+    /// How to name this board unambiguously in a list of candidates.
+    pub fn describe(&self) -> String {
+        let hub = match &self.hub {
+            Hub::Local => "this machine's VM".to_string(),
+            Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+        };
+        let mut s = self.name.clone().unwrap_or_else(|| self.address.clone());
+        if let Some(l) = &self.label {
+            s.push_str(&format!(" ({l})"));
+        }
+        format!("{s} at {} on {hub}", self.address)
+    }
+}
+
+/// Where to look for boards.
+pub struct Scope<'a> {
+    pub via: Via,
+    /// Connect only: which VM, when several know a board.
+    pub vm: Option<&'a str>,
+    pub connect_profile: Option<&'a str>,
+}
+
+/// Does `wanted` name this board (label, firmware name, or address)?
 fn matches(wanted: &str, address: &str, label: Option<&str>, name: Option<&str>) -> bool {
     let w = wanted.trim();
     [Some(address), label, name]
@@ -59,101 +97,305 @@ fn matches(wanted: &str, address: &str, label: Option<&str>, name: Option<&str>)
         .any(|v| v.eq_ignore_ascii_case(w))
 }
 
-enum Hub {
-    Local {
-        address: String,
-    },
-    Connect {
-        vm: String,
-        vm_name: String,
-        address: String,
-    },
+fn s(v: &Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// This machine's VM's boards: its configured list, with each board's live
+/// state when the VM is running. Empty when there is no VM here.
+pub async fn local_boards() -> Result<Vec<Board>> {
+    let Ok(paths) = VmPaths::resolve() else {
+        return Ok(vec![]);
+    };
+    let cfg = VmConfig::load(&paths)?;
+    let list = hub::rubicons(&cfg)?;
+    if list.is_empty() {
+        return Ok(vec![]);
+    }
+    let live = if lifecycle::status().await?.running {
+        let t = lifecycle::ssh_target_for_running()?;
+        hub::agent_request(&t, &json!({"op": "inventory"}))
+            .await
+            .ok()
+    } else {
+        None
+    };
+    Ok(list
+        .into_iter()
+        .map(|r| {
+            let info = live
+                .as_ref()
+                .and_then(|v| {
+                    v["inventory"]["rubicons"]
+                        .as_array()?
+                        .iter()
+                        .find(|b| b["address"] == r.address.as_str())
+                        .cloned()
+                })
+                .unwrap_or(Value::Null);
+            Board {
+                name: s(&info["name"]),
+                label: r.label,
+                address: r.address,
+                hub: Hub::Local,
+                info,
+                vm_instance: None,
+            }
+        })
+        .collect())
+}
+
+/// This machine's VM's instance id, if it has one (read, never created).
+pub fn local_instance() -> Option<String> {
+    let paths = VmPaths::resolve().ok()?;
+    std::fs::read_to_string(paths.instance_id_file())
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+}
+
+/// The boards of the org's VMs, as Connect sees them.
+pub async fn connect_boards(profile: Option<&str>, vm: Option<&str>) -> Result<Vec<Board>> {
+    let (c, org) = connect(profile, None)?;
+    let vms = c
+        .json(Method::GET, &format!("/api/orgs/{org}/vms"), None)
+        .await?;
+    let mut out = Vec::new();
+    for v in vms["data"].as_array().into_iter().flatten() {
+        let id = v["id"].as_str().unwrap_or_default();
+        if vm.is_some_and(|want| want != id) {
+            continue;
+        }
+        let vm_name = s(&v["vm"]["hostname"])
+            .or(s(&v["name"]))
+            .unwrap_or_else(|| id.to_string());
+        for r in v["rubicons"].as_array().into_iter().flatten() {
+            out.push(Board {
+                address: r["address"].as_str().unwrap_or_default().to_string(),
+                name: s(&r["name"]),
+                label: s(&r["label"]),
+                hub: Hub::Connect {
+                    vm: id.to_string(),
+                    vm_name: vm_name.clone(),
+                },
+                info: r.clone(),
+                vm_instance: s(&v["vm"]["instance_id"]),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The one board in `boards` that `wanted` names, if any; several is an
+/// error that lists them.
+pub fn pick(wanted: &str, boards: Vec<Board>) -> Result<Option<Board>> {
+    let mut found: Vec<Board> = boards
+        .into_iter()
+        .filter(|b| matches(wanted, &b.address, b.label.as_deref(), b.name.as_deref()))
+        .collect();
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => bail!(
+            "{wanted:?} matches several Rubicons; name one by its name or address:\n  {}{}",
+            found
+                .iter()
+                .map(Board::describe)
+                .collect::<Vec<_>>()
+                .join("\n  "),
+            if found.iter().any(|b| matches!(b.hub, Hub::Connect { .. })) {
+                "\n(--vm picks the VM)"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// The board `wanted` names: this machine's VM first, then Connect.
+pub async fn resolve(wanted: &str, scope: &Scope<'_>) -> Result<Board> {
+    if scope.via != Via::Connect {
+        if let Some(b) = pick(wanted, local_boards().await?)? {
+            if !lifecycle::status().await?.running {
+                bail!(
+                    "Rubicon {:?} belongs to this machine's avocado-vm, which is not running (`avocado vm start`)",
+                    wanted
+                );
+            }
+            return Ok(b);
+        }
+        if scope.via == Via::Local {
+            bail!("this machine's avocado-vm has no Rubicon {wanted:?} (`avocado rubicon list`)");
+        }
+    }
+    pick(
+        wanted,
+        connect_boards(scope.connect_profile, scope.vm).await?,
+    )?
+    .with_context(|| format!("no VM in this Connect org drives a Rubicon named {wanted:?}"))
+}
+
+/// The board to use when none is named: the project's `rubicon.default`.
+pub fn default_board(config_path: &str) -> Result<String> {
+    let config = crate::utils::config::Config::load(config_path)?;
+    config
+        .rubicon
+        .as_ref()
+        .and_then(|r| r.default.clone())
+        .context(
+            "no Rubicon named, and the project sets no `rubicon.default`; \
+             name one (`avocado rubicon list` shows them)",
+        )
+}
+
+/// Run a hub command on `board` and follow it to its result: the agent's
+/// `command_result` line (local) or Connect's command record, normalized
+/// to `{status, result}`. The job log streams to stdout.
+pub async fn run_command(
+    board: &Board,
+    command: &str,
+    params: Value,
+    connect_profile: Option<&str>,
+) -> Result<Value> {
+    match &board.hub {
+        Hub::Local => {
+            let req = json!({
+                "type": "command",
+                "id": uuid::Uuid::new_v4().to_string(),
+                "command": command,
+                "params": params,
+            });
+            let r = follow_local(req).await?;
+            Ok(json!({"status": r["status"], "result": r["result"]}))
+        }
+        Hub::Connect { vm, .. } => {
+            let (c, org) = connect(connect_profile, None)?;
+            let cmd = c
+                .json(
+                    Method::POST,
+                    &format!("/api/orgs/{org}/vms/{vm}/commands"),
+                    Some(&json!({"command": command, "params": params})),
+                )
+                .await?;
+            let id = cmd["data"]["id"].as_str().context("no command id")?;
+            follow_connect(&c, &org, vm, id).await
+        }
+    }
+}
+
+/// Follow a Connect command to its end; `{status, result}`.
+pub async fn follow_connect(c: &ConnectClient, org: &str, vm: &str, id: &str) -> Result<Value> {
+    let base = format!("/api/orgs/{org}/vms/{vm}/commands/{id}");
+    let mut after: i64 = -1;
+    loop {
+        let logs = c
+            .json(Method::GET, &format!("{base}/logs?after_seq={after}"), None)
+            .await?;
+        for chunk in logs["data"].as_array().into_iter().flatten() {
+            for l in chunk["lines"].as_array().into_iter().flatten() {
+                println!("{}", l.as_str().unwrap_or_default());
+            }
+        }
+        if let Some(n) = logs["next_after_seq"].as_i64() {
+            after = n;
+        }
+        let state = c.json(Method::GET, &base, None).await?;
+        let st = state["data"]["state"].as_str().unwrap_or("");
+        if matches!(st, "completed" | "failed" | "expired") {
+            return Ok(json!({"status": st, "result": state["data"]["result"]}));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// Send one command to this machine's VM agent and follow it; returns its
+/// `command_result` line.
+async fn follow_local(req: Value) -> Result<Value> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
+    let target = lifecycle::ssh_target_for_running()?;
+    let mut child = Command::new("ssh")
+        .args(target.base_args())
+        .arg(format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("ssh to the VM")?;
+    let stdout = child.stdout.take().unwrap();
+    // Blocking reads on a dedicated thread; a job takes minutes.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut result = None;
+        for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("command_ack") => {
+                    println!("job {} accepted by the hub", v["id"].as_str().unwrap_or(""))
+                }
+                Some("command_log") => {
+                    for l in v["lines"].as_array().into_iter().flatten() {
+                        println!("{}", l.as_str().unwrap_or_default());
+                    }
+                }
+                Some("command_result") => result = Some(v),
+                _ => {}
+            }
+        }
+        result
+    })
+    .await?;
+    let _ = child.wait();
+    result.context("the hub connection closed before the job finished (it keeps running in the VM)")
+}
+
+/// Print a job's checks; Err unless it completed and passed.
+pub fn report(r: &Value, what: &str) -> Result<()> {
+    for check in r["result"]["checks"].as_array().into_iter().flatten() {
+        println!(
+            "check {}: {}",
+            check["name"].as_str().unwrap_or("?"),
+            check["status"].as_str().unwrap_or("?")
+        );
+    }
+    if r["status"] != "completed" || r["result"]["status"] != "pass" {
+        bail!(
+            "{what} did not pass: {}",
+            r["result"]["error"]
+                .as_str()
+                .or(r["result"]["status"].as_str())
+                .or(r["status"].as_str())
+                .unwrap_or("failed")
+        );
+    }
+    Ok(())
+}
+
+pub struct RemoteProvision {
+    /// The board; empty: the project's `rubicon.default`.
+    pub rubicon: String,
+    pub via: Via,
+    pub vm: Option<String>,
+    pub connect_profile: Option<String>,
+    pub provision_profile: Option<String>,
+    /// Project directory (where `--pack` stages into).
+    pub src_dir: PathBuf,
+    pub config_path: String,
 }
 
 impl RemoteProvision {
-    async fn local_hub(&self) -> Result<Option<String>> {
-        let paths = VmPaths::resolve()?;
-        let cfg = VmConfig::load(&paths)?;
-        let Some(r) = hub::rubicons(&cfg)?
-            .into_iter()
-            .find(|r| matches(&self.rubicon, &r.address, r.label.as_deref(), None))
-        else {
-            return Ok(None);
-        };
-        if !lifecycle::status().await?.running {
-            bail!(
-                "Rubicon {:?} belongs to this machine's avocado-vm, which is not running (`avocado vm start`)",
-                self.rubicon
-            );
-        }
-        Ok(Some(r.address))
-    }
-
-    async fn connect_hub(&self) -> Result<Hub> {
-        let (c, org) = connect(self.connect_profile.as_deref(), None)?;
-        let vms = c
-            .json(Method::GET, &format!("/api/orgs/{org}/vms"), None)
-            .await?;
-        let mut found = Vec::new();
-        for vm in vms["data"].as_array().into_iter().flatten() {
-            let id = vm["id"].as_str().unwrap_or_default();
-            if self.vm.as_deref().is_some_and(|want| want != id) {
-                continue;
-            }
-            for r in vm["rubicons"].as_array().into_iter().flatten() {
-                let address = r["address"].as_str().unwrap_or_default();
-                if matches(
-                    &self.rubicon,
-                    address,
-                    r["label"].as_str(),
-                    r["name"].as_str(),
-                ) {
-                    let vm_name = vm["vm"]["hostname"]
-                        .as_str()
-                        .or(vm["name"].as_str())
-                        .unwrap_or(id)
-                        .to_string();
-                    found.push(Hub::Connect {
-                        vm: id.into(),
-                        vm_name,
-                        address: address.into(),
-                    });
-                }
-            }
-        }
-        match found.len() {
-            1 => Ok(found.pop().unwrap()),
-            0 => bail!(
-                "no VM in this Connect org drives a Rubicon named {:?}",
-                self.rubicon
-            ),
-            n => bail!(
-                "{n} VMs drive a Rubicon named {:?}; pick one with --vm",
-                self.rubicon
-            ),
-        }
-    }
-
-    async fn resolve(&self) -> Result<Hub> {
-        if self.via != Via::Connect {
-            if let Some(address) = self.local_hub().await? {
-                return Ok(Hub::Local { address });
-            }
-            if self.via == Via::Local {
-                bail!(
-                    "this machine's avocado-vm has no Rubicon {:?} (`avocado vm rubicon list`)",
-                    self.rubicon
-                );
-            }
-        }
-        self.connect_hub().await
-    }
-
     pub async fn execute(&self, provision: ProvisionCommand) -> Result<()> {
-        let hub = self.resolve().await?;
-        let out = match &hub {
+        let wanted = match self.rubicon.trim() {
+            "" => default_board(&self.config_path)?,
+            w => w.to_string(),
+        };
+        let scope = Scope {
+            via: self.via,
+            vm: self.vm.as_deref(),
+            connect_profile: self.connect_profile.as_deref(),
+        };
+        let board = resolve(&wanted, &scope).await?;
+        let out = match &board.hub {
             // Inside the VM's workspace share: the guest reads it in place.
-            Hub::Local { .. } => {
+            Hub::Local => {
                 let paths = VmPaths::resolve()?;
                 share::read_recorded_workspace(&paths)?
                     .map(Ok)
@@ -171,16 +413,15 @@ impl RemoteProvision {
             .map(|e| e.path())
             .find(|p| p.extension().is_some_and(|e| e == "bundle"))
             .context("the pack produced no bundle")?;
-        match hub {
-            Hub::Local { address } => self.run_local(&bundle, &address).await,
-            Hub::Connect {
-                vm,
-                vm_name,
-                address,
-            } => {
+        match &board.hub {
+            Hub::Local => self.run_local(&bundle, &board.address).await,
+            Hub::Connect { vm, vm_name } => {
                 let (c, org) = connect(self.connect_profile.as_deref(), None)?;
                 print_info(
-                    &format!("Syncing to Connect for VM {vm_name}, Rubicon {address}..."),
+                    &format!(
+                        "Syncing to Connect for VM {vm_name}, Rubicon {}...",
+                        board.address
+                    ),
                     OutputLevel::Normal,
                 );
                 let name = bundle
@@ -191,8 +432,8 @@ impl RemoteProvision {
                 let id = upload_bundle(&c, &org, &bundle, &name, json!({})).await?;
                 let _ = std::fs::remove_dir_all(&out);
                 ProvisionJobCommand {
-                    vm,
-                    rubicon: address,
+                    vm: vm.clone(),
+                    rubicon: board.address.clone(),
                     bundle: Some(id),
                     runtime: None,
                     profile: self.provision_profile.clone(),
@@ -227,15 +468,18 @@ impl RemoteProvision {
                 })
             })
             .collect::<Result<_>>()?;
-        let id = uuid::Uuid::new_v4().to_string();
         let name = bundle
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        print_info(
+            &format!("Provisioning through this machine's avocado-vm, Rubicon {address}"),
+            OutputLevel::Normal,
+        );
         let req = json!({
             "type": "command",
-            "id": id,
+            "id": uuid::Uuid::new_v4().to_string(),
             "command": "provision",
             "params": {
                 "address": address,
@@ -243,62 +487,8 @@ impl RemoteProvision {
                 "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
             },
         });
-        let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
-        let target = lifecycle::ssh_target_for_running()?;
-        print_info(
-            &format!("Provisioning through this machine's avocado-vm, Rubicon {address}"),
-            OutputLevel::Normal,
-        );
-        let mut child = Command::new("ssh")
-            .args(target.base_args())
-            .arg(format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("ssh to the VM")?;
-        let stdout = child.stdout.take().unwrap();
-        // Blocking reads on a dedicated thread; the job takes minutes.
-        let result = tokio::task::spawn_blocking(move || {
-            let mut result = None;
-            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                match v["type"].as_str() {
-                    Some("command_ack") => {
-                        println!("job {} accepted by the hub", v["id"].as_str().unwrap_or(""))
-                    }
-                    Some("command_log") => {
-                        for l in v["lines"].as_array().into_iter().flatten() {
-                            println!("{}", l.as_str().unwrap_or_default());
-                        }
-                    }
-                    Some("command_result") => result = Some(v),
-                    _ => {}
-                }
-            }
-            result
-        })
-        .await?;
-        let _ = child.wait();
-        let Some(r) = result else {
-            bail!("the hub connection closed before the job finished (it keeps running in the VM)");
-        };
-        for check in r["result"]["checks"].as_array().into_iter().flatten() {
-            println!(
-                "check {}: {}",
-                check["name"].as_str().unwrap_or("?"),
-                check["status"].as_str().unwrap_or("?")
-            );
-        }
-        if r["status"] != "completed" || r["result"]["status"] != "pass" {
-            bail!(
-                "provision on Rubicon {address} did not pass: {}",
-                r["result"]["error"]
-                    .as_str()
-                    .unwrap_or(r["result"]["status"].as_str().unwrap_or("failed"))
-            );
-        }
+        let r = follow_local(req).await?;
+        report(&r, &format!("provision on Rubicon {address}"))?;
         print_success(
             &format!("Provisioned through Rubicon {address}"),
             OutputLevel::Normal,
@@ -309,9 +499,21 @@ impl RemoteProvision {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn board(address: &str, name: &str, label: Option<&str>, hub: Hub) -> Board {
+        Board {
+            address: address.into(),
+            name: Some(name.into()),
+            label: label.map(String::from),
+            hub,
+            info: Value::Null,
+            vm_instance: None,
+        }
+    }
+
     #[test]
     fn rubicon_matches_label_name_or_address() {
-        use super::matches;
         assert!(matches(
             "jetson bench",
             "192.168.1.52",
@@ -331,5 +533,28 @@ mod tests {
             Some("jetson bench"),
             None
         ));
+    }
+
+    #[test]
+    fn an_ambiguous_name_is_an_error_listing_the_boards_never_the_first() {
+        let vm = |n: &str| Hub::Connect {
+            vm: n.into(),
+            vm_name: n.into(),
+        };
+        let boards = vec![
+            board("10.0.0.1", "rubicon-a", Some("bench"), Hub::Local),
+            board("10.0.0.2", "rubicon-b", Some("bench"), vm("lab")),
+            board("10.0.0.3", "rubicon-c", None, vm("lab")),
+        ];
+        let e = pick("bench", boards.clone()).unwrap_err().to_string();
+        assert!(
+            e.contains("rubicon-a") && e.contains("rubicon-b") && e.contains("--vm"),
+            "{e}"
+        );
+        assert_eq!(
+            pick("rubicon-b", boards.clone()).unwrap().unwrap().address,
+            "10.0.0.2"
+        );
+        assert!(pick("nope", boards).unwrap().is_none());
     }
 }

@@ -542,6 +542,18 @@ mod tests {
                 serde_fields::<ConnectConfig>(),
             ),
             (
+                "/definitions/rubiconConfig",
+                serde_fields::<RubiconConfig>(),
+            ),
+            (
+                "/definitions/provisionProfileConfig/properties/rubicon",
+                serde_fields::<ProvisionRubicon>(),
+            ),
+            (
+                "/definitions/rubiconConfig/properties/console",
+                serde_fields::<RubiconConsole>(),
+            ),
+            (
                 "/definitions/containerDevConfig",
                 serde_fields::<ContainerDevConfig>(),
             ),
@@ -554,6 +566,22 @@ mod tests {
                 serde_fields::<RegistryConfig>(),
             ),
         ]
+    }
+
+    #[test]
+    fn rubicon_run_profiles_lint_clean_and_typos_warn() {
+        let ok: Yaml = serde_yaml::from_str(
+            "rubicon:\n  run:\n    enter:\n      - out: { power: \"off\" }\n      - pulse: { ssr3: 200 }\n      - run: other\n      - wait_ms: 500\n\
+             \x20     - hold_usb: [\"0955:*\"]\n      - wait_usb: { id: \"0955:7523\", timeout_s: 30 }\n\
+             \x20     - console_expect: { markers: [\"login:\"], timeout_s: 9 }\n\
+             provision:\n  tegraflash:\n    rubicon: { before: enter }\n",
+        )
+        .unwrap();
+        assert_eq!(ignored_keys(&ok), Vec::<String>::new());
+        let typo: Yaml =
+            serde_yaml::from_str("provision:\n  tegraflash:\n    rubicon: { befor: enter }\n")
+                .unwrap();
+        assert_eq!(ignored_keys(&typo).len(), 1);
     }
 
     /// Every field a typed config struct accepts must be in the schema, or the

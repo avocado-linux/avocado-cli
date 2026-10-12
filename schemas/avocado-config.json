@@ -246,6 +246,11 @@
       "title": "Peridio Connect",
       "$ref": "#/definitions/connectConfig",
       "description": "Default Peridio Connect organization and project for 'avocado connect' commands."
+    },
+    "rubicon": {
+      "title": "Rubicon",
+      "$ref": "#/definitions/rubiconConfig",
+      "description": "Rubicon settings for provisioning through a Rubicon board on a hub (`avocado provision --rubicon`)."
     }
   },
   "patternProperties": {
@@ -1659,6 +1664,22 @@
           "examples": [
             ".avocado/provision-dev.state"
           ]
+        },
+        "rubicon": {
+          "title": "Rubicon run profiles",
+          "type": "object",
+          "description": "Run profiles (names under rubicon.run) a hub runs around this provision profile when provisioning through a Rubicon.",
+          "properties": {
+            "before": {
+              "type": "string",
+              "description": "Run before provisioning, e.g. to put the DUT into recovery."
+            },
+            "after": {
+              "type": "string",
+              "description": "Run after a successful provision, e.g. to check that the DUT boots."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -2272,6 +2293,133 @@
           "$ref": "#/definitions/imageConfig/properties/permissions"
         }
       },
+      "additionalProperties": false
+    },
+    "rubiconConfig": {
+      "title": "Rubicon configuration",
+      "type": "object",
+      "properties": {
+        "run": {
+          "title": "Run profiles",
+          "type": "object",
+          "description": "Named run profiles: steps a hub runs against a Rubicon and its DUT. Extensions contribute them; a project entry of the same name replaces the extension's whole.",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/rubiconStep"
+            }
+          }
+        },
+        "default": {
+          "type": "string",
+          "description": "The board `provision --rubicon` and `avocado rubicon` use when none is named (firmware name, label or address)."
+        },
+        "console": {
+          "type": "object",
+          "description": "The DUT's serial console.",
+          "properties": {
+            "baud": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Console rate (default 115200)."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "rubiconStep": {
+      "title": "Rubicon run profile step",
+      "description": "Exactly one of these keys per step.",
+      "type": "object",
+      "properties": {
+        "out": {
+          "type": "object",
+          "description": "Switch Rubicon outputs (power, ssr1…, od1…) on or off. What each is wired to is the target's business.",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-z]+[0-9]*$"
+          },
+          "additionalProperties": {
+            "enum": [
+              "on",
+              "off"
+            ]
+          }
+        },
+        "pulse": {
+          "type": "object",
+          "description": "Turn outputs on for this many milliseconds, then off (a button press).",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-z]+[0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "run": {
+          "type": "string",
+          "description": "Run another run profile's steps here."
+        },
+        "wait_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wait this many milliseconds."
+        },
+        "hold_usb": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{4}:([0-9a-fA-F]{4}|\\*)$"
+          },
+          "description": "Keep the board's USB devices with these ids (vvvv:pppp or vvvv:*) attached to the hub for the rest of the job."
+        },
+        "wait_usb": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$"
+            },
+            "timeout_s": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "timeout_s"
+          ],
+          "additionalProperties": false,
+          "description": "Wait until a held device with this id is attached."
+        },
+        "console_expect": {
+          "type": "object",
+          "properties": {
+            "markers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "timeout_s": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "markers",
+            "timeout_s"
+          ],
+          "additionalProperties": false,
+          "description": "Wait until the DUT's serial console prints one of these markers."
+        }
+      },
+      "minProperties": 1,
+      "maxProperties": 1,
       "additionalProperties": false
     }
   }
