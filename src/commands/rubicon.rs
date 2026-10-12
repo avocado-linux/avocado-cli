@@ -43,6 +43,11 @@ pub enum RubiconAction {
         board: Option<String>,
         follow: bool,
     },
+    /// Cancel a queued or running job on a board's hub.
+    Cancel {
+        board: Option<String>,
+        job: String,
+    },
     /// Claim a board for the Connect org (someone presses its SW2).
     Claim {
         board: Option<String>,
@@ -160,6 +165,35 @@ impl RubiconCommand {
             RubiconAction::Claim { board } => {
                 let b = self.board(board).await?;
                 self.claim(&b).await
+            }
+            RubiconAction::Cancel { board, job } => {
+                let b = self.board(board).await?;
+                let job = remote::queue_of(&b)
+                    .iter()
+                    .filter_map(|e| e["id"].as_str())
+                    .find(|id| id.starts_with(job.as_str()))
+                    .map(String::from)
+                    .unwrap_or_else(|| job.clone());
+                let r = match &b.hub {
+                    Hub::Local => remote::cancel_local(&job).await?,
+                    Hub::Connect { .. } => {
+                        remote::run_command(
+                            &b,
+                            "cancel",
+                            json!({ "id": job }),
+                            self.connect_profile.as_deref(),
+                        )
+                        .await?
+                    }
+                };
+                if r["status"] != "completed" {
+                    bail!(
+                        "cancel {job}: {}",
+                        r["result"]["error"].as_str().unwrap_or("refused")
+                    );
+                }
+                println!("cancelled {job}");
+                Ok(())
             }
             RubiconAction::Logs { board, follow } => {
                 let b = self.board(board).await?;
@@ -316,6 +350,7 @@ impl RubiconCommand {
                 },
                 state(b)
             );
+            print_queue(b, "  ");
         }
         Ok(())
     }
@@ -616,9 +651,19 @@ fn state(b: &Board) -> String {
     )
 }
 
+/// The board's holder, then whoever waits for it.
+fn print_queue(b: &Board, indent: &str) {
+    let now = b.info["hub_now"].as_u64().unwrap_or_else(remote::unix_now);
+    for (i, e) in remote::queue_of(b).iter().enumerate() {
+        let tag = if i == 0 { "running" } else { "waiting" };
+        println!("{indent}{tag:<8} {}", remote::queue_entry(e, now));
+    }
+}
+
 fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
     println!("{}", b.describe());
     println!("  state:    {}", state(b));
+    print_queue(b, "  ");
     // The project's wiring, by pin: what this board drives on its DUT.
     for (pin, what) in wiring {
         println!("  {:<9} {what}", format!("{pin}:"));

@@ -127,11 +127,14 @@ pub async fn local_boards() -> Result<Vec<Board>> {
             let info = live
                 .as_ref()
                 .and_then(|v| {
-                    v["inventory"]["rubicons"]
+                    let mut b = v["inventory"]["rubicons"]
                         .as_array()?
                         .iter()
                         .find(|b| b["address"] == r.address.as_str())
-                        .cloned()
+                        .cloned()?;
+                    // The hub's clock, for how long its queue entries have waited.
+                    b["hub_now"] = v["now"].clone();
+                    Some(b)
                 })
                 .unwrap_or(Value::Null);
             Board {
@@ -304,6 +307,7 @@ pub async fn run_command(
             if let Some(t) = local_token(board, command, connect_profile).await? {
                 params["rubicon_token"] = json!(t);
             }
+            params["requested_by"] = json!(requester());
             let req = json!({
                 "type": "command",
                 "id": uuid::Uuid::new_v4().to_string(),
@@ -353,18 +357,115 @@ pub async fn follow_connect(c: &ConnectClient, org: &str, vm: &str, id: &str) ->
     }
 }
 
-/// Send one command to this machine's VM agent and follow it; returns its
-/// `command_result` line.
-async fn follow_local(req: Value) -> Result<Value> {
+/// Who is asking, for the hub's queue: `user@host`.
+pub fn requester() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "someone".into());
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    let host = if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    } else {
+        "?".into()
+    };
+    format!("{user}@{host}")
+}
+
+/// A board's queue, holder first, from either hub's record of it.
+pub fn queue_of(b: &Board) -> Vec<Value> {
+    let q = if b.info["queue"].is_array() {
+        &b.info["queue"]
+    } else {
+        &b.info["state"]["queue"]
+    };
+    q.as_array().cloned().unwrap_or_default()
+}
+
+/// One queue entry: `provision 3f2a1c0d by josh@riptide, 12m`.
+pub fn queue_entry(e: &Value, now: u64) -> String {
+    let id = e["id"].as_str().unwrap_or("?");
+    let mut s = format!(
+        "{} {}",
+        e["what"].as_str().unwrap_or("?"),
+        id.get(..8).unwrap_or(id)
+    );
+    if let Some(who) = e["requested_by"].as_str() {
+        s.push_str(&format!(" by {who}"));
+    }
+    if let Some(since) = e["since"].as_u64().filter(|&t| t > 0 && t <= now) {
+        let m = (now - since) / 60;
+        s.push_str(&if m < 60 {
+            format!(", {m}m")
+        } else {
+            format!(", {}h{:02}m", m / 60, m % 60)
+        });
+    }
+    s
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A `command_queued` event as one line.
+fn queued_line(v: &Value) -> String {
+    let now = v["now"].as_u64().unwrap_or_else(unix_now);
+    let ahead: Vec<String> = v["ahead"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| queue_entry(e, now))
+        .collect();
+    format!(
+        "queued: position {} on the board, behind {}",
+        v["position"].as_u64().unwrap_or(0),
+        ahead.join("; ")
+    )
+}
+
+/// One request to this machine's VM agent, streamed back line by line. Its
+/// own process group: Ctrl-C at the terminal is ours to handle, not ssh's.
+fn agent_ctl(req: &Value) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
     let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
     let target = lifecycle::ssh_target_for_running()?;
-    let mut child = Command::new("ssh")
+    Command::new("ssh")
         .args(target.base_args())
         .arg(format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .process_group(0)
         .spawn()
-        .context("ssh to the VM")?;
+        .context("ssh to the VM")
+}
+
+/// Cancel a command on this machine's VM; the agent's answer.
+pub async fn cancel_local(id: &str) -> Result<Value> {
+    let req = json!({"type": "command", "id": uuid::Uuid::new_v4().to_string(),
+                     "command": "cancel", "params": {"id": id}});
+    let mut child = agent_ctl(&req)?;
+    let stdout = child.stdout.take().unwrap();
+    let r = tokio::task::spawn_blocking(move || {
+        BufReader::new(stdout)
+            .lines()
+            .map_while(|l| l.ok())
+            .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+            .find(|v| v["type"] == "command_result")
+    })
+    .await?;
+    let _ = child.wait();
+    r.context("no answer from the hub")
+}
+
+/// Send one command to this machine's VM agent and follow it; returns its
+/// `command_result` line. Ctrl-C cancels the job (a second one stops
+/// following and leaves it to the hub).
+async fn follow_local(req: Value) -> Result<Value> {
+    let id = req["id"].as_str().unwrap_or_default().to_string();
+    let mut child = agent_ctl(&req)?;
     let stdout = child.stdout.take().unwrap();
     // Blocking reads on a dedicated thread; a job takes minutes.
     let result = tokio::task::spawn_blocking(move || {
@@ -377,6 +478,7 @@ async fn follow_local(req: Value) -> Result<Value> {
                 Some("command_ack") => {
                     println!("job {} accepted by the hub", v["id"].as_str().unwrap_or(""))
                 }
+                Some("command_queued") => println!("{}", queued_line(&v)),
                 Some("command_log") => {
                     for l in v["lines"].as_array().into_iter().flatten() {
                         println!("{}", l.as_str().unwrap_or_default());
@@ -387,8 +489,27 @@ async fn follow_local(req: Value) -> Result<Value> {
             }
         }
         result
-    })
-    .await?;
+    });
+    tokio::pin!(result);
+    let mut cancelled = false;
+    let result = loop {
+        tokio::select! {
+            r = &mut result => break r?,
+            _ = tokio::signal::ctrl_c() => {
+                if cancelled {
+                    let _ = child.kill();
+                    bail!("stopped following job {id}; the hub decides when it ends");
+                }
+                cancelled = true;
+                eprintln!("cancelling job {id} (Ctrl-C again to stop following)");
+                match cancel_local(&id).await {
+                    Ok(r) if r["status"] == "completed" => {}
+                    Ok(r) => eprintln!("cancel: {}", r["result"]["error"].as_str().unwrap_or("refused")),
+                    Err(e) => eprintln!("cancel: {e:#}"),
+                }
+            }
+        }
+    };
     let _ = child.wait();
     result.context("the hub connection closed before the job finished (it keeps running in the VM)")
 }
@@ -571,6 +692,7 @@ impl RemoteProvision {
                 "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
                 "rubicon_token": token,
                 "env": env,
+                "requested_by": requester(),
             },
         });
         let r = follow_local(req).await?;
@@ -586,6 +708,32 @@ impl RemoteProvision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_lines_name_the_job_who_and_how_long() {
+        let e = json!({"id": "3f2a1c0d-aaaa", "what": "provision",
+                       "requested_by": "josh@riptide", "since": 1000});
+        assert_eq!(
+            queue_entry(&e, 1000 + 12 * 60 + 5),
+            "provision 3f2a1c0d by josh@riptide, 12m"
+        );
+        assert_eq!(
+            queue_entry(&e, 1000 + 125 * 60),
+            "provision 3f2a1c0d by josh@riptide, 2h05m"
+        );
+        // Short ids, no requester, a clock behind the hub's: still a line.
+        assert_eq!(
+            queue_entry(&json!({"id": "k1", "what": "off", "since": 9}), 5),
+            "off k1"
+        );
+        let b = board("10.0.0.1", "r", None, Hub::Local);
+        assert!(queue_of(&b).is_empty());
+        let mut b = b;
+        b.info = json!({"queue": [e.clone()]});
+        assert_eq!(queue_of(&b).len(), 1);
+        b.info = json!({"state": {"queue": [e]}});
+        assert_eq!(queue_of(&b).len(), 1);
+    }
 
     #[test]
     fn each_board_stages_its_bundle_in_its_own_directory() {
