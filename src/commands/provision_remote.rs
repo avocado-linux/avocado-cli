@@ -427,6 +427,25 @@ pub struct RemoteProvision {
     pub config_path: String,
 }
 
+/// A board's address as a single directory name.
+fn staging_name(address: &str) -> String {
+    let name: String = address
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.chars().all(|c| c == '.') {
+        format!("_{name}")
+    } else {
+        name
+    }
+}
+
 impl RemoteProvision {
     pub async fn execute(&self, provision: ProvisionCommand) -> Result<()> {
         let wanted = match self.rubicon.trim() {
@@ -439,6 +458,9 @@ impl RemoteProvision {
             connect_profile: self.connect_profile.as_deref(),
         };
         let board = resolve(&wanted, &scope).await?;
+        // One staging directory per board: a board runs one job at a time,
+        // while provisions to different boards (from one project or several)
+        // run side by side and must not clear each other's bundle.
         let out = match &board.hub {
             // Inside the VM's workspace share: the guest reads it in place.
             Hub::Local => {
@@ -449,7 +471,8 @@ impl RemoteProvision {
                     .join(".avocado/hub-bundles")
             }
             Hub::Connect { .. } => self.src_dir.join(".avocado/rubicon-bundle"),
-        };
+        }
+        .join(staging_name(&board.address));
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out)?;
         // The caller's --env values (per-run choices such as a provisioning
@@ -563,6 +586,18 @@ impl RemoteProvision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_board_stages_its_bundle_in_its_own_directory() {
+        // Two concurrent provisions to different boards once shared one
+        // directory, and the second cleared the first's bundle mid-job.
+        assert_ne!(staging_name("10.12.0.97"), staging_name("10.12.0.18"));
+        assert_eq!(staging_name("10.12.0.97"), "10.12.0.97");
+        assert_eq!(staging_name("fe80::1%eth0"), "fe80__1_eth0");
+        assert_eq!(staging_name("../x"), ".._x");
+        assert_eq!(staging_name(".."), "_..");
+        assert_eq!(staging_name(""), "_");
+    }
 
     fn board(address: &str, name: &str, label: Option<&str>, hub: Hub) -> Board {
         Board {
