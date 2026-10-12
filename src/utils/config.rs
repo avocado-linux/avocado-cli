@@ -4047,7 +4047,19 @@ impl Config {
                     );
                 }
             }
-            // References resolve and do not loop.
+            // No loops. A name nothing defines may come from an extension
+            // that is not installed yet (a fresh clone, a hub's `sdk
+            // install`): `check_rubicon_refs` catches it where it is used.
+            self.expand_steps(name, false)?;
+        }
+        Ok(())
+    }
+
+    /// Every `run:` and provision profile reference resolves: run at pack
+    /// time, once extensions are installed.
+    pub fn check_rubicon_refs(&self) -> Result<()> {
+        let run = self.rubicon.as_ref().map(|r| &r.run);
+        for name in run.into_iter().flat_map(|m| m.keys()) {
             self.rubicon_steps(name)?;
         }
         for (profile, cfg) in self.provision_profiles.iter().flatten() {
@@ -4083,33 +4095,39 @@ impl Config {
     /// Run profile `name` as the hub runs it: `run:` steps replaced by the
     /// steps of the run profile they name, recursively.
     pub fn rubicon_steps(&self, name: &str) -> Result<Vec<RubiconStep>> {
+        self.expand_steps(name, true)
+    }
+
+    /// `rubicon_steps`; unless `strict`, names nothing defines are skipped.
+    fn expand_steps(&self, name: &str, strict: bool) -> Result<Vec<RubiconStep>> {
         fn expand(
             c: &Config,
             name: &str,
+            strict: bool,
             stack: &mut Vec<String>,
             out: &mut Vec<RubiconStep>,
         ) -> Result<()> {
             if stack.iter().any(|n| n == name) {
                 anyhow::bail!("rubicon.run: {} -> {name} loops", stack.join(" -> "));
             }
-            let steps = c
-                .rubicon
-                .as_ref()
-                .and_then(|r| r.run.get(name))
-                .with_context(|| {
-                    let from = stack
-                        .last()
-                        .map(|f| format!(" (from rubicon.run.{f})"))
-                        .unwrap_or_default();
-                    format!(
-                        "no run profile {name:?}{from} under rubicon.run (defined: {})",
-                        c.rubicon_run_names()
-                    )
-                })?;
+            let steps = c.rubicon.as_ref().and_then(|r| r.run.get(name));
+            if steps.is_none() && !strict {
+                return Ok(());
+            }
+            let steps = steps.with_context(|| {
+                let from = stack
+                    .last()
+                    .map(|f| format!(" (from rubicon.run.{f})"))
+                    .unwrap_or_default();
+                format!(
+                    "no run profile {name:?}{from} under rubicon.run (defined: {})",
+                    c.rubicon_run_names()
+                )
+            })?;
             stack.push(name.to_string());
             for step in steps {
                 match step {
-                    RubiconStep::Run(inner) => expand(c, inner, stack, out)?,
+                    RubiconStep::Run(inner) => expand(c, inner, strict, stack, out)?,
                     s => out.push(s.clone()),
                 }
             }
@@ -4117,7 +4135,7 @@ impl Config {
             Ok(())
         }
         let mut out = Vec::new();
-        expand(self, name, &mut Vec::new(), &mut out)?;
+        expand(self, name, strict, &mut Vec::new(), &mut out)?;
         Ok(out)
     }
 
@@ -15077,7 +15095,9 @@ provision:
             .contains("loops"));
         let missing: Config =
             serde_yaml::from_str("rubicon:\n  run:\n    a: [ { run: nope } ]\n").unwrap();
-        let e = missing.validate_rubicon().unwrap_err().to_string();
+        // Maybe an extension's, not installed yet: caught at pack time.
+        missing.validate_rubicon().unwrap();
+        let e = missing.check_rubicon_refs().unwrap_err().to_string();
         assert!(
             e.contains("\"nope\"") && e.contains("from rubicon.run.a"),
             "{e}"
@@ -15176,7 +15196,8 @@ provision:
             "rubicon:\n  run:\n    a: []\nprovision:\n  p:\n    rubicon: { before: a, after: b }\n",
         )
         .unwrap();
-        let e = c.validate_rubicon().unwrap_err().to_string();
+        c.validate_rubicon().unwrap();
+        let e = c.check_rubicon_refs().unwrap_err().to_string();
         assert!(
             e.contains("provision.p.rubicon.after") && e.contains("\"b\"") && e.contains("a"),
             "{e}"

@@ -120,7 +120,11 @@ pub struct BundleRubicon {
 }
 
 /// The run profiles the config's provision profiles reference, by profile.
-pub fn bundle_rubicon(config: &Config, default_profile: Option<String>) -> Option<BundleRubicon> {
+pub fn bundle_rubicon(
+    config: &Config,
+    default_profile: Option<String>,
+) -> Result<Option<BundleRubicon>> {
+    config.check_rubicon_refs()?;
     let profiles: BTreeMap<String, ProvisionRubicon> = config
         .provision_profiles
         .iter()
@@ -128,20 +132,20 @@ pub fn bundle_rubicon(config: &Config, default_profile: Option<String>) -> Optio
         .filter_map(|(name, p)| Some((name.clone(), p.rubicon.clone()?)))
         .collect();
     if profiles.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Flattened (`run:` steps expanded): the hub runs plain steps.
     let run = profiles
         .values()
         .flat_map(|r| [&r.before, &r.after])
         .flatten()
-        .filter_map(|name| Some((name.clone(), config.rubicon_steps(name).ok()?)))
-        .collect();
-    Some(BundleRubicon {
+        .map(|name| Ok((name.clone(), config.rubicon_steps(name)?)))
+        .collect::<Result<_>>()?;
+    Ok(Some(BundleRubicon {
         default_profile,
         profiles,
         run,
-    })
+    }))
 }
 
 impl BundleMeta {
@@ -364,7 +368,7 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
             std::fs::read_to_string(stage.join("stone-manifest.json"))
                 .ok()
                 .and_then(|m| crate::commands::profiles::stone_default_profile(&m)),
-        ),
+        )?,
     };
     let dir = if out.is_dir() {
         out.join(format!("{}-{}.bundle", p.runtime, p.target))
@@ -685,7 +689,9 @@ provision:
 "#,
         )
         .unwrap();
-        let r = bundle_rubicon(&config, Some("tegraflash".into())).unwrap();
+        let r = bundle_rubicon(&config, Some("tegraflash".into()))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.default_profile.as_deref(), Some("tegraflash"));
         assert_eq!(r.profiles.keys().collect::<Vec<_>>(), ["tegraflash"]);
         assert_eq!(r.run.keys().collect::<Vec<_>>(), ["check", "enter"]);
@@ -698,7 +704,7 @@ provision:
         );
 
         let none: Config = serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();
-        assert!(bundle_rubicon(&none, None).is_none());
+        assert!(bundle_rubicon(&none, None).unwrap().is_none());
     }
 
     #[test]

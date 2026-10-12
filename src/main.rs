@@ -3490,6 +3490,18 @@ async fn main() -> Result<()> {
                 RubiconCommands::Run { profile, board } => A::Run { board, profile },
                 RubiconCommands::Console { board, read_only } => A::Console { board, read_only },
                 RubiconCommands::Logs { board, follow } => A::Logs { board, follow },
+                RubiconCommands::Claim { board } => A::Claim { board },
+                RubiconCommands::Update {
+                    board,
+                    file,
+                    version,
+                    all,
+                } => A::Update {
+                    board,
+                    file,
+                    version,
+                    all,
+                },
             };
             RubiconCommand {
                 action,
@@ -5380,6 +5392,23 @@ enum RubiconCommands {
         /// Watch only; never send input.
         #[arg(long)]
         read_only: bool,
+    },
+    /// Claim a board for the Connect org: someone presses its SW2 within
+    /// the minute. Claimed, the board accepts actions only with tokens.
+    Claim { board: Option<String> },
+    /// Put new firmware on a board (MCUboot test boot; the board keeps it
+    /// only if it comes back healthy, else it rolls back by itself).
+    Update {
+        board: Option<String>,
+        /// A signed image (`zephyr.signed.bin`).
+        #[arg(long, conflicts_with = "version")]
+        file: Option<std::path::PathBuf>,
+        /// A released version (`0.1.0+83` or `0.1.0.83`).
+        #[arg(long)]
+        version: Option<String>,
+        /// Every online board reachable from here (three at a time).
+        #[arg(long, conflicts_with = "board")]
+        all: bool,
     },
     /// What a board's DUT console printed recently.
     Logs {
