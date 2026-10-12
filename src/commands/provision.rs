@@ -50,6 +50,12 @@ pub struct ProvisionCommand {
 }
 
 impl ProvisionCommand {
+    /// The caller's `--env` values, for a remote provision to send with the
+    /// job (a pack leaves them out of the bundle).
+    pub fn env_vars(&self) -> Option<&HashMap<String, String>> {
+        self.config.env_vars.as_ref()
+    }
+
     /// Create a new ProvisionCommand instance
     pub fn new(config: ProvisionConfig) -> Self {
         Self {
