@@ -635,6 +635,8 @@ pub struct RemoteProvision {
     /// Project directory (where `--pack` stages into).
     pub src_dir: PathBuf,
     pub config_path: String,
+    /// `--interactive`: a human watches the console; no boot check.
+    pub interactive: bool,
 }
 
 /// A board's address as a single directory name.
@@ -742,6 +744,7 @@ impl RemoteProvision {
                     wait: true,
                     org: Some(org),
                     profile_name: self.connect_profile.clone(),
+                    interactive: self.interactive,
                 }
                 .execute()
                 .await
@@ -788,6 +791,7 @@ impl RemoteProvision {
             "params": {
                 "address": address,
                 "profile": self.provision_profile,
+                "interactive": self.interactive,
                 "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
                 "rubicon_token": token,
                 "env": env,
@@ -887,6 +891,7 @@ impl RemoteProvision {
                 "rubicon_token": token,
                 "env": env,
                 "requested_by": requester(),
+                "interactive": self.interactive,
             },
         });
         let r = follow_hub(&Hub::Host { ssh: ssh_host.to_string() }, req).await?;
