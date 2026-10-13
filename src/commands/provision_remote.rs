@@ -50,6 +50,10 @@ pub enum Hub {
     Local,
     /// A VM in the Connect org.
     Connect { vm: String, vm_name: String },
+    /// The avocado-vm on another machine this one can ssh to (`--hub
+    /// user@host`): jobs go straight to its agent, bundles by rsync, no
+    /// Connect in between. Same queue and job as `Local`, one ssh hop on.
+    Host { ssh: String },
 }
 
 /// A Rubicon as one hub reports it. `info` is that hub's record of it (the
@@ -72,6 +76,7 @@ impl Board {
         let hub = match &self.hub {
             Hub::Local => "this machine's VM".to_string(),
             Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+            Hub::Host { ssh } => format!("the avocado-vm on {ssh}"),
         };
         let mut s = self.name.clone().unwrap_or_else(|| self.address.clone());
         if let Some(l) = &self.label {
@@ -84,6 +89,8 @@ impl Board {
 /// Where to look for boards.
 pub struct Scope<'a> {
     pub via: Via,
+    /// `--hub user@host`: only that machine's avocado-vm, over ssh.
+    pub host: Option<&'a str>,
     /// Connect only: which VM, when several know a board.
     pub vm: Option<&'a str>,
     pub connect_profile: Option<&'a str>,
@@ -157,6 +164,59 @@ pub fn local_instance() -> Option<String> {
         .map(|s| s.trim().to_lowercase())
 }
 
+/// The command that runs `inner` inside `ssh_host`'s avocado-vm: ssh to the
+/// host, then through the CLI's own `~/.avocado/vm/ssh-config` there into
+/// its VM (the VM's key never leaves that host). `inner` may not hold a
+/// single quote.
+fn host_vm_command(ssh_host: &str, inner: &str) -> Command {
+    let mut c = Command::new("ssh");
+    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15"])
+        .arg(ssh_host)
+        .arg(format!("ssh -F ~/.avocado/vm/ssh-config avocado-vm '{inner}'"));
+    c
+}
+
+fn agent_ctl_line(req: &Value) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
+    format!("echo {b64} | base64 -d | avocado-vm-agent ctl")
+}
+
+/// The boards of the avocado-vm on `ssh_host`, from its agent's inventory.
+pub async fn host_boards(ssh_host: &str) -> Result<Vec<Board>> {
+    let mut cmd = host_vm_command(ssh_host, &agent_ctl_line(&json!({"op": "inventory"})));
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await?
+        .with_context(|| format!("ssh {ssh_host}"))?;
+    if !out.status.success() {
+        bail!(
+            "the avocado-vm on {ssh_host} did not answer: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("unexpected agent reply from {ssh_host}"))?;
+    if v.get("ok") != Some(&json!(true)) {
+        bail!("the agent on {ssh_host} refused: {}", v.get("error").unwrap_or(&v));
+    }
+    Ok(v["inventory"]["rubicons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let mut info = r.clone();
+            info["hub_now"] = v["now"].clone();
+            Board {
+                address: r["address"].as_str().unwrap_or_default().to_string(),
+                name: s(&r["name"]),
+                label: s(&r["label"]),
+                hub: Hub::Host { ssh: ssh_host.to_string() },
+                info,
+                vm_instance: None,
+            }
+        })
+        .collect())
+}
+
 /// The boards of the org's VMs, as Connect sees them.
 pub async fn connect_boards(profile: Option<&str>, vm: Option<&str>) -> Result<Vec<Board>> {
     let (c, org) = connect(profile, None)?;
@@ -217,6 +277,10 @@ pub fn pick(wanted: &str, boards: Vec<Board>) -> Result<Option<Board>> {
 
 /// The board `wanted` names: this machine's VM first, then Connect.
 pub async fn resolve(wanted: &str, scope: &Scope<'_>) -> Result<Board> {
+    if let Some(h) = scope.host {
+        return pick(wanted, host_boards(h).await?)?
+            .with_context(|| format!("the avocado-vm on {h} has no Rubicon {wanted:?}"));
+    }
     if scope.via != Via::Connect {
         if let Some(b) = pick(wanted, local_boards().await?)? {
             if !lifecycle::status().await?.running {
@@ -271,7 +335,7 @@ pub async fn local_token(
     command: &str,
     connect_profile: Option<&str>,
 ) -> Result<Option<String>> {
-    if board.hub != Hub::Local || board.info["claimed"] != true {
+    if matches!(board.hub, Hub::Connect { .. }) || board.info["claimed"] != true {
         return Ok(None);
     }
     let name = board
@@ -302,7 +366,7 @@ pub async fn run_command(
     connect_profile: Option<&str>,
 ) -> Result<Value> {
     match &board.hub {
-        Hub::Local => {
+        Hub::Local | Hub::Host { .. } => {
             let mut params = params;
             if let Some(t) = local_token(board, command, connect_profile).await? {
                 params["rubicon_token"] = json!(t);
@@ -314,7 +378,7 @@ pub async fn run_command(
                 "command": command,
                 "params": params,
             });
-            let r = follow_local(req).await?;
+            let r = follow_hub(&board.hub, req).await?;
             Ok(json!({"status": r["status"], "result": r["result"]}))
         }
         Hub::Connect { vm, .. } => {
@@ -428,25 +492,30 @@ fn queued_line(v: &Value) -> String {
 
 /// One request to this machine's VM agent, streamed back line by line. Its
 /// own process group: Ctrl-C at the terminal is ours to handle, not ssh's.
-fn agent_ctl(req: &Value) -> Result<std::process::Child> {
+fn agent_ctl(hub: &Hub, req: &Value) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
-    let target = lifecycle::ssh_target_for_running()?;
-    Command::new("ssh")
-        .args(target.base_args())
-        .arg(format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
-        .stdin(Stdio::null())
+    let mut cmd = match hub {
+        Hub::Host { ssh } => host_vm_command(ssh, &agent_ctl_line(req)),
+        _ => {
+            let target = lifecycle::ssh_target_for_running()?;
+            let mut c = Command::new("ssh");
+            c.args(target.base_args()).arg(agent_ctl_line(req));
+            c
+        }
+    };
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .process_group(0)
         .spawn()
         .context("ssh to the VM")
 }
 
-/// Cancel a command on this machine's VM; the agent's answer.
-pub async fn cancel_local(id: &str) -> Result<Value> {
+/// Cancel a command on a hub this machine talks to directly (its own VM,
+/// or one over ssh); the agent's answer.
+pub async fn cancel_on(hub: &Hub, id: &str) -> Result<Value> {
     let req = json!({"type": "command", "id": uuid::Uuid::new_v4().to_string(),
                      "command": "cancel", "params": {"id": id}});
-    let mut child = agent_ctl(&req)?;
+    let mut child = agent_ctl(hub, &req)?;
     let stdout = child.stdout.take().unwrap();
     let r = tokio::task::spawn_blocking(move || {
         BufReader::new(stdout)
@@ -463,9 +532,9 @@ pub async fn cancel_local(id: &str) -> Result<Value> {
 /// Send one command to this machine's VM agent and follow it; returns its
 /// `command_result` line. Ctrl-C cancels the job (a second one stops
 /// following and leaves it to the hub).
-async fn follow_local(req: Value) -> Result<Value> {
+async fn follow_hub(hub: &Hub, req: Value) -> Result<Value> {
     let id = req["id"].as_str().unwrap_or_default().to_string();
-    let mut child = agent_ctl(&req)?;
+    let mut child = agent_ctl(hub, &req)?;
     let stdout = child.stdout.take().unwrap();
     // Blocking reads on a dedicated thread; a job takes minutes.
     let result = tokio::task::spawn_blocking(move || {
@@ -502,7 +571,7 @@ async fn follow_local(req: Value) -> Result<Value> {
                 }
                 cancelled = true;
                 eprintln!("cancelling job {id} (Ctrl-C again to stop following)");
-                match cancel_local(&id).await {
+                match cancel_on(hub, &id).await {
                     Ok(r) if r["status"] == "completed" => {}
                     Ok(r) => eprintln!("cancel: {}", r["result"]["error"].as_str().unwrap_or("refused")),
                     Err(e) => eprintln!("cancel: {e:#}"),
@@ -540,6 +609,8 @@ pub struct RemoteProvision {
     /// The board; empty: the project's `rubicon.default`.
     pub rubicon: String,
     pub via: Via,
+    /// `--hub user@host`: that machine's avocado-vm, directly over ssh.
+    pub hub_host: Option<String>,
     pub vm: Option<String>,
     pub connect_profile: Option<String>,
     pub provision_profile: Option<String>,
@@ -575,6 +646,7 @@ impl RemoteProvision {
         };
         let scope = Scope {
             via: self.via,
+            host: self.hub_host.as_deref(),
             vm: self.vm.as_deref(),
             connect_profile: self.connect_profile.as_deref(),
         };
@@ -591,7 +663,7 @@ impl RemoteProvision {
                     .unwrap_or_else(|| share::resolve_workspace(None))?
                     .join(".avocado/hub-bundles")
             }
-            Hub::Connect { .. } => self.src_dir.join(".avocado/rubicon-bundle"),
+            Hub::Connect { .. } | Hub::Host { .. } => self.src_dir.join(".avocado/rubicon-bundle"),
         }
         .join(staging_name(&board.address));
         let _ = std::fs::remove_dir_all(&out);
@@ -613,6 +685,15 @@ impl RemoteProvision {
                     local_token(&board, "provision", self.connect_profile.as_deref()).await?;
                 self.run_local(&bundle, &board.address, token, &job_env)
                     .await
+            }
+            Hub::Host { ssh } => {
+                let token =
+                    local_token(&board, "provision", self.connect_profile.as_deref()).await?;
+                let r = self
+                    .run_host(ssh, &bundle, &board.address, token, &job_env)
+                    .await;
+                let _ = std::fs::remove_dir_all(&out);
+                r
             }
             Hub::Connect { vm, vm_name } => {
                 let (c, org) = connect(self.connect_profile.as_deref(), None)?;
@@ -695,10 +776,105 @@ impl RemoteProvision {
                 "requested_by": requester(),
             },
         });
-        let r = follow_local(req).await?;
+        let r = follow_hub(&Hub::Local, req).await?;
         report(&r, &format!("provision on Rubicon {address}"))?;
         print_success(
             &format!("Provisioned through Rubicon {address}"),
+            OutputLevel::Normal,
+        );
+        Ok(())
+    }
+}
+
+impl RemoteProvision {
+    /// Hand the job to the avocado-vm on `ssh_host`. Blobs go by rsync into
+    /// a content-addressed cache in that host's VM workspace share (only
+    /// the ones it lacks travel), and the job goes straight to its agent.
+    async fn run_host(
+        &self,
+        ssh_host: &str,
+        bundle: &Path,
+        address: &str,
+        token: Option<String>,
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
+        let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
+        // The host's VM workspace share; the cache lives inside it so the
+        // guest reads blobs in place.
+        let ws = {
+            let h = ssh_host.to_string();
+            let out = tokio::task::spawn_blocking(move || {
+                Command::new("ssh")
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"])
+                    .arg(&h)
+                    .arg("cat ~/.avocado/vm/workspace")
+                    .output()
+            })
+            .await??;
+            let ws = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() || !ws.starts_with('/') {
+                bail!("{ssh_host} has no avocado-vm workspace (~/.avocado/vm/workspace)");
+            }
+            ws
+        };
+        let cache = format!("{ws}/.avocado/hub-blobs");
+        print_info(
+            &format!(
+                "Syncing {} blobs to {ssh_host} (only what it lacks)...",
+                meta.blobs().len()
+            ),
+            OutputLevel::Normal,
+        );
+        let src = format!("{}/", bundle.join("blobs").display());
+        let dst = format!("{ssh_host}:{cache}/");
+        let st = tokio::task::spawn_blocking(move || {
+            Command::new("rsync")
+                .args(["-rL", "--ignore-existing", "--partial", "--rsync-path"])
+                .arg(format!("mkdir -p {cache} && rsync"))
+                .args(["-e", "ssh -o BatchMode=yes"])
+                .arg(&src)
+                .arg(&dst)
+                .status()
+        })
+        .await?
+        .context("rsync")?;
+        if !st.success() {
+            bail!("syncing the bundle to {ssh_host} failed ({st})");
+        }
+        let blobs: Vec<Value> = meta
+            .blobs()
+            .iter()
+            .map(|b| {
+                json!({"sha256": b.sha256, "size_bytes": b.size,
+                       "url": format!("{}/.avocado/hub-blobs/{}", share::VM_MOUNT_POINT, b.sha256)})
+            })
+            .collect();
+        let name = bundle
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        print_info(
+            &format!("Provisioning through the avocado-vm on {ssh_host}, Rubicon {address}"),
+            OutputLevel::Normal,
+        );
+        let req = json!({
+            "type": "command",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "command": "provision",
+            "params": {
+                "address": address,
+                "profile": self.provision_profile,
+                "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
+                "rubicon_token": token,
+                "env": env,
+                "requested_by": requester(),
+            },
+        });
+        let r = follow_hub(&Hub::Host { ssh: ssh_host.to_string() }, req).await?;
+        report(&r, &format!("provision on Rubicon {address}"))?;
+        print_success(
+            &format!("Provisioned through Rubicon {address} on {ssh_host}"),
             OutputLevel::Normal,
         );
         Ok(())

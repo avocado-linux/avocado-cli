@@ -2534,6 +2534,7 @@ async fn main() -> Result<()> {
                 via,
                 vm,
                 connect_profile,
+                hub_host,
             } = *remote;
             if rubicon.is_some() && (list || pack.is_some() || bundle.is_some() || out.is_some()) {
                 anyhow::bail!(
@@ -2604,6 +2605,7 @@ async fn main() -> Result<()> {
                 return crate::commands::provision_remote::RemoteProvision {
                     rubicon,
                     via,
+                    hub_host,
                     vm,
                     connect_profile,
                     provision_profile,
@@ -3488,6 +3490,7 @@ async fn main() -> Result<()> {
                 via,
                 vm,
                 connect_profile,
+                hub_host,
             } = *args;
             let action = match command {
                 RubiconCommands::List => A::List,
@@ -3518,6 +3521,7 @@ async fn main() -> Result<()> {
                 via,
                 vm,
                 connect_profile,
+                hub_host,
             }
             .execute()
             .await
@@ -5368,6 +5372,10 @@ struct RubiconArgs {
     /// Connect profile to use.
     #[arg(long, global = true)]
     connect_profile: Option<String>,
+    /// Only the avocado-vm on this machine (`user@host`), straight over
+    /// ssh instead of through Connect.
+    #[arg(long = "hub", global = true)]
+    hub_host: Option<String>,
 }
 
 /// A board is named by its firmware name, label or address; omitted, the
@@ -5511,6 +5519,11 @@ struct ProvisionRemoteArgs {
     /// With --rubicon via Connect: Connect profile to use.
     #[arg(long, requires = "rubicon")]
     pub connect_profile: Option<String>,
+    /// With --rubicon: submit the job straight to the avocado-vm on this
+    /// machine over ssh (`user@host`), as if it were local: the bundle goes
+    /// by rsync (only blobs the host lacks), no Connect in between.
+    #[arg(long = "hub", requires = "rubicon", conflicts_with = "vm")]
+    pub hub_host: Option<String>,
 }
 
 #[derive(Subcommand)]

@@ -67,12 +67,15 @@ pub struct RubiconCommand {
     pub via: Via,
     pub vm: Option<String>,
     pub connect_profile: Option<String>,
+    /// `--hub user@host`: only that machine's avocado-vm, over ssh.
+    pub hub_host: Option<String>,
 }
 
 impl RubiconCommand {
     fn scope(&self) -> Scope<'_> {
         Scope {
             via: self.via,
+            host: self.hub_host.as_deref(),
             vm: self.vm.as_deref(),
             connect_profile: self.connect_profile.as_deref(),
         }
@@ -175,7 +178,7 @@ impl RubiconCommand {
                     .map(String::from)
                     .unwrap_or_else(|| job.clone());
                 let r = match &b.hub {
-                    Hub::Local => remote::cancel_local(&job).await?,
+                    Hub::Local | Hub::Host { .. } => remote::cancel_on(&b.hub, &job).await?,
                     Hub::Connect { .. } => {
                         remote::run_command(
                             &b,
@@ -228,6 +231,7 @@ impl RubiconCommand {
                        "public_key": info["data"]["public_key"]})
             }
             Hub::Connect { .. } => json!({"address": b.address}),
+            Hub::Host { ssh } => bail!("claiming over --hub is not supported yet; claim {} on {ssh}", b.address),
         };
         eprintln!(
             "Press SW2 on {} now (the LED blinks blue for 60 s).",
@@ -262,6 +266,7 @@ impl RubiconCommand {
                 json!({"address": b.address, "firmware": {
                     "url": vm.to_string_lossy(), "sha256": fw.sha256, "version": fw.version}})
             }
+            Hub::Host { ssh } => bail!("firmware updates over --hub are not supported yet; update {} on {ssh}", b.address),
             Hub::Connect { .. } => {
                 let id = upload_firmware(self.connect_profile.as_deref(), fw).await?;
                 json!({"address": b.address, "firmware_id": id})
@@ -347,6 +352,7 @@ impl RubiconCommand {
                 match &b.hub {
                     Hub::Local => "this machine".to_string(),
                     Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+                    Hub::Host { ssh } => format!("vm on {ssh}"),
                 },
                 state(b)
             );
@@ -358,6 +364,9 @@ impl RubiconCommand {
     /// Every board reachable from here, each once (this machine's VM is also
     /// one of the org's VMs in Connect).
     async fn all_boards(&self) -> Result<Vec<Board>> {
+        if let Some(h) = &self.hub_host {
+            return remote::host_boards(h).await;
+        }
         let mut boards = Vec::new();
         if self.via != Via::Connect {
             boards.extend(remote::local_boards().await?);
