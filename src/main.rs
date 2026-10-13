@@ -2534,6 +2534,7 @@ async fn main() -> Result<()> {
                 via,
                 vm,
                 connect_profile,
+                interactive,
             } = *remote;
             if rubicon.is_some() && (list || pack.is_some() || bundle.is_some() || out.is_some()) {
                 anyhow::bail!(
@@ -2609,6 +2610,7 @@ async fn main() -> Result<()> {
                     provision_profile,
                     src_dir,
                     config_path,
+                    interactive,
                 }
                 .execute(provision_cmd)
                 .await;
@@ -3973,6 +3975,7 @@ async fn main() -> Result<()> {
                     wait: a.wait,
                     org: a.org,
                     profile_name: a.profile_name,
+                    interactive: false,
                 }
                 .execute()
                 .await
@@ -5511,6 +5514,14 @@ struct ProvisionRemoteArgs {
     /// With --rubicon via Connect: Connect profile to use.
     #[arg(long, requires = "rubicon")]
     pub connect_profile: Option<String>,
+    /// With --rubicon: for a human at the board's console. Runs the
+    /// recovery steps and the flash, then leaves the DUT powered on to boot:
+    /// no boot check, no console in the job log, and your
+    /// `avocado rubicon console` stays writable throughout. Without it
+    /// (automation, for CI and tests) the job checks the boot and owns the
+    /// console while it runs.
+    #[arg(long, requires = "rubicon")]
+    pub interactive: bool,
 }
 
 #[derive(Subcommand)]
@@ -5816,6 +5827,29 @@ mod tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// `--interactive` is the flag the desktop drives; it needs `--rubicon`.
+    #[test]
+    fn provision_interactive_needs_a_rubicon() {
+        match parse_cli(&["avocado", "provision", "--rubicon", "thor", "--interactive"]) {
+            Commands::Provision { remote, .. } => {
+                assert!(remote.interactive);
+                assert_eq!(remote.rubicon.as_deref(), Some("thor"));
+            }
+            _ => panic!("not a provision"),
+        }
+        match parse_cli(&["avocado", "provision", "--rubicon", "thor"]) {
+            Commands::Provision { remote, .. } => assert!(!remote.interactive),
+            _ => panic!("not a provision"),
+        }
+        let alone = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| Cli::try_parse_from(["avocado", "provision", "--interactive"]).is_err())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(alone, "--interactive without --rubicon must not parse");
     }
 
     #[test]
