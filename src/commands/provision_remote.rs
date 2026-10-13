@@ -384,11 +384,29 @@ pub fn queue_of(b: &Board) -> Vec<Value> {
 /// One queue entry: `provision 3f2a1c0d by josh@riptide, 12m`.
 pub fn queue_entry(e: &Value, now: u64) -> String {
     let id = e["id"].as_str().unwrap_or("?");
-    let mut s = format!(
-        "{} {}",
+    format!(
+        "{} {}{}",
         e["what"].as_str().unwrap_or("?"),
-        id.get(..8).unwrap_or(id)
-    );
+        id.get(..8).unwrap_or(id),
+        who_and_age(e, now)
+    )
+}
+
+/// Who typed on the board's console: `console (writer) by justin@mac, 50m`.
+/// Not a job, so it is shown apart from the queue.
+pub fn console_writer(b: &Board, now: u64) -> Option<String> {
+    let w = if b.info["console_writer"].is_object() {
+        &b.info["console_writer"]
+    } else {
+        &b.info["state"]["console_writer"]
+    };
+    w.is_object()
+        .then(|| format!("console (writer){}", who_and_age(w, now)))
+}
+
+/// ` by josh@riptide, 12m`, whichever parts are known.
+fn who_and_age(e: &Value, now: u64) -> String {
+    let mut s = String::new();
     if let Some(who) = e["requested_by"].as_str() {
         s.push_str(&format!(" by {who}"));
     }
@@ -730,9 +748,22 @@ mod tests {
         assert!(queue_of(&b).is_empty());
         let mut b = b;
         b.info = json!({"queue": [e.clone()]});
+        assert_eq!(console_writer(&b, 3000), None);
         assert_eq!(queue_of(&b).len(), 1);
         b.info = json!({"state": {"queue": [e]}});
         assert_eq!(queue_of(&b).len(), 1);
+        // A console writer is shown apart from the queue, not as a job.
+        b.info = json!({"queue": [], "console_writer":
+                        {"id": "console-3", "what": "console", "requested_by": "justin@mac", "since": 0}});
+        assert_eq!(
+            console_writer(&b, 3000).as_deref(),
+            Some("console (writer) by justin@mac")
+        );
+        b.info = json!({"state": {"console_writer": {"what": "console", "since": 600}}});
+        assert_eq!(
+            console_writer(&b, 3600).as_deref(),
+            Some("console (writer), 50m")
+        );
     }
 
     #[test]
