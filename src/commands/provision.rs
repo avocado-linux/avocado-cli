@@ -50,6 +50,11 @@ pub struct ProvisionCommand {
 }
 
 impl ProvisionCommand {
+    /// The `--target` given on the command line, if any.
+    pub fn target_name(&self) -> Option<&str> {
+        self.config.target.as_deref()
+    }
+
     /// The caller's `--env` values, for a remote provision to send with the
     /// job (a pack leaves them out of the bundle).
     pub fn env_vars(&self) -> Option<&HashMap<String, String>> {

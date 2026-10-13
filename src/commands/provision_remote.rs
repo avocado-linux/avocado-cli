@@ -639,6 +639,37 @@ pub struct RemoteProvision {
     pub interactive: bool,
 }
 
+/// Fail before packing when the project says how to drive a board for some
+/// provision profiles but not the chosen one: the hub would skip the board's
+/// recovery steps and the flash would wait for a device that never comes.
+fn check_rubicon_binding(config_path: &str, target: Option<&str>, profile: Option<&str>) -> Result<()> {
+    let Some(profile) = profile.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    // Composed: extensions (a board's Rubicon support) contribute bindings.
+    let composed = crate::utils::config::Config::load_composed(config_path, target)?;
+    unbound_profile_error(&composed.config, profile).map_or(Ok(()), |e| bail!(e))
+}
+
+fn unbound_profile_error(config: &crate::utils::config::Config, profile: &str) -> Option<String> {
+    let profiles = config.provision_profiles.as_ref()?;
+    let mut bound: Vec<&str> = profiles
+        .iter()
+        .filter(|(_, p)| p.rubicon.is_some())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if bound.is_empty() || bound.contains(&profile) {
+        return None;
+    }
+    bound.sort_unstable();
+    Some(format!(
+        "provision profile {profile:?} has no Rubicon steps, so the hub would not put the board \
+         into recovery; use one that does ({}) or bind it with \
+         `provision.{profile}.rubicon: {{ before: ..., after: ... }}`",
+        bound.join(", ")
+    ))
+}
+
 /// A board's address as a single directory name.
 fn staging_name(address: &str) -> String {
     let name: String = address
@@ -670,6 +701,11 @@ impl RemoteProvision {
             vm: self.vm.as_deref(),
             connect_profile: self.connect_profile.as_deref(),
         };
+        check_rubicon_binding(
+            &self.config_path,
+            provision.target_name(),
+            self.provision_profile.as_deref(),
+        )?;
         let board = resolve(&wanted, &scope).await?;
         // One staging directory per board: a board runs one job at a time,
         // while provisions to different boards (from one project or several)
@@ -1014,5 +1050,20 @@ mod tests {
             "10.0.0.2"
         );
         assert!(pick("nope", boards).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unbound_provision_profile_is_refused_before_packing() {
+        let c: crate::utils::config::Config = serde_yaml::from_str(
+            "provision:\n  tegraflash:\n    rubicon: { before: r, after: b }\n  tegraflash-sd: {}\n",
+        )
+        .unwrap();
+        assert!(unbound_profile_error(&c, "tegraflash").is_none());
+        let e = unbound_profile_error(&c, "tegraflash-sd").unwrap();
+        assert!(e.contains("tegraflash-sd") && e.contains("(tegraflash)"), "{e}");
+        // A project with no Rubicon bindings at all is left to the hub.
+        let none: crate::utils::config::Config =
+            serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();
+        assert!(unbound_profile_error(&none, "usb").is_none());
     }
 }
