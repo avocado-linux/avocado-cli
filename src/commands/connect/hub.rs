@@ -233,6 +233,29 @@ pub struct ProvisionJobCommand {
     pub wait: bool,
     pub org: Option<String>,
     pub profile_name: Option<String>,
+    /// For a human at the console (`--interactive`): see `provision_params`.
+    pub interactive: bool,
+}
+
+/// The `provision` command's params. `interactive` is sent only when set,
+/// so automation requests stay as they were.
+fn provision_params(
+    address: &str,
+    bundle: Option<&str>,
+    runtime: Option<&str>,
+    profile: Option<&str>,
+    interactive: bool,
+) -> serde_json::Value {
+    let mut p = json!({
+        "address": address,
+        "bundle_id": bundle,
+        "runtime_id": runtime,
+        "profile": profile,
+    });
+    if interactive {
+        p["interactive"] = json!(true);
+    }
+    p
 }
 
 /// PR number from a GitHub-style PR URL (`…/pull/123`).
@@ -269,12 +292,13 @@ impl ProvisionJobCommand {
                 &format!("/api/orgs/{org}/vms/{}/commands", self.vm),
                 Some(&json!({
                     "command": "provision",
-                    "params": {
-                        "address": self.rubicon,
-                        "bundle_id": self.bundle,
-                        "runtime_id": self.runtime,
-                        "profile": self.profile,
-                    },
+                    "params": provision_params(
+                        &self.rubicon,
+                        self.bundle.as_deref(),
+                        self.runtime.as_deref(),
+                        self.profile.as_deref(),
+                        self.interactive,
+                    ),
                     "source": source,
                 })),
             )
@@ -307,5 +331,14 @@ mod tests {
             Some(42)
         );
         assert_eq!(super::pr_number("https://github.com/o/r"), None);
+    }
+
+    #[test]
+    fn only_an_interactive_provision_says_so() {
+        let auto = super::provision_params("thor", Some("b1"), None, None, false);
+        assert!(auto.get("interactive").is_none(), "{auto}");
+        let human = super::provision_params("thor", Some("b1"), None, None, true);
+        assert_eq!(human["interactive"], true);
+        assert_eq!(human["bundle_id"], "b1");
     }
 }
