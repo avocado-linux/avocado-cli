@@ -461,6 +461,9 @@ impl RubiconCommand {
         if let Some(t) = token {
             cmd.push_str(&format!(" --token {}", sh_quote(&t)));
         }
+        if write {
+            cmd.push_str(&format!(" --by {}", sh_quote(&remote::requester())));
+        }
         let target = lifecycle::ssh_target_for_running()?;
         let mut ssh = Command::new("ssh");
         ssh.args(target.base_args());
@@ -666,6 +669,9 @@ fn print_queue(b: &Board, indent: &str) {
     for (i, e) in remote::queue_of(b).iter().enumerate() {
         let tag = if i == 0 { "running" } else { "waiting" };
         println!("{indent}{tag:<8} {}", remote::queue_entry(e, now));
+    }
+    if let Some(w) = remote::console_writer(b, now) {
+        println!("{indent}{w}");
     }
 }
 
