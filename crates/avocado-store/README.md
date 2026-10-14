@@ -74,18 +74,19 @@ free space, warm layers + their inputs) as tag `backend-<name>`; `plan <topology
 
 ## Cache management
 
-`gc --high H --low L [--dry-run]`: when the store (objects + layer files) is over H bytes,
+`gc --high H --low L [--dry-run]` (or `--min-free F [--target-free T]`, free-space watermarks for
+hubs/services, the agent's `AVOCADO_VM_WORK_MIN_FREE_GB` equivalent): when the store (objects + layer files) is over H bytes,
 evict least-recently-used layers (record mtime, touched on every mount/use) that no pin and
 no view references, until it is at or under L; then delete objects no remaining layer
 references. Unreferenced objects (e.g. from a crashed writer) go first. Records are deleted
 before their files and objects last, all under the exclusive GC lock. Layers are complete
-trees, so keeping a layer never requires keeping its parent.
+trees, so keeping a layer never requires keeping its parent. A protected alias protects its target.
 
 ## Commands
 
 ```
-preflight  import <dir> <key>  has  record  mount  umount  drop  use  commit  remount  alias
-verify  stats  describe  advertise  plan  gc  pin  unpin  hold  push  pull  checkout  destroy
+preflight  import <dir> <key>  has  check  record  mount  umount  drop  use  commit  remount  alias
+verify  stats  usage  describe  advertise  plan  gc  pin  unpin  hold  push  pull  checkout  destroy
 ```
 
 `hold <key>` takes the per-key build lock and keeps it until its stdin closes; the CLI keeps
