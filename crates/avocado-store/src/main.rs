@@ -71,6 +71,9 @@ enum Cmd {
     Verify { key: String },
     /// Usage, layers, views, pins.
     Stats,
+    /// Desktop-facing summary: store bytes, what the projects would take without sharing, and per
+    /// project the shared (layer) vs private (upper) bytes.
+    Usage,
     /// What this store offers a route planner.
     Describe,
     /// Evict LRU unpinned, unleased layers when over HIGH bytes, down to LOW.
@@ -187,6 +190,24 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats => write_out(&store.stats()?),
+        Cmd::Usage => {
+            let s = store.stats()?;
+            let store_bytes = s["object_bytes"].as_u64().unwrap_or(0) + s["layer_meta_bytes"].as_u64().unwrap_or(0) + s["upper_bytes"].as_u64().unwrap_or(0);
+            let mut projects = Vec::new();
+            let mut without = 0u64;
+            for v in store.views()? {
+                let logical = store.record(&v.layer).map(|r| r.logical_bytes).unwrap_or(0);
+                let private = avocado_store::du(&store.view_dir(&v.name).join("upper"));
+                without += logical + private;
+                projects.push(json!({"view": v.name, "layer": v.layer, "shared_bytes": logical, "private_bytes": private, "mounted_at": v.at}));
+            }
+            write_out(&json!({
+                "store_bytes": store_bytes, "without_sharing_bytes": without,
+                "saved_bytes": without.saturating_sub(store_bytes),
+                "layers": s["layers"].as_array().map(|l| l.len()).unwrap_or(0), "objects": s["objects"],
+                "free_bytes": nix_statvfs(&cli.root), "projects": projects,
+            }));
+        }
         Cmd::Describe => write_out(&describe(&store, &cli.root)?),
         Cmd::Gc { high, low, min_free, target_free, dry_run } => {
             let (mut high, mut low) = (high, low);
