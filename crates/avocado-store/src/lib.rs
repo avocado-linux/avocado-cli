@@ -562,6 +562,8 @@ impl Store {
         let mut v: Vec<String> = fs::read_dir(self.root.join("layers"))?
             .filter_map(|d| d.ok())
             .filter_map(|d| d.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(String::from))
+            // An alias whose target was evicted dangles: it is not a layer (GC removes it).
+            .filter(|k| self.has_layer(k))
             .collect();
         v.sort();
         Ok(v)
@@ -1098,6 +1100,12 @@ impl Store {
         fs::create_dir_all(self.root.join("tmp"))?;
         for d in fs::read_dir(self.root.join("layers"))? {
             let p = d?.path();
+            if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) && fs::metadata(&p).is_err() {
+                if !dry_run {
+                    rm_rf(&p)?;
+                }
+                continue;
+            }
             if let (Some(stem), Some(ext)) = (p.file_stem(), p.extension()) {
                 if ext != "json" && !self.has_layer(&stem.to_string_lossy()) && !dry_run {
                     rm_rf(&p)?;
@@ -1106,7 +1114,7 @@ impl Store {
         }
         let sizes = self.object_sizes()?;
         let meta_size = |k: &str| -> u64 {
-            ["json", "dump", "erofs"].iter().map(|e| fs::metadata(self.layer_file(k, e)).map(|m| m.len()).unwrap_or(0)).sum()
+            ["json", "dump", "erofs"].iter().map(|e| fs::symlink_metadata(self.layer_file(k, e)).map(|m| m.len()).unwrap_or(0)).sum()
         };
         let mut protected: HashSet<String> = HashSet::new();
         protected.insert(EMPTY_KEY.to_string());

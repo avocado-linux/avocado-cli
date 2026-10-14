@@ -78,16 +78,19 @@ pub fn plan(topo: &Value) -> Result<Value> {
     let mut rows = Vec::new();
     for b in backends.iter().filter(|b| b["can_build"].as_bool().unwrap_or(false)) {
         let name = b["name"].as_str().unwrap_or("");
-        if b["offline"].as_bool().unwrap_or(false) {
-            continue;
-        }
         let (t_src, path_src) = transfer(&links, client, name, f(&p["source_bytes"]));
         // Layers: none if warm here; else from the cheapest warm peer; else the package feed.
         let (sdk_b, t_sdk, path_sdk) = if warm(b, target, rv) {
             (0.0, 0.0, "warm".to_string())
         } else {
             let bytes = f(&p["layer_bytes"]);
-            let mut best = (bytes, bytes * 8.0 / (f(&feed["mbps"]).max(1.0) * 1e6) + f(&feed["install_s"]), format!("package feed ({:.0} Mbit/s) + install", f(&feed["mbps"])));
+            // The feed is reached from the builder itself, at the builder's own internet speed.
+            let fm = if b["feed_mbps"].is_number() { f(&b["feed_mbps"]) } else { f(&feed["mbps"]) };
+            let mut best = if b["offline"].as_bool().unwrap_or(false) || fm == 0.0 {
+                (bytes, f64::INFINITY, "no feed reachable".to_string())
+            } else {
+                (bytes, bytes * 8.0 / (fm * 1e6) + f(&feed["install_s"]), format!("package feed ({fm:.0} Mbit/s) + install"))
+            };
             for peer in backends.iter().filter(|x| x["name"] != b["name"] && warm(x, target, rv)) {
                 let (t, path) = transfer(&links, peer["name"].as_str().unwrap_or(""), name, bytes);
                 if t < best.1 {

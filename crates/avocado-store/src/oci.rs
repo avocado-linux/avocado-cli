@@ -230,7 +230,7 @@ pub fn push(store: &Store, remote: &Remote, key: &str, known: &[String]) -> Resu
     let main = serde_json::to_vec(&json!({
         "schemaVersion": 2, "mediaType": MT_MANIFEST, "artifactType": MT_LAYER,
         "config": cfg, "layers": [l_erofs, l_dump],
-        "annotations": {"org.avocado.layer.key": key, "org.avocado.layer.parent": rec.parent,
+        "annotations": {"org.avocado.layer.key": key, "org.avocado.layer.parent": rec.parent.clone().unwrap_or_default(),
                         "org.avocado.layer.tree-digest": rec.tree_digest},
     }))?;
     let main_desc = Remote::manifest_desc(&main, json!({"artifactType": MT_LAYER}));
