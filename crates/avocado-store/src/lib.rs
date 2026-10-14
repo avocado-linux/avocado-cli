@@ -211,6 +211,17 @@ pub fn parse_dump(data: &[u8]) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// A name unique across concurrent helpers: every helper is PID 1 in its own container, so the
+/// container's hostname (its id) plus a per-process counter.
+pub fn uniq() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let h = HOST.get_or_init(|| {
+        fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default()
+    });
+    format!("{h}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
@@ -405,6 +416,10 @@ pub struct ViewRecord {
     /// Top-level names that stay in the view's upper and never enter a layer.
     pub private: Vec<String>,
     pub updated: u64,
+    /// Where the view is mounted, when not `views/<name>/merged` (e.g. inside a docker
+    /// volume's `_data/<target>`, so every existing `-v avo-…:/opt/_avocado` sees it).
+    #[serde(default)]
+    pub at: Option<PathBuf>,
 }
 
 pub struct Store {
@@ -450,7 +465,7 @@ pub fn is_mounted(p: &Path) -> bool {
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = path.with_extension(format!("tmp.{}", crate::uniq()));
     fs::write(&tmp, data)?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -554,7 +569,7 @@ impl Store {
         }
         fs::create_dir_all(dst.parent().unwrap())?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = self.root.join("tmp").join(format!("obj.{hex}.{}.{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let tmp = self.root.join("tmp").join(format!("obj.{hex}.{}.{}", crate::uniq(), SEQ.fetch_add(1, Ordering::Relaxed)));
         if !(movable && fs::rename(src, &tmp).is_ok()) {
             let mut i = File::open(src).with_context(|| format!("open {}", src.display()))?;
             let o = File::create(&tmp)?;
@@ -637,7 +652,7 @@ impl Store {
             return self.record(key);
         }
         let dump = write_dump(entries);
-        let pid = std::process::id();
+        let pid = crate::uniq();
         let tmp_dump = self.root.join("tmp").join(format!("{key}.{pid}.dump"));
         let tmp_img = self.root.join("tmp").join(format!("{key}.{pid}.erofs"));
         fs::write(&tmp_dump, &dump)?;
@@ -721,18 +736,30 @@ impl Store {
     }
 
     /// Mount view `name` on its recorded layer (or `layer`, for a new view). Idempotent.
+    pub fn merged(&self, v: &ViewRecord) -> PathBuf {
+        v.at.clone().unwrap_or_else(|| self.view_dir(&v.name).join("merged"))
+    }
+
     pub fn mount_view(&self, name: &str, layer: Option<&str>, private: &[String]) -> Result<ViewRecord> {
+        self.mount_view_at(name, layer, private, None)
+    }
+
+    pub fn mount_view_at(&self, name: &str, layer: Option<&str>, private: &[String], at: Option<&Path>) -> Result<ViewRecord> {
         let mut v = self.view(name)?.unwrap_or(ViewRecord {
             name: name.to_string(),
             layer: EMPTY_KEY.to_string(),
             private: private.to_vec(),
             updated: now_secs(),
+            at: None,
         });
         if !private.is_empty() {
             v.private = private.to_vec();
         }
+        if let Some(a) = at {
+            v.at = Some(a.to_path_buf());
+        }
         let dir = self.view_dir(name);
-        let merged = dir.join("merged");
+        let merged = self.merged(&v);
         if is_mounted(&merged) {
             if let Some(l) = layer {
                 if l != v.layer {
@@ -747,9 +774,10 @@ impl Store {
         if !self.has_layer(&v.layer) {
             bail!("layer {} is not in this store", v.layer);
         }
-        for d in ["upper", "work", "merged"] {
+        for d in ["upper", "work"] {
             fs::create_dir_all(dir.join(d))?;
         }
+        fs::create_dir_all(&merged)?;
         // A fresh upper's root is what the merged root reports: give it the layer root's metadata.
         let up = dir.join("upper");
         if fs::read_dir(&up)?.next().is_none() {
@@ -769,7 +797,7 @@ impl Store {
         v.updated = now_secs();
         self.save_view(&v)?;
         self.touch(&v.layer);
-        let tmp = self.root.join("tmp").join(format!("erofs.{name}.{}", std::process::id()));
+        let tmp = self.root.join("tmp").join(format!("erofs.{name}.{}", crate::uniq()));
         fs::create_dir_all(&tmp)?;
         run(Command::new("mount").args(["-t", "erofs", "-o", "ro"]).arg(self.erofs_path(&v.layer)).arg(&tmp))?;
         let opts = format!(
@@ -788,7 +816,8 @@ impl Store {
     }
 
     pub fn umount_view(&self, name: &str) -> Result<()> {
-        let merged = self.view_dir(name).join("merged");
+        let Some(v) = self.view(name)? else { return Ok(()) };
+        let merged = self.merged(&v);
         if is_mounted(&merged) {
             run(Command::new("umount").arg(&merged))?;
         }
@@ -841,7 +870,7 @@ impl Store {
         let _gc = self.gc_lock(false)?;
         let v = self.view(name)?.ok_or_else(|| anyhow!("no view {name}"))?;
         let dir = self.view_dir(name);
-        let merged = dir.join("merged");
+        let merged = self.merged(&v);
         if !is_mounted(&merged) {
             bail!("view {name} is not mounted");
         }
@@ -917,7 +946,7 @@ impl Store {
     pub fn verify(&self, key: &str) -> Result<(bool, String, f64)> {
         let t = Instant::now();
         let rec = self.record(key)?;
-        let name = format!("verify-{key}-{}", std::process::id());
+        let name = format!("verify-{key}-{}", crate::uniq());
         self.mount_view(&name, Some(key), &[])?;
         let merged = self.view_dir(&name).join("merged");
         let r = (|| -> Result<String> {
@@ -953,6 +982,33 @@ impl Store {
         self.drop_view(&name)?;
         let got = r?;
         Ok((got == rec.tree_digest, got, t.elapsed().as_secs_f64()))
+    }
+
+    /// Mount every recorded view whose name starts with `prefix` that is not mounted (after a
+    /// reboot, or on a project's first command of the day).
+    pub fn remount(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for v in self.views()? {
+            if v.name.starts_with(prefix) && !is_mounted(&self.merged(&v)) {
+                self.mount_view(&v.name, None, &[])?;
+                out.push(v.name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Make `alias` another name for layer `key` (symlinked files; evicting `key` breaks it,
+    /// which reads as a plain miss).
+    pub fn alias(&self, alias: &str, key: &str) -> Result<()> {
+        if !self.has_layer(key) || self.has_layer(alias) {
+            return Ok(());
+        }
+        for ext in ["dump", "erofs", "json"] {
+            let l = self.layer_file(alias, ext);
+            let _ = fs::remove_file(&l);
+            std::os::unix::fs::symlink(format!("{key}.{ext}"), &l)?;
+        }
+        Ok(())
     }
 
     pub fn pins(&self) -> Result<HashMap<String, Vec<String>>> {

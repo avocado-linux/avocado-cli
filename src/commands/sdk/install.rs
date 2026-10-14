@@ -38,6 +38,8 @@ struct BootstrapResult {
     sdk_sysroot: SysrootType,
     /// Lock file (to be cloned for each parallel task)
     lock_file: LockFile,
+    /// The L0 layer the view is on (layer store), the parent of L1.
+    l0_key: Option<String>,
     /// Active extensions after config reload
     active_extensions: HashSet<String>,
     /// Resolved src_dir for lock file save path
@@ -230,9 +232,32 @@ impl SdkInstallCommand {
             None
         };
 
+        // Layer store (PoC): the project's /opt/_avocado/<target> becomes a store view and the
+        // install steps below become shared layers. Not with --runs-on (its own volume plumbing).
+        let store = match crate::utils::layer_store::store_root() {
+            Some(root) if self.runs_on.is_none() => {
+                let vs = crate::utils::volume::VolumeManager::new(
+                    container_helper.container_tool.clone(),
+                    self.verbose,
+                )
+                .get_or_create_volume(&container_helper.cwd)
+                .await?;
+                let s = crate::utils::layer_store::LayerStore::new(
+                    root,
+                    &container_helper.container_tool,
+                    &vs.volume_name,
+                    &target,
+                );
+                s.ensure_view().await?;
+                Some(s)
+            }
+            _ => None,
+        };
+
         // Phase 1: Bootstrap — sets up SDK env, installs bootstrap package, fetches extensions
         let bootstrap_result = self
             .execute_bootstrap(
+                store.as_ref(),
                 config,
                 &target,
                 container_image,
@@ -305,6 +330,7 @@ impl SdkInstallCommand {
         // Each task gets its own lock_file clone since they write to different sections.
         let result = self
             .execute_parallel_phase(
+                store.as_ref(),
                 &bootstrap,
                 container_image,
                 repo_url.as_deref(),
@@ -342,6 +368,7 @@ impl SdkInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn execute_parallel_phase(
         &self,
+        store: Option<&crate::utils::layer_store::LayerStore>,
         bootstrap: &BootstrapResult,
         container_image: &str,
         repo_url: Option<&str>,
@@ -517,6 +544,33 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
 
+        // L1 (layer store): what the four parallel installs read.
+        let l1_inputs = store.map(|s| {
+            let j = |v: &serde_yaml::Value| serde_json::to_value(v).unwrap_or_default();
+            let mv = &composed.merged_value;
+            let mut v = crate::utils::layer_store::base_inputs();
+            v["step"] = "L1 sdk packages + sysroots".into();
+            v["target"] = target.into();
+            v["sdk"] = j(&mv["sdk"]);
+            v["rootfs"] = j(&mv["rootfs"]);
+            v["initramfs"] = j(&mv["initramfs"]);
+            v["sdk_deps"] = serde_json::to_value(&bootstrap.sdk_dependencies).unwrap_or_default();
+            v["ext_sdk_deps"] = serde_json::to_value(&bootstrap.extension_sdk_dependencies).unwrap_or_default();
+            v["target_dev"] = target_dev_command.as_ref().map(|(c, _, _)| c.clone()).into();
+            v["provision_dto"] = provision_dto.into();
+            v["lock"] = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
+            v["feeds"] = serde_json::json!([
+                feeds.map(|f| f.fingerprint.clone()),
+                target_dev_feeds.map(|f| f.fingerprint.clone()),
+            ]);
+            v["feeds_config"] = j(&mv["feeds"]);
+            v["repo"] = serde_json::json!([repo_url, repo_release]);
+            v["dnf_args"] = self.dnf_args.clone().into();
+            v["no_weak_deps"] = config.get_sdk_disable_weak_dependencies().into();
+            s.scope(&mut v);
+            (s, v)
+        });
+        let phase = async {
         // Clone lock files for each parallel task (they write to different sections)
         let mut sdk_pkg_lock = lock_file.clone();
         let mut rootfs_lock = lock_file.clone();
@@ -843,6 +897,18 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         rootfs_result?;
         initramfs_result?;
         target_dev_result?;
+        Ok::<(), anyhow::Error>(())
+        };
+        match l1_inputs {
+            Some((s, ref v)) => {
+                let parent = bootstrap.l0_key.as_deref().unwrap_or("empty");
+            s.step("L1 sdk packages + sysroots", parent, v, || phase).await?;
+            let saved = LockFile::load(src_dir)?;
+            s.alias_for_lock(&serde_json::to_value(saved.targets.get(target)).unwrap_or_default())
+                .await?;
+            }
+            None => phase.await?,
+        }
 
         // Write compile-deps stamp (unless --no-stamps)
         // This tracks which compile dependencies are installed in the target-sysroot.
@@ -1026,6 +1092,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
     #[allow(clippy::too_many_arguments)]
     async fn execute_bootstrap(
         &self,
+        store: Option<&crate::utils::layer_store::LayerStore>,
         config: &Config,
         target: &str,
         container_image: &str,
@@ -1082,6 +1149,42 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
             );
         }
 
+        let sdk_target_pkg_name = format!("avocado-sdk-{target}");
+        let bootstrap_pkg_name = "avocado-sdk-bootstrap";
+        // Both are queried for the lock file later, whether installed now or taken from a layer.
+        let all_sdk_package_names: Vec<String> =
+            vec![sdk_target_pkg_name.clone(), bootstrap_pkg_name.to_string()];
+
+        // L0 (layer store): everything the four runs below read. Lock pins are in it, so a
+        // project pinned to other versions gets its own layer.
+        let l0_inputs = match store {
+            Some(s) => {
+                let pins = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
+                let pins = &pins["sdk"][host_arch.as_str()];
+                let mut v = crate::utils::layer_store::base_inputs();
+                v["step"] = "L0 sdk bootstrap".into();
+                v["target"] = target.into();
+                v["host_arch"] = host_arch.as_str().into();
+                v["image"] = crate::utils::layer_store::image_id(
+                    &container_helper.container_tool,
+                    container_image,
+                )
+                .await?
+                .into();
+                v["repo_url"] = repo_url.into();
+                v["repo_release"] = repo_release.into();
+                v["feeds"] = feeds.map(|f| f.fingerprint.clone()).into();
+                v["pins"] = serde_json::json!([pins[sdk_target_pkg_name.as_str()], pins[bootstrap_pkg_name]]);
+                v["pins_of"] = serde_json::json!([sdk_target_pkg_name, bootstrap_pkg_name]);
+                v["dnf_args"] = self.dnf_args.clone().into();
+                v["no_weak_deps"] = config.get_sdk_disable_weak_dependencies().into();
+                s.scope(&mut v);
+                Some((s, v))
+            }
+            None => None,
+        };
+
+        let installs = async {
         // Initialize SDK environment first (creates directories, copies configs, sets up wrappers)
         print_info("Initializing SDK environment.", OutputLevel::Normal);
 
@@ -1562,7 +1665,6 @@ MACROS_EOF
         );
 
         // Build package name and spec with lock file support
-        let sdk_target_pkg_name = format!("avocado-sdk-{target}");
         let sdk_target_config_version = "*";
         let sdk_target_pkg = build_package_spec_with_lock(
             &lock_file,
@@ -1632,16 +1734,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
         )
         .await?;
 
-        // Track all SDK packages installed for lock file update at the end
-        let mut all_sdk_package_names: Vec<String> = Vec::new();
-
         if sdk_target_success {
             print_success(
                 &format!("Installed SDK for target '{target}'."),
                 OutputLevel::Normal,
             );
-            // Add to list for later query (after environment is fully set up)
-            all_sdk_package_names.push(sdk_target_pkg_name);
         } else {
             return Err(anyhow::anyhow!(
                 "Failed to install SDK for target '{target}'."
@@ -1689,7 +1786,6 @@ $DNF_SDK_HOST \
         // Install avocado-sdk-bootstrap — repo scoping via --releasever, lock file pins exact version
         print_info("Installing SDK bootstrap.", OutputLevel::Normal);
 
-        let bootstrap_pkg_name = "avocado-sdk-bootstrap";
         let bootstrap_config_version = "*";
         let bootstrap_pkg = build_package_spec_with_lock(
             &lock_file,
@@ -1743,11 +1839,19 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 
         if bootstrap_success {
             print_success("Installed SDK bootstrap.", OutputLevel::Normal);
-            // Add to list for later query (after environment is fully set up)
-            all_sdk_package_names.push(bootstrap_pkg_name.to_string());
         } else {
             return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
         }
+
+        Ok::<(), anyhow::Error>(())
+        };
+        let l0_key = match l0_inputs {
+            Some((s, ref v)) => Some(s.step("L0 sdk bootstrap", "empty", v, || installs).await?),
+            None => {
+                installs.await?;
+                None
+            }
+        };
 
         // Fetch remote extensions now that SDK repos are available
         // Only fetch extensions that are referenced by active runtimes
@@ -1859,6 +1963,7 @@ fi
             lock_file,
             active_extensions,
             src_dir,
+            l0_key,
         })
     }
 

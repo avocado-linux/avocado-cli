@@ -17,6 +17,7 @@ pub mod install_method;
 pub mod interactivity;
 pub mod interpolation;
 pub mod jcs;
+pub mod layer_store;
 pub mod kab_wrap;
 pub mod kernel_resolver;
 pub mod kernel_version;

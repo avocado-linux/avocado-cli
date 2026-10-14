@@ -39,7 +39,14 @@ enum Cmd {
         layer: Option<String>,
         #[arg(long)]
         private: Vec<String>,
+        /// Mount here instead of views/<name>/merged (recorded; later mounts reuse it).
+        #[arg(long)]
+        at: Option<PathBuf>,
     },
+    /// Mount every recorded, unmounted view whose name starts with PREFIX.
+    Remount { prefix: String },
+    /// Make ALIAS another name for layer KEY.
+    Alias { alias: String, key: String },
     Umount { view: String },
     /// Unmount and delete a view and its upper (releases its lease).
     Drop { view: String },
@@ -104,7 +111,7 @@ fn main() -> Result<()> {
             if !kernel_ok(&rel) {
                 bail!("kernel {rel} < 6.6: overlay data-only lowers are missing. Use avocado-vm.");
             }
-            let name = format!("preflight-{}", std::process::id());
+            let name = format!("preflight-{}", avocado_store::uniq());
             let r = store.mount_view(&name, Some(EMPTY_KEY), &[]);
             let _ = store.drop_view(&name);
             if let Err(e) = r {
@@ -122,9 +129,14 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Record { key } => write_out(&serde_json::to_value(store.record(&key)?)?),
-        Cmd::Mount { view, layer, private } => {
-            write_out(&serde_json::to_value(store.mount_view(&view, layer.as_deref(), &private)?)?)
-        }
+        Cmd::Mount { view, layer, private, at } => write_out(&serde_json::to_value(store.mount_view_at(
+            &view,
+            layer.as_deref(),
+            &private,
+            at.as_deref(),
+        )?)?),
+        Cmd::Remount { prefix } => write_out(&json!({"mounted": store.remount(&prefix)?})),
+        Cmd::Alias { alias, key } => store.alias(&alias, &key)?,
         Cmd::Umount { view } => store.umount_view(&view)?,
         Cmd::Drop { view } => store.drop_view(&view)?,
         Cmd::Use { view, key, private } => write_out(&serde_json::to_value(store.use_layer(&view, &key, &private)?)?),

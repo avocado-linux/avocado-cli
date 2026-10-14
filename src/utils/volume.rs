@@ -126,6 +126,11 @@ impl VolumeManager {
         if let Some(existing_state) = VolumeState::load_from_dir(source_dir)? {
             // Verify the volume still exists
             if self.volume_exists(&existing_state.volume_name).await? {
+                crate::utils::layer_store::remount_volume_views(
+                    &self.container_tool,
+                    &existing_state.volume_name,
+                )
+                .await?;
                 if self.verbose {
                     print_info(
                         &format!("Using existing volume: {}", existing_state.volume_name),

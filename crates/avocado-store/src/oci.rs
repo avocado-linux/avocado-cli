@@ -291,14 +291,14 @@ pub fn pull(store: &Store, remote: &Remote, key: &str) -> Result<Value> {
         let data = remote.get_blob(&d, &x)?;
         let dst = store.obj_path(&d);
         fs::create_dir_all(dst.parent().unwrap())?;
-        let tmp = store.root.join("tmp").join(format!("pull.{d}.{}", std::process::id()));
+        let tmp = store.root.join("tmp").join(format!("pull.{d}.{}", crate::uniq()));
         File::create(&tmp)?.write_all(&data)?;
         fs::rename(&tmp, &dst)?;
         x.objects.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })?;
     let lf = |ext: &str| store.root.join("layers").join(format!("{key}.{ext}"));
-    let pid = std::process::id();
+    let pid = crate::uniq();
     fs::write(lf(&format!("dump.{pid}")), &dump)?;
     fs::write(lf(&format!("erofs.{pid}")), &erofs)?;
     fs::rename(lf(&format!("dump.{pid}")), lf("dump"))?;
