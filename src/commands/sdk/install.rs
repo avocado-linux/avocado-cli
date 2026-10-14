@@ -25,6 +25,18 @@ use crate::utils::{
 };
 
 /// Data produced by the bootstrap phase, consumed by the parallel install phase.
+/// Which slice of the parallel phase to run. Without a layer store it is all of it; with one, the
+/// phase is split along the config's structure so the slice every project on a target shares is
+/// its own layer: `Base` = rootfs + initramfs + the platform's `avocado-sdk-*` SDK packages (the
+/// sections nearly every project leaves at their defaults), `Project` = what the project adds on
+/// top (other sdk.packages, extension SDK deps, compile deps / target-dev, the DT-overlay hook).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Part {
+    All,
+    Base,
+    Project,
+}
+
 struct BootstrapResult {
     /// Reloaded composed config (after fetching remote extensions)
     composed: ComposedConfig,
@@ -328,22 +340,45 @@ impl SdkInstallCommand {
 
         // Phase 2: Run SDK packages, rootfs, initramfs, and target-dev in parallel.
         // Each task gets its own lock_file clone since they write to different sections.
-        let result = self
-            .execute_parallel_phase(
-                store.as_ref(),
-                &bootstrap,
-                container_image,
-                repo_url.as_deref(),
-                repo_release.as_deref(),
-                feeds.as_ref(),
-                &container_helper,
-                merged_container_args.as_ref(),
-                runs_on_context.as_ref(),
-                &target,
-                &off_kernel_excludes,
-                target_dev_feeds.as_ref(),
-            )
-            .await;
+        let this = &*self;
+        let run = |part: Part, parent: Option<String>| {
+            let bootstrap = &bootstrap;
+            let store = store.as_ref();
+            let container_helper = &container_helper;
+            let off_kernel_excludes = &off_kernel_excludes;
+            let feeds = feeds.as_ref();
+            let target_dev_feeds = target_dev_feeds.as_ref();
+            let merged_container_args = merged_container_args.as_ref();
+            let runs_on_context = runs_on_context.as_ref();
+            let (repo_url, repo_release, target) = (repo_url.as_deref(), repo_release.as_deref(), &target);
+            async move {
+                this.execute_parallel_phase(
+                    store,
+                    part,
+                    parent.as_deref(),
+                    bootstrap,
+                    container_image,
+                    repo_url,
+                    repo_release,
+                    feeds,
+                    container_helper,
+                    merged_container_args,
+                    runs_on_context,
+                    target,
+                    off_kernel_excludes,
+                    target_dev_feeds,
+                )
+                .await
+            }
+        };
+        let result = if store.is_some() {
+            match run(Part::Base, bootstrap.l0_key.clone()).await {
+                Ok(base) => run(Part::Project, base).await.map(|_| ()),
+                Err(e) => Err(e),
+            }
+        } else {
+            run(Part::All, None).await.map(|_| ())
+        };
 
         // Always teardown the context if it was created
         if let Some(ref mut context) = runs_on_context {
@@ -369,6 +404,8 @@ impl SdkInstallCommand {
     async fn execute_parallel_phase(
         &self,
         store: Option<&crate::utils::layer_store::LayerStore>,
+        part: Part,
+        parent: Option<&str>,
         bootstrap: &BootstrapResult,
         container_image: &str,
         repo_url: Option<&str>,
@@ -380,7 +417,7 @@ impl SdkInstallCommand {
         target: &str,
         off_kernel_excludes: &[String],
         target_dev_feeds: Option<&crate::utils::feeds::FeedMaterialization>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let composed = &bootstrap.composed;
         let config = &composed.config;
         let active_extensions = &bootstrap.active_extensions;
@@ -407,8 +444,30 @@ impl SdkInstallCommand {
                 active_extensions,
             )
             .is_empty();
-        let need_target_dev =
-            (config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto;
+        let provision_dto = provision_dto && part != Part::Base;
+        let need_target_dev = part != Part::Base
+            && ((config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto);
+        // This part's SDK package set: the platform's avocado-sdk-* packages for Base, all of them
+        // (dnf installs only the delta over Base) otherwise.
+        let empty_ext: HashMap<String, HashMap<String, serde_yaml::Value>> = HashMap::new();
+        let (sdk_deps, ext_deps) = match part {
+            Part::Base => (
+                bootstrap.sdk_dependencies.as_ref().map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with("avocado-sdk-"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<HashMap<_, _>>()
+                }),
+                &empty_ext,
+            ),
+            _ => (bootstrap.sdk_dependencies.clone(), &bootstrap.extension_sdk_dependencies),
+        };
+        let run_sysroots = part != Part::Project;
+        // A project that adds nothing over Base: no Project layer, no Project work.
+        let adds_nothing = part == Part::Project
+            && !need_target_dev
+            && ext_deps.values().all(|d| d.is_empty())
+            && sdk_deps.as_ref().is_none_or(|m| m.keys().all(|k| k.starts_with("avocado-sdk-")));
 
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)
         let target_dev_command = if need_target_dev {
@@ -544,29 +603,36 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
 
-        // L1 (layer store): what the four parallel installs read.
-        let l1_inputs = store.map(|s| {
+        // Layer store: what this part's installs read, and nothing else, so a project that only
+        // differs in another part's sections still shares this layer.
+        let l1_inputs = store.filter(|_| !adds_nothing).map(|s| {
             let j = |v: &serde_yaml::Value| serde_json::to_value(v).unwrap_or_default();
             let mv = &composed.merged_value;
+            let lock = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
             let mut v = crate::utils::layer_store::base_inputs();
-            v["step"] = "L1 sdk packages + sysroots".into();
             v["target"] = target.into();
-            v["sdk"] = j(&mv["sdk"]);
-            v["rootfs"] = j(&mv["rootfs"]);
-            v["initramfs"] = j(&mv["initramfs"]);
-            v["sdk_deps"] = serde_json::to_value(&bootstrap.sdk_dependencies).unwrap_or_default();
-            v["ext_sdk_deps"] = serde_json::to_value(&bootstrap.extension_sdk_dependencies).unwrap_or_default();
-            v["target_dev"] = target_dev_command.as_ref().map(|(c, _, _)| c.clone()).into();
-            v["provision_dto"] = provision_dto.into();
-            v["lock"] = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
-            v["feeds"] = serde_json::json!([
-                feeds.map(|f| f.fingerprint.clone()),
-                target_dev_feeds.map(|f| f.fingerprint.clone()),
-            ]);
+            v["sdk_deps"] = serde_json::to_value(&sdk_deps).unwrap_or_default();
+            v["feeds"] = serde_json::json!([feeds.map(|f| f.fingerprint.clone())]);
             v["feeds_config"] = j(&mv["feeds"]);
             v["repo"] = serde_json::json!([repo_url, repo_release]);
             v["dnf_args"] = self.dnf_args.clone().into();
             v["no_weak_deps"] = config.get_sdk_disable_weak_dependencies().into();
+            v["lock"] = serde_json::json!({"sdk": lock["sdk"]});
+            if part == Part::Base {
+                v["step"] = "L1 target base".into();
+                v["rootfs"] = j(&mv["rootfs"]);
+                v["initramfs"] = j(&mv["initramfs"]);
+                for k in ["rootfs", "initramfs", "kernel_versions", "kernels"] {
+                    v["lock"][k] = lock[k].clone();
+                }
+            } else {
+                v["step"] = "L2 project".into();
+                v["ext_sdk_deps"] = serde_json::to_value(ext_deps).unwrap_or_default();
+                v["target_dev"] = target_dev_command.as_ref().map(|(c, _, _)| c.clone()).into();
+                v["target_dev_feeds"] = target_dev_feeds.map(|f| f.fingerprint.clone()).into();
+                v["provision_dto"] = provision_dto.into();
+                v["lock"]["target_sysroot"] = lock["target_sysroot"].clone();
+            }
             s.scope(&mut v);
             (s, v)
         });
@@ -581,8 +647,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // Build SDK packages future
         let sdk_pkg_fut = self.install_sdk_packages(
             config,
-            &bootstrap.sdk_dependencies,
-            &bootstrap.extension_sdk_dependencies,
+            &sdk_deps,
+            ext_deps,
             provision_dto,
             &mut sdk_pkg_lock,
             &bootstrap.all_sdk_package_names,
@@ -752,9 +818,24 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
 
         let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
             with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
-            with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
             with_tui_status!(
-                install_sysroot(&mut initramfs_params),
+                async {
+                    if run_sysroots {
+                        install_sysroot(&mut rootfs_params).await
+                    } else {
+                        Ok(())
+                    }
+                },
+                TaskId::RootfsInstall
+            ),
+            with_tui_status!(
+                async {
+                    if run_sysroots {
+                        install_sysroot(&mut initramfs_params).await
+                    } else {
+                        Ok(())
+                    }
+                },
                 TaskId::InitramfsInstall
             ),
             with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
@@ -899,15 +980,33 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         target_dev_result?;
         Ok::<(), anyhow::Error>(())
         };
-        match l1_inputs {
+        let key = match l1_inputs {
             Some((s, ref v)) => {
-                let parent = bootstrap.l0_key.as_deref().unwrap_or("empty");
-            s.step("L1 sdk packages + sysroots", parent, v, || phase).await?;
-            let saved = LockFile::load(src_dir)?;
-            s.alias_for_lock(&serde_json::to_value(saved.targets.get(target)).unwrap_or_default())
-                .await?;
+                let label = v["step"].as_str().unwrap_or("step").to_string();
+                let key = s.step(&label, parent.unwrap_or("empty"), v, || phase).await?;
+                if part == Part::Project {
+                    let saved = LockFile::load(src_dir)?;
+                    s.alias_for_lock(&serde_json::to_value(saved.targets.get(target)).unwrap_or_default())
+                        .await?;
+                }
+                Some(key)
             }
-            None => phase.await?,
+            None if adds_nothing => {
+                if let Some(s) = store {
+                    let saved = LockFile::load(src_dir)?;
+                    s.alias_for_lock(&serde_json::to_value(saved.targets.get(target)).unwrap_or_default())
+                        .await?;
+                }
+                parent.map(String::from)
+            }
+            None => {
+                phase.await?;
+                None
+            }
+        };
+        if part == Part::Base {
+            // The stamps below describe the whole install: they belong to the last part.
+            return Ok(key);
         }
 
         // Write compile-deps stamp (unless --no-stamps)
@@ -1025,7 +1124,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
             }
         }
 
-        Ok(())
+        Ok(key)
     }
 
     /// Fetch remote extensions after SDK bootstrap

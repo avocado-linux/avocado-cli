@@ -211,15 +211,17 @@ pub fn parse_dump(data: &[u8]) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// A name unique across concurrent helpers: every helper is PID 1 in its own container, so the
-/// container's hostname (its id) plus a per-process counter.
+/// A name unique across concurrent helpers: every helper is PID 1 in its own container and, with
+/// --network=host, shares the host's hostname, so a random per-process tag plus a counter.
 pub fn uniq() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let h = HOST.get_or_init(|| {
-        fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default()
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let t = TAG.get_or_init(|| {
+        let mut b = [0u8; 6];
+        let _ = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+        b.iter().map(|x| format!("{x:02x}")).collect()
     });
-    format!("{h}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+    format!("{t}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -450,6 +452,16 @@ pub fn run(cmd: &mut Command) -> Result<()> {
     let out = cmd.output().with_context(|| format!("spawn {cmd:?}"))?;
     if !out.status.success() {
         bail!("{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+fn mount_erofs(image: &Path, at: &Path) -> Result<()> {
+    let (src, dst) = (cstr(image), cstr(at));
+    let fstype = CString::new("erofs").unwrap();
+    let r = unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("mount erofs {}", image.display()));
     }
     Ok(())
 }
@@ -799,7 +811,10 @@ impl Store {
         self.touch(&v.layer);
         let tmp = self.root.join("tmp").join(format!("erofs.{name}.{}", crate::uniq()));
         fs::create_dir_all(&tmp)?;
-        run(Command::new("mount").args(["-t", "erofs", "-o", "ro"]).arg(self.erofs_path(&v.layer)).arg(&tmp))?;
+        // mount(2) directly, not mount(8): the syscall autoloads erofs and mounts the image file
+        // itself (EROFS_FS_BACKED_BY_FILE, kernel >= 6.12); util-linux would instead reach for a
+        // loop device when the module is not loaded yet, and the helper has none.
+        mount_erofs(&self.erofs_path(&v.layer), &tmp)?;
         let opts = format!(
             "lowerdir={}::{},upperdir={},workdir={},metacopy=on,redirect_dir=on",
             tmp.display(),
