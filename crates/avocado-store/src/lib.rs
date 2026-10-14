@@ -1302,6 +1302,18 @@ impl Store {
         for v in self.views()? {
             protected.insert(v.layer.clone());
         }
+        // A protected alias protects its target: evicting the target would strand the alias (and a
+        // view recorded under the alias name could not be remounted).
+        let targets: Vec<String> = protected
+            .iter()
+            .filter_map(|k| fs::read_link(self.layer_file(k, "json")).ok())
+            .filter_map(|t| {
+                t.to_str()
+                    .and_then(|t| t.strip_suffix(".json"))
+                    .map(String::from)
+            })
+            .collect();
+        protected.extend(targets);
         let mut refs: HashMap<String, u32> = HashMap::new();
         let mut layer_objs: HashMap<String, Vec<String>> = HashMap::new();
         let mut lru: Vec<(SystemTime, String)> = Vec::new();
