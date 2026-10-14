@@ -119,7 +119,9 @@ fn unesc(s: &[u8]) -> Result<Vec<u8>> {
                     i += 2
                 }
                 Some(b'x') => {
-                    let h = std::str::from_utf8(s.get(i + 2..i + 4).ok_or_else(|| anyhow!("bad escape"))?)?;
+                    let h = std::str::from_utf8(
+                        s.get(i + 2..i + 4).ok_or_else(|| anyhow!("bad escape"))?,
+                    )?;
                     out.push(u8::from_str_radix(h, 16)?);
                     i += 4
                 }
@@ -192,7 +194,10 @@ pub fn parse_dump(data: &[u8]) -> Result<Vec<Entry>> {
         let (s, ns) = mt.split_once('.').unwrap_or((mt, "0"));
         let mut xattrs = Vec::new();
         for x in &f[11..] {
-            let pos = x.iter().position(|&c| c == b'=').ok_or_else(|| anyhow!("bad xattr"))?;
+            let pos = x
+                .iter()
+                .position(|&c| c == b'=')
+                .ok_or_else(|| anyhow!("bad xattr"))?;
             xattrs.push((unesc(&x[..pos])?, unesc(&x[pos + 1..])?));
         }
         entries.push(Entry {
@@ -255,7 +260,8 @@ fn keep_xattr(k: &[u8]) -> bool {
 fn list_xattrs(p: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let c = cstr(p);
     let mut buf = vec![0u8; 4096];
-    let n = unsafe { libc::llistxattr(c.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    let n =
+        unsafe { libc::llistxattr(c.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if n < 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOTSUP) {
@@ -264,7 +270,10 @@ fn list_xattrs(p: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         return Err(err).with_context(|| format!("llistxattr {}", p.display()));
     }
     let mut out = Vec::new();
-    for name in buf[..n as usize].split(|&c| c == 0).filter(|n| !n.is_empty()) {
+    for name in buf[..n as usize]
+        .split(|&c| c == 0)
+        .filter(|n| !n.is_empty())
+    {
         if !keep_xattr(name) {
             continue;
         }
@@ -279,11 +288,19 @@ pub fn get_xattr(p: &Path, name: &[u8]) -> Result<Option<Vec<u8>>> {
     let cn = CString::new(name)?;
     let mut buf = vec![0u8; 65536];
     let n = unsafe {
-        libc::lgetxattr(c.as_ptr(), cn.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        libc::lgetxattr(
+            c.as_ptr(),
+            cn.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
-        if matches!(err.raw_os_error(), Some(libc::ENODATA) | Some(libc::ENOTSUP)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::ENOTSUP)
+        ) {
             return Ok(None);
         }
         return Err(err).with_context(|| format!("lgetxattr {}", p.display()));
@@ -309,7 +326,10 @@ struct Walk {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Walk `root` depth-first with siblings sorted by name (the canonical order), skipping the
@@ -320,10 +340,14 @@ fn walk(
     exclude: &HashSet<Vec<u8>>,
     decide: &dyn Fn(&[u8], &fs::Metadata, &Path) -> std::result::Result<Reuse, Src>,
 ) -> Result<Walk> {
-    let mut w = Walk { entries: Vec::new(), todo: Vec::new() };
+    let mut w = Walk {
+        entries: Vec::new(),
+        todo: Vec::new(),
+    };
     let mut stack: Vec<(PathBuf, Vec<u8>)> = vec![(root.to_path_buf(), b"/".to_vec())];
     while let Some((full, path)) = stack.pop() {
-        let md = fs::symlink_metadata(&full).with_context(|| format!("lstat {}", full.display()))?;
+        let md =
+            fs::symlink_metadata(&full).with_context(|| format!("lstat {}", full.display()))?;
         let mode = md.mode();
         let ft = mode & S_IFMT;
         let mut e = Entry {
@@ -363,7 +387,8 @@ fn walk(
             }
             S_IFDIR => {
                 w.entries.push(e);
-                let mut kids: Vec<_> = fs::read_dir(&full).with_context(|| format!("readdir {}", full.display()))?
+                let mut kids: Vec<_> = fs::read_dir(&full)
+                    .with_context(|| format!("readdir {}", full.display()))?
                     .map(|d| d.map(|d| d.file_name()))
                     .collect::<std::io::Result<_>>()?;
                 kids.sort();
@@ -441,7 +466,11 @@ impl Flock {
             .truncate(false)
             .open(path)
             .with_context(|| format!("open lock {}", path.display()))?;
-        let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        let op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
         if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -452,7 +481,10 @@ impl Flock {
 pub fn run(cmd: &mut Command) -> Result<()> {
     let out = cmd.output().with_context(|| format!("spawn {cmd:?}"))?;
     if !out.status.success() {
-        bail!("{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "{cmd:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -460,9 +492,18 @@ pub fn run(cmd: &mut Command) -> Result<()> {
 fn mount_erofs(image: &Path, at: &Path) -> Result<()> {
     let (src, dst) = (cstr(image), cstr(at));
     let fstype = CString::new("erofs").unwrap();
-    let r = unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
+    let r = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
     if r != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("mount erofs {}", image.display()));
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("mount erofs {}", image.display()));
     }
     Ok(())
 }
@@ -486,14 +527,19 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 fn rm_rf(p: &Path) -> Result<()> {
     match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(p).with_context(|| format!("rm -r {}", p.display())),
+        Ok(m) if m.is_dir() => {
+            fs::remove_dir_all(p).with_context(|| format!("rm -r {}", p.display()))
+        }
         Ok(_) => Ok(fs::remove_file(p)?),
         Err(_) => Ok(()),
     }
 }
 
 fn threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(32)
 }
 
 impl Store {
@@ -501,7 +547,9 @@ impl Store {
         for d in ["objects", "layers", "views", "locks", "pins", "tmp"] {
             fs::create_dir_all(root.join(d))?;
         }
-        let s = Store { root: root.to_path_buf() };
+        let s = Store {
+            root: root.to_path_buf(),
+        };
         if !s.has_layer(EMPTY_KEY) {
             let root_entry = Entry {
                 path: b"/".to_vec(),
@@ -516,7 +564,14 @@ impl Store {
                 content: None,
                 xattrs: vec![],
             };
-            s.write_layer(EMPTY_KEY, None, &[root_entry], serde_json::json!({}), (0, 0), 0.0)?;
+            s.write_layer(
+                EMPTY_KEY,
+                None,
+                &[root_entry],
+                serde_json::json!({}),
+                (0, 0),
+                0.0,
+            )?;
         }
         Ok(s)
     }
@@ -543,7 +598,9 @@ impl Store {
 
     pub fn record(&self, key: &str) -> Result<LayerRecord> {
         let p = self.layer_file(key, "json");
-        Ok(serde_json::from_slice(&fs::read(&p).with_context(|| format!("no layer {key}"))?)?)
+        Ok(serde_json::from_slice(
+            &fs::read(&p).with_context(|| format!("no layer {key}"))?,
+        )?)
     }
 
     pub fn dump_bytes(&self, key: &str) -> Result<Vec<u8>> {
@@ -561,7 +618,12 @@ impl Store {
     pub fn layers(&self) -> Result<Vec<String>> {
         let mut v: Vec<String> = fs::read_dir(self.root.join("layers"))?
             .filter_map(|d| d.ok())
-            .filter_map(|d| d.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(String::from))
+            .filter_map(|d| {
+                d.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".json"))
+                    .map(String::from)
+            })
             // An alias whose target was evicted dangles: it is not a layer (GC removes it).
             .filter(|k| self.has_layer(k))
             .collect();
@@ -584,7 +646,11 @@ impl Store {
         }
         fs::create_dir_all(dst.parent().unwrap())?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = self.root.join("tmp").join(format!("obj.{hex}.{}.{}", crate::uniq(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let tmp = self.root.join("tmp").join(format!(
+            "obj.{hex}.{}.{}",
+            crate::uniq(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         if !(movable && fs::rename(src, &tmp).is_ok()) {
             let mut i = File::open(src).with_context(|| format!("open {}", src.display()))?;
             let o = File::create(&tmp)?;
@@ -630,7 +696,10 @@ impl Store {
                             stats.new_objects.fetch_add(1, Ordering::Relaxed);
                             stats.new_bytes.fetch_add(size, Ordering::Relaxed);
                         }
-                        Ok((Some(format!("{}/{}", &hex[..2], &hex[2..]).into_bytes()), None))
+                        Ok((
+                            Some(format!("{}/{}", &hex[..2], &hex[2..]).into_bytes()),
+                            None,
+                        ))
                     })();
                     match r {
                         Ok(v) => results.lock().unwrap().push((*idx, v)),
@@ -671,7 +740,10 @@ impl Store {
         let tmp_dump = self.root.join("tmp").join(format!("{key}.{pid}.dump"));
         let tmp_img = self.root.join("tmp").join(format!("{key}.{pid}.erofs"));
         fs::write(&tmp_dump, &dump)?;
-        run(Command::new("mkcomposefs").arg("--from-file").arg(&tmp_dump).arg(&tmp_img))?;
+        run(Command::new("mkcomposefs")
+            .arg("--from-file")
+            .arg(&tmp_dump)
+            .arg(&tmp_img))?;
         let mut objects = HashSet::new();
         let mut logical = 0;
         for e in entries {
@@ -699,12 +771,21 @@ impl Store {
         };
         fs::rename(&tmp_dump, self.layer_file(key, "dump"))?;
         fs::rename(&tmp_img, self.layer_file(key, "erofs"))?;
-        atomic_write(&self.layer_file(key, "json"), &serde_json::to_vec_pretty(&rec)?)?;
+        atomic_write(
+            &self.layer_file(key, "json"),
+            &serde_json::to_vec_pretty(&rec)?,
+        )?;
         Ok(rec)
     }
 
     /// Import a directory tree as a complete layer.
-    pub fn import_dir(&self, src: &Path, key: &str, inputs: serde_json::Value, exclude: &[String]) -> Result<LayerRecord> {
+    pub fn import_dir(
+        &self,
+        src: &Path,
+        key: &str,
+        inputs: serde_json::Value,
+        exclude: &[String],
+    ) -> Result<LayerRecord> {
         let _gc = self.gc_lock(false)?;
         if self.has_layer(key) {
             return self.record(key);
@@ -714,8 +795,18 @@ impl Store {
         let mut w = walk(src, &ex, &|_, _, full| Err(Src::Copy(full.to_path_buf())))?;
         let stats = HashStats::default();
         self.resolve(&mut w, &stats)?;
-        let new = (stats.new_objects.load(Ordering::Relaxed), stats.new_bytes.load(Ordering::Relaxed));
-        self.write_layer(key, None, &w.entries, inputs, new, t.elapsed().as_secs_f64())
+        let new = (
+            stats.new_objects.load(Ordering::Relaxed),
+            stats.new_bytes.load(Ordering::Relaxed),
+        );
+        self.write_layer(
+            key,
+            None,
+            &w.entries,
+            inputs,
+            new,
+            t.elapsed().as_secs_f64(),
+        )
     }
 
     pub fn view_dir(&self, name: &str) -> PathBuf {
@@ -752,14 +843,26 @@ impl Store {
 
     /// Mount view `name` on its recorded layer (or `layer`, for a new view). Idempotent.
     pub fn merged(&self, v: &ViewRecord) -> PathBuf {
-        v.at.clone().unwrap_or_else(|| self.view_dir(&v.name).join("merged"))
+        v.at.clone()
+            .unwrap_or_else(|| self.view_dir(&v.name).join("merged"))
     }
 
-    pub fn mount_view(&self, name: &str, layer: Option<&str>, private: &[String]) -> Result<ViewRecord> {
+    pub fn mount_view(
+        &self,
+        name: &str,
+        layer: Option<&str>,
+        private: &[String],
+    ) -> Result<ViewRecord> {
         self.mount_view_at(name, layer, private, None)
     }
 
-    pub fn mount_view_at(&self, name: &str, layer: Option<&str>, private: &[String], at: Option<&Path>) -> Result<ViewRecord> {
+    pub fn mount_view_at(
+        &self,
+        name: &str,
+        layer: Option<&str>,
+        private: &[String],
+        at: Option<&Path>,
+    ) -> Result<ViewRecord> {
         // Shared GC lock: GC clears tmp/ (where the staging mount lives) and must see the lease.
         let _gc = self.gc_lock(false)?;
         let mut v = self.view(name)?.unwrap_or(ViewRecord {
@@ -780,7 +883,10 @@ impl Store {
         if is_mounted(&merged) {
             if let Some(l) = layer {
                 if l != v.layer {
-                    bail!("view {name} is mounted on {}, not {l}; use `use` to switch", v.layer);
+                    bail!(
+                        "view {name} is mounted on {}, not {l}; use `use` to switch",
+                        v.layer
+                    );
                 }
             }
             return Ok(v);
@@ -805,7 +911,10 @@ impl Store {
                 unsafe {
                     libc::chown(c.as_ptr(), r.uid, r.gid);
                     libc::chmod(c.as_ptr(), r.mode & 0o7777);
-                    let ts = [libc::timespec { tv_sec: r.mtime.0, tv_nsec: r.mtime.1 as _ }; 2];
+                    let ts = [libc::timespec {
+                        tv_sec: r.mtime.0,
+                        tv_nsec: r.mtime.1 as _,
+                    }; 2];
                     libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0);
                 }
             }
@@ -814,7 +923,10 @@ impl Store {
         v.updated = now_secs();
         self.save_view(&v)?;
         self.touch(&v.layer);
-        let tmp = self.root.join("tmp").join(format!("erofs.{name}.{}", crate::uniq()));
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("erofs.{name}.{}", crate::uniq()));
         fs::create_dir_all(&tmp)?;
         // mount(2) directly, not mount(8): the syscall autoloads erofs and mounts the image file
         // itself (EROFS_FS_BACKED_BY_FILE, kernel >= 6.12); util-linux would instead reach for a
@@ -827,7 +939,9 @@ impl Store {
             dir.join("upper").display(),
             dir.join("work").display()
         );
-        let r = run(Command::new("mount").args(["-t", "overlay", "overlay", "-o", &opts]).arg(&merged));
+        let r = run(Command::new("mount")
+            .args(["-t", "overlay", "overlay", "-o", &opts])
+            .arg(&merged));
         // The overlay holds the erofs superblock; the staging mount can go either way.
         let _ = run(Command::new("umount").arg("-l").arg(&tmp));
         let _ = fs::remove_dir(&tmp);
@@ -836,7 +950,9 @@ impl Store {
     }
 
     pub fn umount_view(&self, name: &str) -> Result<()> {
-        let Some(v) = self.view(name)? else { return Ok(()) };
+        let Some(v) = self.view(name)? else {
+            return Ok(());
+        };
         let merged = self.merged(&v);
         if is_mounted(&merged) {
             run(Command::new("umount").arg(&merged))?;
@@ -886,7 +1002,12 @@ impl Store {
 
     /// Harvest a mounted view into layer `key` (parent = the view's current layer), then remount
     /// the view on it with a fresh upper that keeps only the private paths.
-    pub fn commit_view(&self, name: &str, key: &str, inputs: serde_json::Value) -> Result<LayerRecord> {
+    pub fn commit_view(
+        &self,
+        name: &str,
+        key: &str,
+        inputs: serde_json::Value,
+    ) -> Result<LayerRecord> {
         let _gc = self.gc_lock(false)?;
         let v = self.view(name)?.ok_or_else(|| anyhow!("no view {name}"))?;
         let dir = self.view_dir(name);
@@ -902,7 +1023,11 @@ impl Store {
         }
         let t = Instant::now();
         let parent = v.layer.clone();
-        let pmap: HashMap<Vec<u8>, Entry> = self.dump(&parent)?.into_iter().map(|e| (e.path.clone(), e)).collect();
+        let pmap: HashMap<Vec<u8>, Entry> = self
+            .dump(&parent)?
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect();
 
         // What the upper holds: files with real data, and redirected (renamed) dirs.
         let upper = dir.join("upper");
@@ -924,22 +1049,28 @@ impl Store {
             }
         }
         let ex: HashSet<Vec<u8>> = v.private.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let decide = |path: &[u8], md: &fs::Metadata, full: &Path| -> std::result::Result<Reuse, Src> {
-            if upper_data.contains(path) {
-                return Err(Src::Movable(upper.join(std::ffi::OsStr::from_bytes(&path[1..]))));
-            }
-            if redirected.iter().any(|r| path.starts_with(r)) {
-                return Err(Src::Copy(full.to_path_buf()));
-            }
-            match pmap.get(path) {
-                Some(p) if p.is_reg() && p.size == md.size() => Ok((p.payload.clone(), p.content.clone())),
-                _ => Err(Src::Copy(full.to_path_buf())),
-            }
-        };
+        let decide =
+            |path: &[u8], md: &fs::Metadata, full: &Path| -> std::result::Result<Reuse, Src> {
+                if upper_data.contains(path) {
+                    return Err(Src::Movable(
+                        upper.join(std::ffi::OsStr::from_bytes(&path[1..])),
+                    ));
+                }
+                if redirected.iter().any(|r| path.starts_with(r)) {
+                    return Err(Src::Copy(full.to_path_buf()));
+                }
+                match pmap.get(path) {
+                    Some(p) if p.is_reg() && p.size == md.size() => {
+                        Ok((p.payload.clone(), p.content.clone()))
+                    }
+                    _ => Err(Src::Copy(full.to_path_buf())),
+                }
+            };
         let mut w = walk(&merged, &ex, &decide)?;
         // Files read through the view first; then unmount and move upper files into objects/.
-        let (movable, through): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut w.todo).into_iter().partition(|(_, s)| matches!(s, Src::Movable(_)));
+        let (movable, through): (Vec<_>, Vec<_>) = std::mem::take(&mut w.todo)
+            .into_iter()
+            .partition(|(_, s)| matches!(s, Src::Movable(_)));
         let stats = HashStats::default();
         w.todo = through;
         self.resolve(&mut w, &stats)?;
@@ -952,8 +1083,18 @@ impl Store {
             self.mount_view(name, None, &[])?;
             return Err(e);
         }
-        let new = (stats.new_objects.load(Ordering::Relaxed), stats.new_bytes.load(Ordering::Relaxed));
-        let rec = self.write_layer(key, Some(&parent), &w.entries, inputs, new, t.elapsed().as_secs_f64())?;
+        let new = (
+            stats.new_objects.load(Ordering::Relaxed),
+            stats.new_bytes.load(Ordering::Relaxed),
+        );
+        let rec = self.write_layer(
+            key,
+            Some(&parent),
+            &w.entries,
+            inputs,
+            new,
+            t.elapsed().as_secs_f64(),
+        )?;
         self.reset_upper(&v)?;
         let mut v = v;
         v.layer = key.to_string();
@@ -970,7 +1111,9 @@ impl Store {
         self.mount_view(&name, Some(key), &[])?;
         let merged = self.view_dir(&name).join("merged");
         let r = (|| -> Result<String> {
-            let mut w = walk(&merged, &HashSet::new(), &|_, _, full| Err(Src::Copy(full.to_path_buf())))?;
+            let mut w = walk(&merged, &HashSet::new(), &|_, _, full| {
+                Err(Src::Copy(full.to_path_buf()))
+            })?;
             // Hash without storing: every object must already exist.
             let todo = std::mem::take(&mut w.todo);
             let next = AtomicUsize::new(0);
@@ -979,12 +1122,24 @@ impl Store {
                 for _ in 0..threads() {
                     s.spawn(|| loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((idx, Src::Copy(p))) = todo.get(i) else { break };
+                        let Some((idx, Src::Copy(p))) = todo.get(i) else {
+                            break;
+                        };
                         let v = if w.entries[*idx].size <= INLINE_MAX {
                             (None, fs::read(p).ok())
                         } else {
                             let h = sha256_file(p).unwrap_or_default();
-                            (Some(format!("{}/{}", &h[..2.min(h.len())], h.get(2..).unwrap_or("")).into_bytes()), None)
+                            (
+                                Some(
+                                    format!(
+                                        "{}/{}",
+                                        &h[..2.min(h.len())],
+                                        h.get(2..).unwrap_or("")
+                                    )
+                                    .into_bytes(),
+                                ),
+                                None,
+                            )
                         };
                         res.lock().unwrap().push((*idx, v));
                     });
@@ -1035,14 +1190,20 @@ impl Store {
         let mut out = HashMap::new();
         for d in fs::read_dir(self.root.join("pins"))? {
             let d = d?;
-            let keys = fs::read_to_string(d.path())?.lines().map(String::from).collect();
+            let keys = fs::read_to_string(d.path())?
+                .lines()
+                .map(String::from)
+                .collect();
             out.insert(d.file_name().to_string_lossy().to_string(), keys);
         }
         Ok(out)
     }
 
     pub fn pin(&self, name: &str, keys: &[String]) -> Result<()> {
-        atomic_write(&self.root.join("pins").join(name), keys.join("\n").as_bytes())
+        atomic_write(
+            &self.root.join("pins").join(name),
+            keys.join("\n").as_bytes(),
+        )
     }
 
     pub fn unpin(&self, name: &str) -> Result<()> {
@@ -1057,7 +1218,10 @@ impl Store {
             let pre = d.file_name().to_string_lossy().to_string();
             for f in fs::read_dir(d.path())? {
                 let f = f?;
-                out.insert(format!("{pre}/{}", f.file_name().to_string_lossy()), f.metadata()?.len());
+                out.insert(
+                    format!("{pre}/{}", f.file_name().to_string_lossy()),
+                    f.metadata()?.len(),
+                );
             }
         }
         Ok(out)
@@ -1071,11 +1235,16 @@ impl Store {
         let mut layers = Vec::new();
         for k in self.layers()? {
             let r = self.record(&k)?;
-            layer_bytes += r.image_bytes + fs::metadata(self.layer_file(&k, "dump")).map(|m| m.len()).unwrap_or(0);
+            layer_bytes += r.image_bytes
+                + fs::metadata(self.layer_file(&k, "dump"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
             logical += r.logical_bytes;
-            layers.push(serde_json::json!({"key": k, "files": r.files, "objects": r.objects,
+            layers.push(
+                serde_json::json!({"key": k, "files": r.files, "objects": r.objects,
                 "logical_bytes": r.logical_bytes, "image_bytes": r.image_bytes, "parent": r.parent,
-                "inputs": r.inputs}));
+                "inputs": r.inputs}),
+            );
         }
         let mut upper_bytes = 0;
         for v in self.views()? {
@@ -1100,7 +1269,9 @@ impl Store {
         fs::create_dir_all(self.root.join("tmp"))?;
         for d in fs::read_dir(self.root.join("layers"))? {
             let p = d?.path();
-            if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) && fs::metadata(&p).is_err() {
+            if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink())
+                && fs::metadata(&p).is_err()
+            {
                 if !dry_run {
                     rm_rf(&p)?;
                 }
@@ -1114,7 +1285,14 @@ impl Store {
         }
         let sizes = self.object_sizes()?;
         let meta_size = |k: &str| -> u64 {
-            ["json", "dump", "erofs"].iter().map(|e| fs::symlink_metadata(self.layer_file(k, e)).map(|m| m.len()).unwrap_or(0)).sum()
+            ["json", "dump", "erofs"]
+                .iter()
+                .map(|e| {
+                    fs::symlink_metadata(self.layer_file(k, e))
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                })
+                .sum()
         };
         let mut protected: HashSet<String> = HashSet::new();
         protected.insert(EMPTY_KEY.to_string());
@@ -1130,7 +1308,11 @@ impl Store {
         let mut used: u64 = sizes.values().sum();
         for k in self.layers()? {
             let objs: Vec<String> = {
-                let mut s: Vec<String> = self.dump(&k)?.iter().filter_map(|e| e.object().map(String::from)).collect();
+                let mut s: Vec<String> = self
+                    .dump(&k)?
+                    .iter()
+                    .filter_map(|e| e.object().map(String::from))
+                    .collect();
                 s.sort();
                 s.dedup();
                 s
@@ -1146,7 +1328,11 @@ impl Store {
             layer_objs.insert(k, objs);
         }
         // Unreferenced objects are free to go first.
-        let mut doomed_objs: Vec<String> = sizes.keys().filter(|o| !refs.contains_key(*o)).cloned().collect();
+        let mut doomed_objs: Vec<String> = sizes
+            .keys()
+            .filter(|o| !refs.contains_key(*o))
+            .cloned()
+            .collect();
         let mut freed: u64 = doomed_objs.iter().map(|o| sizes[o]).sum();
         let before = used;
         let mut evicted = Vec::new();
@@ -1197,11 +1383,19 @@ impl Store {
                 S_IFDIR => fs::create_dir_all(&p)?,
                 S_IFLNK => {
                     rm_rf(&p)?;
-                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(e.payload.as_deref().unwrap_or_default()), &p)?
+                    std::os::unix::fs::symlink(
+                        std::ffi::OsStr::from_bytes(e.payload.as_deref().unwrap_or_default()),
+                        &p,
+                    )?
                 }
                 S_IFREG if e.hardlink => {
                     rm_rf(&p)?;
-                    fs::hard_link(dst.join(std::ffi::OsStr::from_bytes(&e.payload.as_deref().unwrap_or_default()[1..])), &p)?
+                    fs::hard_link(
+                        dst.join(std::ffi::OsStr::from_bytes(
+                            &e.payload.as_deref().unwrap_or_default()[1..],
+                        )),
+                        &p,
+                    )?
                 }
                 S_IFREG => {
                     let tmp = p.with_extension("avo-tmp");
@@ -1212,7 +1406,10 @@ impl Store {
                         }
                         _ => fs::write(&tmp, b"")?,
                     }
-                    fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(e.mode & 0o7777))?;
+                    fs::set_permissions(
+                        &tmp,
+                        std::os::unix::fs::PermissionsExt::from_mode(e.mode & 0o7777),
+                    )?;
                     fs::rename(&tmp, &p)?;
                 }
                 _ => {}
@@ -1227,7 +1424,9 @@ pub fn du(p: &Path) -> u64 {
     let mut stack = vec![p.to_path_buf()];
     let mut seen = HashSet::new();
     while let Some(d) = stack.pop() {
-        let Ok(md) = fs::symlink_metadata(&d) else { continue };
+        let Ok(md) = fs::symlink_metadata(&d) else {
+            continue;
+        };
         if md.nlink() > 1 && !md.is_dir() && !seen.insert((md.dev(), md.ino())) {
             continue;
         }
@@ -1248,7 +1447,9 @@ pub fn wait_stdin_eof() {
 }
 
 pub fn read_lines(p: &Path) -> Result<Vec<String>> {
-    Ok(BufReader::new(File::open(p)?).lines().collect::<std::io::Result<_>>()?)
+    Ok(BufReader::new(File::open(p)?)
+        .lines()
+        .collect::<std::io::Result<_>>()?)
 }
 
 pub fn write_out(v: &serde_json::Value) {

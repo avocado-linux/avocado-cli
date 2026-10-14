@@ -26,8 +26,12 @@ fn transfer(links: &[Value], a: &str, b: &str, bytes: f64) -> (f64, String) {
     let mbps = |x: &str, y: &str| -> Option<(f64, String)> {
         links.iter().find_map(|l| {
             let (la, lb) = (l["a"].as_str()?, l["b"].as_str()?);
-            ((la == x && lb == y) || (la == y && lb == x))
-                .then(|| (f(&l["mbps"]), l["kind"].as_str().unwrap_or("link").to_string()))
+            ((la == x && lb == y) || (la == y && lb == x)).then(|| {
+                (
+                    f(&l["mbps"]),
+                    l["kind"].as_str().unwrap_or("link").to_string(),
+                )
+            })
         })
     };
     let secs = |m: f64| bytes * 8.0 / (m * 1e6);
@@ -35,7 +39,11 @@ fn transfer(links: &[Value], a: &str, b: &str, bytes: f64) -> (f64, String) {
     if let Some((m, k)) = mbps(a, b) {
         best = (secs(m), format!("{a}→{b} ({k}, {m:.0} Mbit/s)"));
     }
-    let nodes: Vec<&str> = links.iter().flat_map(|l| [l["a"].as_str(), l["b"].as_str()]).flatten().collect();
+    let nodes: Vec<&str> = links
+        .iter()
+        .flat_map(|l| [l["a"].as_str(), l["b"].as_str()])
+        .flatten()
+        .collect();
     for via in nodes {
         if via == a || via == b {
             continue;
@@ -43,7 +51,10 @@ fn transfer(links: &[Value], a: &str, b: &str, bytes: f64) -> (f64, String) {
         if let (Some((m1, k1)), Some((m2, k2))) = (mbps(a, via), mbps(via, b)) {
             let t = secs(m1.min(m2));
             if t < best.0 {
-                best = (t, format!("{a}→{via}→{b} ({k1}+{k2}, {:.0} Mbit/s)", m1.min(m2)));
+                best = (
+                    t,
+                    format!("{a}→{via}→{b} ({k1}+{k2}, {:.0} Mbit/s)", m1.min(m2)),
+                );
             }
         }
     }
@@ -62,22 +73,34 @@ fn warm(backend: &Value, target: &str, releasever: Option<&str>) -> bool {
 
 pub fn plan(topo: &Value) -> Result<Value> {
     let p = &topo["project"];
-    let target = p["target"].as_str().ok_or_else(|| anyhow!("project.target"))?;
+    let target = p["target"]
+        .as_str()
+        .ok_or_else(|| anyhow!("project.target"))?;
     let rv = p["releasever"].as_str();
     let client = topo["client"].as_str().ok_or_else(|| anyhow!("client"))?;
     let board = topo["board"].as_str().ok_or_else(|| anyhow!("board"))?;
     let links = topo["links"].as_array().cloned().unwrap_or_default();
     let backends = topo["backends"].as_array().cloned().unwrap_or_default();
-    let by_name: HashMap<&str, &Value> = backends.iter().filter_map(|b| Some((b["name"].as_str()?, b))).collect();
+    let by_name: HashMap<&str, &Value> = backends
+        .iter()
+        .filter_map(|b| Some((b["name"].as_str()?, b)))
+        .collect();
     let hub = backends
         .iter()
-        .find(|b| b["rubicons"].as_array().is_some_and(|r| r.iter().any(|x| x == board)))
+        .find(|b| {
+            b["rubicons"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x == board))
+        })
         .ok_or_else(|| anyhow!("no backend is the hub for {board}"))?;
     let hub_name = hub["name"].as_str().unwrap_or("");
     let feed = topo["feed"].clone();
     let mut rows = Vec::new();
     let mut unreachable = Vec::new();
-    for b in backends.iter().filter(|b| b["can_build"].as_bool().unwrap_or(false)) {
+    for b in backends
+        .iter()
+        .filter(|b| b["can_build"].as_bool().unwrap_or(false))
+    {
         let name = b["name"].as_str().unwrap_or("");
         let (t_src, path_src) = transfer(&links, client, name, f(&p["source_bytes"]));
         // Layers: none if warm here; else from the cheapest warm peer; else the package feed.
@@ -86,23 +109,41 @@ pub fn plan(topo: &Value) -> Result<Value> {
         } else {
             let bytes = f(&p["layer_bytes"]);
             // The feed is reached from the builder itself, at the builder's own internet speed.
-            let fm = if b["feed_mbps"].is_number() { f(&b["feed_mbps"]) } else { f(&feed["mbps"]) };
+            let fm = if b["feed_mbps"].is_number() {
+                f(&b["feed_mbps"])
+            } else {
+                f(&feed["mbps"])
+            };
             let mut best = if b["offline"].as_bool().unwrap_or(false) || fm == 0.0 {
                 (bytes, f64::INFINITY, "no feed reachable".to_string())
             } else {
-                (bytes, bytes * 8.0 / (fm * 1e6) + f(&feed["install_s"]), format!("package feed ({fm:.0} Mbit/s) + install"))
+                (
+                    bytes,
+                    bytes * 8.0 / (fm * 1e6) + f(&feed["install_s"]),
+                    format!("package feed ({fm:.0} Mbit/s) + install"),
+                )
             };
-            for peer in backends.iter().filter(|x| x["name"] != b["name"] && warm(x, target, rv)) {
+            for peer in backends
+                .iter()
+                .filter(|x| x["name"] != b["name"] && warm(x, target, rv))
+            {
                 let (t, path) = transfer(&links, peer["name"].as_str().unwrap_or(""), name, bytes);
                 if t < best.1 {
-                    best = (bytes, t, format!("pull from {}: {path}", peer["name"].as_str().unwrap_or("")));
+                    best = (
+                        bytes,
+                        t,
+                        format!("pull from {}: {path}", peer["name"].as_str().unwrap_or("")),
+                    );
                 }
             }
             best
         };
         let build_s = f(&p["build_cpu_s"]) / f(&b["cpus"]).max(1.0);
         // Bundle to the hub: zero when the builder's store is the hub's store (same machine).
-        let same_store = name == hub_name || b["store_shared_with"].as_array().is_some_and(|s| s.iter().any(|x| x == hub_name));
+        let same_store = name == hub_name
+            || b["store_shared_with"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|x| x == hub_name));
         let (bundle_b, t_bundle, path_bundle) = if same_store {
             (0.0, 0.0, "same store as the hub: zero-copy".to_string())
         } else {
@@ -130,12 +171,19 @@ pub fn plan(topo: &Value) -> Result<Value> {
         }));
     }
     rows.sort_by(|a, b| {
-        f(&a["est_total_s"]).total_cmp(&f(&b["est_total_s"])).then(f(&a["bytes_total"]).total_cmp(&f(&b["bytes_total"])))
+        f(&a["est_total_s"])
+            .total_cmp(&f(&b["est_total_s"]))
+            .then(f(&a["bytes_total"]).total_cmp(&f(&b["bytes_total"])))
     });
-    let chosen = rows.first().cloned().ok_or_else(|| anyhow!("no backend can build"))?;
+    let chosen = rows
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("no backend can build"))?;
     let _ = by_name;
-    Ok(json!({"scenario": topo["scenario"], "board": board, "hub": hub_name, "client": client,
-              "chosen": chosen, "candidates": rows, "unreachable": unreachable}))
+    Ok(
+        json!({"scenario": topo["scenario"], "board": board, "hub": hub_name, "client": client,
+              "chosen": chosen, "candidates": rows, "unreachable": unreachable}),
+    )
 }
 
 pub fn render(plan: &Value) -> String {
@@ -157,7 +205,11 @@ pub fn render(plan: &Value) -> String {
         );
     }
     for u in plan["unreachable"].as_array().into_iter().flatten() {
-        s += &format!("    {:<14} not possible: {}\n", u["builder"].as_str().unwrap_or(""), u["why"]);
+        s += &format!(
+            "    {:<14} not possible: {}\n",
+            u["builder"].as_str().unwrap_or(""),
+            u["why"]
+        );
     }
     s
 }

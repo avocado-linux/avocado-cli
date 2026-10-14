@@ -20,10 +20,19 @@ pub const HELPER_IMAGE: &str = "avocado-store:poc";
 /// Top-level names under `/opt/_avocado/<target>` that are project-private: never shared, never
 /// in a layer. Extension/runtime outputs (where confext claim tokens and signed images live) are
 /// here, so secrets cannot reach a shared layer.
-pub const PRIVATE: &[&str] = &["includes", "extensions", "runtimes", "output", "kernel", "var-staging"];
+pub const PRIVATE: &[&str] = &[
+    "includes",
+    "extensions",
+    "runtimes",
+    "output",
+    "kernel",
+    "var-staging",
+];
 
 pub fn store_root() -> Option<String> {
-    std::env::var("AVOCADO_LAYER_STORE").ok().filter(|s| !s.is_empty())
+    std::env::var("AVOCADO_LAYER_STORE")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 pub fn view_name(volume: &str, target: &str) -> String {
@@ -38,7 +47,6 @@ fn helper_args(tool: &str, root: &str) -> Vec<String> {
         tool.to_string(),
         "run".into(),
         "--rm".into(),
-        "-i".into(),
         "--privileged".into(),
         "--network=host".into(),
         "-v".into(),
@@ -56,8 +64,13 @@ fn helper_args(tool: &str, root: &str) -> Vec<String> {
 fn volumes_dir(tool: &str) -> Option<String> {
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let o = std::process::Command::new(tool).args(["info", "-f", "{{.DockerRootDir}}"]).output().ok()?;
-        o.status.success().then(|| format!("{}/volumes", String::from_utf8_lossy(&o.stdout).trim()))
+        let o = std::process::Command::new(tool)
+            .args(["info", "-f", "{{.DockerRootDir}}"])
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| format!("{}/volumes", String::from_utf8_lossy(&o.stdout).trim()))
     })
     .clone()
 }
@@ -66,15 +79,24 @@ fn volumes_dir(tool: &str) -> Option<String> {
 /// but not mounted (a reboot drops mounts). Without this, a command would silently see the
 /// volume's own (empty) directory where the view belongs.
 pub async fn remount_volume_views(tool: &str, volume: &str) -> Result<()> {
-    let Some(root) = store_root() else { return Ok(()) };
+    let Some(root) = store_root() else {
+        return Ok(());
+    };
     if REMOUNTED.lock().unwrap().iter().any(|v| v == volume) {
         return Ok(());
     }
     let mut a = helper_args(tool, &root);
     a.extend(["remount".into(), format!("{volume}-")]);
-    let o = Command::new(&a[0]).args(&a[1..]).stdin(Stdio::null()).output().await?;
+    let o = Command::new(&a[0])
+        .args(&a[1..])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
     if !o.status.success() {
-        bail!("layer store: cannot remount views of {volume}: {}", String::from_utf8_lossy(&o.stderr).trim());
+        bail!(
+            "layer store: cannot remount views of {volume}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
     }
     REMOUNTED.lock().unwrap().push(volume.to_string());
     Ok(())
@@ -129,7 +151,11 @@ impl LayerStore {
     async fn helper_json(&self, args: &[&str]) -> Result<Value> {
         let o = self.helper(args).await?;
         if !o.status.success() {
-            bail!("layer store {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+            bail!(
+                "layer store {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
         }
         Ok(serde_json::from_slice(&o.stdout).unwrap_or(Value::Null))
     }
@@ -143,7 +169,11 @@ impl LayerStore {
         if !o.status.success() {
             bail!("layer store: no volume {}", self.volume);
         }
-        let at = format!("{}/{}", String::from_utf8_lossy(&o.stdout).trim(), self.target);
+        let at = format!(
+            "{}/{}",
+            String::from_utf8_lossy(&o.stdout).trim(),
+            self.target
+        );
         let mut a = vec!["mount", self.view.as_str(), "--at", at.as_str()];
         for p in PRIVATE {
             a.extend(["--private", p]);
@@ -164,11 +194,14 @@ impl LayerStore {
     }
 
     pub async fn use_layer(&self, key: &str) -> Result<()> {
-        self.helper_json(&["use", &self.view, key]).await.map(|_| ())
+        self.helper_json(&["use", &self.view, key])
+            .await
+            .map(|_| ())
     }
 
     pub async fn commit(&self, key: &str, inputs: &Value) -> Result<Value> {
-        self.helper_json(&["commit", &self.view, key, "--inputs", &inputs.to_string()]).await
+        self.helper_json(&["commit", &self.view, key, "--inputs", &inputs.to_string()])
+            .await
     }
 
     /// Alias `alias` → `key` so a lookup by either hits (e.g. the key a re-run computes once
@@ -191,8 +224,14 @@ impl LayerStore {
                     v["lock"][k] = lock[k].clone();
                 }
             }
-            if let (Some(names), Some(arch)) = (v["pins_of"].as_array().cloned(), v["host_arch"].as_str().map(String::from)) {
-                v["pins"] = names.iter().map(|n| lock["sdk"][&arch][n.as_str().unwrap_or("")].clone()).collect();
+            if let (Some(names), Some(arch)) = (
+                v["pins_of"].as_array().cloned(),
+                v["host_arch"].as_str().map(String::from),
+            ) {
+                v["pins"] = names
+                    .iter()
+                    .map(|n| lock["sdk"][&arch][n.as_str().unwrap_or("")].clone())
+                    .collect();
             }
             let parent = match &prev {
                 Some((old, new)) if *old == parent => new.clone(),
@@ -210,6 +249,11 @@ impl LayerStore {
     /// Take the build lock for `key`; waits while another builder holds it.
     pub async fn lock(&self, key: &str) -> Result<BuildLock> {
         let mut a = helper_args(&self.tool, &self.root);
+        // The holder keeps the lock until its stdin closes: attach stdin (our pipe, never a TTY).
+        let stdin_only = crate::utils::interactivity::ContainerStdio::StdinOnly.flags();
+        for (i, f) in stdin_only.iter().enumerate() {
+            a.insert(2 + i, f.to_string());
+        }
         a.extend(["hold".into(), key.into()]);
         let mut child = Command::new(&a[0])
             .args(&a[1..])
@@ -221,9 +265,19 @@ impl LayerStore {
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         match lines.next_line().await? {
             Some(l) if l.starts_with("held") => {
-                let waited: f64 = l.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let waited: f64 = l
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
                 if waited > 1.0 {
-                    print_info(&format!("Layer store: waited {waited:.1}s for another builder of {}.", &key[..12]), OutputLevel::Normal);
+                    print_info(
+                        &format!(
+                            "Layer store: waited {waited:.1}s for another builder of {}.",
+                            &key[..12]
+                        ),
+                        OutputLevel::Normal,
+                    );
                 }
                 Ok(BuildLock { _child: child })
             }
@@ -235,18 +289,31 @@ impl LayerStore {
     /// runs on) and `inputs`: a hit switches the view to it and skips `step`; a miss puts the view
     /// on `parent`, runs `step` under the key's build lock and commits the result.
     /// Returns the step's layer key.
-    pub async fn step<F, Fut>(&self, label: &str, parent: &str, inputs: &Value, step: F) -> Result<String>
+    pub async fn step<F, Fut>(
+        &self,
+        label: &str,
+        parent: &str,
+        inputs: &Value,
+        step: F,
+    ) -> Result<String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
         let t = std::time::Instant::now();
         let key = key_of(&json!({"parent": parent, "inputs": inputs}));
-        self.steps.lock().unwrap().push((parent.to_string(), inputs.clone(), key.clone()));
+        self.steps
+            .lock()
+            .unwrap()
+            .push((parent.to_string(), inputs.clone(), key.clone()));
         let c = self.helper_json(&["check", &self.view, &key]).await?;
         let current = c["current"].as_str();
-        if current == Some(key.as_str()) || (c["has"] == true && current == c["canonical"].as_str()) {
-            print_info(&format!("Layer store: {label} {} already in the view.", &key[..12]), OutputLevel::Normal);
+        if current == Some(key.as_str()) || (c["has"] == true && current == c["canonical"].as_str())
+        {
+            print_info(
+                &format!("Layer store: {label} {} already in the view.", &key[..12]),
+                OutputLevel::Normal,
+            );
             return Ok(key);
         }
         let _lock = self.lock(&key).await?;
@@ -254,14 +321,23 @@ impl LayerStore {
         // fails and this is a miss like any other.
         if self.has(&key).await? && self.use_layer(&key).await.is_ok() {
             print_info(
-                &format!("Layer store: {label} hit {} ({:.1}s).", &key[..12], t.elapsed().as_secs_f64()),
+                &format!(
+                    "Layer store: {label} hit {} ({:.1}s).",
+                    &key[..12],
+                    t.elapsed().as_secs_f64()
+                ),
                 OutputLevel::Normal,
             );
             return Ok(key);
         }
         self.use_layer(parent).await?;
         step().await?;
-        let rec = self.commit(&key, &json!({"label": label, "parent": parent, "inputs": inputs})).await?;
+        let rec = self
+            .commit(
+                &key,
+                &json!({"label": label, "parent": parent, "inputs": inputs}),
+            )
+            .await?;
         print_info(
             &format!(
                 "Layer store: {label} committed {} ({} files, {} new objects, {:.1} MB new; commit {:.1}s, step total {:.1}s).",
@@ -279,16 +355,29 @@ impl LayerStore {
 }
 
 /// Run the helper against `root` with extra docker args (e.g. a bind of a bundle to import).
-pub async fn run_helper(tool: &str, root: &str, docker_args: &[String], args: &[&str]) -> Result<Value> {
+pub async fn run_helper(
+    tool: &str,
+    root: &str,
+    docker_args: &[String],
+    args: &[&str],
+) -> Result<Value> {
     let mut a = helper_args(tool, root);
     let at = a.iter().position(|x| x == HELPER_IMAGE).unwrap();
     for (i, d) in docker_args.iter().enumerate() {
         a.insert(at + i, d.clone());
     }
     a.extend(args.iter().map(|s| s.to_string()));
-    let o = Command::new(&a[0]).args(&a[1..]).stdin(Stdio::null()).output().await?;
+    let o = Command::new(&a[0])
+        .args(&a[1..])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
     if !o.status.success() {
-        bail!("layer store {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+        bail!(
+            "layer store {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
     }
     Ok(serde_json::from_slice(&o.stdout).unwrap_or(Value::Null))
 }
@@ -296,14 +385,27 @@ pub async fn run_helper(tool: &str, root: &str, docker_args: &[String], args: &[
 /// Provision by pull (PoC, `AVOCADO_HUB_STORE=1`): a bundle directory is `bundle.json` +
 /// `blobs/<sha256>`, which is already the store's object naming. Import it as layer
 /// `bundle-<sha256(bundle.json)>` into the local store and return the key.
-pub async fn import_bundle(tool: &str, root: &str, bundle: &std::path::Path) -> Result<(String, Value)> {
+pub async fn import_bundle(
+    tool: &str,
+    root: &str,
+    bundle: &std::path::Path,
+) -> Result<(String, Value)> {
     let meta = std::fs::read(bundle.join("bundle.json"))?;
     let key = format!(
         "bundle-{}",
-        Sha256::digest(&meta).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        Sha256::digest(&meta)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     let bind = format!("{}:/bundle:ro", bundle.display());
-    let rec = run_helper(tool, root, &["-v".into(), bind], &["import", "/bundle", &key]).await?;
+    let rec = run_helper(
+        tool,
+        root,
+        &["-v".into(), bind],
+        &["import", "/bundle", &key],
+    )
+    .await?;
     Ok((key, rec))
 }
 
@@ -320,9 +422,15 @@ pub fn blob_url_in_share(store_root_rel: &str, sha256: &str) -> String {
 
 /// The SDK container image's id: part of every key (same tag, different image = different key).
 pub async fn image_id(tool: &str, image: &str) -> Result<String> {
-    let o = Command::new(tool).args(["image", "inspect", "--format", "{{.Id}}", image]).output().await?;
+    let o = Command::new(tool)
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .await?;
     if !o.status.success() {
-        let p = Command::new(tool).args(["pull", "-q", image]).output().await?;
+        let p = Command::new(tool)
+            .args(["pull", "-q", image])
+            .output()
+            .await?;
         if !p.status.success() {
             bail!("cannot pull {image}");
         }

@@ -170,9 +170,18 @@ pub fn local_instance() -> Option<String> {
 /// single quote.
 fn host_vm_command(ssh_host: &str, inner: &str) -> Command {
     let mut c = Command::new("ssh");
-    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15"])
-        .arg(ssh_host)
-        .arg(format!("ssh -F ~/.avocado/vm/ssh-config avocado-vm '{inner}'"));
+    c.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+    ])
+    .arg(ssh_host)
+    .arg(format!(
+        "ssh -F ~/.avocado/vm/ssh-config avocado-vm '{inner}'"
+    ));
     c
 }
 
@@ -196,7 +205,10 @@ pub async fn host_boards(ssh_host: &str) -> Result<Vec<Board>> {
     let v: Value = serde_json::from_slice(&out.stdout)
         .with_context(|| format!("unexpected agent reply from {ssh_host}"))?;
     if v.get("ok") != Some(&json!(true)) {
-        bail!("the agent on {ssh_host} refused: {}", v.get("error").unwrap_or(&v));
+        bail!(
+            "the agent on {ssh_host} refused: {}",
+            v.get("error").unwrap_or(&v)
+        );
     }
     Ok(v["inventory"]["rubicons"]
         .as_array()
@@ -209,7 +221,9 @@ pub async fn host_boards(ssh_host: &str) -> Result<Vec<Board>> {
                 address: r["address"].as_str().unwrap_or_default().to_string(),
                 name: s(&r["name"]),
                 label: s(&r["label"]),
-                hub: Hub::Host { ssh: ssh_host.to_string() },
+                hub: Hub::Host {
+                    ssh: ssh_host.to_string(),
+                },
                 info,
                 vm_instance: None,
             }
@@ -642,7 +656,11 @@ pub struct RemoteProvision {
 /// Fail before packing when the project says how to drive a board for some
 /// provision profiles but not the chosen one: the hub would skip the board's
 /// recovery steps and the flash would wait for a device that never comes.
-fn check_rubicon_binding(config_path: &str, target: Option<&str>, profile: Option<&str>) -> Result<()> {
+fn check_rubicon_binding(
+    config_path: &str,
+    target: Option<&str>,
+    profile: Option<&str>,
+) -> Result<()> {
     let Some(profile) = profile.filter(|p| !p.is_empty()) else {
         return Ok(());
     };
@@ -861,7 +879,9 @@ impl RemoteProvision {
     ) -> Result<()> {
         let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
         if std::env::var("AVOCADO_HUB_STORE").is_ok_and(|v| v == "1") {
-            return self.run_host_store(ssh_host, bundle, meta, address, token, env).await;
+            return self
+                .run_host_store(ssh_host, bundle, meta, address, token, env)
+                .await;
         }
         // The host's VM workspace share; the cache lives inside it so the
         // guest reads blobs in place.
@@ -936,7 +956,13 @@ impl RemoteProvision {
                 "interactive": self.interactive,
             },
         });
-        let r = follow_hub(&Hub::Host { ssh: ssh_host.to_string() }, req).await?;
+        let r = follow_hub(
+            &Hub::Host {
+                ssh: ssh_host.to_string(),
+            },
+            req,
+        )
+        .await?;
         report(&r, &format!("provision on Rubicon {address}"))?;
         print_success(
             &format!("Provisioned through Rubicon {address} on {ssh_host}"),
@@ -965,8 +991,11 @@ impl RemoteProvision {
     ) -> Result<()> {
         use crate::utils::layer_store as ls;
         let var = |k: &str| std::env::var(k).with_context(|| format!("{k} is not set"));
-        let (root, registry, remote_root) =
-            (var("AVOCADO_LAYER_STORE")?, var("AVOCADO_LAYER_REGISTRY")?, var("AVOCADO_HUB_STORE_ROOT")?);
+        let (root, registry, remote_root) = (
+            var("AVOCADO_LAYER_STORE")?,
+            var("AVOCADO_LAYER_REGISTRY")?,
+            var("AVOCADO_HUB_STORE_ROOT")?,
+        );
         let t = std::time::Instant::now();
         let (key, rec) = ls::import_bundle("docker", &root, bundle).await?;
         let t_import = t.elapsed().as_secs_f64();
@@ -974,7 +1003,14 @@ impl RemoteProvision {
         let t_push = t.elapsed().as_secs_f64() - t_import;
         let ws = {
             let o = Command::new("ssh")
-                .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ssh_host, "cat ~/.avocado/vm/workspace"])
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=15",
+                    ssh_host,
+                    "cat ~/.avocado/vm/workspace",
+                ])
                 .output()?;
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         };
@@ -987,10 +1023,20 @@ impl RemoteProvision {
             ls::HELPER_IMAGE
         );
         let o = Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ssh_host, &pull_cmd])
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                ssh_host,
+                &pull_cmd,
+            ])
             .output()?;
         if !o.status.success() {
-            bail!("pull on {ssh_host} failed: {}", String::from_utf8_lossy(&o.stderr).trim());
+            bail!(
+                "pull on {ssh_host} failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
         }
         let pull: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
         let t_pull = t.elapsed().as_secs_f64() - t_import - t_push;
@@ -1003,14 +1049,22 @@ impl RemoteProvision {
         // Objects at or below the inline size live in the EROFS image, not objects/: a bundle
         // blob that small cannot be served by path.
         if let Some(b) = meta.blobs().iter().find(|b| b.size <= 64) {
-            bail!("blob {} is too small to serve from the store ({} B)", b.sha256, b.size);
+            bail!(
+                "blob {} is too small to serve from the store ({} B)",
+                b.sha256,
+                b.size
+            );
         }
         let blobs: Vec<Value> = meta
             .blobs()
             .iter()
             .map(|b| json!({"sha256": b.sha256, "size_bytes": b.size, "url": ls::blob_url_in_share(&rel, &b.sha256)}))
             .collect();
-        let name = bundle.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = bundle
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         print_info(
             &format!("Provisioning through the avocado-vm on {ssh_host}, Rubicon {address} (bundle by pull)"),
             OutputLevel::Normal,
@@ -1029,9 +1083,18 @@ impl RemoteProvision {
                 "interactive": self.interactive,
             },
         });
-        let r = follow_hub(&Hub::Host { ssh: ssh_host.to_string() }, req).await?;
+        let r = follow_hub(
+            &Hub::Host {
+                ssh: ssh_host.to_string(),
+            },
+            req,
+        )
+        .await?;
         report(&r, &format!("provision on Rubicon {address}"))?;
-        print_success(&format!("Provisioned through Rubicon {address} on {ssh_host}"), OutputLevel::Normal);
+        print_success(
+            &format!("Provisioned through Rubicon {address} on {ssh_host}"),
+            OutputLevel::Normal,
+        );
         Ok(())
     }
 
@@ -1040,7 +1103,8 @@ impl RemoteProvision {
     /// the store's objects. Zero bytes move between machines.
     async fn run_local_store(&self, bundle: &Path) -> Result<Vec<Value>> {
         use crate::utils::layer_store as ls;
-        let root = std::env::var("AVOCADO_LAYER_STORE").context("AVOCADO_LAYER_STORE is not set")?;
+        let root =
+            std::env::var("AVOCADO_LAYER_STORE").context("AVOCADO_LAYER_STORE is not set")?;
         let paths = VmPaths::resolve()?;
         let ws = share::read_recorded_workspace(&paths)?
             .map(Ok)
@@ -1054,13 +1118,20 @@ impl RemoteProvision {
         let (key, rec) = ls::import_bundle("docker", &root, bundle).await?;
         let line = json!({"bundle_layer": key, "files": rec["files"], "new_bytes": rec["new_bytes"],
                           "import_s": t.elapsed().as_secs_f64(), "moved_bytes": 0});
-        print_info(&format!("Layer store (local hub): {line}"), OutputLevel::Normal);
+        print_info(
+            &format!("Layer store (local hub): {line}"),
+            OutputLevel::Normal,
+        );
         if let Ok(f) = std::env::var("AVOCADO_HUB_STORE_REPORT") {
             let _ = std::fs::write(f, line.to_string());
         }
         let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
         if let Some(b) = meta.blobs().iter().find(|b| b.size <= 64) {
-            bail!("blob {} is too small to serve from the store ({} B)", b.sha256, b.size);
+            bail!(
+                "blob {} is too small to serve from the store ({} B)",
+                b.sha256,
+                b.size
+            );
         }
         Ok(meta
             .blobs()
@@ -1190,7 +1261,10 @@ mod tests {
         .unwrap();
         assert!(unbound_profile_error(&c, "tegraflash").is_none());
         let e = unbound_profile_error(&c, "tegraflash-sd").unwrap();
-        assert!(e.contains("tegraflash-sd") && e.contains("(tegraflash)"), "{e}");
+        assert!(
+            e.contains("tegraflash-sd") && e.contains("(tegraflash)"),
+            "{e}"
+        );
         // A project with no Rubicon bindings at all is left to the hub.
         let none: crate::utils::config::Config =
             serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();

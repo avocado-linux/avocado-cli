@@ -30,11 +30,18 @@ enum Cmd {
     },
     /// One round trip for a CLI step: the view's current layer, whether KEY exists, and the
     /// layer KEY resolves to (aliases followed).
-    Check { view: String, key: String },
+    Check {
+        view: String,
+        key: String,
+    },
     /// Exit 0 when layer KEY exists.
-    Has { key: String },
+    Has {
+        key: String,
+    },
     /// Print a layer record.
-    Record { key: String },
+    Record {
+        key: String,
+    },
     /// Mount a view (new views start on LAYER, default the empty layer).
     Mount {
         view: String,
@@ -47,12 +54,21 @@ enum Cmd {
         at: Option<PathBuf>,
     },
     /// Mount every recorded, unmounted view whose name starts with PREFIX.
-    Remount { prefix: String },
+    Remount {
+        prefix: String,
+    },
     /// Make ALIAS another name for layer KEY.
-    Alias { alias: String, key: String },
-    Umount { view: String },
+    Alias {
+        alias: String,
+        key: String,
+    },
+    Umount {
+        view: String,
+    },
     /// Unmount and delete a view and its upper (releases its lease).
-    Drop { view: String },
+    Drop {
+        view: String,
+    },
     /// Switch a view to layer KEY, keeping only its private paths.
     Use {
         view: String,
@@ -68,7 +84,9 @@ enum Cmd {
         inputs: String,
     },
     /// Re-hash a layer through a mounted view and compare its tree digest.
-    Verify { key: String },
+    Verify {
+        key: String,
+    },
     /// Usage, layers, views, pins.
     Stats,
     /// Desktop-facing summary: store bytes, what the projects would take without sharing, and per
@@ -92,10 +110,17 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    Pin { name: String, keys: Vec<String> },
-    Unpin { name: String },
+    Pin {
+        name: String,
+        keys: Vec<String>,
+    },
+    Unpin {
+        name: String,
+    },
     /// Hold the build lock for KEY until stdin closes. Prints "held" once taken.
-    Hold { key: String },
+    Hold {
+        key: String,
+    },
     /// Push layer KEY to http://host:port/repo; --known: layers the remote already has.
     Push {
         registry: String,
@@ -104,7 +129,10 @@ enum Cmd {
         known: Vec<String>,
     },
     /// Pull layer KEY, fetching only missing objects.
-    Pull { registry: String, key: String },
+    Pull {
+        registry: String,
+        key: String,
+    },
     /// Publish this store's descriptor (+ EXTRA json: rubicons, can_build, store_shared_with…)
     /// to REGISTRY as `backend-NAME`.
     Advertise {
@@ -125,11 +153,16 @@ enum Cmd {
     /// Unmount every view and delete the whole store (bench cleanup).
     Destroy,
     /// Materialize layer KEY as a plain directory.
-    Checkout { key: String, dst: PathBuf },
+    Checkout {
+        key: String,
+        dst: PathBuf,
+    },
 }
 
 fn kernel_ok(release: &str) -> bool {
-    let mut it = release.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse::<u32>().ok());
+    let mut it = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|s| s.parse::<u32>().ok());
     let (maj, min) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
     (maj, min) >= (6, 6)
 }
@@ -139,7 +172,9 @@ fn main() -> Result<()> {
     let store = Store::open(&cli.root)?;
     match cli.cmd {
         Cmd::Preflight => {
-            let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease")?.trim().to_string();
+            let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease")?
+                .trim()
+                .to_string();
             if !kernel_ok(&rel) {
                 bail!("kernel {rel} < 6.6: overlay data-only lowers are missing. Use avocado-vm.");
             }
@@ -151,16 +186,27 @@ fn main() -> Result<()> {
             }
             write_out(&json!({"ok": true, "kernel": rel}));
         }
-        Cmd::Import { src, key, inputs, exclude } => {
+        Cmd::Import {
+            src,
+            key,
+            inputs,
+            exclude,
+        } => {
             let r = store.import_dir(&src, &key, serde_json::from_str(&inputs)?, &exclude)?;
             write_out(&serde_json::to_value(r)?);
         }
         Cmd::Check { view, key } => {
             let canon = std::fs::read_link(cli.root.join("layers").join(format!("{key}.json")))
                 .ok()
-                .and_then(|p| p.to_str().and_then(|s| s.strip_suffix(".json")).map(String::from))
+                .and_then(|p| {
+                    p.to_str()
+                        .and_then(|s| s.strip_suffix(".json"))
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| key.clone());
-            write_out(&json!({"current": store.view(&view)?.map(|v| v.layer), "has": store.has_layer(&key), "canonical": canon}));
+            write_out(
+                &json!({"current": store.view(&view)?.map(|v| v.layer), "has": store.has_layer(&key), "canonical": canon}),
+            );
         }
         Cmd::Has { key } => {
             if !store.has_layer(&key) {
@@ -168,7 +214,12 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Record { key } => write_out(&serde_json::to_value(store.record(&key)?)?),
-        Cmd::Mount { view, layer, private, at } => write_out(&serde_json::to_value(store.mount_view_at(
+        Cmd::Mount {
+            view,
+            layer,
+            private,
+            at,
+        } => write_out(&serde_json::to_value(store.mount_view_at(
             &view,
             layer.as_deref(),
             &private,
@@ -178,10 +229,14 @@ fn main() -> Result<()> {
         Cmd::Alias { alias, key } => store.alias(&alias, &key)?,
         Cmd::Umount { view } => store.umount_view(&view)?,
         Cmd::Drop { view } => store.drop_view(&view)?,
-        Cmd::Use { view, key, private } => write_out(&serde_json::to_value(store.use_layer(&view, &key, &private)?)?),
-        Cmd::Commit { view, key, inputs } => {
-            write_out(&serde_json::to_value(store.commit_view(&view, &key, serde_json::from_str(&inputs)?)?)?)
-        }
+        Cmd::Use { view, key, private } => write_out(&serde_json::to_value(
+            store.use_layer(&view, &key, &private)?,
+        )?),
+        Cmd::Commit { view, key, inputs } => write_out(&serde_json::to_value(store.commit_view(
+            &view,
+            &key,
+            serde_json::from_str(&inputs)?,
+        )?)?),
         Cmd::Verify { key } => {
             let (ok, got, secs) = store.verify(&key)?;
             write_out(&json!({"key": key, "ok": ok, "tree_digest": got, "secs": secs}));
@@ -192,7 +247,9 @@ fn main() -> Result<()> {
         Cmd::Stats => write_out(&store.stats()?),
         Cmd::Usage => {
             let s = store.stats()?;
-            let store_bytes = s["object_bytes"].as_u64().unwrap_or(0) + s["layer_meta_bytes"].as_u64().unwrap_or(0) + s["upper_bytes"].as_u64().unwrap_or(0);
+            let store_bytes = s["object_bytes"].as_u64().unwrap_or(0)
+                + s["layer_meta_bytes"].as_u64().unwrap_or(0)
+                + s["upper_bytes"].as_u64().unwrap_or(0);
             let mut projects = Vec::new();
             let mut without = 0u64;
             for v in store.views()? {
@@ -209,11 +266,19 @@ fn main() -> Result<()> {
             }));
         }
         Cmd::Describe => write_out(&describe(&store, &cli.root)?),
-        Cmd::Gc { high, low, min_free, target_free, dry_run } => {
+        Cmd::Gc {
+            high,
+            low,
+            min_free,
+            target_free,
+            dry_run,
+        } => {
             let (mut high, mut low) = (high, low);
             if let Some(mf) = min_free {
                 // Free space is the budget: evicting X bytes frees X, so translate to watermarks.
-                let used = store.gc(u64::MAX, 0, true)?["before_bytes"].as_u64().unwrap_or(0);
+                let used = store.gc(u64::MAX, 0, true)?["before_bytes"]
+                    .as_u64()
+                    .unwrap_or(0);
                 let free = nix_statvfs(&cli.root);
                 let tf = target_free.unwrap_or(mf + mf / 2);
                 high = (used + free).saturating_sub(mf);
@@ -229,24 +294,61 @@ fn main() -> Result<()> {
             println!("held {:.3}", t.elapsed().as_secs_f64());
             avocado_store::wait_stdin_eof();
         }
-        Cmd::Push { registry, key, known } => write_out(&oci::push(&store, &oci::Remote::parse(&registry)?, &key, &known)?),
-        Cmd::Pull { registry, key } => write_out(&oci::pull(&store, &oci::Remote::parse(&registry)?, &key)?),
+        Cmd::Push {
+            registry,
+            key,
+            known,
+        } => write_out(&oci::push(
+            &store,
+            &oci::Remote::parse(&registry)?,
+            &key,
+            &known,
+        )?),
+        Cmd::Pull { registry, key } => {
+            write_out(&oci::pull(&store, &oci::Remote::parse(&registry)?, &key)?)
+        }
         Cmd::Checkout { key, dst } => store.checkout(&key, &dst)?,
-        Cmd::Advertise { registry, name, extra } => {
+        Cmd::Advertise {
+            registry,
+            name,
+            extra,
+        } => {
             let mut d = describe(&store, &cli.root)?;
             d["name"] = json!(name);
-            if let (Some(o), Some(e)) = (d.as_object_mut(), serde_json::from_str::<serde_json::Value>(&extra)?.as_object()) {
+            if let (Some(o), Some(e)) = (
+                d.as_object_mut(),
+                serde_json::from_str::<serde_json::Value>(&extra)?.as_object(),
+            ) {
                 o.extend(e.clone());
             }
-            oci::put_json(&oci::Remote::parse(&registry)?, &format!("backend-{name}"), "application/vnd.avocado.backend.v1+json", &d)?;
+            oci::put_json(
+                &oci::Remote::parse(&registry)?,
+                &format!("backend-{name}"),
+                "application/vnd.avocado.backend.v1+json",
+                &d,
+            )?;
             write_out(&d);
         }
-        Cmd::Plan { topology, registry, json: as_json } => {
+        Cmd::Plan {
+            topology,
+            registry,
+            json: as_json,
+        } => {
             let mut topo: serde_json::Value = serde_json::from_slice(&std::fs::read(&topology)?)?;
             if let Some(r) = registry {
                 let remote = oci::Remote::parse(&r)?;
-                let mut have: Vec<String> = topo["backends"].as_array().map(|b| b.iter().filter_map(|x| x["name"].as_str().map(String::from)).collect()).unwrap_or_default();
-                for t in oci::tags(&remote)?.into_iter().filter(|t| t.starts_with("backend-")) {
+                let mut have: Vec<String> = topo["backends"]
+                    .as_array()
+                    .map(|b| {
+                        b.iter()
+                            .filter_map(|x| x["name"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for t in oci::tags(&remote)?
+                    .into_iter()
+                    .filter(|t| t.starts_with("backend-"))
+                {
                     let name = t.trim_start_matches("backend-").to_string();
                     if have.contains(&name) {
                         // Declared in the topology: merge the advertised store contents in.
@@ -314,7 +416,12 @@ fn nix_statvfs(p: &std::path::Path) -> u64 {
 fn meminfo_total() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|m| m.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|k| k.parse::<u64>().ok()))
+        .and_then(|m| {
+            m.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|k| k.parse::<u64>().ok())
+        })
         .map(|k| k * 1024)
         .unwrap_or(0)
 }

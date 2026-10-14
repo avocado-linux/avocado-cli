@@ -63,11 +63,15 @@ impl Remote {
         let rest = registry
             .strip_prefix("http://")
             .ok_or_else(|| anyhow!("registry must be http://host:port/repo (PoC: no TLS)"))?;
-        let (host, repo) = rest.split_once('/').ok_or_else(|| anyhow!("registry needs a repo path"))?;
+        let (host, repo) = rest
+            .split_once('/')
+            .ok_or_else(|| anyhow!("registry needs a repo path"))?;
         Ok(Remote {
             base: format!("http://{host}"),
             repo: repo.trim_end_matches('/').to_string(),
-            agent: ureq::AgentBuilder::new().max_idle_connections_per_host(64).build(),
+            agent: ureq::AgentBuilder::new()
+                .max_idle_connections_per_host(64)
+                .build(),
         })
     }
 
@@ -77,7 +81,11 @@ impl Remote {
 
     pub fn has_blob(&self, digest: &str, x: &Xfer) -> Result<bool> {
         x.requests.fetch_add(1, Ordering::Relaxed);
-        match self.agent.head(&self.url(&format!("blobs/sha256:{digest}"))).call() {
+        match self
+            .agent
+            .head(&self.url(&format!("blobs/sha256:{digest}")))
+            .call()
+        {
             Ok(_) => Ok(true),
             Err(ureq::Error::Status(404, _)) => Ok(false),
             Err(e) => Err(e.into()),
@@ -87,8 +95,15 @@ impl Remote {
     pub fn put_blob(&self, digest: &str, data: &[u8], x: &Xfer) -> Result<()> {
         x.requests.fetch_add(2, Ordering::Relaxed);
         let r = self.agent.post(&self.url("blobs/uploads/")).call()?;
-        let loc = r.header("Location").ok_or_else(|| anyhow!("upload without Location"))?.to_string();
-        let loc = if loc.starts_with('/') { format!("{}{loc}", self.base) } else { loc };
+        let loc = r
+            .header("Location")
+            .ok_or_else(|| anyhow!("upload without Location"))?
+            .to_string();
+        let loc = if loc.starts_with('/') {
+            format!("{}{loc}", self.base)
+        } else {
+            loc
+        };
         let sep = if loc.contains('?') { '&' } else { '?' };
         self.agent
             .put(&format!("{loc}{sep}digest=sha256:{digest}"))
@@ -184,7 +199,11 @@ fn run_parallel<T: Sync>(items: &[T], f: impl Fn(&T) -> Result<()> + Sync) -> Re
 }
 
 fn objects_of(store: &Store, key: &str) -> Result<Vec<String>> {
-    let mut v: Vec<String> = store.dump(key)?.iter().filter_map(|e| e.object().map(String::from)).collect();
+    let mut v: Vec<String> = store
+        .dump(key)?
+        .iter()
+        .filter_map(|e| e.object().map(String::from))
+        .collect();
     v.sort();
     v.dedup();
     Ok(v)
@@ -204,7 +223,8 @@ pub fn push(store: &Store, remote: &Remote, key: &str, known: &[String]) -> Resu
         }
     }
     let probe: Vec<&String> = objs.iter().filter(|o| !skip.contains(*o)).collect();
-    x.skipped.fetch_add((objs.len() - probe.len()) as u64, Ordering::Relaxed);
+    x.skipped
+        .fetch_add((objs.len() - probe.len()) as u64, Ordering::Relaxed);
     run_parallel(&probe, |o| {
         let d = o.replace('/', "");
         if !remote.has_blob(&d, &x)? {
@@ -234,7 +254,12 @@ pub fn push(store: &Store, remote: &Remote, key: &str, known: &[String]) -> Resu
                         "org.avocado.layer.tree-digest": rec.tree_digest},
     }))?;
     let main_desc = Remote::manifest_desc(&main, json!({"artifactType": MT_LAYER}));
-    remote.put_manifest(main_desc["digest"].as_str().unwrap(), MT_MANIFEST, &main, &x)?;
+    remote.put_manifest(
+        main_desc["digest"].as_str().unwrap(),
+        MT_MANIFEST,
+        &main,
+        &x,
+    )?;
     let mut manifests = vec![main_desc];
     let empty = remote.ensure_blob(b"{}", &x)?;
     for chunk in objs.chunks(CHUNK) {
@@ -249,7 +274,10 @@ pub fn push(store: &Store, remote: &Remote, key: &str, known: &[String]) -> Resu
             "schemaVersion": 2, "mediaType": MT_MANIFEST, "artifactType": "application/vnd.avocado.objects.v1",
             "config": {"mediaType": MT_EMPTY, "digest": empty["digest"], "size": 2}, "layers": sizes,
         }))?;
-        let d = Remote::manifest_desc(&m, json!({"artifactType": "application/vnd.avocado.objects.v1"}));
+        let d = Remote::manifest_desc(
+            &m,
+            json!({"artifactType": "application/vnd.avocado.objects.v1"}),
+        );
         remote.put_manifest(d["digest"].as_str().unwrap(), MT_MANIFEST, &m, &x)?;
         manifests.push(d);
     }
@@ -257,8 +285,10 @@ pub fn push(store: &Store, remote: &Remote, key: &str, known: &[String]) -> Resu
         "schemaVersion": 2, "mediaType": MT_INDEX, "artifactType": MT_LAYER, "manifests": manifests,
     }))?;
     remote.put_manifest(key, MT_INDEX, &index, &x)?;
-    Ok(json!({"key": key, "op": "push", "layer_objects": objs.len(), "xfer": x.json(),
-              "secs": t.elapsed().as_secs_f64()}))
+    Ok(
+        json!({"key": key, "op": "push", "layer_objects": objs.len(), "xfer": x.json(),
+              "secs": t.elapsed().as_secs_f64()}),
+    )
 }
 
 /// Pull layer `key`: the image, the dump, and only the objects this store lacks.
@@ -267,31 +297,61 @@ pub fn pull(store: &Store, remote: &Remote, key: &str) -> Result<Value> {
     let x = Xfer::default();
     let _gc = store.gc_lock(false)?;
     if store.has_layer(key) {
-        return Ok(json!({"key": key, "op": "pull", "hit": true, "xfer": x.json(), "secs": t.elapsed().as_secs_f64()}));
+        return Ok(
+            json!({"key": key, "op": "pull", "hit": true, "xfer": x.json(), "secs": t.elapsed().as_secs_f64()}),
+        );
     }
-    let index = remote.get_manifest(key, &x)?.ok_or_else(|| anyhow!("{key}: not in {}/{}", remote.base, remote.repo))?;
-    let main_d = index["manifests"][0]["digest"].as_str().ok_or_else(|| anyhow!("bad index"))?.to_string();
-    let main = remote.get_manifest(&main_d, &x)?.ok_or_else(|| anyhow!("missing main manifest"))?;
-    let digest = |v: &Value| v["digest"].as_str().unwrap_or("").trim_start_matches("sha256:").to_string();
+    let index = remote
+        .get_manifest(key, &x)?
+        .ok_or_else(|| anyhow!("{key}: not in {}/{}", remote.base, remote.repo))?;
+    let main_d = index["manifests"][0]["digest"]
+        .as_str()
+        .ok_or_else(|| anyhow!("bad index"))?
+        .to_string();
+    let main = remote
+        .get_manifest(&main_d, &x)?
+        .ok_or_else(|| anyhow!("missing main manifest"))?;
+    let digest = |v: &Value| {
+        v["digest"]
+            .as_str()
+            .unwrap_or("")
+            .trim_start_matches("sha256:")
+            .to_string()
+    };
     let record = remote.get_blob(&digest(&main["config"]), &x)?;
     let erofs = remote.get_blob(&digest(&main["layers"][0]), &x)?;
     let mut dump = Vec::new();
-    GzDecoder::new(&remote.get_blob(&digest(&main["layers"][1]), &x)?[..]).read_to_end(&mut dump)?;
+    GzDecoder::new(&remote.get_blob(&digest(&main["layers"][1]), &x)?[..])
+        .read_to_end(&mut dump)?;
     let entries = crate::parse_dump(&dump)?;
-    if sha256_hex(&dump) != serde_json::from_slice::<Value>(&record)?["tree_digest"].as_str().unwrap_or("") {
+    if sha256_hex(&dump)
+        != serde_json::from_slice::<Value>(&record)?["tree_digest"]
+            .as_str()
+            .unwrap_or("")
+    {
         bail!("{key}: dump does not match the record's tree digest");
     }
-    let mut objs: Vec<String> = entries.iter().filter_map(|e| e.object().map(String::from)).collect();
+    let mut objs: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.object().map(String::from))
+        .collect();
     objs.sort();
     objs.dedup();
-    let missing: Vec<&String> = objs.iter().filter(|o| !store.root.join("objects").join(o.as_str()).exists()).collect();
-    x.skipped.fetch_add((objs.len() - missing.len()) as u64, Ordering::Relaxed);
+    let missing: Vec<&String> = objs
+        .iter()
+        .filter(|o| !store.root.join("objects").join(o.as_str()).exists())
+        .collect();
+    x.skipped
+        .fetch_add((objs.len() - missing.len()) as u64, Ordering::Relaxed);
     run_parallel(&missing, |o| {
         let d = o.replace('/', "");
         let data = remote.get_blob(&d, &x)?;
         let dst = store.obj_path(&d);
         fs::create_dir_all(dst.parent().unwrap())?;
-        let tmp = store.root.join("tmp").join(format!("pull.{d}.{}", crate::uniq()));
+        let tmp = store
+            .root
+            .join("tmp")
+            .join(format!("pull.{d}.{}", crate::uniq()));
         File::create(&tmp)?.write_all(&data)?;
         fs::rename(&tmp, &dst)?;
         x.objects.fetch_add(1, Ordering::Relaxed);
@@ -305,8 +365,10 @@ pub fn pull(store: &Store, remote: &Remote, key: &str) -> Result<Value> {
     fs::rename(lf(&format!("erofs.{pid}")), lf("erofs"))?;
     fs::write(lf(&format!("json.{pid}")), &record).context("write record")?;
     fs::rename(lf(&format!("json.{pid}")), lf("json"))?;
-    Ok(json!({"key": key, "op": "pull", "hit": false, "layer_objects": objs.len(), "xfer": x.json(),
-              "secs": t.elapsed().as_secs_f64()}))
+    Ok(
+        json!({"key": key, "op": "pull", "hit": false, "layer_objects": objs.len(), "xfer": x.json(),
+              "secs": t.elapsed().as_secs_f64()}),
+    )
 }
 
 /// Publish a small JSON document as an artifact tagged `tag` (backend descriptors).
@@ -326,12 +388,31 @@ pub fn put_json(remote: &Remote, tag: &str, artifact_type: &str, doc: &Value) ->
 
 pub fn get_json(remote: &Remote, tag: &str) -> Result<Option<Value>> {
     let x = Xfer::default();
-    let Some(m) = remote.get_manifest(tag, &x)? else { return Ok(None) };
-    let d = m["config"]["digest"].as_str().unwrap_or("").trim_start_matches("sha256:").to_string();
+    let Some(m) = remote.get_manifest(tag, &x)? else {
+        return Ok(None);
+    };
+    let d = m["config"]["digest"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches("sha256:")
+        .to_string();
     Ok(Some(serde_json::from_slice(&remote.get_blob(&d, &x)?)?))
 }
 
 pub fn tags(remote: &Remote) -> Result<Vec<String>> {
-    let v: Value = serde_json::from_str(&remote.agent.get(&remote.url("tags/list")).call()?.into_string()?)?;
-    Ok(v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default())
+    let v: Value = serde_json::from_str(
+        &remote
+            .agent
+            .get(&remote.url("tags/list"))
+            .call()?
+            .into_string()?,
+    )?;
+    Ok(v["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
 }
