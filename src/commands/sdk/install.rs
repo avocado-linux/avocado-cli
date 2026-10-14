@@ -628,7 +628,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             } else {
                 v["step"] = "L2 project".into();
                 v["ext_sdk_deps"] = serde_json::to_value(ext_deps).unwrap_or_default();
-                v["target_dev"] = target_dev_command.as_ref().map(|(c, _, _)| c.clone()).into();
+                // Names, not the rendered dnf command: the command embeds versions from the lock,
+                // which the key already carries as v["lock"] (and re-run aliases refresh).
+                v["target_dev"] = target_dev_command
+                    .as_ref()
+                    .map(|(_, names, base)| serde_json::json!({"packages": names, "base": base, "excludes": off_kernel_excludes}))
+                    .unwrap_or_default();
                 v["target_dev_feeds"] = target_dev_feeds.map(|f| f.fingerprint.clone()).into();
                 v["provision_dto"] = provision_dto.into();
                 v["lock"]["target_sysroot"] = lock["target_sysroot"].clone();
