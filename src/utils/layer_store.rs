@@ -193,8 +193,11 @@ impl LayerStore {
         let mut prev: Option<(String, String)> = None; // (old key, new key) of the previous step
         for (parent, inputs, key) in steps {
             let mut v = inputs.clone();
-            if v.get("lock").is_some() {
-                v["lock"] = lock.clone();
+            // Each step keys on its own sections of the lock only: refresh exactly those.
+            if let Some(sections) = v["lock"].as_object().cloned() {
+                for k in sections.keys() {
+                    v["lock"][k] = lock[k].clone();
+                }
             }
             if let (Some(names), Some(arch)) = (v["pins_of"].as_array().cloned(), v["host_arch"].as_str().map(String::from)) {
                 v["pins"] = names.iter().map(|n| lock["sdk"][&arch][n.as_str().unwrap_or("")].clone()).collect();
