@@ -1473,6 +1473,66 @@ pub fn write_out(v: &serde_json::Value) {
 mod tests {
     use super::*;
 
+    /// GC evicts unprotected layers and their objects, and a pinned *alias* keeps its target.
+    /// Needs `mkcomposefs` on PATH (no root: GC never mounts).
+    #[test]
+    fn gc_keeps_alias_targets_and_drops_the_rest() {
+        let dir = std::env::temp_dir().join(format!("avo-store-test-{}", uniq()));
+        let st = Store::open(&dir).unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            let hex = sha256_hex(body);
+            st.put_object(&p, &hex, false).unwrap();
+            Entry {
+                path: format!("/{name}").into_bytes(),
+                size: body.len() as u64,
+                mode: S_IFREG | 0o644,
+                hardlink: false,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                mtime: (0, 0),
+                payload: Some(format!("{}/{}", &hex[..2], &hex[2..]).into_bytes()),
+                content: None,
+                xattrs: vec![],
+            }
+        };
+        let root = st.dump(EMPTY_KEY).unwrap().remove(0);
+        let a = file("a", &[b'a'; 100]);
+        let b = file("b", &[b'b'; 100]);
+        st.write_layer(
+            "kept",
+            None,
+            &[root.clone(), a.clone()],
+            serde_json::json!({}),
+            (1, 100),
+            0.0,
+        )
+        .unwrap();
+        st.write_layer(
+            "dropped",
+            None,
+            &[root, b.clone()],
+            serde_json::json!({}),
+            (1, 100),
+            0.0,
+        )
+        .unwrap();
+        st.alias("kept-alias", "kept").unwrap();
+        st.pin("p", &["kept-alias".to_string()]).unwrap();
+        let r = st.gc(0, 0, false).unwrap();
+        assert!(st.has_layer("kept") && st.has_layer("kept-alias"), "{r}");
+        assert!(!st.has_layer("dropped"), "{r}");
+        let obj = |e: &Entry| {
+            dir.join("objects")
+                .join(std::str::from_utf8(e.payload.as_ref().unwrap()).unwrap())
+        };
+        assert!(obj(&a).exists(), "the pinned alias's object must survive");
+        assert!(!obj(&b).exists(), "the evicted layer's object must go");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dump_round_trips_escapes() {
         let e = Entry {
