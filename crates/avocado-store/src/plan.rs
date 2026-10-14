@@ -76,6 +76,7 @@ pub fn plan(topo: &Value) -> Result<Value> {
     let hub_name = hub["name"].as_str().unwrap_or("");
     let feed = topo["feed"].clone();
     let mut rows = Vec::new();
+    let mut unreachable = Vec::new();
     for b in backends.iter().filter(|b| b["can_build"].as_bool().unwrap_or(false)) {
         let name = b["name"].as_str().unwrap_or("");
         let (t_src, path_src) = transfer(&links, client, name, f(&p["source_bytes"]));
@@ -110,6 +111,14 @@ pub fn plan(topo: &Value) -> Result<Value> {
             (bytes, t, path)
         };
         let total = t_src + t_sdk + build_s + t_bundle;
+        if !total.is_finite() {
+            let why: Vec<String> = [path_src, path_sdk, path_bundle]
+                .into_iter()
+                .filter(|p| p.contains("unreachable") || p.contains("no feed"))
+                .collect();
+            unreachable.push(json!({"builder": name, "why": why}));
+            continue;
+        }
         rows.push(json!({
             "builder": name, "est_total_s": total,
             "source": {"bytes": p["source_bytes"], "s": t_src, "path": path_src},
@@ -126,7 +135,7 @@ pub fn plan(topo: &Value) -> Result<Value> {
     let chosen = rows.first().cloned().ok_or_else(|| anyhow!("no backend can build"))?;
     let _ = by_name;
     Ok(json!({"scenario": topo["scenario"], "board": board, "hub": hub_name, "client": client,
-              "chosen": chosen, "candidates": rows}))
+              "chosen": chosen, "candidates": rows, "unreachable": unreachable}))
 }
 
 pub fn render(plan: &Value) -> String {
@@ -146,6 +155,9 @@ pub fn render(plan: &Value) -> String {
             mb(&r["layers"]["bytes"]), r["layers"]["path"].as_str().unwrap_or(""), f(&r["build_s"]),
             mb(&r["bundle"]["bytes"]), r["bundle"]["path"].as_str().unwrap_or("")
         );
+    }
+    for u in plan["unreachable"].as_array().into_iter().flatten() {
+        s += &format!("    {:<14} not possible: {}\n", u["builder"].as_str().unwrap_or(""), u["why"]);
     }
     s
 }
