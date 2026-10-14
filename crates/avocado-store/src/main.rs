@@ -28,6 +28,9 @@ enum Cmd {
         #[arg(long)]
         exclude: Vec<String>,
     },
+    /// One round trip for a CLI step: the view's current layer, whether KEY exists, and the
+    /// layer KEY resolves to (aliases followed).
+    Check { view: String, key: String },
     /// Exit 0 when layer KEY exists.
     Has { key: String },
     /// Print a layer record.
@@ -148,6 +151,13 @@ fn main() -> Result<()> {
         Cmd::Import { src, key, inputs, exclude } => {
             let r = store.import_dir(&src, &key, serde_json::from_str(&inputs)?, &exclude)?;
             write_out(&serde_json::to_value(r)?);
+        }
+        Cmd::Check { view, key } => {
+            let canon = std::fs::read_link(cli.root.join("layers").join(format!("{key}.json")))
+                .ok()
+                .and_then(|p| p.to_str().and_then(|s| s.strip_suffix(".json")).map(String::from))
+                .unwrap_or_else(|| key.clone());
+            write_out(&json!({"current": store.view(&view)?.map(|v| v.layer), "has": store.has_layer(&key), "canonical": canon}));
         }
         Cmd::Has { key } => {
             if !store.has_layer(&key) {

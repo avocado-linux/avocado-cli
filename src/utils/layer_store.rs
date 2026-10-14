@@ -152,14 +152,6 @@ impl LayerStore {
         Ok(())
     }
 
-    pub async fn current_layer(&self) -> Result<Option<String>> {
-        let s = self.helper_json(&["stats"]).await?;
-        Ok(s["views"]
-            .as_array()
-            .and_then(|v| v.iter().find(|v| v["name"] == self.view.as_str()))
-            .and_then(|v| v["layer"].as_str().map(String::from)))
-    }
-
     /// A key without a snapshot-pinned feed is not shareable: scope it to this project.
     pub fn scope(&self, inputs: &mut Value) {
         if inputs["releasever"].is_null() {
@@ -251,7 +243,9 @@ impl LayerStore {
         let t = std::time::Instant::now();
         let key = key_of(&json!({"parent": parent, "inputs": inputs}));
         self.steps.lock().unwrap().push((parent.to_string(), inputs.clone(), key.clone()));
-        if self.current_layer().await?.as_deref() == Some(key.as_str()) {
+        let c = self.helper_json(&["check", &self.view, &key]).await?;
+        let current = c["current"].as_str();
+        if current == Some(key.as_str()) || (c["has"] == true && current == c["canonical"].as_str()) {
             print_info(&format!("Layer store: {label} {} already in the view.", &key[..12]), OutputLevel::Normal);
             return Ok(key);
         }
