@@ -72,10 +72,17 @@ enum Cmd {
     Describe,
     /// Evict LRU unpinned, unleased layers when over HIGH bytes, down to LOW.
     Gc {
-        #[arg(long)]
+        #[arg(long, default_value_t = u64::MAX)]
         high: u64,
-        #[arg(long)]
+        #[arg(long, default_value_t = 0)]
         low: u64,
+        /// Hub/service mode (the agent's AVOCADO_VM_WORK_MIN_FREE_GB): evict when the store's
+        /// filesystem has less than this many bytes free...
+        #[arg(long)]
+        min_free: Option<u64>,
+        /// ...until it has at least this many (default 1.5 × --min-free).
+        #[arg(long)]
+        target_free: Option<u64>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -171,7 +178,18 @@ fn main() -> Result<()> {
         }
         Cmd::Stats => write_out(&store.stats()?),
         Cmd::Describe => write_out(&describe(&store, &cli.root)?),
-        Cmd::Gc { high, low, dry_run } => write_out(&store.gc(high, low, dry_run)?),
+        Cmd::Gc { high, low, min_free, target_free, dry_run } => {
+            let (mut high, mut low) = (high, low);
+            if let Some(mf) = min_free {
+                // Free space is the budget: evicting X bytes frees X, so translate to watermarks.
+                let used = store.gc(u64::MAX, 0, true)?["before_bytes"].as_u64().unwrap_or(0);
+                let free = nix_statvfs(&cli.root);
+                let tf = target_free.unwrap_or(mf + mf / 2);
+                high = (used + free).saturating_sub(mf);
+                low = (used + free).saturating_sub(tf);
+            }
+            write_out(&store.gc(high, low, dry_run)?)
+        }
         Cmd::Pin { name, keys } => store.pin(&name, &keys)?,
         Cmd::Unpin { name } => store.unpin(&name)?,
         Cmd::Hold { key } => {
