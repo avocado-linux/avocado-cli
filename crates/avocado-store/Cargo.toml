@@ -1,0 +1,24 @@
+[package]
+name = "avocado-store"
+version = "0.1.0"
+edition = "2021"
+description = "Content-addressed layer store for Avocado build state (composefs model). PoC."
+license = "Apache-2.0"
+
+[[bin]]
+name = "avocado-store"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# http only: the PoC registry is a LAN zot. TLS (rustls) is a feature flag away.
+ureq = { version = "2", default-features = false }
+
+[profile.release]
+opt-level = 3
