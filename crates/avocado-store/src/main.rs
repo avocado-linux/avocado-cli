@@ -92,6 +92,25 @@ enum Cmd {
     },
     /// Pull layer KEY, fetching only missing objects.
     Pull { registry: String, key: String },
+    /// Publish this store's descriptor (+ EXTRA json: rubicons, can_build, store_shared_with…)
+    /// to REGISTRY as `backend-NAME`.
+    Advertise {
+        registry: String,
+        name: String,
+        #[arg(long, default_value = "{}")]
+        extra: String,
+    },
+    /// Plan where to build and how bytes move. TOPOLOGY json; backends missing from it are
+    /// discovered from --registry (`backend-*` tags).
+    Plan {
+        topology: PathBuf,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unmount every view and delete the whole store (bench cleanup).
+    Destroy,
     /// Materialize layer KEY as a plain directory.
     Checkout { key: String, dst: PathBuf },
 }
@@ -151,18 +170,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Stats => write_out(&store.stats()?),
-        Cmd::Describe => {
-            let s = store.stats()?;
-            let st = nix_statvfs(&cli.root);
-            write_out(&json!({
-                "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
-                "kernel": std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim(),
-                "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-                "mem_bytes": meminfo_total(),
-                "store": {"root": cli.root, "free_bytes": st, "object_bytes": s["object_bytes"],
-                          "layers": s["layers"].as_array().map(|l| l.iter().map(|l| json!({"key": l["key"], "inputs": l["inputs"]})).collect::<Vec<_>>())},
-            }));
-        }
+        Cmd::Describe => write_out(&describe(&store, &cli.root)?),
         Cmd::Gc { high, low, dry_run } => write_out(&store.gc(high, low, dry_run)?),
         Cmd::Pin { name, keys } => store.pin(&name, &keys)?,
         Cmd::Unpin { name } => store.unpin(&name)?,
@@ -175,8 +183,73 @@ fn main() -> Result<()> {
         Cmd::Push { registry, key, known } => write_out(&oci::push(&store, &oci::Remote::parse(&registry)?, &key, &known)?),
         Cmd::Pull { registry, key } => write_out(&oci::pull(&store, &oci::Remote::parse(&registry)?, &key)?),
         Cmd::Checkout { key, dst } => store.checkout(&key, &dst)?,
+        Cmd::Advertise { registry, name, extra } => {
+            let mut d = describe(&store, &cli.root)?;
+            d["name"] = json!(name);
+            if let (Some(o), Some(e)) = (d.as_object_mut(), serde_json::from_str::<serde_json::Value>(&extra)?.as_object()) {
+                o.extend(e.clone());
+            }
+            oci::put_json(&oci::Remote::parse(&registry)?, &format!("backend-{name}"), "application/vnd.avocado.backend.v1+json", &d)?;
+            write_out(&d);
+        }
+        Cmd::Plan { topology, registry, json: as_json } => {
+            let mut topo: serde_json::Value = serde_json::from_slice(&std::fs::read(&topology)?)?;
+            if let Some(r) = registry {
+                let remote = oci::Remote::parse(&r)?;
+                let mut have: Vec<String> = topo["backends"].as_array().map(|b| b.iter().filter_map(|x| x["name"].as_str().map(String::from)).collect()).unwrap_or_default();
+                for t in oci::tags(&remote)?.into_iter().filter(|t| t.starts_with("backend-")) {
+                    let name = t.trim_start_matches("backend-").to_string();
+                    if have.contains(&name) {
+                        // Declared in the topology: merge the advertised store contents in.
+                        if let Some(d) = oci::get_json(&remote, &t)? {
+                            for b in topo["backends"].as_array_mut().into_iter().flatten() {
+                                if b["name"] == name.as_str() && b.get("store").is_none() {
+                                    b["store"] = d["store"].clone();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(d) = oci::get_json(&remote, &t)? {
+                        topo["backends"].as_array_mut().map(|b| b.push(d));
+                        have.push(name);
+                    }
+                }
+            }
+            let p = avocado_store::plan::plan(&topo)?;
+            if as_json {
+                write_out(&p);
+            } else {
+                print!("{}", avocado_store::plan::render(&p));
+            }
+        }
+        Cmd::Destroy => {
+            for v in store.views()? {
+                store.drop_view(&v.name)?;
+            }
+            for d in ["objects", "layers", "views", "locks", "pins", "tmp"] {
+                let p = cli.root.join(d);
+                if p.exists() {
+                    std::fs::remove_dir_all(&p)?;
+                }
+            }
+            let _ = std::fs::remove_file(cli.root.join("gc.lock"));
+        }
     }
     Ok(())
+}
+
+fn describe(store: &Store, root: &std::path::Path) -> Result<serde_json::Value> {
+    let s = store.stats()?;
+    Ok(json!({
+        "host": std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),
+        "kernel": std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim(),
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        "mem_bytes": meminfo_total(),
+        "cli": env!("CARGO_PKG_VERSION"),
+        "store": {"root": root, "free_bytes": nix_statvfs(root), "object_bytes": s["object_bytes"],
+                  "layers": s["layers"].as_array().map(|l| l.iter().map(|l| json!({"key": l["key"], "inputs": l["inputs"], "logical_bytes": l["logical_bytes"]})).collect::<Vec<_>>())},
+    }))
 }
 
 fn nix_statvfs(p: &std::path::Path) -> u64 {

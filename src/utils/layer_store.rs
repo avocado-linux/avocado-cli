@@ -253,8 +253,9 @@ impl LayerStore {
             return Ok(key);
         }
         let _lock = self.lock(&key).await?;
-        if self.has(&key).await? {
-            self.use_layer(&key).await?;
+        // `use` re-checks under the store's GC lock: if GC evicted the layer since `has`, it
+        // fails and this is a miss like any other.
+        if self.has(&key).await? && self.use_layer(&key).await.is_ok() {
             print_info(
                 &format!("Layer store: {label} hit {} ({:.1}s).", &key[..12], t.elapsed().as_secs_f64()),
                 OutputLevel::Normal,
@@ -278,6 +279,46 @@ impl LayerStore {
         );
         Ok(key)
     }
+}
+
+/// Run the helper against `root` with extra docker args (e.g. a bind of a bundle to import).
+pub async fn run_helper(tool: &str, root: &str, docker_args: &[String], args: &[&str]) -> Result<Value> {
+    let mut a = helper_args(tool, root);
+    let at = a.iter().position(|x| x == HELPER_IMAGE).unwrap();
+    for (i, d) in docker_args.iter().enumerate() {
+        a.insert(at + i, d.clone());
+    }
+    a.extend(args.iter().map(|s| s.to_string()));
+    let o = Command::new(&a[0]).args(&a[1..]).stdin(Stdio::null()).output().await?;
+    if !o.status.success() {
+        bail!("layer store {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+    }
+    Ok(serde_json::from_slice(&o.stdout).unwrap_or(Value::Null))
+}
+
+/// Provision by pull (PoC, `AVOCADO_HUB_STORE=1`): a bundle directory is `bundle.json` +
+/// `blobs/<sha256>`, which is already the store's object naming. Import it as layer
+/// `bundle-<sha256(bundle.json)>` into the local store and return the key.
+pub async fn import_bundle(tool: &str, root: &str, bundle: &std::path::Path) -> Result<(String, Value)> {
+    let meta = std::fs::read(bundle.join("bundle.json"))?;
+    let key = format!(
+        "bundle-{}",
+        Sha256::digest(&meta).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    let bind = format!("{}:/bundle:ro", bundle.display());
+    let rec = run_helper(tool, root, &["-v".into(), bind], &["import", "/bundle", &key]).await?;
+    Ok((key, rec))
+}
+
+/// Where the hub reads blob `sha256` when the store root sits inside the VM workspace share.
+pub fn blob_url_in_share(store_root_rel: &str, sha256: &str) -> String {
+    format!(
+        "{}/{}/objects/{}/{}",
+        crate::utils::vm::share::VM_MOUNT_POINT,
+        store_root_rel.trim_matches('/'),
+        &sha256[..2],
+        &sha256[2..]
+    )
 }
 
 /// The SDK container image's id: part of every key (same tag, different image = different key).

@@ -801,16 +801,19 @@ impl RemoteProvision {
             .map(Ok)
             .unwrap_or_else(|| share::resolve_workspace(None))?;
         let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
-        let blobs: Vec<Value> = meta
-            .blobs()
-            .iter()
-            .map(|b| {
-                let host = bundle.join("blobs").join(&b.sha256);
-                share::translate_to_vm(&host, &ws).map(|vm| {
-                    json!({"sha256": b.sha256, "size_bytes": b.size, "url": vm.to_string_lossy()})
+        let blobs: Vec<Value> = if std::env::var("AVOCADO_HUB_STORE").is_ok_and(|v| v == "1") {
+            self.run_local_store(bundle).await?
+        } else {
+            meta.blobs()
+                .iter()
+                .map(|b| {
+                    let host = bundle.join("blobs").join(&b.sha256);
+                    share::translate_to_vm(&host, &ws).map(|vm| {
+                        json!({"sha256": b.sha256, "size_bytes": b.size, "url": vm.to_string_lossy()})
+                    })
                 })
-            })
-            .collect::<Result<_>>()?;
+                .collect::<Result<_>>()?
+        };
         let name = bundle
             .file_name()
             .unwrap_or_default()
@@ -857,6 +860,9 @@ impl RemoteProvision {
         env: &HashMap<String, String>,
     ) -> Result<()> {
         let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
+        if std::env::var("AVOCADO_HUB_STORE").is_ok_and(|v| v == "1") {
+            return self.run_host_store(ssh_host, bundle, meta, address, token, env).await;
+        }
         // The host's VM workspace share; the cache lives inside it so the
         // guest reads blobs in place.
         let ws = {
@@ -937,6 +943,130 @@ impl RemoteProvision {
             OutputLevel::Normal,
         );
         Ok(())
+    }
+}
+
+impl RemoteProvision {
+    /// `--hub` by pull (layer store PoC): the bundle becomes a layer in the local store, is
+    /// pushed to a registry (only objects it lacks), and the hub host's store pulls only the
+    /// objects *it* lacks. That store lives inside the host's VM workspace share, so the job's
+    /// blob URLs point at the store's objects: the hub reads them in place, nothing is copied
+    /// again. Needs AVOCADO_LAYER_STORE (local root), AVOCADO_LAYER_REGISTRY
+    /// (http://host:port/repo, reachable from both ends) and AVOCADO_HUB_STORE_ROOT (the
+    /// hub host's store root, inside its workspace).
+    async fn run_host_store(
+        &self,
+        ssh_host: &str,
+        bundle: &Path,
+        meta: BundleMeta,
+        address: &str,
+        token: Option<String>,
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
+        use crate::utils::layer_store as ls;
+        let var = |k: &str| std::env::var(k).with_context(|| format!("{k} is not set"));
+        let (root, registry, remote_root) =
+            (var("AVOCADO_LAYER_STORE")?, var("AVOCADO_LAYER_REGISTRY")?, var("AVOCADO_HUB_STORE_ROOT")?);
+        let t = std::time::Instant::now();
+        let (key, rec) = ls::import_bundle("docker", &root, bundle).await?;
+        let t_import = t.elapsed().as_secs_f64();
+        let push = ls::run_helper("docker", &root, &[], &["push", &registry, &key]).await?;
+        let t_push = t.elapsed().as_secs_f64() - t_import;
+        let ws = {
+            let o = Command::new("ssh")
+                .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ssh_host, "cat ~/.avocado/vm/workspace"])
+                .output()?;
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let rel = remote_root
+            .strip_prefix(&ws)
+            .with_context(|| format!("{remote_root} is not inside {ssh_host}'s VM workspace {ws}"))?
+            .to_string();
+        let pull_cmd = format!(
+            "docker run --rm -i --privileged --network=host -v {remote_root}:{remote_root}:rshared {} --root {remote_root} pull {registry} {key}",
+            ls::HELPER_IMAGE
+        );
+        let o = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ssh_host, &pull_cmd])
+            .output()?;
+        if !o.status.success() {
+            bail!("pull on {ssh_host} failed: {}", String::from_utf8_lossy(&o.stderr).trim());
+        }
+        let pull: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
+        let t_pull = t.elapsed().as_secs_f64() - t_import - t_push;
+        let line = json!({"bundle_layer": key, "files": rec["files"], "import_s": t_import,
+            "push": push["xfer"], "push_s": t_push, "pull": pull["xfer"], "pull_s": t_pull});
+        print_info(&format!("Layer store sync: {line}"), OutputLevel::Normal);
+        if let Ok(f) = std::env::var("AVOCADO_HUB_STORE_REPORT") {
+            let _ = std::fs::write(f, line.to_string());
+        }
+        // Objects at or below the inline size live in the EROFS image, not objects/: a bundle
+        // blob that small cannot be served by path.
+        if let Some(b) = meta.blobs().iter().find(|b| b.size <= 64) {
+            bail!("blob {} is too small to serve from the store ({} B)", b.sha256, b.size);
+        }
+        let blobs: Vec<Value> = meta
+            .blobs()
+            .iter()
+            .map(|b| json!({"sha256": b.sha256, "size_bytes": b.size, "url": ls::blob_url_in_share(&rel, &b.sha256)}))
+            .collect();
+        let name = bundle.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        print_info(
+            &format!("Provisioning through the avocado-vm on {ssh_host}, Rubicon {address} (bundle by pull)"),
+            OutputLevel::Normal,
+        );
+        let req = json!({
+            "type": "command",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "command": "provision",
+            "params": {
+                "address": address,
+                "profile": self.provision_profile,
+                "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
+                "rubicon_token": token,
+                "env": env,
+                "requested_by": requester(),
+                "interactive": self.interactive,
+            },
+        });
+        let r = follow_hub(&Hub::Host { ssh: ssh_host.to_string() }, req).await?;
+        report(&r, &format!("provision on Rubicon {address}"))?;
+        print_success(&format!("Provisioned through Rubicon {address} on {ssh_host}"), OutputLevel::Normal);
+        Ok(())
+    }
+
+    /// `--via local` on a hub host whose own store sits in its VM workspace (build on the hub):
+    /// import the bundle into that store (a reflink on btrfs: no data copy) and point the job at
+    /// the store's objects. Zero bytes move between machines.
+    async fn run_local_store(&self, bundle: &Path) -> Result<Vec<Value>> {
+        use crate::utils::layer_store as ls;
+        let root = std::env::var("AVOCADO_LAYER_STORE").context("AVOCADO_LAYER_STORE is not set")?;
+        let paths = VmPaths::resolve()?;
+        let ws = share::read_recorded_workspace(&paths)?
+            .map(Ok)
+            .unwrap_or_else(|| share::resolve_workspace(None))?;
+        let rel = Path::new(&root)
+            .strip_prefix(&ws)
+            .with_context(|| format!("{root} is not inside the VM workspace {}", ws.display()))?
+            .to_string_lossy()
+            .to_string();
+        let t = std::time::Instant::now();
+        let (key, rec) = ls::import_bundle("docker", &root, bundle).await?;
+        let line = json!({"bundle_layer": key, "files": rec["files"], "new_bytes": rec["new_bytes"],
+                          "import_s": t.elapsed().as_secs_f64(), "moved_bytes": 0});
+        print_info(&format!("Layer store (local hub): {line}"), OutputLevel::Normal);
+        if let Ok(f) = std::env::var("AVOCADO_HUB_STORE_REPORT") {
+            let _ = std::fs::write(f, line.to_string());
+        }
+        let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
+        if let Some(b) = meta.blobs().iter().find(|b| b.size <= 64) {
+            bail!("blob {} is too small to serve from the store ({} B)", b.sha256, b.size);
+        }
+        Ok(meta
+            .blobs()
+            .iter()
+            .map(|b| json!({"sha256": b.sha256, "size_bytes": b.size, "url": ls::blob_url_in_share(&rel, &b.sha256)}))
+            .collect())
     }
 }
 

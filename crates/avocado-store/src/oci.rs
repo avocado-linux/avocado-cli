@@ -308,3 +308,30 @@ pub fn pull(store: &Store, remote: &Remote, key: &str) -> Result<Value> {
     Ok(json!({"key": key, "op": "pull", "hit": false, "layer_objects": objs.len(), "xfer": x.json(),
               "secs": t.elapsed().as_secs_f64()}))
 }
+
+/// Publish a small JSON document as an artifact tagged `tag` (backend descriptors).
+pub fn put_json(remote: &Remote, tag: &str, artifact_type: &str, doc: &Value) -> Result<()> {
+    let x = Xfer::default();
+    let body = serde_json::to_vec(doc)?;
+    let mut cfg = remote.ensure_blob(&body, &x)?;
+    cfg["mediaType"] = json!("application/json");
+    let empty = remote.ensure_blob(b"{}", &x)?;
+    let m = serde_json::to_vec(&json!({
+        "schemaVersion": 2, "mediaType": MT_MANIFEST, "artifactType": artifact_type,
+        "config": cfg,
+        "layers": [{"mediaType": MT_EMPTY, "digest": empty["digest"], "size": 2}],
+    }))?;
+    remote.put_manifest(tag, MT_MANIFEST, &m, &x)
+}
+
+pub fn get_json(remote: &Remote, tag: &str) -> Result<Option<Value>> {
+    let x = Xfer::default();
+    let Some(m) = remote.get_manifest(tag, &x)? else { return Ok(None) };
+    let d = m["config"]["digest"].as_str().unwrap_or("").trim_start_matches("sha256:").to_string();
+    Ok(Some(serde_json::from_slice(&remote.get_blob(&d, &x)?)?))
+}
+
+pub fn tags(remote: &Remote) -> Result<Vec<String>> {
+    let v: Value = serde_json::from_str(&remote.agent.get(&remote.url("tags/list")).call()?.into_string()?)?;
+    Ok(v["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default())
+}

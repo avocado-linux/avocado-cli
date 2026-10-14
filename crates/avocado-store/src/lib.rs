@@ -29,6 +29,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub mod oci;
+pub mod plan;
 
 /// Files up to this size are inlined into the EROFS image instead of becoming objects.
 pub const INLINE_MAX: u64 = 64;
@@ -757,6 +758,8 @@ impl Store {
     }
 
     pub fn mount_view_at(&self, name: &str, layer: Option<&str>, private: &[String], at: Option<&Path>) -> Result<ViewRecord> {
+        // Shared GC lock: GC clears tmp/ (where the staging mount lives) and must see the lease.
+        let _gc = self.gc_lock(false)?;
         let mut v = self.view(name)?.unwrap_or(ViewRecord {
             name: name.to_string(),
             layer: EMPTY_KEY.to_string(),
