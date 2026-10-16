@@ -1534,14 +1534,20 @@ $DNF_SDK_HOST \
                     env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
-                let install_success =
-                    run_container_command(container_helper, run_config, runs_on_context).await?;
+                // The result is read before `?` so an interrupted transaction
+                // (Ctrl-C comes back as `Err`) gets the same cleanup as a
+                // failed one.
+                let install_result =
+                    run_container_command(container_helper, run_config, runs_on_context).await;
+                let install_success = matches!(install_result, Ok(true));
 
                 if !install_success {
-                    print_error(
-                        &format!("Failed to install dependencies for extension '{extension}'."),
-                        OutputLevel::Normal,
-                    );
+                    if let Ok(false) = install_result {
+                        print_error(
+                            &format!("Failed to install dependencies for extension '{extension}'."),
+                            OutputLevel::Normal,
+                        );
+                    }
                     // This call seeded the database; take it back so the
                     // retry seeds and installs again instead of reading as
                     // up to date against another runtime's stamp. A sysroot
@@ -1567,16 +1573,22 @@ $DNF_SDK_HOST \
                             .await
                             .unwrap_or(false)
                         {
+                            let runtime_flag = self
+                                .runtime
+                                .as_deref()
+                                .map(|rt| format!(" -r {rt}"))
+                                .unwrap_or_default();
                             print_warning(
                                 &format!(
                                     "Could not remove the seeded rpm database for extension \
                                      '{extension}'; the next install may skip it. Run \
-                                     'avocado ext clean {extension}' before retrying."
+                                     'avocado ext clean {extension}{runtime_flag}' before retrying."
                                 ),
                                 OutputLevel::Normal,
                             );
                         }
                     }
+                    install_result?;
                     return Ok(false);
                 }
 

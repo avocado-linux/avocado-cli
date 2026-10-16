@@ -16,16 +16,34 @@ use crate::utils::stamps::{
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
 
-/// Does `extensions.<ext>.packages` list at least one package? Only such an
-/// extension needs an installed sysroot before it can build; an overlay-only
-/// extension has nothing for dnf to install.
+/// Does `extensions.<ext>` list at least one package, at the top level or
+/// inside a `target-*`, `kernel-*`, or bare-target override block? Only such
+/// an extension needs an installed sysroot before it can build; an
+/// overlay-only extension has nothing for dnf to install.
+///
+/// Override blocks count whether or not they match this target or kernel.
+/// Matching the kernel needs the dnf round trip install does, and the extra
+/// breadth never refuses a build install prepared: install seeds the rpm
+/// database for every extension before it reads `packages`, so a sysroot
+/// that went through install always passes the probe.
 fn declares_packages(parsed: &serde_yaml::Value, extension: &str, target: &str) -> bool {
     // Template keys such as `avocado-bsp-{{ avocado.target.board }}` are
     // matched the same way the rest of the ext commands match them.
     crate::commands::ext::find_ext_in_mapping(parsed, extension, target)
-        .and_then(|e| e.get("packages"))
-        .and_then(|p| p.as_mapping())
-        .is_some_and(|m| !m.is_empty())
+        .is_some_and(|ext| lists_packages(ext, target))
+}
+
+fn lists_packages(block: &serde_yaml::Value, target: &str) -> bool {
+    let Some(map) = block.as_mapping() else {
+        return false;
+    };
+    map.iter().any(|(key, value)| match key.as_str() {
+        Some("packages") => value.as_mapping().is_some_and(|m| !m.is_empty()),
+        Some(k) if k.starts_with("target-") || k.starts_with("kernel-") || k == target => {
+            lists_packages(value, target)
+        }
+        _ => false,
+    })
 }
 
 /// The error for a package extension whose sysroot was never installed.
@@ -1907,6 +1925,22 @@ extensions:
   avocado-bsp-{{ avocado.target }}:
     packages:
       avocado-bsp: "*"
+  target-only:
+    target-qemux86-64:
+      packages:
+        curl: "*"
+  kernel-only:
+    kernel-6.6:
+      packages:
+        kernel-module-foo: "*"
+  nested-only:
+    target-qemuarm64:
+      kernel-6.6:
+        packages:
+          kernel-module-foo: "*"
+  override-without-pkgs:
+    target-qemux86-64:
+      overlay: app/overlay
 "#,
         )
         .unwrap();
@@ -1915,6 +1949,13 @@ extensions:
         assert!(!declares_packages(&parsed, "empty-pkgs", t));
         assert!(!declares_packages(&parsed, "overlay-only", t));
         assert!(!declares_packages(&parsed, "not-there", t));
+        // Packages declared only inside an override block still count,
+        // including a block for another target or kernel (see the doc
+        // comment on `declares_packages` for why that is safe).
+        assert!(declares_packages(&parsed, "target-only", t));
+        assert!(declares_packages(&parsed, "kernel-only", t));
+        assert!(declares_packages(&parsed, "nested-only", t));
+        assert!(!declares_packages(&parsed, "override-without-pkgs", t));
         // A template key still in the mapping resolves through the same
         // lookup the other ext commands use (`find_ext_in_mapping`).
         assert!(declares_packages(&parsed, "avocado-bsp-qemux86-64", t));
