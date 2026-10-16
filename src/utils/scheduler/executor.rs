@@ -36,6 +36,17 @@ impl TaskScheduler {
     where
         F: Fn(TaskId) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync + 'static,
     {
+        // Every task gets a renderer entry before it can start. The TTY
+        // renderer registers them up front with these same labels; the
+        // fallback passthrough renderer the commands hand over when there is
+        // no TTY does not, and `set_error` / `set_status` keep nothing for a
+        // task the renderer has never seen, so a failure printed "<id> failed"
+        // with no reason behind it. `register_task` is idempotent, so a
+        // renderer that already holds the task keeps its entry and its order.
+        for id in self.graph.all_pending() {
+            self.renderer.register_task(id.clone(), id.to_string());
+        }
+
         let semaphore = Arc::new(Semaphore::new(self.max_parallel));
         let spawn_task = Arc::new(spawn_task);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(TaskId, Result<()>)>();
@@ -124,5 +135,33 @@ impl TaskScheduler {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command's error must reach the renderer the scheduler was given,
+    /// whether or not the caller registered the tasks on it. The fallback
+    /// renderer used when there is no TTY arrives empty; without
+    /// registration the error was dropped and the output said only
+    /// "<id> failed".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_task_keeps_its_error_on_an_unregistered_renderer() {
+        let id = TaskId::ExtBuild("foo".to_string());
+        let mut graph = TaskGraph::new();
+        graph.add_task(id.clone(), vec![]);
+        let renderer = Arc::new(TaskRenderer::new(true));
+        let mut scheduler = TaskScheduler::new(graph, renderer.clone(), 1);
+
+        let result = scheduler
+            .run(|_| Box::pin(async { Err(anyhow::anyhow!("no package database")) }))
+            .await;
+
+        assert!(result.is_err());
+        let (status, error) = renderer.get_task_state(&id).expect("task registered");
+        assert_eq!(status, TaskStatus::Failed);
+        assert_eq!(error.as_deref(), Some("no package database"));
     }
 }
