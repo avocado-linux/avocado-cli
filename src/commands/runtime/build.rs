@@ -1152,9 +1152,11 @@ impl RuntimeBuildCommand {
         // modes, so it would otherwise vanish exactly where builds usually
         // run. TUI queues it above the task region; JSON mode writes it to
         // stderr without corrupting the NDJSON stream.
-        let project_dir = std::path::Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
+        // The staging files are handed to the container through `/opt/src`,
+        // which is the resolved `src_dir`, so they have to be written under
+        // that root and not under the config file's directory. The two differ
+        // whenever `src_dir` is set.
+        let project_dir = config.project_root(&self.config_path);
         if let Err(e) = self
             .generate_tuf_staging(
                 config,
@@ -1165,7 +1167,7 @@ impl RuntimeBuildCommand {
                 repo_release,
                 container_helper,
                 runs_on_context,
-                project_dir,
+                &project_dir,
             )
             .await
         {
@@ -1430,10 +1432,18 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
+        let copied =
+            run_container_command(container_helper, copy_run_config, runs_on_context).await?;
 
         // Clean up host temp files.
         let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        if !copied {
+            return Err(anyhow::anyhow!(
+                "failed to copy the delegation staging files into the build volume for runtime '{}'",
+                self.runtime_name
+            ));
+        }
 
         print_info(
             &format!(
@@ -1547,9 +1557,17 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
+        let copied =
+            run_container_command(container_helper, copy_run_config, runs_on_context).await?;
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        if !copied {
+            return Err(anyhow::anyhow!(
+                "failed to copy the content delegation staging files into the build volume for runtime '{}'",
+                self.runtime_name
+            ));
+        }
 
         print_info(
             &format!(
