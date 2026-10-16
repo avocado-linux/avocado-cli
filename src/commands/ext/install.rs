@@ -1709,7 +1709,11 @@ mod tests {
             .env("AVOCADO_EXT_SYSROOTS", root.path())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let parsed = parse_batch_stamps_output(&String::from_utf8_lossy(&out.stdout));
         let get = |k: &str| parsed.get(k).and_then(|v| v.as_deref()).map(str::to_string);
         assert_eq!(get("sysroot:bare").as_deref(), Some("no"));
