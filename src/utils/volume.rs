@@ -52,6 +52,17 @@ impl VolumeState {
         Ok(Some(state))
     }
 
+    /// Load the volume state the container layer keys on.
+    ///
+    /// `get_or_create_volume` writes `.avocado-state` in the process working
+    /// directory (`SdkContainer::cwd`), not in `src_dir`. Readers that looked in
+    /// `src_dir` found nothing whenever the two differed, so every reader of
+    /// the state file goes through this one key.
+    pub fn load_from_current_dir() -> Result<Option<Self>> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_from_dir(&cwd)
+    }
+
     /// Save volume state to .avocado-state file in the given directory
     pub fn save_to_dir(&self, dir_path: &Path) -> Result<()> {
         let state_file = dir_path.join(".avocado-state");
@@ -628,5 +639,33 @@ mod tests {
         let reason =
             avo_abandonment_reason("avo-different-uuid", Some(&state.source_path)).unwrap();
         assert!(reason.contains("not this volume"));
+    }
+
+    /// The state file lives in the working directory, which is where
+    /// `get_or_create_volume` writes it. A copy in `src_dir` is not consulted,
+    /// so a `src_dir: ..` project run from its config directory finds the
+    /// volume the container layer created there.
+    #[test]
+    #[serial_test::serial]
+    fn load_from_current_dir_reads_the_working_directory_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().canonicalize().unwrap();
+        let config_dir = src_dir.join("avocado");
+        fs::create_dir_all(&config_dir).unwrap();
+        VolumeState::new(src_dir.clone(), "docker".to_string())
+            .save_to_dir(&src_dir)
+            .unwrap();
+
+        // Restore the cwd before asserting, so a failure here does not leave
+        // later tests running from a deleted directory.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&config_dir).unwrap();
+        let from_config_dir = VolumeState::load_from_current_dir();
+        std::env::set_current_dir(&src_dir).unwrap();
+        let from_src_dir = VolumeState::load_from_current_dir();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(from_config_dir.unwrap().is_none());
+        assert!(from_src_dir.unwrap().is_some());
     }
 }

@@ -2382,14 +2382,15 @@ impl Config {
             return Ok(RemoteExtensionMerge::default());
         }
 
-        // Get src_dir for loading volume state
+        // `src_dir` is the base for `path:` sources. The volume state is keyed
+        // on the working directory, not on `src_dir`.
         let config_path_str = config_path.to_string_lossy();
         let src_dir = temp_config
             .get_resolved_src_dir::<&str>(config_path_str.as_ref())
             .unwrap_or_else(|| config_file_dir(config_path).to_path_buf());
 
         // Try to load volume state for container-based config reading
-        let volume_state = crate::utils::volume::VolumeState::load_from_dir(&src_dir)
+        let volume_state = crate::utils::volume::VolumeState::load_from_current_dir()
             .ok()
             .flatten();
 
@@ -5505,8 +5506,9 @@ impl Config {
                 .to_path_buf()
         });
 
-        // Try to load volume state and get the mountpoint
-        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_dir(&src_dir) {
+        // Try to load volume state and get the mountpoint. The state file is
+        // keyed on the working directory, not on `src_dir`.
+        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_current_dir() {
             // Use synchronous Docker inspect to get the mountpoint
             if let Ok(mountpoint) =
                 crate::utils::ext_source_reader::volume_mountpoint(&volume_state)
