@@ -1390,9 +1390,10 @@ echo -n '}}'
         )?;
 
         // Phase 3: Write signed files into the build volume via a container run.
-        // We write them to a temp dir under the project directory (accessible inside
-        // the container as /opt/src/.tuf-staging-tmp/), then copy into the volume.
-        let tmp_dir = project_dir.join(".tuf-staging-tmp");
+        // They go to a temp dir under the project root, then a container copy
+        // moves them into the volume.
+        let (staging, staging_dir) = tuf_staging_dir(project_dir)?;
+        let tmp_dir = staging.path();
         let tmp_delegations = tmp_dir.join("delegations");
         std::fs::create_dir_all(&tmp_delegations)
             .context("Failed to create TUF staging temp directory")?;
@@ -1411,8 +1412,8 @@ echo -n '}}'
             r#"set -euo pipefail
 DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
 mkdir -p "$DEST/delegations"
-cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
-cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
+cp "/opt/src/{staging_dir}/targets.json" "$DEST/targets.json"
+cp "/opt/src/{staging_dir}/delegations/runtime-{runtime_uuid}.json" \
    "$DEST/delegations/runtime-{runtime_uuid}.json"
 "#
         );
@@ -1436,7 +1437,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             run_container_command(container_helper, copy_run_config, runs_on_context).await?;
 
         // Clean up host temp files.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        drop(staging);
 
         if !copied {
             return Err(anyhow::anyhow!(
@@ -1517,7 +1518,8 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         )?;
 
         // Phase 3: Write files into the build volume.
-        let tmp_dir = project_dir.join(".tuf-staging-tmp");
+        let (staging, staging_dir) = tuf_staging_dir(project_dir)?;
+        let tmp_dir = staging.path();
         let tmp_delegations = tmp_dir.join("delegations");
         std::fs::create_dir_all(&tmp_delegations)
             .context("Failed to create TUF staging temp directory")?;
@@ -1536,8 +1538,8 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             r#"set -euo pipefail
 DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
 mkdir -p "$DEST/delegations"
-cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
-cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
+cp "/opt/src/{staging_dir}/targets.json" "$DEST/targets.json"
+cp "/opt/src/{staging_dir}/delegations/runtime-{runtime_uuid}.json" \
    "$DEST/delegations/runtime-{runtime_uuid}.json"
 "#
         );
@@ -1560,7 +1562,7 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         let copied =
             run_container_command(container_helper, copy_run_config, runs_on_context).await?;
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        drop(staging);
 
         if !copied {
             return Err(anyhow::anyhow!(
@@ -3176,6 +3178,24 @@ fn collect_runtime_compile_entries(merged_runtime: &serde_yaml::Value) -> Vec<Ru
 }
 
 /// Helper function to run a container command, using shared context if available
+/// A fresh staging directory under the project root for one copy into the
+/// volume. The container sees it as `/opt/src/<name>/`. Unique per call, so
+/// two builds sharing a `src_dir` cannot overwrite or delete each other's
+/// files; removed when the handle drops.
+fn tuf_staging_dir(project_dir: &std::path::Path) -> Result<(tempfile::TempDir, String)> {
+    let staging = tempfile::Builder::new()
+        .prefix(".tuf-staging-")
+        .tempdir_in(project_dir)
+        .context("Failed to create TUF staging temp directory")?;
+    let name = staging
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("TUF staging temp directory has no name")?
+        .to_string();
+    Ok((staging, name))
+}
+
 async fn run_container_command(
     container_helper: &SdkContainer,
     config: RunConfig,
@@ -3335,6 +3355,27 @@ fi
 
 #[cfg(test)]
 mod tests {
+    /// Each staging call gets its own directory under the project root, so
+    /// two builds sharing a `src_dir` never write or delete each other's
+    /// files. The name is what the copy script appends to `/opt/src`.
+    #[test]
+    fn tuf_staging_dir_is_unique_per_call_and_removed_on_drop() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (a, a_name) = super::tuf_staging_dir(root.path()).unwrap();
+        let (b, b_name) = super::tuf_staging_dir(root.path()).unwrap();
+        assert_ne!(a_name, b_name);
+        assert!(a_name.starts_with(".tuf-staging-"));
+        assert_eq!(a.path(), root.path().join(&a_name));
+        assert!(a.path().is_dir() && b.path().is_dir());
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(
+            !a_path.exists(),
+            "dropping the handle removes the directory"
+        );
+        assert!(b.path().is_dir(), "the other call's directory is untouched");
+    }
+
     #[test]
     fn fit_assembly_script_is_gated_and_handles_signing_both_ways() {
         let s = super::generate_fit_assembly_script();
