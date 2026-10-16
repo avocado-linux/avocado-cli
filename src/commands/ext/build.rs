@@ -16,6 +16,32 @@ use crate::utils::stamps::{
 use crate::utils::target::resolve_target_required;
 use crate::utils::tui::{TaskId, TuiGuard};
 
+/// Does `extensions.<ext>.packages` list at least one package? Only such an
+/// extension needs an installed sysroot before it can build; an overlay-only
+/// extension has nothing for dnf to install.
+fn declares_packages(parsed: &serde_yaml::Value, extension: &str, target: &str) -> bool {
+    // Template keys such as `avocado-bsp-{{ avocado.target.board }}` are
+    // matched the same way the rest of the ext commands match them.
+    crate::commands::ext::find_ext_in_mapping(parsed, extension, target)
+        .and_then(|e| e.get("packages"))
+        .and_then(|p| p.as_mapping())
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// The error for a package extension whose sysroot was never installed.
+fn packages_not_installed_message(extension: &str, runtime: Option<&str>) -> String {
+    match runtime {
+        Some(rt) => format!(
+            "Extension '{extension}' declares packages, but its sysroot for runtime '{rt}' \
+             has no package database. Run 'avocado install -r {rt}' first."
+        ),
+        None => format!(
+            "Extension '{extension}' declares packages, but its sysroot has no package \
+             database. Run 'avocado install' first."
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OverlayConfig {
     dir: String,
@@ -289,13 +315,14 @@ impl ExtBuildCommand {
             // sysroot it would build — the two facts the skip below needs.
             let own_req = crate::utils::stamps::StampRequirement::ext_build(&self.extension);
             let batch_script = format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}{}",
                 generate_batch_read_stamps_script(&required),
                 generate_batch_read_stamps_script(std::slice::from_ref(&own_req)),
                 crate::utils::stamps::generate_output_listing_probe(&format!(
                     "\"$AVOCADO_EXT_SYSROOTS/{}\"",
                     self.extension
                 )),
+                crate::commands::ext::install::sysroot_probe_line(&self.extension),
             );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -369,6 +396,25 @@ impl ExtBuildCommand {
                         &target,
                     ));
                 return Err(anyhow::anyhow!("{err}"));
+            }
+
+            // A package extension builds from the packages dnf installed into
+            // its sysroot. The install stamp above is per extension, not per
+            // runtime, so it is satisfied by another runtime's install while
+            // this runtime's sysroot has nothing in it. Building anyway would
+            // create the directory with `mkdir -p` below and ship an empty
+            // image with exit 0. The rpm database is the sign that an install
+            // reached this sysroot; without it, stop and say what to run.
+            if declares_packages(parsed, &self.extension, &target)
+                && crate::utils::stamps::parse_batch_stamps_output(batch)
+                    .get(&format!("sysroot:{}", self.extension))
+                    .and_then(|v| v.as_deref())
+                    != Some("yes")
+            {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    packages_not_installed_message(&self.extension, self.runtime.as_deref())
+                ));
             }
 
             // Skip: this step's own stamp is current for every input computed
@@ -1843,6 +1889,48 @@ fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an extension with packages needs an installed sysroot before it
+    /// builds. Overlay-only, empty, and missing `packages:` all read as none.
+    #[test]
+    fn declares_packages_needs_a_non_empty_packages_map() {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+extensions:
+  with-pkgs:
+    packages:
+      curl: "*"
+  empty-pkgs:
+    packages: {}
+  overlay-only:
+    overlay: app/overlay
+  avocado-bsp-{{ avocado.target }}:
+    packages:
+      avocado-bsp: "*"
+"#,
+        )
+        .unwrap();
+        let t = "qemux86-64";
+        assert!(declares_packages(&parsed, "with-pkgs", t));
+        assert!(!declares_packages(&parsed, "empty-pkgs", t));
+        assert!(!declares_packages(&parsed, "overlay-only", t));
+        assert!(!declares_packages(&parsed, "not-there", t));
+        // A template key still in the mapping resolves through the same
+        // lookup the other ext commands use (`find_ext_in_mapping`).
+        assert!(declares_packages(&parsed, "avocado-bsp-qemux86-64", t));
+    }
+
+    /// The refusal tells the user the command that repairs it, scoped to the
+    /// runtime when one is in play.
+    #[test]
+    fn packages_not_installed_message_names_the_install_command() {
+        let with_rt = packages_not_installed_message("app", Some("rt-b"));
+        assert!(with_rt.contains("runtime 'rt-b'"));
+        assert!(with_rt.contains("avocado install -r rt-b"));
+        let no_rt = packages_not_installed_message("app", None);
+        assert!(no_rt.contains("Run 'avocado install' first"));
+        assert!(!no_rt.contains("-r"));
+    }
 
     #[test]
     fn test_create_sysext_build_script_basic() {
