@@ -395,7 +395,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
     # `grep: .../etc/passwd: No such file`.
     if [ ! -f "$ROOTFS_WORK/etc/passwd" ]; then
         echo "ERROR: rootfs staging at $ROOTFS_WORK is missing /etc/passwd. The build volume looks half-populated or stale." >&2
-        echo "Reset the build state with 'avocado clean' and 'avocado prune', then re-run 'avocado install -f' and 'avocado build'." >&2
+        echo "Reset the build state with 'avocado clean' and 'avocado prune', then re-run 'avocado install' and 'avocado build'." >&2
         exit 1
     fi
 {permissions_section}
@@ -1063,6 +1063,18 @@ mod tests {
             !script.contains("var/log/dnf.log"),
             "the script must not claim to purge dnf logs that are never staged"
         );
+    }
+
+    #[test]
+    fn test_rootfs_passwd_guard_hint_does_not_force_install() {
+        // `avocado install -f` erases every extension sysroot, so the hint must
+        // send the user through `avocado clean` and a plain `avocado install`.
+        let script = rootfs_script();
+        assert!(script.contains(
+            "Reset the build state with 'avocado clean' and 'avocado prune', \
+             then re-run 'avocado install' and 'avocado build'."
+        ));
+        assert!(!script.contains("install -f"));
     }
 
     #[test]
