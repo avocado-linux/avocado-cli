@@ -1401,8 +1401,8 @@ if [ -n "$unit_file" ]; then
     # input stream, so the /^\[Install\]/,/^\[/ range would run past the
     # end of one file and match keys in the next.
     _avocado_collect_install() {{
-        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$1" | tr ',' ' ')"
-        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$1" | tr ',' ' ')"
+        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p;}}' "$1" | tr ',' ' ')"
+        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p;}}' "$1" | tr ',' ' ')"
     }}
     wanted_by=""
     required_by=""

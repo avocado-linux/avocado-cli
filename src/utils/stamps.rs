@@ -5931,7 +5931,7 @@ extensions:
         let dir = tempfile::tempdir().unwrap();
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(&script)
+            .arg(format!("{}\n{script}", host_shell_prelude()))
             .env("AVOCADO_PREFIX", dir.path())
             .output()
             .expect("sh should run");
@@ -6253,6 +6253,52 @@ extensions:
         assert_ne!(base, h("sdk:\n  image: img\nsrc_dir: ../proj\n"));
     }
 
+    /// Shell prepended to a generated script when a test runs it on the host.
+    /// The scripts are written for the GNU tools in the SDK container; a macOS
+    /// host has BSD `sed` and `find`, so those are shimmed here, in the test
+    /// only. Empty elsewhere. `sha256sum` is a program, not a function, because
+    /// the sysroot digest reaches it through `xargs`: see [`host_shim_path`].
+    fn host_shell_prelude() -> &'static str {
+        if cfg!(target_os = "macos") {
+            r#"sed() { if [ "$1" = -i ]; then shift; command sed -i '' "$@"; else command sed "$@"; fi; }
+find() {
+    _n=$#
+    while [ "$_n" -gt 0 ]; do
+        if [ "$1" = -printf ]; then
+            set -- "$@" -exec stat -f '%HT %Mp%Lp %u %g %N%t%Y' '{}' +
+            shift 2; _n=$((_n - 2))
+        else
+            set -- "$@" "$1"; shift; _n=$((_n - 1))
+        fi
+    done
+    command find "$@"
+}
+"#
+        } else {
+            ""
+        }
+    }
+
+    /// `PATH` for running a generated script on the host, with `bin` first.
+    /// On macOS `bin` gains an executable `sha256sum` backed by `shasum`, which
+    /// is what `xargs -0 sha256sum` in the sysroot digest finds. A shell
+    /// function in the prelude would not reach it: `xargs` runs programs.
+    #[cfg(unix)]
+    fn host_shim_path(bin: &Path) -> String {
+        if cfg!(target_os = "macos") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(bin).unwrap();
+            let shim = bin.join("sha256sum");
+            std::fs::write(&shim, "#!/bin/sh\nexec shasum -a 256 \"$@\"\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
     /// Run a generated stamp-writing script the way the container would:
     /// `$AVOCADO_PREFIX` pointed at a temp dir, bash executing it. Returns the
     /// exit status and the stamp read back, if one was written.
@@ -6260,7 +6306,7 @@ extensions:
     fn run_stamp_script(prefix: &Path, script: &str) -> (bool, Option<Stamp>) {
         let status = std::process::Command::new("bash")
             .arg("-c")
-            .arg(script)
+            .arg(format!("{}\n{script}", host_shell_prelude()))
             .env("AVOCADO_PREFIX", prefix)
             .stderr(std::process::Stdio::null())
             .status()
@@ -6359,14 +6405,11 @@ extensions:
             std::fs::set_permissions(bin.join("rpm"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        let path_env = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let path_env = host_shim_path(&bin);
         let digest = |dbpath: Option<&str>| -> String {
             let script = format!(
-                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                host_shell_prelude(),
                 render_sysroot_digest_script(&root.display().to_string(), dbpath)
             );
             let out = std::process::Command::new("bash")
@@ -6422,14 +6465,17 @@ extensions:
     #[test]
     fn sysroot_digest_fails_closed_and_never_creates_a_database() {
         let dir = tempfile::tempdir().unwrap();
+        let path_env = host_shim_path(&dir.path().join("bin"));
         let run = |root: &Path| {
             let script = format!(
-                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                host_shell_prelude(),
                 render_sysroot_digest_script(&root.display().to_string(), None)
             );
             std::process::Command::new("bash")
                 .arg("-c")
                 .arg(&script)
+                .env("PATH", &path_env)
                 .stderr(std::process::Stdio::null())
                 .output()
                 .expect("bash on PATH")
@@ -7784,6 +7830,7 @@ rootfs:
     }
 
     #[test]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_is_deterministic() {
         let yaml = "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n";
         let root = Path::new(".");
@@ -7808,6 +7855,7 @@ rootfs:
     }
 
     #[test]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_tracks_filesystem_image_and_permissions() {
         let root = Path::new(".");
         let base = image_hash("rootfs", "filesystem: erofs\n", root).unwrap();
@@ -7979,7 +8027,7 @@ rootfs:
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_tracks_kab_keyset_content() {
         let tmp = tempfile::TempDir::new().unwrap();
         let keyset = tmp.path().join("kab.keyset");
