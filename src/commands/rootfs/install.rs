@@ -15,37 +15,63 @@ use crate::utils::overlay_preprocess::parse_overlay_config;
 /// Uses `cp -a` (preserve attrs + symlinks + recursive) followed by
 /// `chown -R root:root` rather than `rsync -a` so we don't depend on rsync
 /// being present in the SDK image (some SDK variants don't ship it).
+///
+/// The sysroot persists between installs and the copy is additive, so the
+/// snippet records every file and symlink the overlay placed in
+/// `$AVOCADO_PREFIX/.stamps/<sysroot_dir>/overlay.files` and, before the next
+/// copy, removes each recorded path the overlay no longer provides. A path a
+/// package owns is kept with a notice. The sysroot clean removes the list
+/// along with the stamp directory.
 fn build_overlay_script(overlay_dir: &str, opaque: bool, sysroot_dir: &str) -> String {
-    if opaque {
-        format!(
-            r#"
-# Apply overlay (opaque mode) — cp -r replaces directory contents
-if [ -d "/opt/src/{overlay_dir}" ]; then
-    echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (opaque mode)"
-    cp -r "/opt/src/{overlay_dir}/." "$AVOCADO_PREFIX/{sysroot_dir}/"
-    chown -R root:root "$AVOCADO_PREFIX/{sysroot_dir}/"
-else
-    echo "Error: Overlay directory '{overlay_dir}' not found in /opt/src"
-    exit 1
-fi
-"#
-        )
+    let (mode, cp) = if opaque {
+        // cp -r copies without preserving timestamps or ownership.
+        ("opaque", "cp -r")
     } else {
-        format!(
-            r#"
-# Apply overlay (merge mode) — cp -a copies + preserves attrs, merging into
-# the existing sysroot tree; chown -R then resets ownership to root:root.
-if [ -d "/opt/src/{overlay_dir}" ]; then
-    echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot (merge mode)"
-    cp -a "/opt/src/{overlay_dir}/." "$AVOCADO_PREFIX/{sysroot_dir}/"
-    chown -R root:root "$AVOCADO_PREFIX/{sysroot_dir}/"
+        // cp -a copies and preserves attrs, merging into the existing tree.
+        ("merge", "cp -a")
+    };
+    format!(
+        r#"
+# Remove what the previous overlay copy placed that this install no longer
+# provides, so a file deleted from the overlay does not ship in later images.
+overlay_list="$AVOCADO_PREFIX/.stamps/{sysroot_dir}/overlay.files"
+sysroot="$AVOCADO_PREFIX/{sysroot_dir}"
+overlay_src="${{AVOCADO_SRC_DIR:-/opt/src}}/{overlay_dir}"
+if [ -f "$overlay_list" ]; then
+    while IFS= read -r relpath; do
+        [ -n "$relpath" ] || continue
+        [ -f "$sysroot/$relpath" ] || [ -L "$sysroot/$relpath" ] || continue
+        if [ -f "$overlay_src/$relpath" ] || [ -L "$overlay_src/$relpath" ]; then
+            continue
+        fi
+        if [ -d "$sysroot/var/lib/rpm" ] && owner="$(rpm --dbpath /var/lib/rpm --root "$sysroot" -qf --qf '%{{NAME}}\n' "/$relpath" 2>/dev/null)"; then
+            echo "Kept /$relpath: owned by package $owner; run 'avocado {sysroot_dir} clean' then 'avocado install' to restore the packaged file."
+            continue
+        fi
+        rm -f "$sysroot/$relpath"
+        echo "Removed /$relpath (no longer in overlay '{overlay_dir}')"
+    done < "$overlay_list"
+fi
+
+# Apply overlay ({mode} mode); chown -R then resets ownership to root:root.
+if [ -d "$overlay_src" ]; then
+    echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot ({mode} mode)"
+    {cp} "$overlay_src/." "$sysroot/"
+    chown -R root:root "$sysroot/"
 else
     echo "Error: Overlay directory '{overlay_dir}' not found in /opt/src"
     exit 1
 fi
+
+# Record every file and symlink the overlay placed, so the next install can
+# remove the ones it drops. Directories are not recorded and never removed:
+# an empty directory left behind is harmless, and removing one a package owns
+# is not.
+mkdir -p "$(dirname "$overlay_list")"
+(cd "$overlay_src" && find . \( -type f -o -type l \) | sed 's|^\./||') > "$overlay_list.tmp"
+mv "$overlay_list.tmp" "$overlay_list"
 "#
-        )
-    }
+    )
 }
 
 use crate::utils::{
@@ -1991,5 +2017,203 @@ mod tests {
                 assert!(script.contains(&format!(" to {sysroot_dir} sysroot ")));
             }
         }
+    }
+
+    /// Run a generated overlay script against a tempfile sysroot at
+    /// `prefix/rootfs`, with the overlay at `src/overlay`. `chown` is stubbed
+    /// out, and `rpm -qf` either answers with `rpm_owner` or fails, which is
+    /// how the real one says no package owns the file.
+    #[cfg(unix)]
+    fn run_overlay_script(script: &str, root: &std::path::Path, rpm_owner: Option<&str>) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let rpm = match rpm_owner {
+            Some(name) => format!("#!/bin/sh\necho {name}\n"),
+            None => "#!/bin/sh\nexit 1\n".to_string(),
+        };
+        for (name, body) in [("chown", "#!/bin/sh\nexit 0\n".to_string()), ("rpm", rpm)] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("AVOCADO_PREFIX", root.join("prefix"))
+            .env("AVOCADO_SRC_DIR", root.join("src"))
+            .output()
+            .expect("run script");
+        assert!(
+            out.status.success(),
+            "script failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A rootfs sysroot, overlay and recorded list under `root`. Paths are
+    /// relative to the sysroot; the list is written only when given.
+    #[cfg(unix)]
+    fn overlay_fixture(
+        root: &std::path::Path,
+        sysroot_files: &[&str],
+        overlay_files: &[&str],
+        recorded: Option<&[&str]>,
+    ) {
+        for rel in sysroot_files {
+            let p = root.join("prefix/rootfs").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        }
+        for rel in overlay_files {
+            let p = root.join("src/overlay").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        }
+        if let Some(lines) = recorded {
+            let list = root.join("prefix/.stamps/rootfs/overlay.files");
+            std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+            std::fs::write(&list, format!("{}\n", lines.join("\n"))).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn recorded_list(root: &std::path::Path) -> Vec<String> {
+        let mut lines: Vec<String> =
+            std::fs::read_to_string(root.join("prefix/.stamps/rootfs/overlay.files"))
+                .expect("list written")
+                .lines()
+                .map(str::to_string)
+                .collect();
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_dropped_from_the_overlay_is_removed_and_the_list_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["etc/motd.extra", "etc/hello.conf"],
+            &["etc/hello.conf", "etc/new.conf"],
+            Some(&["etc/motd.extra", "etc/hello.conf"]),
+        );
+        let out = run_overlay_script(
+            &build_overlay_script("overlay", false, "rootfs"),
+            root,
+            None,
+        );
+        let sysroot = root.join("prefix/rootfs");
+        assert!(!sysroot.join("etc/motd.extra").exists());
+        assert!(sysroot.join("etc/hello.conf").is_file());
+        assert!(sysroot.join("etc/new.conf").is_file());
+        assert!(
+            out.contains("Removed /etc/motd.extra (no longer in overlay 'overlay')"),
+            "{out}"
+        );
+        assert_eq!(recorded_list(root), vec!["etc/hello.conf", "etc/new.conf"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_first_install_without_a_list_removes_nothing_and_writes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &["etc/motd.extra"], &["etc/hello.conf"], None);
+        let out = run_overlay_script(
+            &build_overlay_script("overlay", false, "rootfs"),
+            root,
+            None,
+        );
+        assert!(root.join("prefix/rootfs/etc/motd.extra").is_file());
+        assert!(!out.contains("Removed"), "{out}");
+        assert_eq!(recorded_list(root), vec!["etc/hello.conf"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unlisted_files_survive_and_an_already_absent_entry_is_skipped_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["etc/from-package.conf"],
+            &["etc/hello.conf"],
+            Some(&["etc/gone.conf"]),
+        );
+        let out = run_overlay_script(
+            &build_overlay_script("overlay", false, "rootfs"),
+            root,
+            None,
+        );
+        assert!(root.join("prefix/rootfs/etc/from-package.conf").is_file());
+        assert!(!out.contains("gone.conf"), "{out}");
+        assert!(!out.contains("Removed"), "{out}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_recorded_file_a_package_owns_is_kept_with_a_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/bin/tool"],
+            &["etc/hello.conf"],
+            Some(&["usr/bin/tool"]),
+        );
+        std::fs::create_dir_all(root.join("prefix/rootfs/var/lib/rpm")).unwrap();
+        let out = run_overlay_script(
+            &build_overlay_script("overlay", false, "rootfs"),
+            root,
+            Some("tool-pkg"),
+        );
+        assert!(root.join("prefix/rootfs/usr/bin/tool").is_file());
+        assert!(
+            out.contains("Kept /usr/bin/tool: owned by package tool-pkg; run 'avocado rootfs clean' then 'avocado install' to restore the packaged file."),
+            "{out}"
+        );
+        assert!(!out.contains("Removed"), "{out}");
+    }
+
+    /// Opaque mode copies `overlay/.`, which includes top-level hidden paths,
+    /// so those are placed and recorded like any other file.
+    #[test]
+    #[cfg(unix)]
+    fn opaque_mode_removes_what_the_overlay_dropped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["etc/motd.extra", "etc/hello.conf"],
+            &["etc/hello.conf", "etc/new.conf", ".hidden/x"],
+            Some(&["etc/motd.extra", "etc/hello.conf"]),
+        );
+        let out = run_overlay_script(&build_overlay_script("overlay", true, "rootfs"), root, None);
+        let sysroot = root.join("prefix/rootfs");
+        assert!(!sysroot.join("etc/motd.extra").exists());
+        assert!(sysroot.join("etc/hello.conf").is_file());
+        assert!(sysroot.join("etc/new.conf").is_file());
+        assert!(sysroot.join(".hidden/x").is_file());
+        assert!(
+            out.contains("Removed /etc/motd.extra (no longer in overlay 'overlay')"),
+            "{out}"
+        );
+        assert_eq!(
+            recorded_list(root),
+            vec![".hidden/x", "etc/hello.conf", "etc/new.conf"]
+        );
     }
 }
