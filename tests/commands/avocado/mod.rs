@@ -23,6 +23,36 @@ fn test_long_help() {
 }
 
 #[test]
+fn test_no_vm_auto_start_help_states_the_auto_start_condition() {
+    let result = common::run_cli(&["--help"]);
+    assert!(
+        result
+            .stdout
+            .contains("starts a stopped one only when `AVOCADO_VM_DIR` is set"),
+        "{}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("AVOCADO_VM_AUTO_START=0"),
+        "{}",
+        result.stdout
+    );
+}
+
+#[test]
+fn test_vm_start_help_says_it_fails_when_already_running() {
+    let result = common::run_cli(&["vm", "start", "--help"]);
+    assert!(
+        result
+            .stdout
+            .contains("Boot the avocado-vm (fails if it is already running)"),
+        "{}",
+        result.stdout
+    );
+    assert!(!result.stdout.contains("no-op"), "{}", result.stdout);
+}
+
+#[test]
 fn test_short_help() {
     common::assert_cmd(&["-h"], None, None);
 }
