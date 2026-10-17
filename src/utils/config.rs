@@ -2382,14 +2382,15 @@ impl Config {
             return Ok(RemoteExtensionMerge::default());
         }
 
-        // Get src_dir for loading volume state
+        // `src_dir` is the base for `path:` sources. The volume state is keyed
+        // on the working directory, not on `src_dir`.
         let config_path_str = config_path.to_string_lossy();
         let src_dir = temp_config
             .get_resolved_src_dir::<&str>(config_path_str.as_ref())
             .unwrap_or_else(|| config_file_dir(config_path).to_path_buf());
 
         // Try to load volume state for container-based config reading
-        let volume_state = crate::utils::volume::VolumeState::load_from_dir(&src_dir)
+        let volume_state = crate::utils::volume::VolumeState::load_from_current_dir()
             .ok()
             .flatten();
 
@@ -5505,8 +5506,9 @@ impl Config {
                 .to_path_buf()
         });
 
-        // Try to load volume state and get the mountpoint
-        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_dir(&src_dir) {
+        // Try to load volume state and get the mountpoint. The state file is
+        // keyed on the working directory, not on `src_dir`.
+        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_current_dir() {
             // Use synchronous Docker inspect to get the mountpoint
             if let Ok(mountpoint) =
                 crate::utils::ext_source_reader::volume_mountpoint(&volume_state)
@@ -6893,6 +6895,27 @@ mod tests {
             config.project_root("nested/dir/avocado.yaml"),
             std::path::PathBuf::from("nested/dir")
         );
+    }
+
+    /// With `src_dir` set, the project root is `src_dir` and not the config
+    /// file's directory. The runtime build writes its TUF staging files under
+    /// the root and the container reads them back through `/opt/src`, which
+    /// is `src_dir`; a root taken from the config path put the two out of step.
+    #[test]
+    fn project_root_follows_src_dir_above_the_config_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "avocado-project-root-src-dir-{}",
+            std::process::id()
+        ));
+        let config_dir = dir.join("project").join("avocado");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("avocado.yaml");
+
+        let config = super::Config::load_from_yaml_str("src_dir: ..\nextensions: {}\n").unwrap();
+        let root = config.project_root(&config_path);
+        assert_eq!(root, dir.join("project").canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Recording the feed set must be a no-op when there is nothing to record.
