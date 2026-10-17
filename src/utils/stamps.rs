@@ -6255,12 +6255,12 @@ extensions:
 
     /// Shell prepended to a generated script when a test runs it on the host.
     /// The scripts are written for the GNU tools in the SDK container; a macOS
-    /// host has BSD `sed` and `find` and no `sha256sum`, so those are shimmed
-    /// here, in the test only. Empty elsewhere.
+    /// host has BSD `sed` and `find`, so those are shimmed here, in the test
+    /// only. Empty elsewhere. `sha256sum` is a program, not a function, because
+    /// the sysroot digest reaches it through `xargs`: see [`host_shim_path`].
     fn host_shell_prelude() -> &'static str {
         if cfg!(target_os = "macos") {
             r#"sed() { if [ "$1" = -i ]; then shift; command sed -i '' "$@"; else command sed "$@"; fi; }
-sha256sum() { shasum -a 256 "$@"; }
 find() {
     _n=$#
     while [ "$_n" -gt 0 ]; do
@@ -6277,6 +6277,26 @@ find() {
         } else {
             ""
         }
+    }
+
+    /// `PATH` for running a generated script on the host, with `bin` first.
+    /// On macOS `bin` gains an executable `sha256sum` backed by `shasum`, which
+    /// is what `xargs -0 sha256sum` in the sysroot digest finds. A shell
+    /// function in the prelude would not reach it: `xargs` runs programs.
+    #[cfg(unix)]
+    fn host_shim_path(bin: &Path) -> String {
+        if cfg!(target_os = "macos") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(bin).unwrap();
+            let shim = bin.join("sha256sum");
+            std::fs::write(&shim, "#!/bin/sh\nexec shasum -a 256 \"$@\"\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
     }
 
     /// Run a generated stamp-writing script the way the container would:
@@ -6385,11 +6405,7 @@ find() {
             std::fs::set_permissions(bin.join("rpm"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        let path_env = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let path_env = host_shim_path(&bin);
         let digest = |dbpath: Option<&str>| -> String {
             let script = format!(
                 "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
@@ -6449,6 +6465,7 @@ find() {
     #[test]
     fn sysroot_digest_fails_closed_and_never_creates_a_database() {
         let dir = tempfile::tempdir().unwrap();
+        let path_env = host_shim_path(&dir.path().join("bin"));
         let run = |root: &Path| {
             let script = format!(
                 "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
@@ -6458,6 +6475,7 @@ find() {
             std::process::Command::new("bash")
                 .arg("-c")
                 .arg(&script)
+                .env("PATH", &path_env)
                 .stderr(std::process::Stdio::null())
                 .output()
                 .expect("bash on PATH")
