@@ -128,6 +128,18 @@ cp "{src}/group" "{etc_dir}/group"
                 } else {
                     String::new()
                 };
+                let gid_check = if gid == "$CURRENT_GID" {
+                    String::new()
+                } else {
+                    format!(
+                        r#"
+    EXISTING_GID=$(grep "^{groupname}:" "{etc_dir}/group" | cut -d: -f3)
+    if [ "$EXISTING_GID" != "{gid}" ]; then
+        echo "Group '{groupname}' exists with GID $EXISTING_GID but avocado.yaml sets {gid}. Set gid: $EXISTING_GID or drop it." >&2
+        exit 1
+    fi"#
+                    )
+                };
 
                 script_lines.push(format!(
                     r#"
@@ -139,10 +151,10 @@ if ! grep -q "^{groupname}:" "{etc_dir}/group"; then
     if [ "{gid}" = "$CURRENT_GID" ]; then
         CURRENT_GID=$((CURRENT_GID + 1))
     fi
-else
+else{gid_check}
     echo "Group '{groupname}' already exists, updating members"
     if [ -n "{members}" ]; then
-        sed -i "s|^{groupname}:x:{gid}:.*$|{groupname}:x:{gid}:{members}|" "{etc_dir}/group"
+        sed -i "s|^{groupname}:\([^:]*\):\([^:]*\):.*$|{groupname}:\1:\2:{members}|" "{etc_dir}/group"
         echo "Updated members for group '{groupname}'"
     fi
 fi{password_config}"#
@@ -193,16 +205,6 @@ fi"#
                     "$CURRENT_UID".to_string()
                 };
 
-                let gid = if let Some(gid_value) = user_table.get("gid") {
-                    if let Some(gid_num) = gid_value.as_i64() {
-                        gid_num.to_string()
-                    } else {
-                        "$CURRENT_UID".to_string()
-                    }
-                } else {
-                    "$CURRENT_UID".to_string()
-                };
-
                 let gecos = user_table
                     .get("gecos")
                     .and_then(|g| g.as_str())
@@ -219,18 +221,51 @@ fi"#
                     .and_then(|s| s.as_str())
                     .unwrap_or("/bin/sh");
 
-                let groups_list = if let Some(groups_value) = user_table.get("groups") {
-                    if let Some(groups_array) = groups_value.as_sequence() {
+                let groups_list = user_table
+                    .get("groups")
+                    .and_then(|g| g.as_sequence())
+                    .map(|groups_array| {
                         groups_array
                             .iter()
                             .filter_map(|g| g.as_str())
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>()
-                    } else {
-                        vec![username.to_string()]
-                    }
+                    })
+                    .unwrap_or_default();
+
+                // The primary GID: `gid` when set, else the GID of the first
+                // entry in `groups`, else a user-private group with the UID.
+                // The lookup runs only when the user is created, so an
+                // existing user keeps its GID.
+                let (gid, gid_lookup) = if let Some(gid_num) =
+                    user_table.get("gid").and_then(|g| g.as_i64())
+                {
+                    (gid_num.to_string(), String::new())
+                } else if let Some(primary) = groups_list.first() {
+                    (
+                        "$USER_GID".to_string(),
+                        format!(
+                            r#"
+    USER_GID=$(grep "^{primary}:" "{etc_dir}/group" | cut -d: -f3)
+    if [ -z "$USER_GID" ]; then
+        echo "User '{username}' has no gid and its first group '{primary}' is not in {etc_dir}/group. Add the group under groups: or set gid:." >&2
+        exit 1
+    fi"#
+                        ),
+                    )
                 } else {
-                    vec![username.to_string()]
+                    (
+                        "$USER_GID".to_string(),
+                        format!(
+                            r#"
+    USER_GID=$(grep "^{username}:" "{etc_dir}/group" | cut -d: -f3)
+    if [ -z "$USER_GID" ]; then
+        USER_GID={uid}
+        echo "{username}:x:$USER_GID:" >> "{etc_dir}/group"
+        echo "Group '{username}' created with GID $USER_GID"
+    fi"#
+                        ),
+                    )
                 };
 
                 let last_change = user_table
@@ -300,7 +335,7 @@ fi"#
                     r#"
 # Create user '{username}'
 echo "Creating user '{username}'{system_label}"{warning_message}
-if ! grep -q "^{username}:" "{etc_dir}/passwd"; then
+if ! grep -q "^{username}:" "{etc_dir}/passwd"; then{gid_lookup}
     echo "{username}:x:{uid}:{gid}:{gecos}:{home}:{shell}" >> "{etc_dir}/passwd"
     echo "User '{username}' created with UID {uid}, GID {gid}, home '{home}', shell '{shell}'"
 
@@ -337,8 +372,8 @@ fi{disabled_note}"#
                         user_script_lines.push(format!(
                             r#"
 if grep -q "^{group}:" "{etc_dir}/group"; then
-    if ! grep "^{group}:" "{etc_dir}/group" | grep -q "{username}"; then
-        sed -i "s|^{group}:\([^:]*\):\([^:]*\):\(.*\)$|{group}:\1:\2:\3,{username}|" "{etc_dir}/group"
+    if ! grep "^{group}:" "{etc_dir}/group" | cut -d: -f4 | tr ',' '\n' | grep -qx "{username}"; then
+        sed -i -e "s|^\({group}:[^:]*:[^:]*:[^:][^:]*\)$|\1,{username}|" -e "s|^\({group}:[^:]*:[^:]*:\)$|\1{username}|" "{etc_dir}/group"
         echo "Added user '{username}' to group '{group}'"
     fi
 else
@@ -501,5 +536,187 @@ mod tests {
         // Empty / absent maps still fold to nothing.
         assert!(mapping_from_map(None).is_none());
         assert!(mapping_from_map(Some(&std::collections::BTreeMap::new())).is_none());
+    }
+
+    #[cfg(unix)]
+    fn mapping(yaml: &str) -> Mapping {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// Seed `etc/{passwd,group,shadow}` under a temp dir and run the generated
+    /// script against it with `sh`, the way the SDK container would. `chown`
+    /// is stubbed since the test does not run as root. BSD sed needs an
+    /// argument after `-i`, so on macOS `sed` is wrapped to supply it.
+    #[cfg(unix)]
+    fn run_script(
+        passwd: &str,
+        group: &str,
+        users: &str,
+        groups: Option<&str>,
+    ) -> (tempfile::TempDir, std::process::Output) {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), passwd).unwrap();
+        std::fs::write(etc.join("group"), group).unwrap();
+        std::fs::write(etc.join("shadow"), "").unwrap();
+
+        let users = mapping(users);
+        let groups = groups.map(mapping);
+        let script = render_users_groups_script(
+            Some(&users),
+            groups.as_ref(),
+            &etc.display().to_string(),
+            None,
+        );
+        let sed_shim = if cfg!(target_os = "macos") {
+            "sed() { if [ \"$1\" = -i ]; then shift; command sed -i '' \"$@\"; else command sed \"$@\"; fi; }; "
+        } else {
+            ""
+        };
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e; chown() {{ :; }}; {sed_shim}{script}"))
+            .output()
+            .expect("sh ran");
+        (dir, output)
+    }
+
+    #[cfg(unix)]
+    fn read(dir: &tempfile::TempDir, file: &str) -> String {
+        std::fs::read_to_string(dir.path().join("etc").join(file)).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_joins_an_empty_group_without_a_leading_comma() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\nusers:x:100:\ndialout:x:20:\n";
+        let users = "app:\n  groups: [users, dialout]\n";
+        let (dir, out) = run_script(passwd, group, users, None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = read(&dir, "group");
+        assert!(got.contains("\ndialout:x:20:app\n"), "{got}");
+        assert!(!got.contains(":,"), "{got}");
+
+        // A second run over the same files must not add the user twice.
+        let (dir, out) = run_script(&read(&dir, "passwd"), &got, users, None);
+        assert!(out.status.success());
+        assert_eq!(read(&dir, "group"), got);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_matches_a_whole_member_not_a_substring() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\nusers:x:100:\napp-admin:x:1002:appuser\nvideo:x:44:app\n";
+        let users = "app:\n  groups: [users, app-admin, video]\n";
+        let (dir, out) = run_script(passwd, group, users, None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = read(&dir, "group");
+        assert!(got.contains("\napp-admin:x:1002:appuser,app\n"), "{got}");
+        assert!(got.contains("\nvideo:x:44:app\n"), "{got}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_without_gid_takes_its_first_group_or_gets_a_private_group() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "users:x:100:\n";
+
+        // gid from groups[0].
+        let (dir, out) = run_script(passwd, group, "app:\n  groups: [users]\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "passwd").contains("\napp:x:1000:100:"));
+
+        // groups[0] missing from the target: fail and say which.
+        let (dir, out) = run_script(passwd, group, "app:\n  groups: [nosuch]\n", None);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("User 'app'") && err.contains("group 'nosuch'"),
+            "{err}"
+        );
+        assert!(!read(&dir, "passwd").contains("app:"));
+
+        // Neither gid nor groups: a user-private group with the UID.
+        let (dir, out) = run_script(passwd, group, "app:\n  password: '*'\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "passwd").contains("\napp:x:1000:1000:"));
+        assert!(read(&dir, "group").contains("\napp:x:1000:\n"));
+
+        // An existing user keeps its GID and gets no group.
+        let (dir, out) = run_script(passwd, group, "root:\n  password: ''\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(read(&dir, "passwd"), passwd);
+        assert_eq!(read(&dir, "group"), group);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_exists_with_another_gid_fails_the_build() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\ndocker:x:998:\n";
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  gid: 999\n"),
+        );
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "Group 'docker' exists with GID 998 but avocado.yaml sets 999. Set gid: 998 or drop it.\n"
+            ),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(read(&dir, "group"), group);
+
+        // The same GID, or no gid at all, proceeds and updates members.
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  gid: 998\n  members: [root]\n"),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "group").contains("\ndocker:x:998:root\n"));
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  members: [root]\n"),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "group").contains("\ndocker:x:998:root\n"));
     }
 }
