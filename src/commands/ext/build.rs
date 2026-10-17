@@ -1180,9 +1180,15 @@ fi
             Some(oc) => (format!("{ext_src_path}/{}", oc.dir), oc.dir.as_str()),
             None => (String::new(), ""),
         };
+        let inventory = match overlay_config.map(|oc| &oc.mode) {
+            Some(OverlayMode::Opaque) => {
+                r"find . -path './.*' -prune -o \( -type f -o -type l \) -print"
+            }
+            _ => r"find . \( -type f -o -type l \)",
+        };
         let service_link_rule = match enable_services {
             Some(services) => format!(
-                r#"case " {} " in *" $unit "*) continue ;; esac"#,
+                r#"case " {} " in *" $unit "*) rm -f "$sysroot/$relpath"; continue ;; esac # re-linked below at its current target"#,
                 services.join(" ")
             ),
             None => "continue # service links are the confext script's to judge".to_string(),
@@ -1204,7 +1210,7 @@ fi
 # Remove what the previous overlay copy and service linking placed that this
 # build no longer provides. The sysroot persists between builds, so a file
 # deleted from the overlay would otherwise ship in every later image.
-overlay_list="$AVOCADO_PREFIX/.stamps/ext/{ext_name}/overlay.files"
+overlay_list="$AVOCADO_PREFIX/.stamps/ext/{ext_name}/overlay${{AVOCADO_RUNTIME:+.$AVOCADO_RUNTIME}}.files"
 sysroot="$AVOCADO_EXT_SYSROOTS/{ext_name}"
 overlay_src="{overlay_src}"
 if [ -f "$overlay_list" ]; then
@@ -1234,10 +1240,12 @@ fi
 # Record every file and symlink the overlay placed, so the next build can
 # remove the ones it drops. Directories are not recorded and never removed:
 # an empty directory left behind is harmless, and removing one a package owns
-# is not. The service linking below appends the links it creates.
+# is not. Opaque mode copies with cp -r src/*, which skips top-level hidden
+# paths, so those are not recorded either. The service linking below appends
+# the links it creates.
 mkdir -p "$(dirname "$overlay_list")"
 if [ -n "$overlay_src" ]; then
-    (cd "$overlay_src" && find . \( -type f -o -type l \) | sed 's|^\./||') > "$overlay_list.tmp"
+    (cd "$overlay_src" && {inventory} | sed 's|^\./||') > "$overlay_list.tmp"
 else
     : > "$overlay_list.tmp"
 fi
@@ -1403,7 +1411,7 @@ fi
                     r#"
 # Enable service file for {}
 sysroot="$AVOCADO_EXT_SYSROOTS/{}"
-overlay_list="$AVOCADO_PREFIX/.stamps/ext/{}/overlay.files"
+overlay_list="$AVOCADO_PREFIX/.stamps/ext/{}/overlay${{AVOCADO_RUNTIME:+.$AVOCADO_RUNTIME}}.files"
 service="{}"
 
 # Search the same unit directories systemd does, in its precedence order, rather
@@ -2483,6 +2491,7 @@ mod tests {
     /// Run a generated build script against a tempfile sysroot. `chown` is
     /// stubbed out, and `rpm -qf` either answers with `rpm_owner` or fails,
     /// which is how the real one says no package owns the file.
+    #[cfg(unix)]
     fn run_overlay_script(script: &str, root: &std::path::Path, rpm_owner: Option<&str>) -> String {
         use std::os::unix::fs::PermissionsExt;
         let bin = root.join("bin");
@@ -2522,6 +2531,7 @@ mod tests {
 
     /// A sysroot, overlay and recorded list for extension `app` under `root`.
     /// Paths are relative to the sysroot; the list is written only when given.
+    #[cfg(unix)]
     fn overlay_fixture(
         root: &std::path::Path,
         sysroot_files: &[&str],
@@ -2545,6 +2555,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn recorded_list(root: &std::path::Path) -> Vec<String> {
         let mut lines: Vec<String> =
             std::fs::read_to_string(root.join("prefix/.stamps/ext/app/overlay.files"))
@@ -2556,6 +2567,7 @@ mod tests {
         lines
     }
 
+    #[cfg(unix)]
     fn confext_script_for(root: &std::path::Path, mode: OverlayMode, services: &[&str]) -> String {
         let cmd = ExtBuildCommand {
             extension: "app".to_string(),
@@ -2583,6 +2595,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_file_dropped_from_the_overlay_is_removed_and_the_list_rewritten() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2612,6 +2625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_first_build_without_a_list_removes_nothing_and_writes_one() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2632,6 +2646,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unlisted_files_survive_and_an_already_absent_entry_is_skipped_silently() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2654,6 +2669,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_recorded_file_a_package_owns_is_kept_with_a_notice() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2678,6 +2694,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_service_dropped_from_enable_services_loses_its_wants_link() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2717,6 +2734,8 @@ mod tests {
             out.contains("Removed /etc/systemd/system/multi-user.target.wants/app.service (service 'app.service' no longer enabled)"),
             "{out}"
         );
+        // The kept unit's link is re-created in place, without a notice.
+        assert_eq!(out.matches("Removed ").count(), 1, "{out}");
         assert_eq!(
             recorded_list(root),
             vec![
@@ -2727,13 +2746,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn opaque_mode_removes_what_the_overlay_dropped_too() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
             root,
             &["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"],
-            &["usr/local/bin/hello.sh", "usr/local/bin/new.sh"],
+            &[
+                "usr/local/bin/hello.sh",
+                "usr/local/bin/new.sh",
+                ".hidden/x",
+            ],
             Some(&["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"]),
         );
         let out = run_overlay_script(
@@ -2759,6 +2783,7 @@ mod tests {
     /// the list the confext script wrote. The sysext script links no services,
     /// so it must leave the recorded links for the confext script to judge.
     #[test]
+    #[cfg(unix)]
     fn the_sysext_script_leaves_recorded_service_links_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2801,6 +2826,7 @@ mod tests {
     /// script against one sysroot and one list. A link for a service that
     /// left enable_services must survive the first and be removed by the second.
     #[test]
+    #[cfg(unix)]
     fn a_dropped_service_link_is_removed_when_both_scripts_run_in_turn() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2873,10 +2899,60 @@ mod tests {
         );
         assert!(!wants.join("old.service").is_symlink());
         assert!(wants.join("app.service").is_symlink());
+        assert_eq!(out.matches("Removed ").count(), 1, "{out}");
         assert_eq!(
             recorded_list(root),
             vec![
                 "etc/systemd/system/multi-user.target.wants/app.service",
+                "usr/local/bin/hello.sh"
+            ]
+        );
+    }
+
+    /// A unit still in enable_services whose WantedBy moved: the old link is
+    /// removed in place and the linker creates the new one, so neither a stale
+    /// link nor a stale record is left.
+    #[test]
+    #[cfg(unix)]
+    fn a_changed_wantedby_target_leaves_no_stale_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &[],
+            &["usr/local/bin/hello.sh"],
+            Some(&["etc/systemd/system/a.target.wants/app.service"]),
+        );
+        let sysroot = root.join("sysroots/app");
+        let unit_dir = sysroot.join("usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("app.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=b.target\n",
+        )
+        .unwrap();
+        let old_wants = sysroot.join("etc/systemd/system/a.target.wants");
+        std::fs::create_dir_all(&old_wants).unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/app.service",
+            old_wants.join("app.service"),
+        )
+        .unwrap();
+
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["app.service"]),
+            root,
+            None,
+        );
+        assert!(!out.contains("Removed"), "{out}");
+        assert!(!old_wants.join("app.service").is_symlink());
+        assert!(sysroot
+            .join("etc/systemd/system/b.target.wants/app.service")
+            .is_symlink());
+        assert_eq!(
+            recorded_list(root),
+            vec![
+                "etc/systemd/system/b.target.wants/app.service",
                 "usr/local/bin/hello.sh"
             ]
         );
