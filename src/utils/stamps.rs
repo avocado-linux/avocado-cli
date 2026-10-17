@@ -5931,7 +5931,7 @@ extensions:
         let dir = tempfile::tempdir().unwrap();
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(&script)
+            .arg(format!("{}\n{script}", host_shell_prelude()))
             .env("AVOCADO_PREFIX", dir.path())
             .output()
             .expect("sh should run");
@@ -6253,6 +6253,32 @@ extensions:
         assert_ne!(base, h("sdk:\n  image: img\nsrc_dir: ../proj\n"));
     }
 
+    /// Shell prepended to a generated script when a test runs it on the host.
+    /// The scripts are written for the GNU tools in the SDK container; a macOS
+    /// host has BSD `sed` and `find` and no `sha256sum`, so those are shimmed
+    /// here, in the test only. Empty elsewhere.
+    fn host_shell_prelude() -> &'static str {
+        if cfg!(target_os = "macos") {
+            r#"sed() { if [ "$1" = -i ]; then shift; command sed -i '' "$@"; else command sed "$@"; fi; }
+sha256sum() { shasum -a 256 "$@"; }
+find() {
+    _n=$#
+    while [ "$_n" -gt 0 ]; do
+        if [ "$1" = -printf ]; then
+            set -- "$@" -exec stat -f '%HT %Mp%Lp %u %g %N%t%Y' '{}' +
+            shift 2; _n=$((_n - 2))
+        else
+            set -- "$@" "$1"; shift; _n=$((_n - 1))
+        fi
+    done
+    command find "$@"
+}
+"#
+        } else {
+            ""
+        }
+    }
+
     /// Run a generated stamp-writing script the way the container would:
     /// `$AVOCADO_PREFIX` pointed at a temp dir, bash executing it. Returns the
     /// exit status and the stamp read back, if one was written.
@@ -6260,7 +6286,7 @@ extensions:
     fn run_stamp_script(prefix: &Path, script: &str) -> (bool, Option<Stamp>) {
         let status = std::process::Command::new("bash")
             .arg("-c")
-            .arg(script)
+            .arg(format!("{}\n{script}", host_shell_prelude()))
             .env("AVOCADO_PREFIX", prefix)
             .stderr(std::process::Stdio::null())
             .status()
@@ -6366,7 +6392,8 @@ extensions:
         );
         let digest = |dbpath: Option<&str>| -> String {
             let script = format!(
-                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                host_shell_prelude(),
                 render_sysroot_digest_script(&root.display().to_string(), dbpath)
             );
             let out = std::process::Command::new("bash")
@@ -6424,7 +6451,8 @@ extensions:
         let dir = tempfile::tempdir().unwrap();
         let run = |root: &Path| {
             let script = format!(
-                "{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                "{}\n{}\necho \"$AVOCADO_CONTENT_HASH\"",
+                host_shell_prelude(),
                 render_sysroot_digest_script(&root.display().to_string(), None)
             );
             std::process::Command::new("bash")
@@ -7784,6 +7812,7 @@ rootfs:
     }
 
     #[test]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_is_deterministic() {
         let yaml = "filesystem: erofs\nimage:\n  type: kab\n  args: -v 1\n";
         let root = Path::new(".");
@@ -7808,6 +7837,7 @@ rootfs:
     }
 
     #[test]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_tracks_filesystem_image_and_permissions() {
         let root = Path::new(".");
         let base = image_hash("rootfs", "filesystem: erofs\n", root).unwrap();
@@ -7979,7 +8009,7 @@ rootfs:
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(kab_keyset)]
     fn sysroot_image_hash_tracks_kab_keyset_content() {
         let tmp = tempfile::TempDir::new().unwrap();
         let keyset = tmp.path().join("kab.keyset");
