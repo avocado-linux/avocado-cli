@@ -196,7 +196,7 @@ impl SdkCompileCommand {
         let merged_container_args = config.merge_sdk_container_args(self.container_args.as_ref());
 
         // Get compile sections from config
-        let compile_sections = self.get_compile_sections_from_config(config);
+        let compile_sections = self.get_compile_sections_from_config(config)?;
 
         if compile_sections.is_empty() {
             // If specific sections were requested but none found, this is an error
@@ -346,27 +346,37 @@ impl SdkCompileCommand {
         Ok(())
     }
 
-    /// Extract compile sections from configuration
-    fn get_compile_sections_from_config(&self, config: &Config) -> Vec<CompileSection> {
+    /// Extract compile sections from configuration.
+    ///
+    /// A section without a `compile:` script (clean-only, install-only) is
+    /// skipped, unless it was requested by name: then it is an error, because
+    /// "not found" would be wrong for a section that does exist.
+    fn get_compile_sections_from_config(&self, config: &Config) -> Result<Vec<CompileSection>> {
         let mut compile_sections = Vec::new();
 
         if let Some(sdk) = &config.sdk {
             if let Some(compile) = &sdk.compile {
                 for (section_name, section_config) in compile {
                     // Look for a compile script in the section config
-                    if let Some(compile_script) =
-                        self.find_compile_script_in_section(section_config)
-                    {
-                        compile_sections.push(CompileSection {
+                    match self.find_compile_script_in_section(section_config) {
+                        Some(compile_script) => compile_sections.push(CompileSection {
                             name: section_name.clone(),
                             script: compile_script,
-                        });
+                        }),
+                        None if self.sections.contains(section_name) => {
+                            return Err(anyhow::anyhow!(
+                                "sdk.compile.{section_name} has no compile script. \
+                                 Add a compile: script to the section \
+                                 (an install-only section is not supported yet)."
+                            ));
+                        }
+                        None => {}
                     }
                 }
             }
         }
 
-        compile_sections
+        Ok(compile_sections)
     }
 
     /// Find compile script in section configuration
@@ -422,7 +432,7 @@ sdk:
         write!(temp_file, "{config_content}").unwrap();
         let config = Config::load(temp_file.path()).unwrap();
 
-        let sections = cmd.get_compile_sections_from_config(&config);
+        let sections = cmd.get_compile_sections_from_config(&config).unwrap();
 
         assert_eq!(sections.len(), 2);
 
@@ -433,6 +443,72 @@ sdk:
         // Find the app section and verify its script
         let app_section = sections.iter().find(|s| s.name == "app").unwrap();
         assert_eq!(app_section.script, "build.sh");
+    }
+
+    fn composed(config_content: &str) -> Arc<ComposedConfig> {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{config_content}").unwrap();
+        Arc::new(ComposedConfig {
+            config: Config::load(temp_file.path()).unwrap(),
+            merged_value: serde_yaml::Value::Null,
+            config_path: temp_file.path().display().to_string(),
+            extension_sources: Default::default(),
+            ext_version_sources: Default::default(),
+        })
+    }
+
+    const INSTALL_ONLY: &str = r#"
+sdk:
+  image: "test-image"
+  compile:
+    app:
+      install: "x.sh"
+"#;
+
+    #[test]
+    fn requested_section_without_compile_script_is_an_error() {
+        let cmd = SdkCompileCommand::new(
+            "test.yaml".to_string(),
+            false,
+            vec!["app".to_string()],
+            None,
+            None,
+            None,
+        );
+        let err = cmd
+            .get_compile_sections_from_config(&composed(INSTALL_ONLY).config)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sdk.compile.app has no compile script. Add a compile: script to the section \
+             (an install-only section is not supported yet)."
+        );
+    }
+
+    #[test]
+    fn unrequested_section_without_compile_script_is_skipped() {
+        let cmd = SdkCompileCommand::new("test.yaml".to_string(), false, vec![], None, None, None);
+        let sections = cmd
+            .get_compile_sections_from_config(&composed(INSTALL_ONLY).config)
+            .unwrap();
+        assert!(sections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_section_is_still_not_found() {
+        let cmd = SdkCompileCommand::new(
+            "test.yaml".to_string(),
+            false,
+            vec!["nosuch".to_string()],
+            None,
+            None,
+            None,
+        )
+        .with_no_stamps(true)
+        .with_composed_config(composed(INSTALL_ONLY));
+        let err = cmd.execute().await.unwrap_err().to_string();
+        assert!(err.contains("not found in config"), "{err}");
+        assert!(!err.contains("no compile script"), "{err}");
     }
 
     #[tokio::test]
