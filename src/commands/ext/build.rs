@@ -1187,6 +1187,17 @@ fi
             ),
             None => "continue # service links are the confext script's to judge".to_string(),
         };
+        let carry_service_links = match enable_services {
+            Some(_) => "",
+            None => {
+                r#"# This script does not judge service links, so the ones the previous
+# build recorded are carried forward for the confext script to judge.
+if [ -f "$overlay_list" ]; then
+    grep -E '^etc/systemd/system/[^/]+\.(wants|requires)/' "$overlay_list" >> "$overlay_list.tmp" || true
+fi
+"#
+            }
+        };
 
         format!(
             r#"
@@ -1226,10 +1237,11 @@ fi
 # is not. The service linking below appends the links it creates.
 mkdir -p "$(dirname "$overlay_list")"
 if [ -n "$overlay_src" ]; then
-    (cd "$overlay_src" && find . \( -type f -o -type l \) | sed 's|^\./||') > "$overlay_list"
+    (cd "$overlay_src" && find . \( -type f -o -type l \) | sed 's|^\./||') > "$overlay_list.tmp"
 else
-    : > "$overlay_list"
+    : > "$overlay_list.tmp"
 fi
+{carry_service_links}mv "$overlay_list.tmp" "$overlay_list"
 "#,
             ext_name = self.extension,
         )
@@ -2783,6 +2795,91 @@ mod tests {
             .join("sysroots/app/etc/systemd/system/multi-user.target.wants/app.service")
             .is_file());
         assert!(!out.contains("Removed"), "{out}");
+    }
+
+    /// A both-types extension runs the sysext script and then the confext
+    /// script against one sysroot and one list. A link for a service that
+    /// left enable_services must survive the first and be removed by the second.
+    #[test]
+    fn a_dropped_service_link_is_removed_when_both_scripts_run_in_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &[],
+            &["usr/local/bin/hello.sh"],
+            Some(&[
+                "usr/local/bin/hello.sh",
+                "etc/systemd/system/multi-user.target.wants/old.service",
+            ]),
+        );
+        let sysroot = root.join("sysroots/app");
+        let unit_dir = sysroot.join("usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("app.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+        )
+        .unwrap();
+        let wants = sysroot.join("etc/systemd/system/multi-user.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/lib/systemd/system/old.service",
+            wants.join("old.service"),
+        )
+        .unwrap();
+
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let overlay = OverlayConfig {
+            dir: "overlay".to_string(),
+            mode: OverlayMode::Merge,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
+        };
+        let sysext = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            &root.join("src").display().to_string(),
+        );
+        let out = run_overlay_script(&sysext, root, None);
+        assert!(!out.contains("Removed"), "{out}");
+        assert!(wants.join("old.service").is_symlink());
+        assert_eq!(
+            recorded_list(root),
+            vec![
+                "etc/systemd/system/multi-user.target.wants/old.service",
+                "usr/local/bin/hello.sh"
+            ]
+        );
+
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["app.service"]),
+            root,
+            None,
+        );
+        assert!(
+            out.contains("Removed /etc/systemd/system/multi-user.target.wants/old.service (service 'old.service' no longer enabled)"),
+            "{out}"
+        );
+        assert!(!wants.join("old.service").is_symlink());
+        assert!(wants.join("app.service").is_symlink());
+        assert_eq!(
+            recorded_list(root),
+            vec![
+                "etc/systemd/system/multi-user.target.wants/app.service",
+                "usr/local/bin/hello.sh"
+            ]
+        );
     }
 
     #[test]
