@@ -2118,11 +2118,17 @@ pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
 /// The lock stores `VERSION-RELEASE.ARCH`; the pin matches when it equals
 /// `VERSION`, `VERSION-RELEASE` or the whole string. A plain prefix test is
 /// not enough: `1.2.3` is a prefix of `1.2.30-r0.x86_64` and must not match.
+/// The last dot segment is the architecture only when it has a letter in it
+/// (`x86_64`, `aarch64`, `noarch`); an all-digit segment such as the `.4` of
+/// `7.88.1-r0.4` is part of the release, so the pin `7.88.1-r0` must not
+/// match it.
 fn config_pin_matches_locked(config_version: &str, locked_version: &str) -> bool {
     let version_end = locked_version.find('-').unwrap_or(locked_version.len());
     let release_end = locked_version[version_end..]
         .rfind('.')
-        .map_or(locked_version.len(), |i| version_end + i);
+        .map(|i| version_end + i)
+        .filter(|&i| locked_version[i + 1..].contains(|c: char| c.is_ascii_alphabetic()))
+        .unwrap_or(locked_version.len());
     config_version == locked_version
         || config_version == &locked_version[..release_end]
         || config_version == &locked_version[..version_end]
@@ -3294,6 +3300,20 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert!(config_pin_matches_locked("2.6.1", "2.6.1-r0"));
         assert!(config_pin_matches_locked("2.6.1-r0", "2.6.1-r0"));
         assert!(!config_pin_matches_locked("2.6", "2.6.1-r0"));
+        // A dotted release with no architecture: the all-digit tail is
+        // release, not arch, so the shorter pin is a different release.
+        assert!(!config_pin_matches_locked("7.88.1-r0", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked("7.88.1-r0.4", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked("7.88.1", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked(
+            "7.88.1-r0.4",
+            "7.88.1-r0.4.x86_64"
+        ));
+        assert!(!config_pin_matches_locked(
+            "7.88.1-r0",
+            "7.88.1-r0.4.x86_64"
+        ));
+        assert!(config_pin_matches_locked("1.0", "1.0-r0.noarch"));
     }
 
     /// With no lock entry the yaml decides, as before.
