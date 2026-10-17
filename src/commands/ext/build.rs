@@ -1182,9 +1182,20 @@ fi
         };
         let inventory = match overlay_config.map(|oc| &oc.mode) {
             Some(OverlayMode::Opaque) => {
-                r"find . -path './.*' -prune -o \( -type f -o -type l \) -print"
+                r"find . -path './.*' -prune -o \( -type f -o -type l \) -print0"
             }
-            _ => r"find . \( -type f -o -type l \)",
+            _ => r"find . \( -type f -o -type l \) -print0",
+        };
+        let overlay_check = match overlay_config {
+            Some(_) => format!(
+                r#"# Checked before the removal step, so a mistyped overlay removes nothing.
+if [ ! -d "$overlay_src" ]; then
+    echo "Error: Overlay directory '{overlay_dir}' not found in source"
+    exit 1
+fi
+"#
+            ),
+            None => String::new(),
         };
         let service_link_rule = match enable_services {
             Some(services) => format!(
@@ -1199,7 +1210,7 @@ fi
                 r#"# This script does not judge service links, so the ones the previous
 # build recorded are carried forward for the confext script to judge.
 if [ -f "$overlay_list" ]; then
-    grep -E '^etc/systemd/system/[^/]+\.(wants|requires)/' "$overlay_list" >> "$overlay_list.tmp" || true
+    grep -zE '^(\./)?etc/systemd/system/[^/]+\.(wants|requires)/' "$overlay_list" >> "$overlay_list.tmp" || true
 fi
 "#
             }
@@ -1213,9 +1224,12 @@ fi
 overlay_list="$AVOCADO_PREFIX/.stamps/ext/{ext_name}/overlay${{AVOCADO_RUNTIME:+.$AVOCADO_RUNTIME}}.files"
 sysroot="$AVOCADO_EXT_SYSROOTS/{ext_name}"
 overlay_src="{overlay_src}"
-if [ -f "$overlay_list" ]; then
-    while IFS= read -r relpath; do
+{overlay_check}if [ -f "$overlay_list" ]; then
+    while IFS= read -r -d '' relpath; do
+        relpath="${{relpath#./}}"
         [ -n "$relpath" ] || continue
+        # Never reach outside the sysroot, whatever the list holds.
+        case "$relpath" in /*|../*|*/../*|*/..|..) continue ;; esac
         [ -f "$sysroot/$relpath" ] || [ -L "$sysroot/$relpath" ] || continue
         if [ -n "$overlay_src" ] && {{ [ -f "$overlay_src/$relpath" ] || [ -L "$overlay_src/$relpath" ]; }}; then
             continue
@@ -1237,15 +1251,16 @@ if [ -f "$overlay_list" ]; then
     done < "$overlay_list"
 fi
 {copy_section}
-# Record every file and symlink the overlay placed, so the next build can
-# remove the ones it drops. Directories are not recorded and never removed:
+# Record every file and symlink the overlay placed, NUL-delimited so any path
+# survives, so the next build can remove the ones it drops. Directories are
+# not recorded and never removed:
 # an empty directory left behind is harmless, and removing one a package owns
 # is not. Opaque mode copies with cp -r src/*, which skips top-level hidden
 # paths, so those are not recorded either. The service linking below appends
 # the links it creates.
 mkdir -p "$(dirname "$overlay_list")"
 if [ -n "$overlay_src" ]; then
-    (cd "$overlay_src" && {inventory} | sed 's|^\./||') > "$overlay_list.tmp"
+    (cd "$overlay_src" && {inventory}) > "$overlay_list.tmp"
 else
     : > "$overlay_list.tmp"
 fi
@@ -1466,7 +1481,7 @@ if [ -n "$unit_file" ]; then
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
-        echo "etc/systemd/system/$target.wants/$service" >> "$overlay_list"
+        printf '%s\0' "etc/systemd/system/$target.wants/$service" >> "$overlay_list"
         echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
@@ -1474,7 +1489,7 @@ if [ -n "$unit_file" ]; then
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
-        echo "etc/systemd/system/$target.requires/$service" >> "$overlay_list"
+        printf '%s\0' "etc/systemd/system/$target.requires/$service" >> "$overlay_list"
         echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
@@ -2134,7 +2149,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(".stamps/ext/sysroot/overlay.files")).unwrap(),
-            "etc/systemd/system/multi-user.target.wants/qga.service\n"
+            "etc/systemd/system/multi-user.target.wants/qga.service\0"
         );
     }
 
@@ -2493,6 +2508,22 @@ mod tests {
     /// which is how the real one says no package owns the file.
     #[cfg(unix)]
     fn run_overlay_script(script: &str, root: &std::path::Path, rpm_owner: Option<&str>) -> String {
+        let out = run_overlay_script_raw(script, root, rpm_owner);
+        assert!(
+            out.status.success(),
+            "script failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    fn run_overlay_script_raw(
+        script: &str,
+        root: &std::path::Path,
+        rpm_owner: Option<&str>,
+    ) -> std::process::Output {
         use std::os::unix::fs::PermissionsExt;
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2505,7 +2536,7 @@ mod tests {
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = std::process::Command::new("bash")
+        std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
             .env(
@@ -2519,14 +2550,7 @@ mod tests {
             .env("AVOCADO_EXT_SYSROOTS", root.join("sysroots"))
             .env("AVOCADO_PREFIX", root.join("prefix"))
             .output()
-            .expect("run script");
-        assert!(
-            out.status.success(),
-            "script failed:\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
+            .expect("run script")
     }
 
     /// A sysroot, overlay and recorded list for extension `app` under `root`.
@@ -2551,18 +2575,21 @@ mod tests {
         if let Some(lines) = recorded {
             let list = root.join("prefix/.stamps/ext/app/overlay.files");
             std::fs::create_dir_all(list.parent().unwrap()).unwrap();
-            std::fs::write(&list, format!("{}\n", lines.join("\n"))).unwrap();
+            std::fs::write(&list, format!("{}\0", lines.join("\0"))).unwrap();
         }
     }
 
     #[cfg(unix)]
+    /// The list as bare sysroot-relative paths: NUL-delimited on disk, with
+    /// overlay entries carrying the `./` that find prints.
     fn recorded_list(root: &std::path::Path) -> Vec<String> {
-        let mut lines: Vec<String> =
-            std::fs::read_to_string(root.join("prefix/.stamps/ext/app/overlay.files"))
-                .expect("list written")
-                .lines()
-                .map(str::to_string)
-                .collect();
+        let raw = std::fs::read_to_string(root.join("prefix/.stamps/ext/app/overlay.files"))
+            .expect("list written");
+        let mut lines: Vec<String> = raw
+            .split('\0')
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim_start_matches("./").to_string())
+            .collect();
         lines.sort();
         lines
     }
@@ -2956,6 +2983,54 @@ mod tests {
                 "usr/local/bin/hello.sh"
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_entry_that_points_outside_the_sysroot_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/abs.txt"],
+            &["usr/local/bin/hello.sh"],
+            Some(&["../victim", "/usr/local/bin/abs.txt"]),
+        );
+        std::fs::write(root.join("sysroots/victim"), "victim").unwrap();
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            None,
+        );
+        assert!(root.join("sysroots/victim").is_file());
+        assert!(root.join("sysroots/app/usr/local/bin/abs.txt").is_file());
+        assert!(!out.contains("Removed"), "{out}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_missing_overlay_directory_fails_before_anything_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/stale.txt"],
+            &[],
+            Some(&["usr/local/bin/stale.txt"]),
+        );
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("Error: Overlay directory 'overlay' not found in source"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("Removed"), "{stdout}");
+        assert!(root.join("sysroots/app/usr/local/bin/stale.txt").is_file());
     }
 
     #[test]
