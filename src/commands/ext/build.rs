@@ -1112,21 +1112,19 @@ impl ExtBuildCommand {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn create_sysext_build_script(
+    /// Shell that brings the extension sysroot in line with the overlay and
+    /// `enable_services`: removes what the previous build placed and this one
+    /// no longer provides, copies the overlay in, and records what it placed
+    /// in `$AVOCADO_PREFIX/.stamps/ext/<ext>/overlay.files` for the next build.
+    /// `enable_services` is `None` for the sysext script, which never links
+    /// services and so leaves every recorded link alone.
+    fn overlay_section(
         &self,
-        ext_version: &str,
-        ext_scopes: &[String],
         overlay_config: Option<&OverlayConfig>,
-        modprobe_modules: &[String],
-        on_merge_commands: &[String],
-        on_unmerge_commands: &[String],
-        users_config: Option<&serde_yaml::Mapping>,
-        groups_config: Option<&serde_yaml::Mapping>,
-        reload_service_manager: bool,
         ext_src_path: &str,
+        enable_services: Option<&[String]>,
     ) -> String {
-        let overlay_section = if let Some(overlay_config) = overlay_config {
+        let copy_section = if let Some(overlay_config) = overlay_config {
             match overlay_config.mode {
                 OverlayMode::Merge => format!(
                     r#"
@@ -1177,6 +1175,81 @@ fi
         } else {
             String::new()
         };
+
+        let (overlay_src, overlay_dir) = match overlay_config {
+            Some(oc) => (format!("{ext_src_path}/{}", oc.dir), oc.dir.as_str()),
+            None => (String::new(), ""),
+        };
+        let service_link_rule = match enable_services {
+            Some(services) => format!(
+                r#"case " {} " in *" $unit "*) continue ;; esac"#,
+                services.join(" ")
+            ),
+            None => "continue # service links are the confext script's to judge".to_string(),
+        };
+
+        format!(
+            r#"
+# Remove what the previous overlay copy and service linking placed that this
+# build no longer provides. The sysroot persists between builds, so a file
+# deleted from the overlay would otherwise ship in every later image.
+overlay_list="$AVOCADO_PREFIX/.stamps/ext/{ext_name}/overlay.files"
+sysroot="$AVOCADO_EXT_SYSROOTS/{ext_name}"
+overlay_src="{overlay_src}"
+if [ -f "$overlay_list" ]; then
+    while IFS= read -r relpath; do
+        [ -n "$relpath" ] || continue
+        [ -f "$sysroot/$relpath" ] || [ -L "$sysroot/$relpath" ] || continue
+        if [ -n "$overlay_src" ] && {{ [ -f "$overlay_src/$relpath" ] || [ -L "$overlay_src/$relpath" ]; }}; then
+            continue
+        fi
+        case "$relpath" in
+            etc/systemd/system/*.wants/*|etc/systemd/system/*.requires/*)
+                unit="${{relpath##*/}}"
+                {service_link_rule}
+                reason="service '$unit' no longer enabled" ;;
+            *)
+                reason="no longer in overlay '{overlay_dir}'" ;;
+        esac
+        if [ -d "$sysroot/var/lib/rpm" ] && owner="$(rpm --dbpath /var/lib/rpm --root "$sysroot" -qf --qf '%{{NAME}}\n' "/$relpath" 2>/dev/null)"; then
+            echo "Kept /$relpath: owned by package $owner; run 'avocado ext clean {ext_name}' then 'avocado install' to restore the packaged file."
+            continue
+        fi
+        rm -f "$sysroot/$relpath"
+        echo "Removed /$relpath ($reason)"
+    done < "$overlay_list"
+fi
+{copy_section}
+# Record every file and symlink the overlay placed, so the next build can
+# remove the ones it drops. Directories are not recorded and never removed:
+# an empty directory left behind is harmless, and removing one a package owns
+# is not. The service linking below appends the links it creates.
+mkdir -p "$(dirname "$overlay_list")"
+if [ -n "$overlay_src" ]; then
+    (cd "$overlay_src" && find . \( -type f -o -type l \) | sed 's|^\./||') > "$overlay_list"
+else
+    : > "$overlay_list"
+fi
+"#,
+            ext_name = self.extension,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_sysext_build_script(
+        &self,
+        ext_version: &str,
+        ext_scopes: &[String],
+        overlay_config: Option<&OverlayConfig>,
+        modprobe_modules: &[String],
+        on_merge_commands: &[String],
+        on_unmerge_commands: &[String],
+        users_config: Option<&serde_yaml::Mapping>,
+        groups_config: Option<&serde_yaml::Mapping>,
+        reload_service_manager: bool,
+        ext_src_path: &str,
+    ) -> String {
+        let overlay_section = self.overlay_section(overlay_config, ext_src_path, None);
 
         // Create modprobe commands section for AVOCADO_ON_MERGE
         let modprobe_section = if !modprobe_modules.is_empty() {
@@ -1307,57 +1380,8 @@ fi
         reload_service_manager: bool,
         ext_src_path: &str,
     ) -> String {
-        let overlay_section = if let Some(overlay_config) = overlay_config {
-            match overlay_config.mode {
-                OverlayMode::Merge => format!(
-                    r#"
-# Merge overlay directory into extension sysroot
-if [ -d "{src_path}/{overlay_dir}" ]; then
-    echo "Merging overlay directory '{overlay_dir}' into extension sysroot with root:root ownership"
-    # cp -a preserves attrs/symlinks while merging into the existing tree;
-    # chown -R sets ownership to root:root. Avoids depending on rsync.
-    cp -a "{src_path}/{overlay_dir}/." "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
-    chown -R root:root "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
-else
-    echo "Error: Overlay directory '{overlay_dir}' not found in source"
-    exit 1
-fi
-"#,
-                    src_path = ext_src_path,
-                    overlay_dir = overlay_config.dir,
-                    ext_name = self.extension,
-                ),
-                OverlayMode::Opaque => format!(
-                    r#"
-# Copy overlay directory to extension sysroot (opaque mode)
-if [ -d "{src_path}/{overlay_dir}" ]; then
-    echo "Copying overlay directory '{overlay_dir}' to extension sysroot (opaque mode)"
-    # Use cp to replace directory contents completely while preserving permissions
-    cp -r {src_path}/{overlay_dir}/* "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
-    # Fix ownership to root:root for copied overlay files only (permissions are preserved)
-    echo "Setting ownership to root:root for overlay files"
-    find "{src_path}/{overlay_dir}" -mindepth 1 | while IFS= read -r srcpath; do
-        relpath="$(echo "$srcpath" | sed "s|^{src_path}/{overlay_dir}||" | sed "s|^/||")"
-        if [ -n "$relpath" ]; then
-            destpath="$AVOCADO_EXT_SYSROOTS/{ext_name}/$relpath"
-            if [ -e "$destpath" ]; then
-                chown root:root "$destpath" 2>/dev/null || true
-            fi
-        fi
-    done
-else
-    echo "Error: Overlay directory '{overlay_dir}' not found in source"
-    exit 1
-fi
-"#,
-                    src_path = ext_src_path,
-                    overlay_dir = overlay_config.dir,
-                    ext_name = self.extension,
-                ),
-            }
-        } else {
-            String::new()
-        };
+        let overlay_section =
+            self.overlay_section(overlay_config, ext_src_path, Some(enable_services));
 
         // Create service enabling section by parsing [Install] section and creating symlinks
         let service_linking_section = if !enable_services.is_empty() {
@@ -1367,6 +1391,7 @@ fi
                     r#"
 # Enable service file for {}
 sysroot="$AVOCADO_EXT_SYSROOTS/{}"
+overlay_list="$AVOCADO_PREFIX/.stamps/ext/{}/overlay.files"
 service="{}"
 
 # Search the same unit directories systemd does, in its precedence order, rather
@@ -1401,8 +1426,8 @@ if [ -n "$unit_file" ]; then
     # input stream, so the /^\[Install\]/,/^\[/ range would run past the
     # end of one file and match keys in the next.
     _avocado_collect_install() {{
-        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p}}' "$1" | tr ',' ' ')"
-        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p}}' "$1" | tr ',' ' ')"
+        wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p;}}' "$1" | tr ',' ' ')"
+        required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p;}}' "$1" | tr ',' ' ')"
     }}
     wanted_by=""
     required_by=""
@@ -1421,6 +1446,7 @@ if [ -n "$unit_file" ]; then
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
+        echo "etc/systemd/system/$target.wants/$service" >> "$overlay_list"
         echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
@@ -1428,6 +1454,7 @@ if [ -n "$unit_file" ]; then
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
+        echo "etc/systemd/system/$target.requires/$service" >> "$overlay_list"
         echo "Created symlink: $target_dir/$service -> $unit_target"
     done
 
@@ -1442,7 +1469,7 @@ else
     echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
     exit 1
 fi"#,
-                    service, self.extension, service
+                    service, self.extension, self.extension, service
                 ));
             }
             service_commands.join("\n")
@@ -2062,11 +2089,14 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::create_dir_all(tmp.path().join(".stamps/ext/sysroot")).unwrap();
+
         let fragment = fragment_for("qga.service");
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&fragment)
             .env("AVOCADO_EXT_SYSROOTS", tmp.path())
+            .env("AVOCADO_PREFIX", tmp.path())
             .output()
             .expect("run fragment");
 
@@ -2081,6 +2111,10 @@ mod tests {
                 .is_symlink(),
             "no .wants symlink created: {}",
             String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".stamps/ext/sysroot/overlay.files")).unwrap(),
+            "etc/systemd/system/multi-user.target.wants/qga.service\n"
         );
     }
 
@@ -2432,6 +2466,323 @@ mod tests {
         assert!(script.contains("find \"/opt/src/peridio\" -mindepth 1"));
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
         assert!(script.contains("exit 1"));
+    }
+
+    /// Run a generated build script against a tempfile sysroot. `chown` is
+    /// stubbed out, and `rpm -qf` either answers with `rpm_owner` or fails,
+    /// which is how the real one says no package owns the file.
+    fn run_overlay_script(script: &str, root: &std::path::Path, rpm_owner: Option<&str>) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let rpm = match rpm_owner {
+            Some(name) => format!("#!/bin/sh\necho {name}\n"),
+            None => "#!/bin/sh\nexit 1\n".to_string(),
+        };
+        for (name, body) in [("chown", "#!/bin/sh\nexit 0\n".to_string()), ("rpm", rpm)] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("AVOCADO_EXT_SYSROOTS", root.join("sysroots"))
+            .env("AVOCADO_PREFIX", root.join("prefix"))
+            .output()
+            .expect("run script");
+        assert!(
+            out.status.success(),
+            "script failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A sysroot, overlay and recorded list for extension `app` under `root`.
+    /// Paths are relative to the sysroot; the list is written only when given.
+    fn overlay_fixture(
+        root: &std::path::Path,
+        sysroot_files: &[&str],
+        overlay_files: &[&str],
+        recorded: Option<&[&str]>,
+    ) {
+        for rel in sysroot_files {
+            let p = root.join("sysroots/app").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        }
+        for rel in overlay_files {
+            let p = root.join("src/overlay").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        }
+        if let Some(lines) = recorded {
+            let list = root.join("prefix/.stamps/ext/app/overlay.files");
+            std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+            std::fs::write(&list, format!("{}\n", lines.join("\n"))).unwrap();
+        }
+    }
+
+    fn recorded_list(root: &std::path::Path) -> Vec<String> {
+        let mut lines: Vec<String> =
+            std::fs::read_to_string(root.join("prefix/.stamps/ext/app/overlay.files"))
+                .expect("list written")
+                .lines()
+                .map(str::to_string)
+                .collect();
+        lines.sort();
+        lines
+    }
+
+    fn confext_script_for(root: &std::path::Path, mode: OverlayMode, services: &[&str]) -> String {
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let overlay = OverlayConfig {
+            dir: "overlay".to_string(),
+            mode,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
+        };
+        let services: Vec<String> = services.iter().map(|s| s.to_string()).collect();
+        cmd.create_confext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay),
+            &services,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            &root.join("src").display().to_string(),
+        )
+    }
+
+    #[test]
+    fn a_file_dropped_from_the_overlay_is_removed_and_the_list_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"],
+            &["usr/local/bin/hello.sh", "usr/local/bin/new.sh"],
+            Some(&["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"]),
+        );
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            None,
+        );
+        let sysroot = root.join("sysroots/app");
+        assert!(!sysroot.join("usr/local/bin/stale.txt").exists());
+        assert!(sysroot.join("usr/local/bin/hello.sh").is_file());
+        assert!(sysroot.join("usr/local/bin/new.sh").is_file());
+        assert!(
+            out.contains("Removed /usr/local/bin/stale.txt (no longer in overlay 'overlay')"),
+            "{out}"
+        );
+        assert_eq!(
+            recorded_list(root),
+            vec!["usr/local/bin/hello.sh", "usr/local/bin/new.sh"]
+        );
+    }
+
+    #[test]
+    fn the_first_build_without_a_list_removes_nothing_and_writes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/stale.txt"],
+            &["usr/local/bin/hello.sh"],
+            None,
+        );
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            None,
+        );
+        assert!(root.join("sysroots/app/usr/local/bin/stale.txt").is_file());
+        assert!(!out.contains("Removed"), "{out}");
+        assert_eq!(recorded_list(root), vec!["usr/local/bin/hello.sh"]);
+    }
+
+    #[test]
+    fn unlisted_files_survive_and_an_already_absent_entry_is_skipped_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/hook-output.txt"],
+            &["usr/local/bin/hello.sh"],
+            Some(&["usr/local/bin/gone.txt"]),
+        );
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            None,
+        );
+        assert!(root
+            .join("sysroots/app/usr/local/bin/hook-output.txt")
+            .is_file());
+        assert!(!out.contains("gone.txt"), "{out}");
+        assert!(!out.contains("Removed"), "{out}");
+    }
+
+    #[test]
+    fn a_recorded_file_a_package_owns_is_kept_with_a_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/bin/tool"],
+            &["usr/local/bin/hello.sh"],
+            Some(&["usr/bin/tool"]),
+        );
+        std::fs::create_dir_all(root.join("sysroots/app/var/lib/rpm")).unwrap();
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &[]),
+            root,
+            Some("tool-pkg"),
+        );
+        assert!(root.join("sysroots/app/usr/bin/tool").is_file());
+        assert!(
+            out.contains("Kept /usr/bin/tool: owned by package tool-pkg; run 'avocado ext clean app' then 'avocado install' to restore the packaged file."),
+            "{out}"
+        );
+        assert!(!out.contains("Removed"), "{out}");
+    }
+
+    #[test]
+    fn a_service_dropped_from_enable_services_loses_its_wants_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let sysroot = root.join("sysroots/app");
+        let unit_dir = sysroot.join("usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("keep.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+        )
+        .unwrap();
+        let wants = sysroot.join("etc/systemd/system/multi-user.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        for unit in ["app.service", "keep.service"] {
+            std::os::unix::fs::symlink(format!("/usr/lib/systemd/system/{unit}"), wants.join(unit))
+                .unwrap();
+        }
+        overlay_fixture(
+            root,
+            &[],
+            &[],
+            Some(&[
+                "etc/systemd/system/multi-user.target.wants/app.service",
+                "etc/systemd/system/multi-user.target.wants/keep.service",
+            ]),
+        );
+
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["keep.service"]),
+            root,
+            None,
+        );
+        assert!(!wants.join("app.service").is_symlink());
+        assert!(wants.join("keep.service").is_symlink());
+        assert!(
+            out.contains("Removed /etc/systemd/system/multi-user.target.wants/app.service (service 'app.service' no longer enabled)"),
+            "{out}"
+        );
+        assert_eq!(
+            recorded_list(root),
+            vec![
+                "etc/systemd/system/multi-user.target.wants/keep.service",
+                "usr/local/bin/hello.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn opaque_mode_removes_what_the_overlay_dropped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"],
+            &["usr/local/bin/hello.sh", "usr/local/bin/new.sh"],
+            Some(&["usr/local/bin/stale.txt", "usr/local/bin/hello.sh"]),
+        );
+        let out = run_overlay_script(
+            &confext_script_for(root, OverlayMode::Opaque, &[]),
+            root,
+            None,
+        );
+        let sysroot = root.join("sysroots/app");
+        assert!(!sysroot.join("usr/local/bin/stale.txt").exists());
+        assert!(sysroot.join("usr/local/bin/hello.sh").is_file());
+        assert!(sysroot.join("usr/local/bin/new.sh").is_file());
+        assert!(
+            out.contains("Removed /usr/local/bin/stale.txt (no longer in overlay 'overlay')"),
+            "{out}"
+        );
+        assert_eq!(
+            recorded_list(root),
+            vec!["usr/local/bin/hello.sh", "usr/local/bin/new.sh"]
+        );
+    }
+
+    /// An extension built as both types runs the sysext script first, against
+    /// the list the confext script wrote. The sysext script links no services,
+    /// so it must leave the recorded links for the confext script to judge.
+    #[test]
+    fn the_sysext_script_leaves_recorded_service_links_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["etc/systemd/system/multi-user.target.wants/app.service"],
+            &["usr/local/bin/hello.sh"],
+            Some(&["etc/systemd/system/multi-user.target.wants/app.service"]),
+        );
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let overlay = OverlayConfig {
+            dir: "overlay".to_string(),
+            mode: OverlayMode::Merge,
+            preprocess: crate::utils::overlay_preprocess::PreprocessSpec::None,
+        };
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            Some(&overlay),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            &root.join("src").display().to_string(),
+        );
+        let out = run_overlay_script(&script, root, None);
+        assert!(root
+            .join("sysroots/app/etc/systemd/system/multi-user.target.wants/app.service")
+            .is_file());
+        assert!(!out.contains("Removed"), "{out}");
     }
 
     #[test]
