@@ -68,7 +68,9 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
     let device_tree_overlay_section = {
         let overlays =
             crate::utils::device_tree_overlay::collect_for_runtime(merged_runtime, parsed)?;
-        crate::utils::device_tree_overlay::render_build_section(&overlays)?
+        let boot_config =
+            crate::utils::device_tree_overlay::collect_boot_config(merged_runtime, parsed)?;
+        crate::utils::device_tree_overlay::render_build_section(&overlays, &boot_config)?
     };
 
     let (resolved_subvolumes, _subvol_warnings) =
@@ -862,6 +864,35 @@ extensions:
         let ota = render_both(&with, &["test-ext".to_string()]).1;
         assert!(ota.contains("device-tree overlays"));
         assert!(ota.contains("device-tree-overlay-deliver"));
+        assert!(ota.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
+    }
+
+    /// A runtime that declares only `boot_config` and stock overlays has
+    /// nothing to compile, but the BSP hook still has to run or the settings
+    /// never reach the boot medium.
+    #[test]
+    fn boot_config_without_any_overlay_source_still_reaches_the_hook() {
+        let with = BASE.to_string()
+            + r#"    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+    boot_config:
+      - dtparam=i2c_arm=on
+      - usb_max_current_enable=1
+    device_tree_overlays:
+      - name: disable-bt
+"#;
+        let ota = render_both(&with, &["test-ext".to_string()]).1;
+        assert!(ota.contains("device-tree-overlay-deliver"));
+        assert!(!ota.contains("avocado-dtc-overlay --name"));
+        assert!(ota.contains("\"dtparam=i2c_arm=on\""));
+        assert!(ota.contains("\"usb_max_current_enable=1\""));
+        assert!(ota.contains("\"stock\": true"));
         assert!(ota.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""));
     }
 

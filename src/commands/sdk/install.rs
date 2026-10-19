@@ -663,6 +663,14 @@ impl SdkInstallCommand {
                 active_extensions,
             )
             .is_empty();
+        // The SDK compile wrapper is only needed when an overlay has a source to
+        // compile; stock overlays and boot_config need the hook alone.
+        let provision_dto_compiler =
+            !crate::utils::device_tree_overlay::active_extensions_compiling_overlays(
+                &composed.merged_value,
+                active_extensions,
+            )
+            .is_empty();
         let need_target_dev =
             (config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto;
 
@@ -812,7 +820,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             config,
             &bootstrap.sdk_dependencies,
             &bootstrap.extension_sdk_dependencies,
-            provision_dto,
+            provision_dto_compiler,
             &mut sdk_pkg_lock,
             &bootstrap.all_sdk_package_names,
             &bootstrap.sdk_sysroot,
@@ -1964,7 +1972,7 @@ fi
         config: &Config,
         sdk_dependencies: &Option<HashMap<String, serde_yaml::Value>>,
         extension_sdk_dependencies: &HashMap<String, HashMap<String, serde_yaml::Value>>,
-        provision_dto: bool,
+        provision_dto_compiler: bool,
         lock_file: &mut LockFile,
         bootstrap_package_names: &[String],
         sdk_sysroot: &SysrootType,
@@ -2006,10 +2014,10 @@ fi
         }
 
         // Provision the SDK overlay build wrapper when any active
-        // extension declares device-tree overlays. Its RDEPENDS pulls
-        // nativesdk-dtc, and stone is a baseline SDK package, so neither is
-        // provisioned separately.
-        if provision_dto {
+        // extension declares a device-tree overlay with a source to compile.
+        // Its RDEPENDS pulls nativesdk-dtc, and stone is a baseline SDK
+        // package, so neither is provisioned separately.
+        if provision_dto_compiler {
             sdk_packages.push(build_package_spec_with_lock(
                 lock_file,
                 target,
