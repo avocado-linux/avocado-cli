@@ -3214,6 +3214,14 @@ pub fn generate_fit_assembly_script() -> String {
 # U-Boot, and an unsigned FIT would not boot there. Without either, the feed's
 # FIT is left alone - which also means this runtime's initramfs is not in it.
 FIT_ITS="$OUTPUT_DIR/fit-image.its"
+# kernel.cmdline_extra reaches the kernel only through a rebuilt FIT, and the
+# FIT is only rebuilt around this runtime's initramfs: with no initramfs the
+# value would be dropped without a word.
+if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -z "${AVOCADO_INITRAMFS_IMAGE:-}" ] \
+    && [ -n "${AVOCADO_KERNEL_CMDLINE_EXTRA:-}" ]; then
+    echo "ERROR: kernel.cmdline_extra is set, which on this machine travels in the boot FIT, but this runtime built no initramfs to rebuild the FIT around. Install the initramfs packages, or drop kernel.cmdline_extra." >&2
+    exit 1
+fi
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
     if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
         if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
@@ -3368,6 +3376,7 @@ mod tests {
     /// Runs the FIT assembly script against a two-configuration template with
     /// a stub `mkimage` that copies the .its to the output, so the result can
     /// be read back. Returns (exit code, stderr, assembled .its or "").
+    #[cfg(unix)]
     fn run_fit_script(env: &[(&str, &str)]) -> (i32, String, String) {
         let dir = tempfile::TempDir::new().unwrap();
         let out = dir.path().join("out");
@@ -3412,6 +3421,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn fit_carries_kernel_cmdline_extra_in_every_configuration() {
         let (rc, err, fit) = run_fit_script(&[
@@ -3430,6 +3440,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn fit_without_cmdline_extra_carries_no_property() {
         let (rc, err, fit) = run_fit_script(&[("AVOCADO_FIT_UNSIGNED", "1")]);
@@ -3437,6 +3448,7 @@ mod tests {
         assert!(!fit.contains("avocado,cmdline-extra"), "{fit}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn fit_refuses_cmdline_extra_it_cannot_carry() {
         for bad in ["a\"b", "a'b", "a\\b", "a#b", "a&b", "a\nb"] {
@@ -3449,6 +3461,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn cmdline_extra_without_a_fit_key_fails_instead_of_dropping_it() {
         let (rc, err, fit) =
@@ -3456,6 +3469,25 @@ mod tests {
         assert_eq!(rc, 1, "{err}");
         assert!(err.contains("kernel.cmdline_extra is set"), "{err}");
         assert!(fit.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmdline_extra_without_an_initramfs_fails_instead_of_dropping_it() {
+        let (rc, err, fit) = run_fit_script(&[
+            ("AVOCADO_FIT_UNSIGNED", "1"),
+            ("AVOCADO_INITRAMFS_IMAGE", ""),
+            ("AVOCADO_KERNEL_CMDLINE_EXTRA", "avocado.board_tests=1"),
+        ]);
+        assert_eq!(rc, 1, "{err}");
+        assert!(err.contains("built no initramfs"), "{err}");
+        assert!(fit.is_empty());
+        // Without the extra arguments, no initramfs still leaves the feed FIT alone.
+        let (rc, err, _) = run_fit_script(&[
+            ("AVOCADO_FIT_UNSIGNED", "1"),
+            ("AVOCADO_INITRAMFS_IMAGE", ""),
+        ]);
+        assert_eq!(rc, 0, "{err}");
     }
 
     use super::*;
