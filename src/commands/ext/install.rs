@@ -95,6 +95,38 @@ fn stamp_allows_skip(status: &StampStatus) -> bool {
 /// to date" over a sysroot that no longer holds its work, and `ext image` would
 /// then image an empty extension. Same rule as `--no-stamps`: a step that
 /// destroys an output invalidates the stamp claiming it exists.
+/// `[ -d <sysroot>/var/lib/rpm ]`: the sysroot has been seeded and dnf has a
+/// database to install into.
+///
+/// A bare directory test is not enough. `ext build` creates the directory
+/// with `mkdir -p` when it runs ahead of install, and the install stamp is
+/// per extension, not per runtime, so a directory test let a new runtime's
+/// empty tree pass the fast path as installed and ship an empty image. The
+/// rpm database is written by the seed step and by nothing else, so its
+/// presence means an install reached dnf. Same rule as the runtime install
+/// (`rpmdb_seeded_check`).
+pub(crate) fn ext_sysroot_seeded_test(extension: &str) -> String {
+    format!("[ -d \"$AVOCADO_EXT_SYSROOTS/{extension}/var/lib/rpm\" ]")
+}
+
+/// One line for a batch read: `sysroot:<ext>:::yes|no`, keyed so
+/// `parse_batch_stamps_output` returns it next to the stamps.
+pub(crate) fn sysroot_probe_line(extension: &str) -> String {
+    format!(
+        "\nprintf 'sysroot:{extension}:::%s\\n' \"$({} && echo yes || echo no)\"",
+        ext_sysroot_seeded_test(extension)
+    )
+}
+
+/// Undo the seed after a failed first transaction. The seed copies the rpm
+/// database before dnf runs; left behind, it makes an empty sysroot look
+/// installed to [`ext_sysroot_seeded_test`], and a stamp written by another
+/// runtime's install then skips the retry. Only the database goes: the
+/// directory may hold `ext build` output that is not ours to remove.
+fn drop_seeded_rpmdb_command(extension: &str) -> String {
+    format!("rm -rf \"$AVOCADO_EXT_SYSROOTS/{extension}/var/lib/rpm\"")
+}
+
 fn clean_ext_sysroot_command(extension: &str) -> String {
     format!(
         r#"rm -rf "$AVOCADO_EXT_SYSROOTS/{extension}"
@@ -637,14 +669,13 @@ impl ExtInstallCommand {
                 .filter(|(name, _)| stamp_safe(name))
                 .map(|(name, _)| StampRequirement::ext_install(name))
                 .collect();
-            // Read the stamps AND probe each sysroot's existence in the same
-            // call, so a surviving stamp over a manually-removed sysroot does
-            // not skip a needed reinstall.
+            // Read the stamps AND probe each sysroot in the same call, so a
+            // surviving stamp over a manually-removed sysroot does not skip a
+            // needed reinstall. The probe is the rpm database, not the
+            // directory: see `ext_sysroot_seeded_test`.
             let mut command = generate_batch_read_stamps_script(&reqs);
             for (name, _) in extensions_to_install.iter().filter(|(n, _)| stamp_safe(n)) {
-                command.push_str(&format!(
-                        "\nprintf 'sysroot:{name}:::%s\\n' \"$([ -d \"$AVOCADO_EXT_SYSROOTS/{name}\" ] && echo yes || echo no)\""
-                    ));
+                command.push_str(&sysroot_probe_line(name));
             }
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -1086,13 +1117,17 @@ impl ExtInstallCommand {
         // clean. On any failure the in-memory lock is dropped and the one on
         // disk still says what the sysroot actually holds.
 
-        // Does the sysroot exist? Decides whether a first pin counts as a
+        // Is the sysroot seeded? Decides whether a first pin counts as a
         // change (a cleared pin over a populated sysroot) and, further down,
-        // whether a fresh rpmdb has to be seeded.
+        // whether a fresh rpmdb has to be seeded. The test is the rpm
+        // database, not the directory: a directory that `ext build` created
+        // ahead of install has no database, and dnf against it would resolve
+        // the whole dependency closure into the extension instead of only
+        // the net-new packages.
         let run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target.to_string(),
-            command: format!("[ -d $AVOCADO_EXT_SYSROOTS/{extension} ]"),
+            command: ext_sysroot_seeded_test(extension),
             verbose: self.verbose,
             source_environment: false,
             interactive: false,
@@ -1346,7 +1381,7 @@ impl ExtInstallCommand {
                         }
 
                         // Check for extension dependency
-                        // Format: { ext: "extension-name" } or { ext: "name", config: "path" } or { ext: "name", vsn: "version" }
+                        // Format: { extensions: "extension-name" } or { extensions: "name", config: "path" } or { extensions: "name", vsn: "version" }
                         if let Some(ext_name) = spec_map.get("extensions").and_then(|v| v.as_str())
                         {
                             // Check if this is a versioned extension (has vsn field)
@@ -1499,14 +1534,61 @@ $DNF_SDK_HOST \
                     env_vars: self.runtime_env_vars(),
                     ..Default::default()
                 };
-                let install_success =
-                    run_container_command(container_helper, run_config, runs_on_context).await?;
+                // The result is read before `?` so an interrupted transaction
+                // (Ctrl-C comes back as `Err`) gets the same cleanup as a
+                // failed one.
+                let install_result =
+                    run_container_command(container_helper, run_config, runs_on_context).await;
+                let install_success = matches!(install_result, Ok(true));
 
                 if !install_success {
-                    print_error(
-                        &format!("Failed to install dependencies for extension '{extension}'."),
-                        OutputLevel::Normal,
-                    );
+                    if let Ok(false) = install_result {
+                        print_error(
+                            &format!("Failed to install dependencies for extension '{extension}'."),
+                            OutputLevel::Normal,
+                        );
+                    }
+                    // This call seeded the database; take it back so the
+                    // retry seeds and installs again instead of reading as
+                    // up to date against another runtime's stamp. A sysroot
+                    // that existed before this call keeps what it had.
+                    if !sysroot_exists {
+                        let run_config = RunConfig {
+                            container_image: container_image.to_string(),
+                            target: target.to_string(),
+                            command: drop_seeded_rpmdb_command(extension),
+                            verbose: self.verbose,
+                            source_environment: false,
+                            interactive: false,
+                            repo_url: repo_url.cloned(),
+                            feeds: feeds.cloned(),
+                            repo_release: repo_release.cloned(),
+                            container_args: merged_container_args.clone(),
+                            dnf_args: self.dnf_args.clone(),
+                            tui_context: effective_tui_context.clone(),
+                            env_vars: self.runtime_env_vars(),
+                            ..Default::default()
+                        };
+                        if !run_container_command(container_helper, run_config, runs_on_context)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            let runtime_flag = self
+                                .runtime
+                                .as_deref()
+                                .map(|rt| format!(" -r {rt}"))
+                                .unwrap_or_default();
+                            print_warning(
+                                &format!(
+                                    "Could not remove the seeded rpm database for extension \
+                                     '{extension}'; the next install may skip it. Run \
+                                     'avocado ext clean {extension}{runtime_flag}' before retrying."
+                                ),
+                                OutputLevel::Normal,
+                            );
+                        }
+                    }
+                    install_result?;
                     return Ok(false);
                 }
 
@@ -1616,6 +1698,70 @@ async fn run_container_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast path must not read a bare directory as an installed sysroot.
+    /// Run the probe under `sh`: an extension directory with no rpm database
+    /// (what `ext build` leaves behind) reports `no`, a seeded one reports
+    /// `yes`, and both land in the batch map under `sysroot:<ext>`.
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_probe_reports_yes_only_for_a_seeded_sysroot() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("bare/usr/lib/extension-release.d")).unwrap();
+        std::fs::create_dir_all(root.path().join("seeded/var/lib/rpm")).unwrap();
+        let script = format!(
+            "{}{}{}",
+            sysroot_probe_line("bare"),
+            sysroot_probe_line("seeded"),
+            sysroot_probe_line("absent")
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_EXT_SYSROOTS", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let parsed = parse_batch_stamps_output(&String::from_utf8_lossy(&out.stdout));
+        let get = |k: &str| parsed.get(k).and_then(|v| v.as_deref()).map(str::to_string);
+        assert_eq!(get("sysroot:bare").as_deref(), Some("no"));
+        assert_eq!(get("sysroot:seeded").as_deref(), Some("yes"));
+        assert_eq!(get("sysroot:absent").as_deref(), Some("no"));
+    }
+
+    /// A failed first transaction takes its seeded database with it and
+    /// nothing else: `ext build` output already in the directory stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_first_install_drops_only_the_seeded_rpmdb() {
+        let root = tempfile::tempdir().unwrap();
+        let ext = root.path().join("my-ext");
+        std::fs::create_dir_all(ext.join("var/lib/rpm")).unwrap();
+        std::fs::write(ext.join("var/lib/rpm/Packages"), b"x").unwrap();
+        std::fs::create_dir_all(ext.join("usr/lib/extension-release.d")).unwrap();
+        std::fs::write(ext.join("usr/lib/extension-release.d/release"), b"ID=_any").unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(drop_seeded_rpmdb_command("my-ext"))
+            .env("AVOCADO_EXT_SYSROOTS", root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(!ext.join("var/lib/rpm").exists());
+        assert!(ext.join("usr/lib/extension-release.d/release").exists());
+        // And the probe now says so.
+        assert!(!std::process::Command::new("sh")
+            .arg("-c")
+            .arg(ext_sysroot_seeded_test("my-ext"))
+            .env("AVOCADO_EXT_SYSROOTS", root.path())
+            .status()
+            .unwrap()
+            .success());
+    }
 
     #[test]
     fn fast_path_only_accepts_shell_safe_extension_names() {

@@ -1271,7 +1271,7 @@
                 "merge",
                 "opaque"
               ],
-              "description": "'merge' (default) copies with cp -a, preserving attributes. 'opaque' copies with cp -r, so timestamps and ownership are not preserved, and for extensions top-level dotfiles are skipped. Neither mode removes files already in the image."
+              "description": "'merge' (default) copies with cp -a, preserving attributes. 'opaque' copies with cp -r, so timestamps and ownership are not preserved, and for extensions top-level dotfiles are skipped. Both modes copy the overlay over the extension sysroot and remove the files the overlay no longer has. Files from packages or hooks are left alone."
             },
             "preprocess": {
               "description": "Run template interpolation over overlay files: true for all files, or a list of globs matched against paths relative to the overlay. Only UTF-8 files are templated. Ignored for remote extensions.",
@@ -1532,7 +1532,7 @@
         },
         "gid": {
           "type": "integer",
-          "description": "Primary group ID written to /etc/passwd. When omitted, it takes the current auto-assigned UID value (equal to the UID when that is auto-assigned too). No matching group is created."
+          "description": "Primary group ID written to /etc/passwd. When omitted, the GID of the first entry in 'groups' is used, and the build fails if that group does not exist. When 'groups' is also omitted, a group with the user's name and the UID as its GID is created. An existing user keeps its GID."
         },
         "gecos": {
           "type": "string",
@@ -1554,7 +1554,7 @@
         },
         "groups": {
           "$ref": "#/definitions/stringList",
-          "description": "Groups for the user. The first entry is skipped (by convention the user's own group; the primary GID comes from 'gid'). The user is added as a member of each remaining group, which must already exist in /etc/group.",
+          "description": "Groups for the user. The first entry is the primary group: its GID is written to /etc/passwd when 'gid' is omitted, and it must exist in /etc/group. The user is added as a member of each remaining group, which must already exist in /etc/group.",
           "examples": [
             [
               "developer",
@@ -1639,7 +1639,7 @@
         },
         "members": {
           "$ref": "#/definitions/stringList",
-          "description": "Users in the group. For a group already in the base image, applied only when its GID matches."
+          "description": "Users in the group. For a group already in the base image, the member list is replaced. If 'gid' is set and differs from the GID in the base image, the build fails."
         }
       },
       "additionalProperties": false

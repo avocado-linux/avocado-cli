@@ -128,32 +128,47 @@ cp "{src}/group" "{etc_dir}/group"
                 } else {
                     String::new()
                 };
+                let g = awk_value(groupname);
+                let m = awk_value(&members);
+                let gid_check = if gid == "$CURRENT_GID" {
+                    String::new()
+                } else {
+                    format!(
+                        r#"
+    EXISTING_GID=$(awk -F: -v g='{g}' '$1 == g {{ print $3 }}' "{etc_dir}/group")
+    if [ "$EXISTING_GID" != "{gid}" ]; then
+        echo "Group '{groupname}' exists with GID $EXISTING_GID but avocado.yaml sets {gid}. Set gid: $EXISTING_GID or drop it." >&2
+        exit 1
+    fi"#
+                    )
+                };
 
                 script_lines.push(format!(
                     r#"
 # Create group '{groupname}'{system_type}
 echo "Creating group '{groupname}'"{password_note}
-if ! grep -q "^{groupname}:" "{etc_dir}/group"; then
+if ! awk -F: -v g='{g}' '$1 == g {{ f = 1 }} END {{ exit !f }}' "{etc_dir}/group"; then
     echo "{groupname}:x:{gid}:{members}" >> "{etc_dir}/group"
     echo "Group '{groupname}' created with GID {gid}{members_msg}"
     if [ "{gid}" = "$CURRENT_GID" ]; then
         CURRENT_GID=$((CURRENT_GID + 1))
     fi
-else
+else{gid_check}
     echo "Group '{groupname}' already exists, updating members"
     if [ -n "{members}" ]; then
-        sed -i "s|^{groupname}:x:{gid}:.*$|{groupname}:x:{gid}:{members}|" "{etc_dir}/group"
+        awk -F: -v OFS=: -v g='{g}' -v m='{m}' '$1 == g {{ $4 = m }} {{ print }}' "{etc_dir}/group" > "{etc_dir}/group.tmp" && mv "{etc_dir}/group.tmp" "{etc_dir}/group"
         echo "Updated members for group '{groupname}'"
     fi
 fi{password_config}"#
                 ));
             } else {
                 // Simple group with just GID auto-assignment
+                let g = awk_value(groupname);
                 script_lines.push(format!(
                     r#"
 # Create group '{groupname}'
 echo "Creating group '{groupname}'"
-if ! grep -q "^{groupname}:" "{etc_dir}/group"; then
+if ! awk -F: -v g='{g}' '$1 == g {{ f = 1 }} END {{ exit !f }}' "{etc_dir}/group"; then
     echo "{groupname}:x:$CURRENT_GID:" >> "{etc_dir}/group"
     echo "Group '{groupname}' created with GID $CURRENT_GID"
     CURRENT_GID=$((CURRENT_GID + 1))
@@ -193,16 +208,6 @@ fi"#
                     "$CURRENT_UID".to_string()
                 };
 
-                let gid = if let Some(gid_value) = user_table.get("gid") {
-                    if let Some(gid_num) = gid_value.as_i64() {
-                        gid_num.to_string()
-                    } else {
-                        "$CURRENT_UID".to_string()
-                    }
-                } else {
-                    "$CURRENT_UID".to_string()
-                };
-
                 let gecos = user_table
                     .get("gecos")
                     .and_then(|g| g.as_str())
@@ -219,18 +224,53 @@ fi"#
                     .and_then(|s| s.as_str())
                     .unwrap_or("/bin/sh");
 
-                let groups_list = if let Some(groups_value) = user_table.get("groups") {
-                    if let Some(groups_array) = groups_value.as_sequence() {
+                let groups_list = user_table
+                    .get("groups")
+                    .and_then(|g| g.as_sequence())
+                    .map(|groups_array| {
                         groups_array
                             .iter()
                             .filter_map(|g| g.as_str())
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>()
-                    } else {
-                        vec![username.to_string()]
-                    }
+                    })
+                    .unwrap_or_default();
+
+                // The primary GID: `gid` when set, else the GID of the first
+                // entry in `groups`, else a user-private group with the UID.
+                // The lookup runs only when the user is created, so an
+                // existing user keeps its GID.
+                let u = awk_value(username);
+                let (gid, gid_lookup) = if let Some(gid_num) =
+                    user_table.get("gid").and_then(|g| g.as_i64())
+                {
+                    (gid_num.to_string(), String::new())
+                } else if let Some(primary) = groups_list.first() {
+                    let p = awk_value(primary);
+                    (
+                        "$USER_GID".to_string(),
+                        format!(
+                            r#"
+    USER_GID=$(awk -F: -v g='{p}' '$1 == g {{ print $3 }}' "{etc_dir}/group")
+    if [ -z "$USER_GID" ]; then
+        echo "User '{username}' has no gid and its first group '{primary}' is not in {etc_dir}/group. Add the group under groups: or set gid:." >&2
+        exit 1
+    fi"#
+                        ),
+                    )
                 } else {
-                    vec![username.to_string()]
+                    (
+                        "$USER_GID".to_string(),
+                        format!(
+                            r#"
+    USER_GID=$(awk -F: -v g='{u}' '$1 == g {{ print $3 }}' "{etc_dir}/group")
+    if [ -z "$USER_GID" ]; then
+        USER_GID={uid}
+        echo "{username}:x:$USER_GID:" >> "{etc_dir}/group"
+        echo "Group '{username}' created with GID $USER_GID"
+    fi"#
+                        ),
+                    )
                 };
 
                 let last_change = user_table
@@ -275,13 +315,9 @@ fi"#
                     .and_then(|s| s.as_bool())
                     .unwrap_or(false);
 
-                // We use | as sed delimiter to avoid conflicts with / in
-                // password hashes; we still need to escape the chars that
-                // are special inside a sed replacement string itself.
-                let escaped_password = password
-                    .replace("\\", "\\\\")
-                    .replace("&", "\\&")
-                    .replace("$", "\\$");
+                // The shadow entry is written with echo inside double quotes,
+                // so the shell-special chars in a password hash are escaped.
+                let escaped_password = password.replace("\\", "\\\\").replace("$", "\\$");
 
                 let system_label = if system_user { " (system user)" } else { "" };
                 let warning_message = if password.is_empty() {
@@ -300,7 +336,7 @@ fi"#
                     r#"
 # Create user '{username}'
 echo "Creating user '{username}'{system_label}"{warning_message}
-if ! grep -q "^{username}:" "{etc_dir}/passwd"; then
+if ! awk -F: -v u='{u}' '$1 == u {{ f = 1 }} END {{ exit !f }}' "{etc_dir}/passwd"; then{gid_lookup}
     echo "{username}:x:{uid}:{gid}:{gecos}:{home}:{shell}" >> "{etc_dir}/passwd"
     echo "User '{username}' created with UID {uid}, GID {gid}, home '{home}', shell '{shell}'"
 
@@ -317,8 +353,9 @@ fi"#
                     r#"
 # Set password and shadow attributes for user '{username}'
 echo "Setting password and aging policy for user '{username}'"
-if grep -q "^{username}:" "{etc_dir}/shadow"; then
-    sed -i "s|^{username}:.*$|{username}:{escaped_password}:{last_change}:{min_days}:{max_days}:{warn_days}:{inactive_days}:{expire_date}:|" "{etc_dir}/shadow"
+if awk -F: -v u='{u}' '$1 == u {{ f = 1 }} END {{ exit !f }}' "{etc_dir}/shadow"; then
+    awk -F: -v u='{u}' '$1 != u' "{etc_dir}/shadow" > "{etc_dir}/shadow.tmp" && mv "{etc_dir}/shadow.tmp" "{etc_dir}/shadow"
+    echo "{username}:{escaped_password}:{last_change}:{min_days}:{max_days}:{warn_days}:{inactive_days}:{expire_date}:" >> "{etc_dir}/shadow"
     echo "Updated shadow entry for existing user '{username}'"
 else
     echo "{username}:{escaped_password}:{last_change}:{min_days}:{max_days}:{warn_days}:{inactive_days}:{expire_date}:" >> "{etc_dir}/shadow"
@@ -334,11 +371,12 @@ fi{disabled_note}"#
                     ));
 
                     for group in &groups_list[1..] {
+                        let g = awk_value(group);
                         user_script_lines.push(format!(
                             r#"
-if grep -q "^{group}:" "{etc_dir}/group"; then
-    if ! grep "^{group}:" "{etc_dir}/group" | grep -q "{username}"; then
-        sed -i "s|^{group}:\([^:]*\):\([^:]*\):\(.*\)$|{group}:\1:\2:\3,{username}|" "{etc_dir}/group"
+if awk -F: -v g='{g}' '$1 == g {{ f = 1 }} END {{ exit !f }}' "{etc_dir}/group"; then
+    if ! awk -F: -v g='{g}' -v u='{u}' '$1 == g {{ n = split($4, m, ","); for (i = 1; i <= n; i++) if (m[i] == u) f = 1 }} END {{ exit !f }}' "{etc_dir}/group"; then
+        awk -F: -v OFS=: -v g='{g}' -v u='{u}' '$1 == g {{ $4 = ($4 == "" ? u : $4 "," u) }} {{ print }}' "{etc_dir}/group" > "{etc_dir}/group.tmp" && mv "{etc_dir}/group.tmp" "{etc_dir}/group"
         echo "Added user '{username}' to group '{group}'"
     fi
 else
@@ -370,6 +408,12 @@ echo "Set proper permissions on authentication files""#
     }
 
     script_lines.join("")
+}
+
+/// Quote a value for `awk -v name='...'`. The shell reads the single quotes
+/// and awk reads escape sequences in `-v` values, so both are escaped.
+fn awk_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "'\\''")
 }
 
 /// Convert an `Option<&BTreeMap<String, serde_yaml::Value>>` (the shape
@@ -501,5 +545,226 @@ mod tests {
         // Empty / absent maps still fold to nothing.
         assert!(mapping_from_map(None).is_none());
         assert!(mapping_from_map(Some(&std::collections::BTreeMap::new())).is_none());
+    }
+
+    #[cfg(unix)]
+    fn mapping(yaml: &str) -> Mapping {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// Seed `etc/{passwd,group,shadow}` under a temp dir and run the generated
+    /// script against it under the same shell options the image builders use.
+    /// `bash` rather than `sh`, since `sh` may be dash without `pipefail`.
+    /// `chown` is stubbed since the test does not run as root.
+    #[cfg(unix)]
+    fn run_script(
+        passwd: &str,
+        group: &str,
+        users: &str,
+        groups: Option<&str>,
+    ) -> (tempfile::TempDir, std::process::Output) {
+        run_script_with_shadow(passwd, group, "", users, groups)
+    }
+
+    #[cfg(unix)]
+    fn run_script_with_shadow(
+        passwd: &str,
+        group: &str,
+        shadow: &str,
+        users: &str,
+        groups: Option<&str>,
+    ) -> (tempfile::TempDir, std::process::Output) {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), passwd).unwrap();
+        std::fs::write(etc.join("group"), group).unwrap();
+        std::fs::write(etc.join("shadow"), shadow).unwrap();
+
+        let users = mapping(users);
+        let groups = groups.map(mapping);
+        let script = render_users_groups_script(
+            Some(&users),
+            groups.as_ref(),
+            &etc.display().to_string(),
+            None,
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -euo pipefail; chown() {{ :; }}; {script}"))
+            .output()
+            .expect("bash ran");
+        (dir, output)
+    }
+
+    #[cfg(unix)]
+    fn read(dir: &tempfile::TempDir, file: &str) -> String {
+        std::fs::read_to_string(dir.path().join("etc").join(file)).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_joins_an_empty_group_without_a_leading_comma() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\nusers:x:100:\ndialout:x:20:\n";
+        let users = "app:\n  groups: [users, dialout]\n";
+        let (dir, out) = run_script(passwd, group, users, None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = read(&dir, "group");
+        assert!(got.contains("\ndialout:x:20:app\n"), "{got}");
+        assert!(!got.contains(":,"), "{got}");
+
+        // A second run over the same files must not add the user twice.
+        let (dir, out) = run_script(&read(&dir, "passwd"), &got, users, None);
+        assert!(out.status.success());
+        assert_eq!(read(&dir, "group"), got);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_matches_a_whole_member_not_a_substring() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\nusers:x:100:\napp-admin:x:1002:appuser\nvideo:x:44:app\n";
+        let users = "app:\n  groups: [users, app-admin, video]\n";
+        let (dir, out) = run_script(passwd, group, users, None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = read(&dir, "group");
+        assert!(got.contains("\napp-admin:x:1002:appuser,app\n"), "{got}");
+        assert!(got.contains("\nvideo:x:44:app\n"), "{got}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_without_gid_takes_its_first_group_or_gets_a_private_group() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "users:x:100:\n";
+
+        // gid from groups[0].
+        let (dir, out) = run_script(passwd, group, "app:\n  groups: [users]\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "passwd").contains("\napp:x:1000:100:"));
+
+        // groups[0] missing from the target: fail and say which.
+        let (dir, out) = run_script(passwd, group, "app:\n  groups: [nosuch]\n", None);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("User 'app'") && err.contains("group 'nosuch'"),
+            "{err}"
+        );
+        assert!(!read(&dir, "passwd").contains("app:"));
+
+        // Neither gid nor groups: a user-private group with the UID.
+        let (dir, out) = run_script(passwd, group, "app:\n  password: '*'\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "passwd").contains("\napp:x:1000:1000:"));
+        assert!(read(&dir, "group").contains("\napp:x:1000:\n"));
+
+        // An existing user keeps its GID and gets no group.
+        let (dir, out) = run_script(passwd, group, "root:\n  password: ''\n", None);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(read(&dir, "passwd"), passwd);
+        assert_eq!(read(&dir, "group"), group);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_exists_with_another_gid_fails_the_build() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\ndocker:x:998:\n";
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  gid: 999\n"),
+        );
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "Group 'docker' exists with GID 998 but avocado.yaml sets 999. Set gid: 998 or drop it.\n"
+            ),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(read(&dir, "group"), group);
+
+        // The same GID, or no gid at all, proceeds and updates members.
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  gid: 998\n  members: [root]\n"),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "group").contains("\ndocker:x:998:root\n"));
+        let (dir, out) = run_script(
+            passwd,
+            group,
+            "root:\n  password: ''\n",
+            Some("docker:\n  members: [root]\n"),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(read(&dir, "group").contains("\ndocker:x:998:root\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_match_literally_not_as_patterns() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nsvc-app:x:1002:1002::/:/bin/sh\n";
+        let group = "root:x:0:\nsvc.app:x:1001:\nsvc-app:x:1002:\nops:x:50:appXsvc\n";
+        let shadow = "svc-app:*:1:0:99999:7:::\n";
+        let users = "\
+app.svc:\n  groups: [svc.app, ops]\n\
+bob:\n  groups: [svc-app, svc.app]\n\
+svc.app:\n  gid: 1001\n  password: 'h$h'\n";
+        let groups = "svc.app:\n  gid: 1001\n";
+        let (dir, out) = run_script_with_shadow(passwd, group, shadow, users, Some(groups));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = read(&dir, "group");
+        assert!(got.contains("\nsvc.app:x:1001:bob\n"), "{got}");
+        assert!(got.contains("\nsvc-app:x:1002:\n"), "{got}");
+        assert!(got.contains("\nops:x:50:appXsvc,app.svc\n"), "{got}");
+        let got = read(&dir, "passwd");
+        assert!(got.contains("\napp.svc:x:1000:1001:"), "{got}");
+        assert!(got.contains("\nbob:x:1001:1002:"), "{got}");
+        assert!(got.contains("\nsvc.app:x:1002:1001:"), "{got}");
+        assert!(got.contains("\nsvc-app:x:1002:1002::/:/bin/sh\n"), "{got}");
+        let got = read(&dir, "shadow");
+        assert!(got.contains("svc-app:*:1:0:99999:7:::\n"), "{got}");
+        assert!(got.contains("\nsvc.app:h$h:19000:"), "{got}");
+
+        assert_eq!(awk_value(r"it's a\b"), r"it'\''s a\\b");
     }
 }
