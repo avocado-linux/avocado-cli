@@ -21,7 +21,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const SCHEMA_SOURCE: &str = include_str!("../../schemas/avocado-config.json");
+/// The avocado.yaml schema, as `avocado config schema` prints it.
+pub const SCHEMA_SOURCE: &str = include_str!("../../schemas/avocado-config.json");
 
 fn schema() -> &'static Json {
     static SCHEMA: OnceLock<Json> = OnceLock::new();

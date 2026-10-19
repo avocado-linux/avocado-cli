@@ -1423,6 +1423,8 @@ enum ConfigCommands {
         #[arg(long)]
         detail: bool,
     },
+    /// Print the JSON Schema for avocado.yaml that this CLI uses.
+    Schema,
 }
 
 /// Arguments shared by `avocado login` and `avocado connect auth login`.
@@ -3385,6 +3387,10 @@ async fn main() -> Result<()> {
                     detail,
                 };
                 cmd.execute().await?;
+                Ok(())
+            }
+            ConfigCommands::Schema => {
+                print!("{}", utils::config_lint::SCHEMA_SOURCE);
                 Ok(())
             }
         },
