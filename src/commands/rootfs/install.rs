@@ -26,9 +26,9 @@ use crate::utils::overlay_preprocess::parse_overlay_config;
 /// package owns is kept with a notice. The sysroot clean removes the list
 /// along with the stamp directory. The container runs this under `bash -c`,
 /// which the NUL-delimited read relies on.
-fn build_overlay_script(overlay: Option<(&str, bool)>, sysroot_dir: &str) -> String {
+fn build_overlay_script(overlay: Option<(&str, &str, bool)>, sysroot_dir: &str) -> String {
     let (overlay_src, check, copy, record, reason) = match overlay {
-        Some((overlay_dir, opaque)) => {
+        Some((copy_dir, overlay_dir, opaque)) => {
             let (mode, cp) = if opaque {
                 // cp -r copies without preserving timestamps or ownership.
                 ("opaque", "cp -r")
@@ -37,7 +37,7 @@ fn build_overlay_script(overlay: Option<(&str, bool)>, sysroot_dir: &str) -> Str
                 ("merge", "cp -a")
             };
             (
-                format!("${{AVOCADO_SRC_DIR:-/opt/src}}/{overlay_dir}"),
+                format!("${{AVOCADO_SRC_DIR:-/opt/src}}/{copy_dir}"),
                 format!(
                     r#"if [ ! -d "$overlay_src" ]; then
     echo "Error: Overlay directory '{overlay_dir}' not found in /opt/src"
@@ -103,6 +103,58 @@ mkdir -p "$(dirname "$overlay_list")"
 mv "$overlay_list.tmp" "$overlay_list"
 "#
     )
+}
+
+/// The overlay part of a rootfs or initramfs install command. Rendered whether
+/// or not the config sets `<section>.overlay`, so the files a removed overlay
+/// placed are pruned on the next install.
+fn render_overlay_snippet(
+    parsed: Option<&serde_yaml::Value>,
+    sysroot_type: &SysrootType,
+    src_dir: &Path,
+    target: &str,
+    target_board: Option<&str>,
+    sysroot_dir: &str,
+) -> Result<String> {
+    let overlay_value = parsed.and_then(|parsed| {
+        let key = match sysroot_type {
+            SysrootType::Rootfs => "rootfs",
+            SysrootType::Initramfs => "initramfs",
+            _ => return None,
+        };
+        parsed.get(key)?.get("overlay").cloned()
+    });
+    let (Some(v), Some(parsed)) = (overlay_value, parsed) else {
+        return Ok(build_overlay_script(None, sysroot_dir));
+    };
+    let (dir, opaque) = parse_overlay_config(&v);
+    // Opt-in preprocessing: materialize an interpolated copy of the overlay on
+    // the host under `.avocado/overlay-staging/` and copy from there, so
+    // `{{ ... }}` in overlay files is substituted without mutating the working
+    // tree. Messages still name the user's overlay directory.
+    let spec = crate::utils::overlay_preprocess::PreprocessSpec::from_overlay_value(&v);
+    let copy_dir = if spec.is_enabled() {
+        let context = crate::utils::interpolation::AvocadoContext::from_main_config(
+            parsed,
+            Some(target),
+            target_board,
+        );
+        crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
+            src_dir,
+            &dir,
+            sysroot_dir,
+            &spec,
+            parsed,
+            &context,
+        )?
+        .unwrap_or_else(|| dir.clone())
+    } else {
+        dir.clone()
+    };
+    Ok(build_overlay_script(
+        Some((&copy_dir, &dir, opaque)),
+        sysroot_dir,
+    ))
 }
 
 use crate::utils::{
@@ -1123,47 +1175,14 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // Build the overlay snippet, appended to the install command so it runs in
     // the same container invocation immediately after DNF finishes. Rendered
     // even without an overlay, so files a removed overlay placed are pruned.
-    let overlay_snippet = {
-        let overlay_value = params.parsed.and_then(|parsed| {
-            let key = match params.sysroot_type {
-                SysrootType::Rootfs => "rootfs",
-                SysrootType::Initramfs => "initramfs",
-                _ => return None,
-            };
-            parsed.get(key)?.get("overlay").cloned()
-        });
-        if let (Some(v), Some(parsed)) = (overlay_value, params.parsed) {
-            let (dir, opaque) = parse_overlay_config(&v);
-            // Opt-in preprocessing: materialize an interpolated copy of the
-            // overlay on the host under `.avocado/overlay-staging/` and copy
-            // from there, so `{{ ... }}` in overlay files is substituted without
-            // mutating the working tree.
-            let spec = crate::utils::overlay_preprocess::PreprocessSpec::from_overlay_value(&v);
-            let effective_dir = if spec.is_enabled() {
-                let context = crate::utils::interpolation::AvocadoContext::from_main_config(
-                    parsed,
-                    Some(params.target),
-                    params.target_board,
-                );
-                match crate::utils::overlay_preprocess::materialize_preprocessed_overlay(
-                    params.src_dir,
-                    &dir,
-                    sysroot_dir,
-                    &spec,
-                    parsed,
-                    &context,
-                )? {
-                    Some(staging_rel_dir) => staging_rel_dir,
-                    None => dir,
-                }
-            } else {
-                dir
-            };
-            build_overlay_script(Some((&effective_dir, opaque)), sysroot_dir)
-        } else {
-            build_overlay_script(None, sysroot_dir)
-        }
-    };
+    let overlay_snippet = render_overlay_snippet(
+        params.parsed,
+        &params.sysroot_type,
+        params.src_dir,
+        params.target,
+        params.target_board,
+        sysroot_dir,
+    )?;
 
     let exclude_str = if off_kernel_excludes.is_empty() {
         String::new()
@@ -1663,7 +1682,7 @@ impl RootfsInstallCommand {
 mod tests {
     use super::{
         build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
-        incomplete_install_reason, parse_probe_output,
+        incomplete_install_reason, parse_probe_output, render_overlay_snippet,
     };
     use crate::utils::lockfile::{LockFile, SysrootType};
     use std::collections::{HashMap, HashSet};
@@ -2018,7 +2037,8 @@ mod tests {
         // Merge mode now uses `cp -a` + `chown -R` (universally available
         // POSIX tools) instead of `rsync -a --chown` — the SDK doesn't
         // always ship rsync.
-        let script = build_overlay_script(Some(("overlays/dev", false)), "initramfs");
+        let script =
+            build_overlay_script(Some(("overlays/dev", "overlays/dev", false)), "initramfs");
         assert!(
             script.contains("cp -a"),
             "merge-mode overlay script must use cp -a; got:\n{script}"
@@ -2033,7 +2053,7 @@ mod tests {
 
     #[test]
     fn overlay_script_uses_cp_r_in_opaque_mode() {
-        let script = build_overlay_script(Some(("overlays/dev", true)), "rootfs");
+        let script = build_overlay_script(Some(("overlays/dev", "overlays/dev", true)), "rootfs");
         assert!(script.contains("cp -r"));
         assert!(script.contains("(opaque mode)"));
     }
@@ -2045,7 +2065,10 @@ mod tests {
         // each combination.
         for sysroot_dir in ["rootfs", "initramfs"] {
             for opaque in [false, true] {
-                let script = build_overlay_script(Some(("overlays/dev", opaque)), sysroot_dir);
+                let script = build_overlay_script(
+                    Some(("overlays/dev", "overlays/dev", opaque)),
+                    sysroot_dir,
+                );
                 assert!(script.contains(&format!(" to {sysroot_dir} sysroot ")));
             }
         }
@@ -2159,7 +2182,7 @@ mod tests {
             Some(&["etc/motd.extra", "etc/hello.conf"]),
         );
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2181,7 +2204,7 @@ mod tests {
         let root = tmp.path();
         overlay_fixture(root, &["etc/motd.extra"], &["etc/hello.conf"], None);
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2202,7 +2225,7 @@ mod tests {
             Some(&["etc/gone.conf"]),
         );
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2224,7 +2247,7 @@ mod tests {
         );
         std::fs::create_dir_all(root.join("prefix/rootfs/var/lib/rpm")).unwrap();
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             Some("tool-pkg"),
         );
@@ -2250,7 +2273,7 @@ mod tests {
             Some(&["etc/motd.extra", "etc/hello.conf"]),
         );
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", true)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", true)), "rootfs"),
             root,
             None,
         );
@@ -2276,7 +2299,7 @@ mod tests {
         let root = tmp.path();
         overlay_fixture(root, &["etc/motd.extra"], &[], Some(&["etc/motd.extra"]));
         let out = overlay_script_output(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2296,9 +2319,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["etc/hello.conf"], Some(&["../victim"]));
+        // The sysroot must exist, so `$sysroot/../victim` resolves to the file
+        // and only the guard keeps it from being removed.
+        std::fs::create_dir_all(root.join("prefix/rootfs")).unwrap();
         std::fs::write(root.join("prefix/victim"), "victim").unwrap();
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2318,7 +2344,7 @@ mod tests {
             Some(&["/etc/stale.conf"]),
         );
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
@@ -2354,6 +2380,71 @@ mod tests {
         assert!(recorded_list(root).is_empty());
     }
 
+    /// A config without `rootfs.overlay` still renders the pruning step, so
+    /// the files an earlier overlay placed are removed once it is dropped.
+    #[test]
+    #[cfg(unix)]
+    fn an_install_without_an_overlay_still_prunes_what_the_last_one_placed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &["etc/old.conf"], &[], Some(&["./etc/old.conf"]));
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str("rootfs:\n  packages:\n    avocado-rootfs: '*'\n").unwrap();
+        let script = render_overlay_snippet(
+            Some(&parsed),
+            &SysrootType::Rootfs,
+            root,
+            "qemux86-64",
+            None,
+            "rootfs",
+        )
+        .unwrap();
+        let out = run_overlay_script(&script, root, None);
+        assert!(!root.join("prefix/rootfs/etc/old.conf").exists(), "{out}");
+        assert!(
+            out.contains("Removed /etc/old.conf (no overlay configured)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_configured_overlay_renders_its_directory() {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str("initramfs:\n  overlay: overlays/initramfs\n").unwrap();
+        let script = render_overlay_snippet(
+            Some(&parsed),
+            &SysrootType::Initramfs,
+            std::path::Path::new("."),
+            "qemux86-64",
+            None,
+            "initramfs",
+        )
+        .unwrap();
+        assert!(
+            script.contains("/opt/src}/overlays/initramfs\""),
+            "{script}"
+        );
+        assert!(
+            script.contains("Applying overlay 'overlays/initramfs'"),
+            "{script}"
+        );
+    }
+
+    /// With preprocessing the copy reads the staging directory, but every
+    /// message names the overlay directory the user configured.
+    #[test]
+    fn messages_name_the_configured_overlay_not_the_staging_copy() {
+        let script = build_overlay_script(
+            Some((".avocado/overlay-staging/rootfs", "overlays/rootfs", false)),
+            "rootfs",
+        );
+        assert!(script.contains("/opt/src}/.avocado/overlay-staging/rootfs\""));
+        assert!(script.contains("no longer in overlay 'overlays/rootfs'"));
+        assert!(script.contains("Applying overlay 'overlays/rootfs'"));
+        assert!(script.contains("Overlay directory 'overlays/rootfs' not found"));
+        assert!(!script.contains("overlay 'overlay-staging"));
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_path_with_a_newline_is_recorded_and_removed_whole() {
@@ -2366,7 +2457,7 @@ mod tests {
             Some(&["etc/old\nname"]),
         );
         let out = run_overlay_script(
-            &build_overlay_script(Some(("overlay", false)), "rootfs"),
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
             root,
             None,
         );
