@@ -592,9 +592,15 @@ impl TaskRenderer {
             }
             TaskStatus::Failed => {
                 self.emit_line(&format!("\x1b[91m[ERROR]\x1b[0m {id} failed"));
-                // Dump full output in passthrough mode too
+                // Dump the error and the full output in passthrough mode too,
+                // in the same order as the TTY summary. A task can fail before
+                // running any container (a precondition check), so full_output
+                // may be empty and the message is all there is to show.
                 let state = self.state.lock().unwrap();
                 if let Some(task) = state.iter().find(|t| &t.id == id) {
+                    if let Some(ref msg) = task.error_message {
+                        self.emit_line(&format!("    {msg}"));
+                    }
                     for line in &task.full_output {
                         self.emit_line(&format!("    {}", strip_ansi(line)));
                     }
@@ -869,6 +875,30 @@ mod tests {
         assert_eq!(task.full_output[0], "Installing packages...");
         assert_eq!(task.full_output[1], "Error: package not found");
         assert!(task.error_message.as_deref() == Some("package not found"));
+    }
+
+    /// A task that fails before it runs a container has no captured output;
+    /// its error message is the only explanation. Passthrough mode (logs, CI,
+    /// the desktop, the MCP) must print it, as the TTY summary already does.
+    #[test]
+    fn passthrough_failed_task_prints_its_error_message() {
+        let r = test_renderer();
+        let id = TaskId::ExtBuild("foo".to_string());
+        r.register_task(id.clone(), "ext build foo".to_string());
+        r.set_status(&id, TaskStatus::Running);
+        r.set_error(
+            &id,
+            "Extension 'foo' declares packages, but its sysroot has no package database."
+                .to_string(),
+        );
+        r.set_status(&id, TaskStatus::Failed);
+
+        let output = clean_output(&r);
+        let failed = output.iter().position(|l| l.ends_with("failed")).unwrap();
+        assert_eq!(
+            output[failed + 1].trim(),
+            "Extension 'foo' declares packages, but its sysroot has no package database."
+        );
     }
 
     #[test]
