@@ -2514,6 +2514,10 @@ fi"#,
             "ROOTFS_IMAGE_REUSE",
             "rootfs",
             image_reuse.rootfs,
+            &crate::commands::rootfs::image::rootfs_verity_sidecars(rootfs_verity)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         );
         let fit_section = generate_fit_assembly_script();
 
@@ -2594,6 +2598,7 @@ fi"#,
             "INITRAMFS_IMAGE_REUSE",
             "initramfs",
             image_reuse.initramfs,
+            &[],
         );
 
         let script = format!(
@@ -4303,6 +4308,50 @@ runtimes:
             );
         }
     }
+
+    /// With rootfs verity on, the rootfs reuse gate also requires the hash tree
+    /// and root hash; with it off, it does not.
+    #[test]
+    fn rootfs_reuse_gate_requires_the_verity_tree_when_verity_is_on() {
+        let temp_dir = TempDir::new().unwrap();
+        let gate_for = |content: &str| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            let s = cmd
+                .create_build_script(
+                    &config,
+                    &parsed,
+                    "x86_64",
+                    &[],
+                    SysrootImageReuse {
+                        rootfs: true,
+                        initramfs: true,
+                    },
+                )
+                .unwrap();
+            s.lines()
+                .find(|l| l.contains("if [ \"$ROOTFS_IMAGE_REUSE\" = \"1\" ]"))
+                .unwrap()
+                .to_string()
+        };
+        let base = "connect:\n  org: test\n\nruntimes:\n  test-runtime:\n    target: \"x86_64\"\n";
+        let on = gate_for(&format!("{base}\nrootfs:\n  image:\n    verity: true\n"));
+        for sc in crate::commands::rootfs::image::rootfs_verity_sidecars(true) {
+            assert!(on.contains(&format!("[ -s \"{sc}\" ]")), "{on}");
+        }
+        let off = gate_for(base);
+        assert!(!off.contains("rootfs-verity"), "{off}");
+    }
+
     /// `encrypt:` under a `target-<x>:` override is honored like every other
     /// `var:` key; the package union reads the same merged source, so the
     /// marker never ships without cryptsetup-var behind it.

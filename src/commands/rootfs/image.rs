@@ -276,24 +276,52 @@ pub fn render_exports_file(output_expr: &str, vars: &[&str]) -> String {
 /// `var` names the gate variable (`ROOTFS_IMAGE_REUSE`), bound rather than
 /// inlined so the rendered text cannot collide with other `if [ "0" = "1" ]`
 /// gates the script already carries.
+///
+/// `sidecars` are further files the section writes that downstream steps
+/// need (the rootfs dm-verity tree and root hash). Each must exist and be
+/// non-empty, or the section rebuilds: a current stamp with a deleted or
+/// half-written tree must never ship without it.
 pub fn gate_image_section(
     section: &str,
     output_expr: &str,
     var: &str,
     label: &str,
     reuse: bool,
+    sidecars: &[&str],
 ) -> String {
     let flag = if reuse { "1" } else { "0" };
+    let sidecar_checks: String = sidecars
+        .iter()
+        .map(|p| format!(" && [ -s \"{p}\" ]"))
+        .collect();
     format!(
         r#"
 {var}="{flag}"
-if [ "${var}" = "1" ] && [ -f "{output_expr}" ] && [ -f "{output_expr}.exports" ]; then
+if [ "${var}" = "1" ] && [ -f "{output_expr}" ] && [ -f "{output_expr}.exports" ]{sidecar_checks}; then
     echo "{label} image is up to date; reusing {output_expr}"
     . "{output_expr}.exports"
 else
 {section}
 fi"#
     )
+}
+
+/// Shell path of the rootfs dm-verity hash tree and root hash, without the
+/// `.verity` / `.roothash` suffix. One spelling for the section that writes
+/// them and the reuse gate that requires them.
+const ROOTFS_VERITY_BASE: &str = "$OUTPUT_DIR/rootfs-verity/avocado-image-rootfs-$TARGET_ARCH";
+
+/// Files the rootfs section must leave behind for its image to be reused:
+/// the dm-verity tree and root hash when verity is on, nothing otherwise.
+pub fn rootfs_verity_sidecars(verity: bool) -> Vec<String> {
+    if verity {
+        vec![
+            format!("{ROOTFS_VERITY_BASE}.verity"),
+            format!("{ROOTFS_VERITY_BASE}.roothash"),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Generate the shell script fragment that builds a rootfs image from the shared sysroot.
@@ -346,27 +374,29 @@ pub fn generate_rootfs_build_script(
     // root hash must reach the cmdline from inside the signed FIT - the FIT
     // assembly step in the runtime build picks AVOCADO_ROOTFS_ROOTHASH up.
     let verity_step = if verity {
-        r#"
+        format!(
+            r#"
     echo "Computing dm-verity hash tree for the rootfs..."
     rm -rf "$OUTPUT_DIR/rootfs-verity"
     mkdir -p "$OUTPUT_DIR/rootfs-verity"
-    ROOTFS_VERITY_BASE="$OUTPUT_DIR/rootfs-verity/$(basename "${ROOTFS_OUTPUT%.*}")"
+    ROOTFS_VERITY_BASE="{ROOTFS_VERITY_BASE}"
     ROOTFS_VERITY="$ROOTFS_VERITY_BASE.verity"
     ROOTFS_ROOTHASH_FILE="$ROOTFS_VERITY_BASE.roothash"
     veritysetup format \
         --salt=0000000000000000000000000000000000000000000000000000000000000000 \
         --uuid=00000000-0000-0000-0000-000000000000 \
         --root-hash-file="$ROOTFS_ROOTHASH_FILE" "$ROOTFS_OUTPUT" "$ROOTFS_VERITY" > /dev/null \
-        || { echo "ERROR: veritysetup format failed on $ROOTFS_OUTPUT" >&2; exit 1; }
+        || {{ echo "ERROR: veritysetup format failed on $ROOTFS_OUTPUT" >&2; exit 1; }}
     # This block runs without set -e in the runtime build: an empty root hash
     # here would mean no root_hash in the manifest, no avocado,roothash in the
     # FIT, and a device booting unverified with verity: true in config.
     AVOCADO_ROOTFS_ROOTHASH="$(cat "$ROOTFS_ROOTHASH_FILE" 2>/dev/null)"
-    [ -n "$AVOCADO_ROOTFS_ROOTHASH" ] || { echo "ERROR: veritysetup produced no root hash for $ROOTFS_OUTPUT" >&2; exit 1; }
+    [ -n "$AVOCADO_ROOTFS_ROOTHASH" ] || {{ echo "ERROR: veritysetup produced no root hash for $ROOTFS_OUTPUT" >&2; exit 1; }}
     export AVOCADO_ROOTFS_ROOTHASH
     export AVOCADO_ROOTFS_VERITY="$ROOTFS_VERITY"
     echo "rootfs dm-verity root hash: $AVOCADO_ROOTFS_ROOTHASH"
 "#
+        )
     } else {
         // Verity off: drop a tree from an earlier verity-on build, so stone
         // falls through to the placeholder avocado-img-bootfiles installed.
@@ -374,6 +404,7 @@ pub fn generate_rootfs_build_script(
     rm -rf "$OUTPUT_DIR/rootfs-verity"
     mkdir -p "$OUTPUT_DIR/rootfs-verity"
 "#
+        .to_string()
     };
     format!(
         r#"
@@ -900,6 +931,7 @@ mod tests {
                 "ROOTFS_IMAGE_REUSE",
                 "rootfs",
                 reuse,
+                &[],
             );
             let o = std::process::Command::new("bash")
                 .arg("-c")
@@ -924,10 +956,67 @@ mod tests {
 
         // Text shape: a bound variable, never a bare literal that could collide
         // with the script's other `if [ "0" = "1" ]` gates.
-        let s = gate_image_section("x", "/o", "ROOTFS_IMAGE_REUSE", "rootfs", true);
+        let s = gate_image_section("x", "/o", "ROOTFS_IMAGE_REUSE", "rootfs", true, &[]);
         assert!(
             s.contains("ROOTFS_IMAGE_REUSE=\"1\"")
                 && s.contains("if [ \"$ROOTFS_IMAGE_REUSE\" = \"1\" ]")
+        );
+    }
+
+    /// A current image whose required sidecar is missing, empty or only one of
+    /// two present must rebuild: a reused rootfs with verity on and no hash
+    /// tree would reach stone without its hash image.
+    #[cfg(unix)]
+    #[test]
+    fn image_gate_rebuilds_when_a_sidecar_is_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("img.erofs");
+        let tree = dir.path().join("img.verity");
+        let hash = dir.path().join("img.roothash");
+        std::fs::write(&out, "x").unwrap();
+        std::fs::write(format!("{}.exports", out.display()), "export Y=1\n").unwrap();
+        let (tree_s, hash_s) = (tree.display().to_string(), hash.display().to_string());
+        let run = || {
+            let script = gate_image_section(
+                "    echo FULL-SECTION",
+                &out.display().to_string(),
+                "ROOTFS_IMAGE_REUSE",
+                "rootfs",
+                true,
+                &[&tree_s, &hash_s],
+            );
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert!(run().contains("FULL-SECTION"), "no tree, no hash: rebuild");
+        std::fs::write(&tree, "t").unwrap();
+        assert!(run().contains("FULL-SECTION"), "tree without hash: rebuild");
+        std::fs::write(&hash, "").unwrap();
+        assert!(run().contains("FULL-SECTION"), "empty root hash: rebuild");
+        std::fs::write(&hash, "abc").unwrap();
+        assert!(!run().contains("FULL-SECTION"), "both present: reuse");
+        std::fs::remove_file(&tree).unwrap();
+        assert!(run().contains("FULL-SECTION"), "tree deleted: rebuild");
+    }
+
+    /// The gate requires exactly the files the verity step writes.
+    #[test]
+    fn rootfs_verity_sidecars_match_the_verity_step() {
+        assert!(rootfs_verity_sidecars(false).is_empty());
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", true);
+        assert!(script.contains(&format!("ROOTFS_VERITY_BASE=\"{ROOTFS_VERITY_BASE}\"")));
+        assert!(script.contains("ROOTFS_VERITY=\"$ROOTFS_VERITY_BASE.verity\""));
+        assert!(script.contains("ROOTFS_ROOTHASH_FILE=\"$ROOTFS_VERITY_BASE.roothash\""));
+        assert_eq!(
+            rootfs_verity_sidecars(true),
+            [
+                format!("{ROOTFS_VERITY_BASE}.verity"),
+                format!("{ROOTFS_VERITY_BASE}.roothash")
+            ]
         );
     }
 
