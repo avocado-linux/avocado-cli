@@ -467,6 +467,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
             mkfs.erofs \
                 -T "${{SOURCE_DATE_EPOCH:-0}}" \
                 -U 00000000-0000-0000-0000-000000000000 \
+                ${{AVOCADO_EROFS_BLOCK_SIZE:+-b "$AVOCADO_EROFS_BLOCK_SIZE"}} \
                 -x -1 \
                 --all-root \
                 -z zstd \
@@ -477,6 +478,7 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
             mkfs.erofs \
                 -T "${{SOURCE_DATE_EPOCH:-0}}" \
                 -U 00000000-0000-0000-0000-000000000000 \
+                ${{AVOCADO_EROFS_BLOCK_SIZE:+-b "$AVOCADO_EROFS_BLOCK_SIZE"}} \
                 -x -1 \
                 --all-root \
                 -z lz4hc \
@@ -964,6 +966,22 @@ mod tests {
             script.matches(r#"-T "${SOURCE_DATE_EPOCH:-0}""#).count(),
             2,
             "both mkfs.erofs branches must take their timestamp from $SOURCE_DATE_EPOCH"
+        );
+    }
+
+    /// A kernel with pages larger than 4 KiB (the Raspberry Pi 5's 16 KiB) only
+    /// reads compressed erofs inodes whose block size matches its page size on
+    /// some kernels (6.6 does not), so the target's SDK exports the size it
+    /// needs and both mkfs.erofs branches must pass it through when set.
+    #[test]
+    fn test_rootfs_image_takes_erofs_block_size_from_sdk() {
+        let script = generate_rootfs_build_script(NAMESPACE_UUID, "erofs-lz4", None, "", false);
+        assert_eq!(
+            script
+                .matches(r#"${AVOCADO_EROFS_BLOCK_SIZE:+-b "$AVOCADO_EROFS_BLOCK_SIZE"}"#)
+                .count(),
+            2,
+            "both mkfs.erofs branches must take the SDK's erofs block size"
         );
     }
 
