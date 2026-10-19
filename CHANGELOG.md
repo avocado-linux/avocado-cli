@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry
   `os_build_id`/`initramfs_build_id` once `runtime var-image` has run.
+- `avocado config schema` prints the avocado.yaml JSON Schema this CLI uses.
+  avocado-mcp reads the schema from this command. (ENG-2775)
 - `avocado connect upload --no-sbom` skips SBOM generation.
 - `avocado connect runtimes list` gains an `SBOM` column: `indexed`,
   `pending`, `failed` or `none`, and `?` against a server that does not report
