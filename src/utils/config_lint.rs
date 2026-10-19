@@ -24,7 +24,7 @@ use std::sync::{Mutex, OnceLock};
 /// The avocado.yaml schema, as `avocado config schema` prints it.
 pub const SCHEMA_SOURCE: &str = include_str!("../../schemas/avocado-config.json");
 
-fn schema() -> &'static Json {
+pub fn schema() -> &'static Json {
     static SCHEMA: OnceLock<Json> = OnceLock::new();
     SCHEMA.get_or_init(|| serde_json::from_str(SCHEMA_SOURCE).expect("embedded schema is JSON"))
 }

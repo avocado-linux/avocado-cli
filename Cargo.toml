@@ -69,6 +69,9 @@ globset = "0.4"
 tempfile = "3.0"
 regex = "1.0"
 strsim = "0.11"
+# `avocado config validate` checks configs against schemas/avocado-config.json.
+# No remote $ref resolution, so no HTTP stack.
+jsonschema = { version = "0.59", default-features = false }
 ed25519-compact = "2.2"
 rand = "0.10"
 base64 = "0.22"
