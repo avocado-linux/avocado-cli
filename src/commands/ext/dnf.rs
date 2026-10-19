@@ -370,6 +370,7 @@ impl ExtDnfCommand {
             ExtensionLocation::Remote { name, .. } => name,
         };
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
+        let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&installroot);
         let command_args_str = self.command.join(" ");
         let dnf_args_str = if let Some(args) = &self.dnf_args {
             format!(" {} ", args.join(" "))
@@ -381,7 +382,7 @@ impl ExtDnfCommand {
             r#"
 RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT={installroot} \
-PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
+{offline_env}PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR=$DNF_SDK_TARGET_PREFIX \
 $DNF_SDK_HOST \

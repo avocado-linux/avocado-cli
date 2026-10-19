@@ -354,13 +354,16 @@ fn dnf_sync_step(
     if !fresh_resolve {
         return String::new();
     }
+    let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
+        "$AVOCADO_PREFIX/{sysroot_dir}"
+    ));
     format!(
         r#"
 # No version pins for this sysroot (first install, or `avocado update` cleared
 # them): bring already-installed packages in line with the feed too.
 RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/{sysroot_dir} \
-AVOCADO_SYSROOT_SCRIPTS=1 \
+{offline_env}AVOCADO_SYSROOT_SCRIPTS=1 \
 PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
@@ -1153,6 +1156,9 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
+    let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
+        "$AVOCADO_PREFIX/{sysroot_dir}"
+    ));
     let mut command = format!(
         r#"
 # Create usrmerge symlinks before install so scriptlets (depmod, ldconfig) can
@@ -1164,7 +1170,7 @@ ln -sfn usr/lib $AVOCADO_PREFIX/{sysroot_dir}/lib
 
 RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/{sysroot_dir} \
-AVOCADO_SYSROOT_SCRIPTS=1 \
+{offline_env}AVOCADO_SYSROOT_SCRIPTS=1 \
 PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
