@@ -3604,10 +3604,10 @@ mod tests {
         assert!(script.contains("# Create and configure users"));
         assert!(script.contains("Creating user 'root'"));
         assert!(script.contains("[WARNING] User 'root' will be able to login with NO PASSWORD"));
-        assert!(script.contains("root:x:$CURRENT_UID:$CURRENT_UID:root:/home/root:/bin/sh"));
+        assert!(script.contains("root:x:$CURRENT_UID:$USER_GID:root:/home/root:/bin/sh"));
 
         assert!(script.contains("Creating user 'alice'"));
-        assert!(script.contains("alice:x:1001:$CURRENT_UID:Alice Developer:/home/alice:/bin/zsh"));
+        assert!(script.contains("alice:x:1001:$USER_GID:Alice Developer:/home/alice:/bin/zsh"));
 
         assert!(script.contains("Creating user 'bob'"));
         assert!(script.contains(
@@ -3659,7 +3659,7 @@ mod tests {
 
         // Should use all defaults
         assert!(
-            script.contains("testuser:x:$CURRENT_UID:$CURRENT_UID:testuser:/home/testuser:/bin/sh")
+            script.contains("testuser:x:$CURRENT_UID:$USER_GID:testuser:/home/testuser:/bin/sh")
         );
         assert!(script.contains("testuser:*:19000:0:99999:7:::")); // Default password "*" (no login)
     }
