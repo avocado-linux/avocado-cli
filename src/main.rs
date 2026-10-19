@@ -116,7 +116,9 @@ struct Cli {
     #[arg(long, global = true)]
     no_tui: bool,
 
-    /// On macOS/Windows, don't auto-start the avocado-vm; talk to the local docker daemon directly.
+    /// On macOS/Windows, do not route docker through the avocado-vm; talk to the local docker daemon directly.
+    /// Without this flag the CLI uses a running avocado-vm, and starts a stopped one only when
+    /// `AVOCADO_VM_DIR` is set; otherwise it warns and uses local docker.
     /// (Equivalent to `AVOCADO_VM_AUTO_START=0`.)
     #[arg(long, global = true)]
     no_vm_auto_start: bool,
@@ -4946,7 +4948,7 @@ enum KernelCommands {
 
 #[derive(Subcommand)]
 enum VmCommands {
-    /// Boot the avocado-vm (no-op if already running).
+    /// Boot the avocado-vm (fails if it is already running).
     Start {
         /// Directory containing `direct` profile output (manifest.json + artifacts).
         /// Resolution order when unset: $AVOCADO_VM_DIR → ~/.avocado/vm/install/

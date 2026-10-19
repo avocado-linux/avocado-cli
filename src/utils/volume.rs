@@ -21,6 +21,13 @@ pub struct VolumeState {
     pub container_tool: String,
 }
 
+/// What `volume rm` says about a volume that does not exist. Docker prints
+/// `get <name>: no such volume` (older daemons: `No such volume: <name>`),
+/// podman prints `no volume with name "<name>" found: no such volume`.
+fn volume_already_gone(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("no such volume")
+}
+
 impl VolumeState {
     /// Create a new volume state with a generated UUID-based name
     pub fn new(source_path: PathBuf, container_tool: String) -> Self {
@@ -307,7 +314,9 @@ impl VolumeManager {
         Ok(())
     }
 
-    /// Remove a docker volume
+    /// Remove a docker volume. A volume that is already gone counts as
+    /// removed: `.avocado-state` can outlive its volume (a VM reset, a
+    /// manual `volume rm`), and the state `clean` wants is "no volume".
     pub async fn remove_volume(&self, volume_name: &str) -> Result<()> {
         let output = AsyncCommand::new(&self.container_tool)
             .args(["volume", "rm", volume_name])
@@ -317,6 +326,9 @@ impl VolumeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if volume_already_gone(&stderr) {
+                return Ok(());
+            }
             anyhow::bail!("Failed to remove volume {volume_name}: {stderr}");
         }
 
@@ -628,5 +640,25 @@ mod tests {
         let reason =
             avo_abandonment_reason("avo-different-uuid", Some(&state.source_path)).unwrap();
         assert!(reason.contains("not this volume"));
+    }
+
+    /// `clean -f` on a project whose recorded volume is already gone must
+    /// not fail: the volume being absent is the result `rm` was asked for.
+    /// Any other `rm` failure (in use, daemon down) still stops the clean.
+    #[test]
+    fn a_missing_volume_counts_as_removed() {
+        assert!(volume_already_gone(
+            "Error response from daemon: get avo-f49a9283: no such volume\n"
+        ));
+        assert!(volume_already_gone("Error: No such volume: avo-f49a9283\n"));
+        assert!(volume_already_gone(
+            "Error: no volume with name \"avo-f49a9283\" found: no such volume\n"
+        ));
+        assert!(!volume_already_gone(
+            "Error response from daemon: remove avo-f49a9283: volume is in use\n"
+        ));
+        assert!(!volume_already_gone(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"
+        ));
     }
 }

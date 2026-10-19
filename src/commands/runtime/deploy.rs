@@ -190,6 +190,16 @@ impl RuntimeDeployCommand {
         crate::utils::container::container_failure_message(context, stderr)
     }
 
+    /// `--connect-sign` reads credentials from the saved Connect profile only,
+    /// so `AVOCADO_CONNECT_TOKEN` on its own is not enough; CI has to save a
+    /// profile with `avocado login --token`.
+    fn connect_sign_login_message() -> String {
+        "--connect-sign requires an active Connect session. Run `avocado login` first. \
+         For non-interactive use, run `avocado login --token <token>` to save a profile; \
+         AVOCADO_CONNECT_TOKEN alone is not read for signing."
+            .to_string()
+    }
+
     pub async fn execute(&self) -> Result<()> {
         let composed = match &self.composed_config {
             Some(cc) => Arc::clone(cc),
@@ -426,12 +436,8 @@ impl RuntimeDeployCommand {
 
             if self.connect_sign {
                 // Route Phase 2 through the Connect signing endpoint.
-                let connect_config = connect_client::load_config()?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--connect-sign requires an active Connect session. \
-                         Run `avocado connect auth login` first."
-                    )
-                })?;
+                let connect_config = connect_client::load_config()?
+                    .ok_or_else(|| anyhow::anyhow!(Self::connect_sign_login_message()))?;
                 let org_hint = config.connect.as_ref().and_then(|c| c.org.as_deref());
                 let (_, profile) = connect_config.resolve_profile(None, org_hint)?;
                 let org = org_hint
@@ -1186,6 +1192,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn connect_sign_login_message_names_login_and_the_token_path() {
+        let msg = RuntimeDeployCommand::connect_sign_login_message();
+        assert!(msg.contains("Run `avocado login` first."), "{msg}");
+        assert!(msg.contains("`avocado login --token <token>`"), "{msg}");
+        assert!(msg.contains("AVOCADO_CONNECT_TOKEN alone"), "{msg}");
+        assert!(!msg.contains("connect auth login"), "{msg}");
+    }
 
     /// Runs the extension-verity probe exactly as the container does: under
     /// `set -e`. The probe exits 1 for the ordinary "no extension verity" case,
