@@ -3,6 +3,8 @@
 //! This module provides functionality to track and pin package versions
 //! across different sysroots to ensure reproducible builds.
 
+use crate::commands::rootfs::install::is_explicit_version;
+use crate::utils::output::{print_info, OutputLevel};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1809,10 +1811,14 @@ impl LockFile {
         }
     }
 
-    /// Clear a specific extension's entries for a target
+    /// Clear a specific extension's entries for a target, in the global
+    /// namespace and under every runtime of that target
     pub fn clear_extension(&mut self, target: &str, extension_name: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.extensions.remove(extension_name);
+            for runtime in target_locks.runtimes.values_mut() {
+                runtime.extensions.remove(extension_name);
+            }
         }
     }
 
@@ -2107,8 +2113,33 @@ pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
     result
 }
 
+/// Whether an avocado.yaml pin names the version the lock holds.
+///
+/// The lock stores `VERSION-RELEASE.ARCH`; the pin matches when it equals
+/// `VERSION`, `VERSION-RELEASE` or the whole string. A plain prefix test is
+/// not enough: `1.2.3` is a prefix of `1.2.30-r0.x86_64` and must not match.
+/// The last dot segment is the architecture only when it has a letter in it
+/// (`x86_64`, `aarch64`, `noarch`); an all-digit segment such as the `.4` of
+/// `7.88.1-r0.4` is part of the release, so the pin `7.88.1-r0` must not
+/// match it.
+fn config_pin_matches_locked(config_version: &str, locked_version: &str) -> bool {
+    let version_end = locked_version.find('-').unwrap_or(locked_version.len());
+    let release_end = locked_version[version_end..]
+        .rfind('.')
+        .map(|i| version_end + i)
+        .filter(|&i| locked_version[i + 1..].contains(|c: char| c.is_ascii_alphabetic()))
+        .unwrap_or(locked_version.len());
+    config_version == locked_version
+        || config_version == &locked_version[..release_end]
+        || config_version == &locked_version[..version_end]
+}
+
 /// Build a package specification for DNF install, using locked version if available
 /// Returns the package spec string (e.g., "curl" or "curl-7.88.1-r0.core2_64")
+///
+/// An exact pin in avocado.yaml (no `*`, `?` or `[`) that the locked version
+/// does not match wins over the lock: the user changed the pin, and the
+/// install that follows records what dnf put down.
 pub fn build_package_spec_with_lock(
     lock_file: &LockFile,
     target: &str,
@@ -2116,16 +2147,27 @@ pub fn build_package_spec_with_lock(
     package_name: &str,
     config_version: &str,
 ) -> String {
-    // First, check if we have a locked version for this target
-    if let Some(locked_version) = lock_file.get_locked_version(target, sysroot, package_name) {
+    let exact_pin =
+        is_explicit_version(Some(config_version)) && !config_version.contains(['*', '?', '[']);
+    match lock_file.get_locked_version(target, sysroot, package_name) {
+        Some(locked_version)
+            if exact_pin && !config_pin_matches_locked(config_version, locked_version) =>
+        {
+            print_info(
+                &format!(
+                    "{package_name}: avocado.yaml pins {config_version}, avocado.lock has \
+                     {locked_version}. Using the yaml pin and re-locking."
+                ),
+                OutputLevel::Normal,
+            );
+            format!("{package_name}-{config_version}")
+        }
         // Use the full locked version (NEVRA format)
-        format!("{package_name}-{locked_version}")
-    } else if config_version == "*" {
+        Some(locked_version) => format!("{package_name}-{locked_version}"),
         // No lock and config says latest - just use package name
-        package_name.to_string()
-    } else {
+        None if config_version == "*" => package_name.to_string(),
         // No lock but config specifies a version
-        format!("{package_name}-{config_version}")
+        None => format!("{package_name}-{config_version}"),
     }
 }
 
@@ -3208,25 +3250,116 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         );
     }
 
+    /// A lock entry pins what the feed resolved last time. An exact pin in
+    /// avocado.yaml that the entry does not match is the user changing their
+    /// mind, and the lock must follow the yaml, not block it. Anything looser
+    /// than an exact pin (`*`, a glob) keeps today's rule: the lock wins.
     #[test]
-    fn test_build_package_spec_locked_overrides_config() {
+    fn an_exact_yaml_pin_wins_over_a_lock_entry_that_does_not_match_it() {
         let mut lock = LockFile::new();
         let target = "qemux86-64";
         let sdk_x86 = SysrootType::Sdk("x86_64".to_string());
-
-        // Set a locked version
         lock.set_locked_version(target, &sdk_x86, "curl", "7.88.1-r0.x86_64");
+        let spec =
+            |config: &str| build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", config);
 
-        // Even if config specifies a different version, locked version should be used
+        // The pin matches the lock at any of its three boundaries.
+        assert_eq!(spec("7.88.1"), "curl-7.88.1-r0.x86_64");
+        assert_eq!(spec("7.88.1-r0"), "curl-7.88.1-r0.x86_64");
+        assert_eq!(spec("7.88.1-r0.x86_64"), "curl-7.88.1-r0.x86_64");
+
+        // A different exact pin wins over the lock.
+        assert_eq!(spec("7.80.0"), "curl-7.80.0");
+
+        // Not an exact pin: the lock wins.
+        assert_eq!(spec("*"), "curl-7.88.1-r0.x86_64");
+        assert_eq!(spec("7.88.*"), "curl-7.88.1-r0.x86_64");
+    }
+
+    /// `1.2.3` is a prefix of `1.2.30-r0.x86_64` but not the same version.
+    #[test]
+    fn a_yaml_pin_that_is_only_a_prefix_of_the_lock_entry_does_not_match_it() {
+        let mut lock = LockFile::new();
+        let target = "qemux86-64";
+        let rootfs = SysrootType::Rootfs;
+        lock.set_locked_version(target, &rootfs, "curl", "1.2.30-r0.x86_64");
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", "7.80.0"),
-            "curl-7.88.1-r0.x86_64"
+            build_package_spec_with_lock(&lock, target, &rootfs, "curl", "1.2.3"),
+            "curl-1.2.3"
         );
 
-        // And if config says "*", locked version should still be used
+        assert!(config_pin_matches_locked("1.2.30", "1.2.30-r0.x86_64"));
+        assert!(!config_pin_matches_locked("1.2.3", "1.2.30-r0.x86_64"));
+        assert!(!config_pin_matches_locked("1.2", "1.2.30-r0.x86_64"));
+        assert!(!config_pin_matches_locked("1.2.30-r", "1.2.30-r0.x86_64"));
+        assert!(!config_pin_matches_locked(
+            "1.2.30-r0.x86",
+            "1.2.30-r0.x86_64"
+        ));
+        // A lock entry without an arch still matches on version or version-release.
+        assert!(config_pin_matches_locked("2.6.1", "2.6.1-r0"));
+        assert!(config_pin_matches_locked("2.6.1-r0", "2.6.1-r0"));
+        assert!(!config_pin_matches_locked("2.6", "2.6.1-r0"));
+        // A dotted release with no architecture: the all-digit tail is
+        // release, not arch, so the shorter pin is a different release.
+        assert!(!config_pin_matches_locked("7.88.1-r0", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked("7.88.1-r0.4", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked("7.88.1", "7.88.1-r0.4"));
+        assert!(config_pin_matches_locked(
+            "7.88.1-r0.4",
+            "7.88.1-r0.4.x86_64"
+        ));
+        assert!(!config_pin_matches_locked(
+            "7.88.1-r0",
+            "7.88.1-r0.4.x86_64"
+        ));
+        assert!(config_pin_matches_locked("1.0", "1.0-r0.noarch"));
+    }
+
+    /// With no lock entry the yaml decides, as before.
+    #[test]
+    fn without_a_lock_entry_the_yaml_version_or_bare_name_is_used() {
+        let lock = LockFile::new();
+        let rootfs = SysrootType::Rootfs;
         assert_eq!(
-            build_package_spec_with_lock(&lock, target, &sdk_x86, "curl", "*"),
-            "curl-7.88.1-r0.x86_64"
+            build_package_spec_with_lock(&lock, "qemux86-64", &rootfs, "curl", "7.80.0"),
+            "curl-7.80.0"
+        );
+        assert_eq!(
+            build_package_spec_with_lock(&lock, "qemux86-64", &rootfs, "curl", "*"),
+            "curl"
+        );
+    }
+
+    /// `avocado unlock -e <ext>` has to forget the extension wherever the
+    /// target recorded it. The runtime-scoped entry is the one an install
+    /// reads back, so leaving it behind keeps the stale pin alive.
+    #[test]
+    fn clearing_an_extension_also_drops_its_runtime_scoped_entries() {
+        let mut lock = LockFile::new();
+        let target = "icam-540";
+        let global = SysrootType::Extension("acme-nfs".to_string());
+        let scoped = SysrootType::RuntimeExtension {
+            runtime: "dev".to_string(),
+            extension: "acme-nfs".to_string(),
+        };
+        let other = SysrootType::RuntimeExtension {
+            runtime: "dev".to_string(),
+            extension: "acme-tools".to_string(),
+        };
+        lock.set_locked_version(target, &global, "nfs-utils", "2.6.1-r0.x86_64");
+        lock.set_locked_version(target, &scoped, "nfs-utils", "2.6.1-r0.x86_64");
+        lock.set_locked_version(target, &other, "jq", "1.7-r0.x86_64");
+
+        lock.clear_extension(target, "acme-nfs");
+
+        let target_locks = lock.targets.get(target).unwrap();
+        assert!(!target_locks.extensions.contains_key("acme-nfs"));
+        let dev = target_locks.runtimes.get("dev").unwrap();
+        assert!(!dev.extensions.contains_key("acme-nfs"));
+        assert_eq!(
+            lock.get_locked_version(target, &other, "jq"),
+            Some(&"1.7-r0.x86_64".to_string())
         );
     }
 
