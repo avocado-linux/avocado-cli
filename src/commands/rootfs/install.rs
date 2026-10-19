@@ -80,6 +80,12 @@ if [ -f "$overlay_list" ]; then
         # Only paths inside the sysroot are ever removed.
         case "$relpath" in /*|../*|*/../*|*/..|..) continue ;; esac
         [ -f "$sysroot/$relpath" ] || [ -L "$sysroot/$relpath" ] || continue
+        # The parent must resolve inside the sysroot, so a symlinked directory
+        # cannot lead the removal outside it. The last component is not
+        # followed, so a stale symlink is still removed.
+        sysroot_real="$(cd "$sysroot" && pwd -P)"
+        parent="$(cd "$sysroot/$(dirname "$relpath")" 2>/dev/null && pwd -P)" || continue
+        case "$parent/" in "$sysroot_real"/*) ;; *) continue ;; esac
         if [ -n "$overlay_src" ] && {{ [ -f "$overlay_src/$relpath" ] || [ -L "$overlay_src/$relpath" ]; }}; then
             continue
         fi
@@ -2443,6 +2449,35 @@ mod tests {
         assert!(script.contains("Applying overlay 'overlays/rootfs'"));
         assert!(script.contains("Overlay directory 'overlays/rootfs' not found"));
         assert!(!script.contains("overlay 'overlay-staging"));
+    }
+
+    /// A recorded path whose parent is a symlink to a directory outside the
+    /// sysroot is left alone; one whose parent links inside it is removed.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_parent_cannot_lead_the_removal_outside_the_sysroot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["opt/real/stale"],
+            &["etc/hello.conf"],
+            Some(&["opt/data/stale", "opt/link/stale"]),
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("stale"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("prefix/rootfs/opt/data")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("prefix/rootfs/opt/link")).unwrap();
+        let out = run_overlay_script(
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
+            root,
+            None,
+        );
+        assert!(outside.join("stale").is_file(), "{out}");
+        assert!(!out.contains("Removed /opt/data/stale"), "{out}");
+        assert!(!root.join("prefix/rootfs/opt/real/stale").exists(), "{out}");
+        assert!(out.contains("Removed /opt/link/stale"), "{out}");
     }
 
     #[test]
