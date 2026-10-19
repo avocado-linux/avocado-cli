@@ -1346,7 +1346,7 @@ impl ExtInstallCommand {
                         }
 
                         // Check for extension dependency
-                        // Format: { ext: "extension-name" } or { ext: "name", config: "path" } or { ext: "name", vsn: "version" }
+                        // Format: { extensions: "extension-name" } or { extensions: "name", config: "path" } or { extensions: "name", vsn: "version" }
                         if let Some(ext_name) = spec_map.get("extensions").and_then(|v| v.as_str())
                         {
                             // Check if this is a versioned extension (has vsn field)
