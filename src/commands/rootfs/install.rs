@@ -83,8 +83,14 @@ if [ -f "$overlay_list" ]; then
         # The parent must resolve inside the sysroot, so a symlinked directory
         # cannot lead the removal outside it. The last component is not
         # followed, so a stale symlink is still removed.
-        sysroot_real="$(cd "$sysroot" && pwd -P)"
-        parent="$(cd "$sysroot/$(dirname "$relpath")" 2>/dev/null && pwd -P)" || continue
+        # The parent comes from parameter expansion, not dirname, and the
+        # resolved paths keep any trailing newline: command substitution would
+        # strip it and check a different directory than the one rm reaches.
+        case "$relpath" in */*) parent_rel="${{relpath%/*}}" ;; *) parent_rel=. ;; esac
+        sysroot_real="$(cd "$sysroot" && pwd -P && printf x)" || continue
+        sysroot_real="${{sysroot_real%x}}"; sysroot_real="${{sysroot_real%$'\n'}}"
+        parent="$(cd "$sysroot/$parent_rel" 2>/dev/null && pwd -P && printf x)" || continue
+        parent="${{parent%x}}"; parent="${{parent%$'\n'}}"
         case "$parent/" in "$sysroot_real"/*) ;; *) continue ;; esac
         if [ -n "$overlay_src" ] && {{ [ -f "$overlay_src/$relpath" ] || [ -L "$overlay_src/$relpath" ]; }}; then
             continue
@@ -2478,6 +2484,33 @@ mod tests {
         assert!(!out.contains("Removed /opt/data/stale"), "{out}");
         assert!(!root.join("prefix/rootfs/opt/real/stale").exists(), "{out}");
         assert!(out.contains("Removed /opt/link/stale"), "{out}");
+    }
+
+    /// A directory name that ends in a newline is checked as itself: here
+    /// `opt/data` is inside the sysroot but `opt/data\n` links outside, and
+    /// the entry under the second must be left alone.
+    #[test]
+    #[cfg(unix)]
+    fn a_parent_ending_in_a_newline_is_checked_as_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(
+            root,
+            &["opt/data/keep"],
+            &["etc/hello.conf"],
+            Some(&["opt/data\n/stale"]),
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("stale"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("prefix/rootfs/opt/data\n")).unwrap();
+        let out = run_overlay_script(
+            &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
+            root,
+            None,
+        );
+        assert!(outside.join("stale").is_file(), "{out}");
+        assert!(!out.contains("Removed /opt/data"), "{out}");
     }
 
     #[test]
