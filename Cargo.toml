@@ -103,3 +103,6 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 serial_test = "3.0"
+# Validates configs against schemas/avocado-config.json in tests/schema_rules.rs.
+# No remote $ref resolution, so no HTTP stack.
+jsonschema = { version = "0.59", default-features = false }
