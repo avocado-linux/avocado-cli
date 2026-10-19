@@ -119,10 +119,7 @@ pub fn validate(content: &str) -> Report {
     match serde_json::to_value(checked) {
         Ok(instance) => {
             for e in validator().iter_errors(&instance) {
-                report.errors.push(ConfigError {
-                    path: e.instance_path().to_string(),
-                    message: e.to_string(),
-                });
+                report.errors.extend(schema_errors(&e));
             }
         }
         Err(e) => report.errors.push(ConfigError {
@@ -131,14 +128,14 @@ pub fn validate(content: &str) -> Report {
         }),
     }
 
-    // The loader's checks: shape inference, cross-references, and the rules
-    // the schema cannot express. It stops at the first one.
-    if let Err(e) = Config::load_from_yaml_str(content) {
-        let message = e.root_cause().to_string();
-        if !report.errors.iter().any(|r| r.message == message) {
+    // The loader's checks, for the rules the schema cannot express. It stops
+    // at its first error and gives no path, and that error mostly repeats a
+    // schema error, so it is shown only when the schema found none.
+    if report.errors.is_empty() {
+        if let Err(e) = Config::load_from_yaml_str(content) {
             report.errors.push(ConfigError {
                 path: String::new(),
-                message,
+                message: e.root_cause().to_string(),
             });
         }
     }
@@ -155,15 +152,119 @@ fn dotted(pointer: &str) -> String {
         .join(".")
 }
 
+/// One schema error as the errors to show. An `anyOf` or `oneOf` that no
+/// branch matches is shown as the errors of the branch the loader would read
+/// the value as (`branch_score`). Among equal branches it is the one that
+/// came closest: its errors go deepest into the config, then it has the
+/// fewest. The error's own message only says that no branch matched.
+fn schema_errors(e: &jsonschema::ValidationError) -> Vec<ConfigError> {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    match e.kind() {
+        Kind::AnyOf { context } | Kind::OneOfNotValid { context } => {
+            let root = config_lint::schema();
+            let branches = root
+                .pointer(e.schema_path().as_str())
+                .and_then(Json::as_array);
+            let score = |i: usize| {
+                branches
+                    .and_then(|b| b.get(i))
+                    .map_or(0, |b| branch_score(root, b, e.instance()))
+            };
+            let depth = |errors: &Vec<jsonschema::ValidationError>| {
+                errors
+                    .iter()
+                    .map(|e| e.instance_path().as_str().matches('/').count())
+                    .max()
+                    .unwrap_or(0)
+            };
+            let closest = context
+                .iter()
+                .enumerate()
+                .filter(|(_, errors)| !errors.is_empty())
+                .max_by(|(i, a), (j, b)| {
+                    score(*i)
+                        .cmp(&score(*j))
+                        .then(depth(a).cmp(&depth(b)))
+                        .then(b.len().cmp(&a.len()))
+                });
+            match closest {
+                Some((_, errors)) => errors.iter().flat_map(schema_errors).collect(),
+                None => vec![leaf_error(e)],
+            }
+        }
+        _ => vec![leaf_error(e)],
+    }
+}
+
+/// How strongly the loader reads `value` as this branch, the same shape
+/// inference as `config_lint`: a matching `const`/`enum` tag (the extension
+/// `source` type) wins, then each key the branch declares as a field (the
+/// one-block form of `rootfs`, `kernel` and friends). A map of named entries
+/// declares no fields, so it wins only when no key is a field.
+fn branch_score(root: &Json, branch: &Json, value: &Json) -> usize {
+    let branch = branch
+        .get("$ref")
+        .and_then(Json::as_str)
+        .and_then(|r| r.strip_prefix('#'))
+        .and_then(|pointer| root.pointer(pointer))
+        .unwrap_or(branch);
+    let (Some(fields), Some(map)) = (
+        branch.get("properties").and_then(Json::as_object),
+        value.as_object(),
+    ) else {
+        return 0;
+    };
+    let tagged = fields.iter().any(|(key, field)| {
+        let Some(v) = map.get(key) else { return false };
+        field.get("const") == Some(v)
+            || field
+                .get("enum")
+                .and_then(Json::as_array)
+                .is_some_and(|e| e.contains(v))
+    });
+    let declared = map.keys().filter(|k| fields.contains_key(*k)).count();
+    if tagged {
+        1000 + declared
+    } else {
+        declared
+    }
+}
+
+fn leaf_error(e: &jsonschema::ValidationError) -> ConfigError {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let message = match e.kind() {
+        // The schema uses `false` for keys that exclude each other, such as
+        // kernel `cmdline` and `cmdline_extra`.
+        Kind::FalseSchema => "must not be set together with another key in this block".to_string(),
+        // Only the one-block form keeps `additionalProperties: false`
+        // (`keep_singleton_keys`).
+        Kind::AdditionalProperties { unexpected } => format!(
+            "is one block, because it sets a field, so {} cannot be named entries. Use one form",
+            unexpected
+                .iter()
+                .map(|k| format!("'{k}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => e.to_string(),
+    };
+    ConfigError {
+        path: e.instance_path().to_string(),
+        message,
+    }
+}
+
 /// The schema validator. `additionalProperties: false` is removed, because
 /// the CLI ignores an unknown key and warns about it (`config_lint`); it is
-/// not an error. Where an unknown key picks between one block and named
-/// entries, the loader reports the mix.
+/// not an error. The one exception is where the rule picks the branch
+/// (`keep_singleton_keys`).
 fn validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     VALIDATOR.get_or_init(|| {
-        let mut schema = config_lint::schema().clone();
+        let original = config_lint::schema();
+        let mut schema = original.clone();
         relax(&mut schema);
+        keep_singleton_keys(original, &mut schema);
         jsonschema::validator_for(&schema).expect("embedded schema compiles")
     })
 }
@@ -178,6 +279,82 @@ fn relax(node: &mut Json) {
         }
         Json::Array(items) => items.iter_mut().for_each(relax),
         _ => {}
+    }
+}
+
+/// Put the unknown-key rule back where it picks the branch. `rootfs`,
+/// `initramfs`, `kernel` and `permissions` take one block or a map of named
+/// blocks. The loader reads the mapping as one block when a key is a field of
+/// that block, and then every other key is an error, except `target-<name>`
+/// and `kernel-<spec>` overrides (`named_or_single_deserializer`). Without the
+/// rule, the one-block branch accepts any mapping, so named entries are never
+/// checked.
+///
+/// Only the branch site gets the rule. The named entries themselves stay
+/// relaxed, so their unknown keys are `config_lint` warnings.
+fn keep_singleton_keys(original: &Json, node: &mut Json) {
+    match node {
+        Json::Array(items) => items
+            .iter_mut()
+            .for_each(|n| keep_singleton_keys(original, n)),
+        Json::Object(map) => {
+            map.values_mut()
+                .for_each(|n| keep_singleton_keys(original, n));
+            let key = if map.contains_key("anyOf") {
+                "anyOf"
+            } else {
+                "oneOf"
+            };
+            if let Some(Json::Array(branches)) = map.get_mut(key) {
+                set_singleton_rule(original, branches);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_singleton_rule(original: &Json, branches: &mut [Json]) {
+    let resolve = |node: &Json| -> Json {
+        let target = node
+            .get("$ref")
+            .and_then(Json::as_str)
+            .and_then(|r| r.strip_prefix('#'))
+            .and_then(|pointer| original.pointer(pointer));
+        target.unwrap_or(node).clone()
+    };
+    // The named-entry form: a map with no fields of its own.
+    let named = branches.iter().any(|b| {
+        let b = resolve(b);
+        b.get("properties").is_none() && b.get("additionalProperties").is_some_and(Json::is_object)
+    });
+    if !named {
+        return;
+    }
+    for branch in branches.iter_mut() {
+        let single = resolve(branch);
+        let Some(fields) = single.get("properties").and_then(Json::as_object) else {
+            continue;
+        };
+        if single.get("additionalProperties") != Some(&Json::Bool(false)) {
+            continue;
+        }
+        let Json::Object(b) = branch else { continue };
+        let mut properties: serde_json::Map<String, Json> = fields
+            .keys()
+            .map(|k| (k.clone(), Json::Bool(true)))
+            .collect();
+        if let Some(Json::Object(own)) = b.get("properties") {
+            properties.extend(own.clone());
+        }
+        let mut patterns = serde_json::Map::new();
+        patterns.insert("^(target|kernel)-".to_string(), Json::Bool(true));
+        if let Some(Json::Object(own)) = b.get("patternProperties") {
+            patterns.extend(own.clone());
+        }
+        b.insert("type".to_string(), json!("object"));
+        b.insert("properties".to_string(), Json::Object(properties));
+        b.insert("patternProperties".to_string(), Json::Object(patterns));
+        b.insert("additionalProperties".to_string(), Json::Bool(false));
     }
 }
 
@@ -236,19 +413,94 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_block_is_the_loader_error() {
+    fn a_mixed_block_is_one_error_on_the_block() {
         let errs = errors("kernel: {cmdline: a, other: {cmdline: b}}\n");
-        assert!(
-            errs.iter().any(|e| e.contains("cannot mix singleton form")),
-            "{errs:?}"
+        assert_eq!(
+            errs,
+            ["/kernel is one block, because it sets a field, so 'other' cannot be named entries. Use one form"]
         );
     }
 
     #[test]
-    fn a_template_is_checked_after_interpolation() {
+    fn exclusive_keys_are_errors_on_both_keys() {
+        let errs = errors("kernel: {cmdline: a, cmdline_extra: b}\n");
+        assert_eq!(
+            errs,
+            [
+                "/kernel/cmdline_extra must not be set together with another key in this block",
+                "/kernel/cmdline must not be set together with another key in this block",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_only_the_loader_knows_is_reported() {
+        // The loader rejects a recovery key without an encrypted /var. Once
+        // the schema encodes it too, the schema error is reported instead.
         let report = validate(
-            "default_target: qemux86-64\nhw: tpm2\nruntimes:\n  dev:\n    var:\n      encrypt: true\n      hardware: \"{{ config.hw }}\"\n",
+            "default_target: qemux86-64\nruntimes:\n  dev:\n    var: {recovery: master}\n",
+        );
+        assert!(!report.errors.is_empty());
+    }
+
+    // The cases below came from avocado-mcp's validate-yaml tests, which
+    // moved here when the MCP started to call `config validate`.
+
+    const BASE: &str =
+        "distro: {release: 2024, channel: edge}\nruntimes:\n  dev:\n    extensions: [app]\n";
+
+    #[test]
+    fn valid_configs_have_no_errors_or_warnings() {
+        for (name, yaml) in [
+            ("git source", format!("{BASE}extensions:\n  app:\n    source: {{type: git, url: https://x/y.git, ref: main}}\n")),
+            ("path source", format!("{BASE}extensions:\n  app:\n    source: {{type: path, path: ../app}}\n")),
+            ("version from a file", format!("{BASE}extensions:\n  app:\n    types: [sysext]\n    version: {{file: Cargo.toml, key: package.version, format: toml}}\n")),
+            ("runtime extension in object form", "distro: {release: 2024, channel: edge}\nruntimes:\n  dev:\n    extensions:\n      - app: {enabled: false}\n".to_string()),
+            ("distro.repo as a repos: name", "distro: {release: 2024, channel: edge, repo: mirror, feeds: [acme]}\nrepos:\n  mirror: {url: https://m}\n  acme: {org: acme}\nruntimes: {dev: {extensions: [a]}}\n".to_string()),
+            ("extension-only config", "supported_targets: '*'\nextensions:\n  foo: {types: [sysext], version: \"1.0.0\"}\n".to_string()),
+            ("target overrides in a one-block rootfs", "rootfs:\n  packages: {}\n  target-raspberrypi4: { image: { type: kab } }\n".to_string()),
+        ] {
+            let report = validate(&yaml);
+            assert!(report.errors.is_empty(), "{name}: {:?}", report.errors);
+            assert!(report.warnings.is_empty(), "{name}: {:?}", report.warnings);
+        }
+    }
+
+    #[test]
+    fn schema_errors_point_at_the_key() {
+        for (yaml, path) in [
+            ("kernel: {cmdline: a, cmdline_extra: b}\n", "/kernel/cmdline_extra"),
+            (
+                "runtimes:\n  dev:\n    extensions: [a]\n    var: {encrypt: true, hardware: bogus}\n",
+                "/runtimes/dev/var/hardware",
+            ),
+            // A bad named entry must not pass as an unknown key of the
+            // one-block form.
+            ("permissions:\n  dev:\n    users: [root]\n", "/permissions/dev/users"),
+            ("rootfs:\n  prod:\n    permissions: 123\n", "/rootfs/prod/permissions"),
+            ("kernel:\n  lts:\n    cmdline: 5\n", "/kernel/lts/cmdline"),
+        ] {
+            let report = validate(yaml);
+            assert!(
+                report.errors.iter().any(|e| e.path == path),
+                "{path}: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_named_entry_is_a_warning() {
+        let report = validate(
+            "permissions:\n  dev:\n    users: { root: {} }\n    colour: blue\nkernel:\n  lts: { package: k, colour: blue }\n",
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.warnings,
+            [
+                "unknown key 'permissions.dev.colour' is ignored",
+                "unknown key 'kernel.lts.colour' is ignored",
+            ]
+        );
     }
 }
