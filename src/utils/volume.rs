@@ -52,12 +52,13 @@ impl VolumeState {
         Ok(Some(state))
     }
 
-    /// Load the volume state the container layer keys on.
+    /// Load the volume state from the process working directory.
     ///
-    /// `get_or_create_volume` writes `.avocado-state` in the process working
-    /// directory (`SdkContainer::cwd`), not in `src_dir`. Readers that looked in
-    /// `src_dir` found nothing whenever the two differed, so every reader of
-    /// the state file goes through this one key.
+    /// `SdkContainer` keys the volume on its `cwd`, so install, build and the
+    /// stamps code find `.avocado-state` in the working directory, not in
+    /// `src_dir`. Not every reader agrees: runtime provision keys its state
+    /// file copy on `src_dir`, and `profiles`, `save` and `load` read from the
+    /// config file's directory.
     pub fn load_from_current_dir() -> Result<Option<Self>> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self::load_from_dir(&cwd)
