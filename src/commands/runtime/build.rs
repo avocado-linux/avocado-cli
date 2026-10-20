@@ -3199,7 +3199,9 @@ async fn run_container_command_capture(
 /// is verity-protected the root hash is added to every configuration node as
 /// `avocado,roothash`, which the U-Boot env reads back after the FIT has been
 /// verified and folds into the kernel cmdline - so the hash is covered by the
-/// FIT signature. Signed with the project's key when AVOCADO_FIT_KEY_DIR is
+/// FIT signature. `kernel.cmdline_extra` travels the same way, as
+/// `avocado,cmdline-extra`, which the U-Boot env appends to bootargs: on a FIT
+/// machine that is the only route the project's kernel arguments have. Signed with the project's key when AVOCADO_FIT_KEY_DIR is
 /// set; otherwise the signature nodes are dropped and the FIT is unsigned.
 /// No-op on machines without a FIT template.
 pub fn generate_fit_assembly_script() -> String {
@@ -3212,10 +3214,22 @@ pub fn generate_fit_assembly_script() -> String {
 # U-Boot, and an unsigned FIT would not boot there. Without either, the feed's
 # FIT is left alone - which also means this runtime's initramfs is not in it.
 FIT_ITS="$OUTPUT_DIR/fit-image.its"
+# kernel.cmdline_extra reaches the kernel only through a rebuilt FIT, and the
+# FIT is only rebuilt around this runtime's initramfs: with no initramfs the
+# value would be dropped without a word.
+if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -z "${AVOCADO_INITRAMFS_IMAGE:-}" ] \
+    && [ -n "${AVOCADO_KERNEL_CMDLINE_EXTRA:-}" ]; then
+    echo "ERROR: kernel.cmdline_extra is set, which on this machine travels in the boot FIT, but this runtime built no initramfs to rebuild the FIT around. Install the initramfs packages, or drop kernel.cmdline_extra." >&2
+    exit 1
+fi
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
     if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
         if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
             echo "ERROR: rootfs.image.verity is on, which needs the boot FIT rebuilt with the root hash, but no FIT signing key is configured. Set runtimes.<name>.signing.fit_key to an RSA key in the signing-key registry, or signing.fit_unsigned: true if this machine's U-Boot enforces no key." >&2
+            exit 1
+        fi
+        if [ -n "${AVOCADO_KERNEL_CMDLINE_EXTRA:-}" ]; then
+            echo "ERROR: kernel.cmdline_extra is set, which on this machine travels in the boot FIT, but no FIT signing key is configured. Set runtimes.<name>.signing.fit_key to an RSA key in the signing-key registry, or signing.fit_unsigned: true if this machine's U-Boot enforces no key." >&2
             exit 1
         fi
         echo "WARNING: boot FIT not rebuilt (no signing.fit_key, signing.fit_unsigned not set): the feed's fitImage, with the feed's initramfs, will be used." >&2
@@ -3233,6 +3247,22 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRA
             sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\";#" "$FIT_WORK_ITS"
             grep -qF "avocado,roothash = \"$AVOCADO_ROOTFS_ROOTHASH\"" "$FIT_WORK_ITS" \
                 || { echo "ERROR: no conf-* configuration node in $FIT_ITS to carry the rootfs root hash" >&2; exit 1; }
+        fi
+        if [ -n "${AVOCADO_KERNEL_CMDLINE_EXTRA:-}" ]; then
+            # kernel.cmdline_extra: carried like the root hash, so the FIT
+            # signature covers it, and appended to bootargs by the U-Boot env
+            # (avocado,cmdline-extra). Refuse what a DTS string or this sed
+            # replacement cannot hold, and a single quote, which U-Boot's hush
+            # treats as a quote when it reparses the env's setenv line, rather
+            # than write a different line.
+            if printf '%s' "$AVOCADO_KERNEL_CMDLINE_EXTRA" | grep -q -e '["\\#&]' -e "'" \
+                || [ "$(printf '%s' "$AVOCADO_KERNEL_CMDLINE_EXTRA" | wc -l)" -ne 0 ]; then
+                echo "ERROR: kernel.cmdline_extra holds a character the boot FIT cannot carry (a double or single quote, backslash, '#', '&' or newline)" >&2
+                exit 1
+            fi
+            sed -i -E "s#^([[:space:]]*conf-[^[:space:]]+ \{)\$#\1\n\t\t\tavocado,cmdline-extra = \"$AVOCADO_KERNEL_CMDLINE_EXTRA\";#" "$FIT_WORK_ITS"
+            grep -qF "avocado,cmdline-extra = \"$AVOCADO_KERNEL_CMDLINE_EXTRA\"" "$FIT_WORK_ITS" \
+                || { echo "ERROR: no conf-* configuration node in $FIT_ITS to carry kernel.cmdline_extra" >&2; exit 1; }
         fi
         FIT_SIGN_ARGS=""
         if [ -n "${AVOCADO_FIT_KEY_DIR:-}" ]; then
@@ -3341,6 +3371,123 @@ mod tests {
             s.contains("signature-[0-9]+"),
             "unsigned path must strip signature nodes"
         );
+    }
+
+    /// Runs the FIT assembly script against a two-configuration template with
+    /// a stub `mkimage` that copies the .its to the output, so the result can
+    /// be read back. Returns (exit code, stderr, assembled .its or "").
+    #[cfg(unix)]
+    fn run_fit_script(env: &[(&str, &str)]) -> (i32, String, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("out");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            out.join("fit-image.its"),
+            "/dts-v1/;\n/ {\n\timages {\n\t\tramdisk-1 { data = /incbin/(\"/build/initramfs-image.cpio\"); };\n\t};\n\tconfigurations {\n\t\tdefault = \"conf-1\";\n\t\tconf-1 {\n\t\t\tkernel = \"kernel-1\";\n\t\t};\n\t\tconf-2 {\n\t\t\tkernel = \"kernel-1\";\n\t\t};\n\t};\n};\n",
+        )
+        .unwrap();
+        std::fs::write(out.join("linux.bin"), "k").unwrap();
+        let mkimage = bin.join("mkimage");
+        std::fs::write(
+            &mkimage,
+            "#!/bin/sh\n[ \"$1\" = -f ] || exit 0\nits=$2; for a; do last=$a; done; cp \"$its\" \"$last\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mkimage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(super::generate_fit_assembly_script())
+            .env_clear()
+            .env("PATH", path)
+            .env("OUTPUT_DIR", &out)
+            .env("AVOCADO_INITRAMFS_IMAGE", "/project/initramfs.cpio");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let o = cmd.output().unwrap();
+        let fit = std::fs::read_to_string(out.join("fitImage")).unwrap_or_default();
+        (
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+            fit,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fit_carries_kernel_cmdline_extra_in_every_configuration() {
+        let (rc, err, fit) = run_fit_script(&[
+            ("AVOCADO_FIT_UNSIGNED", "1"),
+            (
+                "AVOCADO_KERNEL_CMDLINE_EXTRA",
+                "avocado.board_tests=1 quiet",
+            ),
+        ]);
+        assert_eq!(rc, 0, "{err}");
+        assert_eq!(
+            fit.matches("avocado,cmdline-extra = \"avocado.board_tests=1 quiet\";")
+                .count(),
+            2,
+            "{fit}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fit_without_cmdline_extra_carries_no_property() {
+        let (rc, err, fit) = run_fit_script(&[("AVOCADO_FIT_UNSIGNED", "1")]);
+        assert_eq!(rc, 0, "{err}");
+        assert!(!fit.contains("avocado,cmdline-extra"), "{fit}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fit_refuses_cmdline_extra_it_cannot_carry() {
+        for bad in ["a\"b", "a'b", "a\\b", "a#b", "a&b", "a\nb"] {
+            let (rc, err, _) = run_fit_script(&[
+                ("AVOCADO_FIT_UNSIGNED", "1"),
+                ("AVOCADO_KERNEL_CMDLINE_EXTRA", bad),
+            ]);
+            assert_ne!(rc, 0, "accepted {bad:?}");
+            assert!(err.contains("cannot carry"), "{bad:?}: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmdline_extra_without_a_fit_key_fails_instead_of_dropping_it() {
+        let (rc, err, fit) =
+            run_fit_script(&[("AVOCADO_KERNEL_CMDLINE_EXTRA", "avocado.board_tests=1")]);
+        assert_eq!(rc, 1, "{err}");
+        assert!(err.contains("kernel.cmdline_extra is set"), "{err}");
+        assert!(fit.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmdline_extra_without_an_initramfs_fails_instead_of_dropping_it() {
+        let (rc, err, fit) = run_fit_script(&[
+            ("AVOCADO_FIT_UNSIGNED", "1"),
+            ("AVOCADO_INITRAMFS_IMAGE", ""),
+            ("AVOCADO_KERNEL_CMDLINE_EXTRA", "avocado.board_tests=1"),
+        ]);
+        assert_eq!(rc, 1, "{err}");
+        assert!(err.contains("built no initramfs"), "{err}");
+        assert!(fit.is_empty());
+        // Without the extra arguments, no initramfs still leaves the feed FIT alone.
+        let (rc, err, _) = run_fit_script(&[
+            ("AVOCADO_FIT_UNSIGNED", "1"),
+            ("AVOCADO_INITRAMFS_IMAGE", ""),
+        ]);
+        assert_eq!(rc, 0, "{err}");
     }
 
     use super::*;
