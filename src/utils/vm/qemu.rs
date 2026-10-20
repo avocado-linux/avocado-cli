@@ -361,7 +361,8 @@ fn ensure_idle_states_dtb(paths: &VmPaths, cfg: &QemuConfig) -> Result<PathBuf> 
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create {}", cache_dir.display()))?;
     let cache_path = cache_dir.join(format!(
-        "virt-smp{}-m{}-q{}.dtb",
+        // `idle3`: bump when patch_idle_states changes, so cached DTBs rebuild.
+        "virt-smp{}-m{}-q{}-idle3.dtb",
         cfg.cpus, cfg.memory_mib, qemu_tag
     ));
     if cache_path.is_file() {

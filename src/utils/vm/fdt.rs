@@ -362,12 +362,10 @@ fn strprop(s: &str) -> Vec<u8> {
 /// Splice a single PSCI idle-state node into the root and add
 /// `cpu-idle-states = <phandle>` to each `/cpus/cpu@N` for N in 0..smp.
 ///
-/// Latency values are intentionally conservative. With aggressive thresholds
-/// (entry=10, exit=20, min-residency=100) the kernel falls into a polling
-/// code path for sub-100us idles and host CPU goes *up*, not down.
-/// entry=100/exit=250/min-residency=1000 keeps cpuidle going through plain
-/// WFI which HVF blocks cleanly on `pthread_cond_timedwait`. Confirmed
-/// empirically: 670% → 275% on smp=8 idle.
+/// The state is never entered (see below), so cpuidle always goes through
+/// plain WFI, which HVF blocks cleanly on `pthread_cond_timedwait`. Host CPU
+/// at guest idle: no cpuidle driver 670% (smp=8); the earlier powerdown
+/// state 130 to 390% (smp=6); this one 1 to 2% (smp=6).
 ///
 /// Returns the phandle assigned to the new state node, for diagnostics.
 pub fn patch_idle_states(fdt: &mut Fdt, smp: u32) -> Result<u32> {
@@ -379,13 +377,21 @@ pub fn patch_idle_states(fdt: &mut Fdt, smp: u32) -> Result<u32> {
     let mut sleep = Node::new("cpu-sleep-0");
     sleep.set_prop("compatible", strprop("arm,idle-state"));
     sleep.set_prop("idle-state-name", strprop("cpu-sleep"));
-    // PSCI v0.2+ power_state encoding for a CPU-level powerdown:
-    // bit 16 = StateType (1 = powerdown), bits 31:24 = AffinityLevel (0 = CPU).
-    sleep.set_prop("arm,psci-suspend-param", be32(0x0001_0000));
+    // This state exists only so the PSCI cpuidle driver binds (it needs at
+    // least one DT state); the governor must never pick it, so idle stays
+    // on state0 (WFI), which HVF blocks on cleanly.
+    //
+    // PSCI v0.2+ power_state for a CPU-level standby (StateType bit 16 = 0).
+    // A powerdown state (0x0001_0000) with local-timer-stop made the kernel
+    // treat every HVF return as a failed suspend: each idle entry paid a
+    // context save and a timer broadcast handoff, and the cpuidle `rejected`
+    // count grew by millions. That slowed every syscall and 9p round trip in
+    // the guest about 10x. A standby state that is entered still costs about
+    // 100% host CPU at idle, hence the unreachable min-residency below.
+    sleep.set_prop("arm,psci-suspend-param", be32(0x0000_0000));
     sleep.set_prop("entry-latency-us", be32(100));
     sleep.set_prop("exit-latency-us", be32(250));
-    sleep.set_prop("min-residency-us", be32(1000));
-    sleep.set_prop("local-timer-stop", Vec::new());
+    sleep.set_prop("min-residency-us", be32(u32::MAX));
     sleep.set_prop("phandle", be32(phandle));
     idle_states.children.push(sleep);
     fdt.root.children.push(idle_states);
@@ -463,6 +469,17 @@ mod tests {
             .find(|c| c.name == "idle-states")
             .expect("idle-states node missing");
         assert_eq!(idle.children[0].name, "cpu-sleep-0");
+
+        // Standby, never entered: a powerdown param or local-timer-stop makes
+        // the guest treat each HVF return as a failed suspend.
+        let sleep = &idle.children[0];
+        let u32_prop = |name: &str| {
+            let p = sleep.props.iter().find(|p| p.name == name).unwrap();
+            u32::from_be_bytes(p.value.as_slice().try_into().unwrap())
+        };
+        assert_eq!(u32_prop("arm,psci-suspend-param"), 0);
+        assert_eq!(u32_prop("min-residency-us"), u32::MAX);
+        assert!(!sleep.props.iter().any(|p| p.name == "local-timer-stop"));
 
         let cpus = fdt.root.children.iter().find(|c| c.name == "cpus").unwrap();
         for cpu in &cpus.children {
