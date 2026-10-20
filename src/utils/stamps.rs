@@ -108,6 +108,14 @@ impl fmt::Display for StampComponent {
     }
 }
 
+/// Version of the environment target-package scriptlets run in (see
+/// `offline_scriptlet_env`). Bump it whenever that environment changes what a
+/// scriptlet writes: it is folded into the install input hashes, recorded in
+/// install stamps, and written next to the SDK's scriptlet wrappers, so a
+/// sysroot or SDK set up under an older contract is reinstalled or refused
+/// instead of trusted.
+pub const SCRIPTLET_CONTRACT: &str = "offline-root-1";
+
 /// Input hashes that determine if a stamp is stale
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StampInputs {
@@ -172,6 +180,12 @@ pub struct StampOutputs {
     /// options could have fooled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nonstandard_options: bool,
+    /// The [`SCRIPTLET_CONTRACT`] a sysroot install ran its packages'
+    /// scriptlets under. A later install that finds an older (or no) contract
+    /// on the previous stamp wipes the sysroot first: dnf does not rerun the
+    /// scriptlets of packages that are already installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scriptlet_contract: Option<String>,
 }
 
 /// A stamp representing successful completion of a command
@@ -1534,6 +1548,10 @@ pub fn compute_ext_install_input_hash_with_deps(
     resolved_kernel: Option<&str>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
+    hash_data.insert(
+        serde_yaml::Value::String("scriptlet_contract".to_string()),
+        serde_yaml::Value::String(SCRIPTLET_CONTRACT.to_string()),
+    );
 
     if !dep_state.is_empty() {
         // Sorted so the hash does not depend on map iteration order.
@@ -2383,6 +2401,10 @@ fn compute_sysroot_install_input_hash(
     resolved: &SysrootStampInputs<'_>,
 ) -> Result<StampInputs> {
     let mut hash_data = serde_yaml::Mapping::new();
+    hash_data.insert(
+        serde_yaml::Value::String("scriptlet_contract".to_string()),
+        serde_yaml::Value::String(SCRIPTLET_CONTRACT.to_string()),
+    );
 
     // The effective set, not the raw `<section>.packages` node — an absent
     // section and one that names the default meta-package install the same
@@ -3531,6 +3553,24 @@ mod tests {
         let req = StampRequirement::runtime_build("my-runtime");
         assert_eq!(req.description(), "runtime 'my-runtime' build");
         assert_eq!(req.fix_command(), "avocado runtime build my-runtime");
+    }
+
+    /// Stamps written before the contract existed still parse, with no
+    /// contract recorded, which is what marks their sysroot for a rebuild.
+    #[test]
+    fn stamps_without_a_scriptlet_contract_still_parse() {
+        let mut stamp = Stamp::rootfs_install(
+            "t",
+            StampInputs::new("h".to_string()),
+            StampOutputs::default(),
+        );
+        stamp.outputs.scriptlet_contract = None;
+        let json = stamp.to_json().unwrap();
+        assert!(!json.contains("scriptlet_contract"));
+        assert_eq!(
+            Stamp::from_json(&json).unwrap().outputs.scriptlet_contract,
+            None
+        );
     }
 
     #[test]

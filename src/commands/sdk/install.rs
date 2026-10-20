@@ -304,6 +304,22 @@ exec ${AVOCADO_SDK_PREFIX}/usr/bin/bash "$@"
 /// through `$D`, as it does in an OE image build, which exports these same
 /// variables; without them a postinst that writes to `$D/...` acts on the SDK
 /// container instead of the sysroot being installed.
+/// Shell that refuses to run target scriptlets against wrappers written by an
+/// older CLI. The wrappers live in the SDK volume and only `sdk install`
+/// rewrites them, so an install run straight after a CLI upgrade would
+/// otherwise pair the new environment (`$D`) with old wrappers, e.g. a
+/// `systemctl` that honours `--root=$D` inside an extension.
+pub(crate) fn scriptlet_contract_check() -> String {
+    format!(
+        r#"if [ "$(cat "$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/contract" 2>/dev/null)" != "{contract}" ]; then
+    echo "[ERROR] The SDK's package scriptlet wrappers were set up by an older avocado. Run 'avocado sdk install' to refresh them." >&2
+    exit 1
+fi
+"#,
+        contract = crate::utils::stamps::SCRIPTLET_CONTRACT
+    )
+}
+
 pub(crate) fn offline_scriptlet_env(installroot: &str) -> String {
     format!(
         "D={installroot} \\\nOFFLINE_ROOT={installroot} \\\nOPKG_OFFLINE_ROOT={installroot} \\\nIPKG_OFFLINE_ROOT={installroot} \\\nINTERCEPT_DIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts \\\n"
@@ -1580,6 +1596,10 @@ cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept <
 @POSTINST_INTERCEPT@INTERCEPT_EOF
 chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept
 
+# The scriptlet contract these wrappers implement; installs check it before
+# running scriptlets (scriptlet_contract_check).
+echo "@SCRIPTLET_CONTRACT@" > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/contract
+
 # Update macros for extension scriptlets
 sed -i "s|^%_dbpath[[:space:]]*%{_var}/lib/rpm$|%_dbpath                %{_var}/lib/rpm|" $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros
 
@@ -1594,7 +1614,8 @@ MACROS_EOF
         .replace("@SYSTEMCTL_WRAPPER@", SYSTEMCTL_WRAPPER)
         .replace("@DEPMODWRAPPER@", DEPMODWRAPPER)
         .replace("@SCRIPTLET_SHELL@", SCRIPTLET_SHELL)
-        .replace("@POSTINST_INTERCEPT@", POSTINST_INTERCEPT);
+        .replace("@POSTINST_INTERCEPT@", POSTINST_INTERCEPT)
+        .replace("@SCRIPTLET_CONTRACT@", crate::utils::stamps::SCRIPTLET_CONTRACT);
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
@@ -2261,10 +2282,15 @@ mod tests {
         ] {
             let no_chroot = src.matches("RPM_NO_CHROOT_FOR_SCRIPTS=1 \\").count();
             let offline = src.matches("{offline_env}").count();
+            let checked = src.matches("{contract_check}").count();
             assert!(no_chroot > 0, "{file}: no no-chroot install found");
             assert_eq!(
                 no_chroot, offline,
                 "{file}: a no-chroot install lacks the offline env"
+            );
+            assert_eq!(
+                no_chroot, checked,
+                "{file}: a no-chroot install skips the scriptlet contract check"
             );
         }
     }
@@ -2304,6 +2330,37 @@ mod tests {
             std::fs::read_to_string(&log).unwrap().trim(),
             format!("-a -b {} 6.12.0", root.display())
         );
+    }
+
+    /// Installs refuse to run scriptlets against wrappers an older CLI wrote
+    /// (no contract file, or a different one), and run against current ones.
+    #[cfg(unix)]
+    #[test]
+    fn scriptlet_contract_check_refuses_old_wrappers() {
+        let prefix = tempfile::tempdir().unwrap();
+        let dir = prefix.path().join("ext-rpm-config-scripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{}echo ran", scriptlet_contract_check()))
+                .env("AVOCADO_SDK_PREFIX", prefix.path())
+                .output()
+                .unwrap()
+        };
+        let missing = run();
+        assert!(!missing.status.success());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("avocado sdk install"));
+        std::fs::write(dir.join("contract"), "offline-root-0\n").unwrap();
+        assert!(!run().status.success(), "an older contract must be refused");
+        std::fs::write(
+            dir.join("contract"),
+            format!("{}\n", crate::utils::stamps::SCRIPTLET_CONTRACT),
+        )
+        .unwrap();
+        let current = run();
+        assert!(current.status.success());
+        assert_eq!(String::from_utf8_lossy(&current.stdout).trim(), "ran");
     }
 
     #[cfg(unix)]

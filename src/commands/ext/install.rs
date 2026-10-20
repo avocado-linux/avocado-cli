@@ -75,6 +75,19 @@ fn drop_content_stamps_script(ext_name: &str) -> String {
         + &remove_own_stamp_line(&StampRequirement::ext_image(ext_name))
 }
 
+/// Whether the previous install stamp (raw JSON) shows the sysroot was
+/// installed under an older scriptlet contract. dnf does not rerun the
+/// scriptlets of packages already installed, so such a sysroot is rebuilt from
+/// empty. No stamp, or one that does not parse, says nothing.
+fn scriptlet_contract_stale(stamp_json: Option<&str>) -> bool {
+    stamp_json
+        .and_then(|json| Stamp::from_json(json).ok())
+        .is_some_and(|stamp| {
+            stamp.outputs.scriptlet_contract.as_deref()
+                != Some(crate::utils::stamps::SCRIPTLET_CONTRACT)
+        })
+}
+
 /// Whether the fast path may skip an install on this stamp read.
 ///
 /// Current, and not written by a transaction whose options the input hash does
@@ -795,6 +808,11 @@ impl ExtInstallCommand {
                     effective_tui_context,
                     direct_deps.get(ext_name).map(Vec::as_slice).unwrap_or(&[]),
                     ext_up_to_date,
+                    scriptlet_contract_stale(
+                        stamp_reads
+                            .get(&StampRequirement::ext_install(ext_name).relative_path())
+                            .and_then(|v| v.as_deref()),
+                    ),
                 )
                 .await?
             {
@@ -860,6 +878,7 @@ impl ExtInstallCommand {
                 )?;
                 let outputs = StampOutputs {
                     nonstandard_options: !standard,
+                    scriptlet_contract: Some(crate::utils::stamps::SCRIPTLET_CONTRACT.to_string()),
                     ..Default::default()
                 };
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
@@ -1010,6 +1029,7 @@ impl ExtInstallCommand {
         effective_tui_context: &Option<TuiContext>,
         direct_deps: &[String],
         up_to_date: bool,
+        scriptlet_contract_stale: bool,
     ) -> Result<bool> {
         let sysroot = self.extension_sysroot(extension);
 
@@ -1191,8 +1211,19 @@ impl ExtInstallCommand {
         // stamps are off), so rebuilding a dependent is not extra work in the
         // steady state.
         let reseed_required = !direct_deps.is_empty();
-        let clean_first =
-            needs_clean_reinstall || self.force || reseed_required || kernel_pin_change.is_some();
+        if scriptlet_contract_stale {
+            print_info(
+                &format!(
+                    "Extension '{extension}': installed under an older package-scriptlet environment; cleaning sysroot for fresh install"
+                ),
+                OutputLevel::Normal,
+            );
+        }
+        let clean_first = needs_clean_reinstall
+            || self.force
+            || reseed_required
+            || kernel_pin_change.is_some()
+            || scriptlet_contract_stale;
         if clean_first {
             // Clean the sysroot so it will be recreated fresh below, and drop
             // the stamps that vouch for what was in it. `ext build`'s output —
@@ -1473,6 +1504,7 @@ impl ExtInstallCommand {
                 // `sdk dnf` / `ext dnf` / `runtime dnf` are the interactive path.
                 let yes = "-y";
                 let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension}");
+                let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
                 let offline_env =
                     crate::commands::sdk::install::offline_scriptlet_env(&installroot);
                 let dnf_args_str = if let Some(args) = &self.dnf_args {
@@ -1487,7 +1519,7 @@ impl ExtInstallCommand {
                 };
                 let command = format!(
                     r#"
-RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+{contract_check}RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT={} \
 {offline_env}PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
@@ -1700,6 +1732,34 @@ async fn run_container_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extension fast path reads the previous stamp as raw JSON; the same
+    /// rule applies: rebuild only under an older (or no recorded) contract.
+    #[test]
+    fn extension_rebuilds_only_under_an_older_scriptlet_contract() {
+        let json = |contract: Option<&str>| {
+            Stamp::ext_install(
+                "app",
+                "t",
+                crate::utils::stamps::StampInputs::new("h".to_string()),
+                StampOutputs {
+                    scriptlet_contract: contract.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .to_json()
+            .unwrap()
+        };
+        assert!(!scriptlet_contract_stale(None));
+        assert!(!scriptlet_contract_stale(Some("not json")));
+        assert!(!scriptlet_contract_stale(Some(&json(Some(
+            crate::utils::stamps::SCRIPTLET_CONTRACT
+        )))));
+        assert!(scriptlet_contract_stale(Some(&json(None))));
+        assert!(scriptlet_contract_stale(Some(&json(Some(
+            "offline-root-0"
+        )))));
+    }
 
     /// The fast path must not read a bare directory as an installed sysroot.
     /// Run the probe under `sh`: an extension directory with no rpm database

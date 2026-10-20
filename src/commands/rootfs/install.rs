@@ -354,6 +354,7 @@ fn dnf_sync_step(
     if !fresh_resolve {
         return String::new();
     }
+    let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
     let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
         "$AVOCADO_PREFIX/{sysroot_dir}"
     ));
@@ -361,7 +362,7 @@ fn dnf_sync_step(
         r#"
 # No version pins for this sysroot (first install, or `avocado update` cleared
 # them): bring already-installed packages in line with the feed too.
-RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+{contract_check}RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/{sysroot_dir} \
 {offline_env}AVOCADO_SYSROOT_SCRIPTS=1 \
 PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
@@ -648,6 +649,27 @@ fn parse_probe_output(text: &str) -> Option<bool> {
     Some(!names.trim().is_empty())
 }
 
+/// Install-stamp outputs recording the scriptlet contract this install ran
+/// under, so a later install can tell the sysroot needs rebuilding when it
+/// changes.
+fn contract_outputs() -> StampOutputs {
+    StampOutputs {
+        scriptlet_contract: Some(crate::utils::stamps::SCRIPTLET_CONTRACT.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Whether the sysroot was installed under an older scriptlet contract, going
+/// by the previous install stamp. dnf does not rerun the scriptlets of
+/// packages that are already installed, so such a sysroot has to be rebuilt
+/// from empty. No stamp (a first install, or `--no-stamps`) says nothing.
+fn scriptlet_contract_stale(prev: Option<&Stamp>) -> bool {
+    prev.is_some_and(|stamp| {
+        stamp.outputs.scriptlet_contract.as_deref()
+            != Some(crate::utils::stamps::SCRIPTLET_CONTRACT)
+    })
+}
+
 /// Write this sysroot's install stamp.
 ///
 /// Split out of [`install_sysroot`] so its failures can be reported without
@@ -667,12 +689,12 @@ async fn write_install_stamp(
     // default — the same split the image build-id derivation makes.
     let (stamp, sysroot_dir, rpm_dbpath) = match params.sysroot_type {
         SysrootType::Rootfs => (
-            Stamp::rootfs_install(params.target, inputs, StampOutputs::default()),
+            Stamp::rootfs_install(params.target, inputs, contract_outputs()),
             "rootfs",
             Some("/var/lib/rpm"),
         ),
         SysrootType::Initramfs => (
-            Stamp::initramfs_install(params.target, inputs, StampOutputs::default()),
+            Stamp::initramfs_install(params.target, inputs, contract_outputs()),
             "initramfs",
             None,
         ),
@@ -953,7 +975,17 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         )
     };
 
-    let needs_clean_reinstall = kernel_pin_change.is_some() || !removed_packages.is_empty();
+    let contract_stale = scriptlet_contract_stale(params.prefetched_stamp.as_ref());
+    let needs_clean_reinstall =
+        kernel_pin_change.is_some() || !removed_packages.is_empty() || contract_stale;
+    if contract_stale {
+        print_info(
+            &format!(
+                "{label}: installed under an older package-scriptlet environment; cleaning sysroot for fresh install"
+            ),
+            OutputLevel::Normal,
+        );
+    }
 
     if let Some((prev, new_kver)) = kernel_pin_change {
         // A plain re-install would land the new kernel-image and module
@@ -1156,6 +1188,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
+    let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
     let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
         "$AVOCADO_PREFIX/{sysroot_dir}"
     ));
@@ -1168,7 +1201,7 @@ ln -sfn usr/bin $AVOCADO_PREFIX/{sysroot_dir}/bin
 ln -sfn usr/sbin $AVOCADO_PREFIX/{sysroot_dir}/sbin
 ln -sfn usr/lib $AVOCADO_PREFIX/{sysroot_dir}/lib
 
-RPM_NO_CHROOT_FOR_SCRIPTS=1 \
+{contract_check}RPM_NO_CHROOT_FOR_SCRIPTS=1 \
 AVOCADO_EXT_INSTALLROOT=$AVOCADO_PREFIX/{sysroot_dir} \
 {offline_env}AVOCADO_SYSROOT_SCRIPTS=1 \
 PATH=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin:$PATH \
@@ -1613,8 +1646,43 @@ mod tests {
         build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
         incomplete_install_reason, parse_probe_output,
     };
+    use super::{contract_outputs, scriptlet_contract_stale};
     use crate::utils::lockfile::{LockFile, SysrootType};
+    use crate::utils::stamps::{Stamp, StampOutputs};
     use std::collections::{HashMap, HashSet};
+
+    fn install_stamp(contract: Option<&str>) -> Stamp {
+        Stamp::rootfs_install(
+            "t",
+            crate::utils::stamps::StampInputs::new("h".to_string()),
+            StampOutputs {
+                scriptlet_contract: contract.map(str::to_string),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A sysroot is rebuilt only when its previous stamp shows an older
+    /// scriptlet contract: no stamp says nothing, and the current one matches.
+    #[test]
+    fn sysroot_rebuilds_only_under_an_older_scriptlet_contract() {
+        assert!(!scriptlet_contract_stale(None));
+        assert!(!scriptlet_contract_stale(Some(&install_stamp(Some(
+            crate::utils::stamps::SCRIPTLET_CONTRACT
+        )))));
+        assert!(
+            scriptlet_contract_stale(Some(&install_stamp(None))),
+            "a stamp from a CLI before the contract existed must rebuild"
+        );
+        assert!(scriptlet_contract_stale(Some(&install_stamp(Some(
+            "offline-root-0"
+        )))));
+        assert_eq!(
+            contract_outputs().scriptlet_contract.as_deref(),
+            Some(crate::utils::stamps::SCRIPTLET_CONTRACT),
+            "the install stamp must record the contract it ran under"
+        );
+    }
 
     // A sysroot install that places its packages but cannot finish the job must
     // not report success: no stamp is written for it, and `runtime build`
