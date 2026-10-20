@@ -185,18 +185,35 @@ pub async fn off_kernel_dnf_excludes(
     for kver in available.iter().filter(|k| k.as_str() != resolved_kver) {
         // Single-quote the glob so the host shell doesn't expand it before dnf
         // sees it.
-        //
-        // The pattern is `kernel-*${kver}*` (no dash before ${kver}) so it
-        // matches both the renamed kernel-base shell (`kernel-${kver}`, which
-        // has no separator before the version) AND subpackages like
-        // `kernel-image-${kver}` / `kernel-module-X-${kver}`. The earlier
-        // `kernel-*-${kver}*` pattern required a dash and silently let the
-        // base shell slip through, leaving an orphaned off-kernel `kernel-`
-        // package in the sysroot's rpmdb after every cross-kernel install.
-        excludes.push(format!("--exclude='kernel-*{kver}*'"));
-        excludes.push(format!("--exclude='nv-kernel-module-*{kver}*'"));
+        excludes.extend(
+            off_kernel_exclude_globs(kver)
+                .iter()
+                .map(|g| format!("--exclude='{g}'")),
+        );
     }
     Ok(excludes)
+}
+
+/// Package-name globs for every package built for kernel `kver`.
+///
+/// `kernel-*${kver}` (no dash before ${kver}) matches both the renamed
+/// kernel-base shell (`kernel-${kver}`, which has no separator before the
+/// version) AND subpackages like `kernel-image-${kver}` /
+/// `kernel-module-X-${kver}`. The earlier `kernel-*-${kver}*` pattern required
+/// a dash and silently let the base shell slip through, leaving an orphaned
+/// off-kernel `kernel-` package in the sysroot's rpmdb after every
+/// cross-kernel install.
+///
+/// Anchored at the end: every per-kernel package name ends in its
+/// KERNEL_VERSION, and one kernel's version can be a prefix of another's
+/// (L4T `6.8.12-l4t-r39.2.0-1021.21` and its PREEMPT_RT sibling
+/// `...-1021.21-rt`). A trailing `*` excluded the RT kernel's own packages
+/// whenever the RT kernel was the one selected, so it could never install.
+fn off_kernel_exclude_globs(kver: &str) -> [String; 2] {
+    [
+        format!("kernel-*{kver}"),
+        format!("nv-kernel-module-*{kver}"),
+    ]
 }
 
 /// Cached wrapper around [`query_available_kernel_versions`]. The key is
@@ -355,6 +372,37 @@ fn parse_kernel_names_and_provides(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn off_kernel_excludes_spare_a_kernel_whose_version_extends_it() {
+        // Selected: the L4T RT kernel. Excluded: the stock L4T kernel, whose
+        // version is a prefix of the RT one.
+        let globs = off_kernel_exclude_globs("6.8.12-l4t-r39.2.0-1021.21");
+        let set = globs
+            .iter()
+            .fold(globset::GlobSetBuilder::new(), |mut b, g| {
+                b.add(globset::Glob::new(g).unwrap());
+                b
+            })
+            .build()
+            .unwrap();
+        for off in [
+            "kernel-6.8.12-l4t-r39.2.0-1021.21",
+            "kernel-image-6.8.12-l4t-r39.2.0-1021.21",
+            "kernel-module-zram-6.8.12-l4t-r39.2.0-1021.21",
+            "nv-kernel-module-nvgpu-6.8.12-l4t-r39.2.0-1021.21",
+        ] {
+            assert!(set.is_match(off), "{off} must be excluded");
+        }
+        for kept in [
+            "kernel-6.8.12-l4t-r39.2.0-1021.21-rt",
+            "kernel-image-6.8.12-l4t-r39.2.0-1021.21-rt",
+            "kernel-module-zram-6.8.12-l4t-r39.2.0-1021.21-rt",
+            "nv-kernel-module-nvgpu-6.8.12-l4t-r39.2.0-1021.21-rt",
+        ] {
+            assert!(!set.is_match(kept), "{kept} must not be excluded");
+        }
+    }
 
     #[test]
     fn parse_avocado_kernel_provides_happy_path() {
