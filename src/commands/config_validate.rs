@@ -109,14 +109,18 @@ pub fn validate(content: &str) -> Report {
     report.warnings = config_lint::ignored_keys(&doc);
 
     // Check the value the loader deserializes, after interpolation, so a
-    // `{{ }}` template in a boolean or number field is not a type error.
+    // `{{ }}` template in a boolean or number field is not a type error. When
+    // interpolation fails there is no such value: the raw template would only
+    // give a misleading schema error, so the interpolation error is the one.
     let mut interpolated = doc.clone();
-    let checked =
-        match crate::utils::interpolation::interpolate_config(&mut interpolated, None, None) {
-            Ok(()) => &interpolated,
-            Err(_) => &doc,
-        };
-    match serde_json::to_value(checked) {
+    if let Err(e) = crate::utils::interpolation::interpolate_config(&mut interpolated, None, None) {
+        report.errors.push(ConfigError {
+            path: String::new(),
+            message: e.root_cause().to_string(),
+        });
+        return report;
+    }
+    match serde_json::to_value(&interpolated) {
         Ok(instance) => {
             for e in validator().iter_errors(&instance) {
                 report.errors.extend(schema_errors(&e));
@@ -323,13 +327,14 @@ fn set_singleton_rule(original: &Json, branches: &mut [Json]) {
         target.unwrap_or(node).clone()
     };
     // The named-entry form: a map with no fields of its own.
-    let named = branches.iter().any(|b| {
+    let is_named = |b: &Json| {
         let b = resolve(b);
         b.get("properties").is_none() && b.get("additionalProperties").is_some_and(Json::is_object)
-    });
-    if !named {
+    };
+    if !branches.iter().any(is_named) {
         return;
     }
+    let mut claims = None;
     for branch in branches.iter_mut() {
         let single = resolve(branch);
         let Some(fields) = single.get("properties").and_then(Json::as_object) else {
@@ -338,6 +343,7 @@ fn set_singleton_rule(original: &Json, branches: &mut [Json]) {
         if single.get("additionalProperties") != Some(&Json::Bool(false)) {
             continue;
         }
+        let claim = field_claim(&resolve, fields);
         let Json::Object(b) = branch else { continue };
         let mut properties: serde_json::Map<String, Json> = fields
             .keys()
@@ -355,7 +361,57 @@ fn set_singleton_rule(original: &Json, branches: &mut [Json]) {
         b.insert("properties".to_string(), Json::Object(properties));
         b.insert("patternProperties".to_string(), Json::Object(patterns));
         b.insert("additionalProperties".to_string(), Json::Bool(false));
+        b.insert("allOf".to_string(), json!([claim.clone()]));
+        claims = Some(claim);
     }
+    // The loader reads a mapping with no field key as named entries, even
+    // one whose keys start with `target-`, and a mapping with a field key as
+    // one block. So each form must reject the other's mappings.
+    let Some(claims) = claims else { return };
+    for branch in branches.iter_mut() {
+        if is_named(branch) {
+            if let Json::Object(b) = branch {
+                b.insert("not".to_string(), claims.clone());
+            }
+        }
+    }
+}
+
+/// A schema that matches a mapping the loader reads as one block: it sets
+/// one of `fields`. A field that is a tagged object, such as
+/// `source: {type: path}`, counts only when the tag matches. Otherwise the
+/// loader reads `source` as the name of an entry.
+fn field_claim(resolve: &dyn Fn(&Json) -> Json, fields: &serde_json::Map<String, Json>) -> Json {
+    let branches: Vec<Json> = fields
+        .iter()
+        .map(|(name, spec)| {
+            let spec = resolve(spec);
+            let tags: serde_json::Map<String, Json> = spec
+                .get("properties")
+                .and_then(Json::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(_, p)| p.get("enum").is_some() || p.get("const").is_some())
+                .map(|(k, p)| {
+                    let rule = p
+                        .get("const")
+                        .map(|c| json!({ "const": c }))
+                        .unwrap_or_else(|| json!({ "enum": p["enum"] }));
+                    (k.clone(), rule)
+                })
+                .collect();
+            if tags.is_empty() {
+                json!({ "required": [name] })
+            } else {
+                let required: Vec<&String> = tags.keys().collect();
+                json!({
+                    "required": [name],
+                    "properties": { name: { "type": "object", "required": required, "properties": tags } },
+                })
+            }
+        })
+        .collect();
+    json!({ "anyOf": branches })
 }
 
 #[cfg(test)]
@@ -487,6 +543,52 @@ mod tests {
                 report.errors
             );
         }
+    }
+
+    #[test]
+    fn a_field_key_makes_one_block_and_its_fields_are_checked() {
+        // `users` is a field, so this is one block, not an entry named
+        // `users`. The loader keeps users as raw YAML and would not notice.
+        let errs = errors("permissions: {users: {root: {uid: wrong}}}\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/permissions/users/root/uid ")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn no_field_key_makes_named_entries_even_with_a_target_prefix() {
+        // No field key, so `target-dev` is the name of an entry.
+        let errs = errors("permissions: {target-dev: {users: {root: {uid: wrong}}}}\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/permissions/target-dev/users/root/uid ")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn source_is_a_field_only_with_type_path() {
+        let path = validate("rootfs:\n  source: { type: path, path: fragments/rootfs }\n");
+        assert!(path.errors.is_empty(), "{:?}", path.errors);
+        // Without `type: path`, `source` is an entry name.
+        let named = validate("kernel:\n  source: { compile: linux, install: install.sh }\n");
+        assert!(named.errors.is_empty(), "{:?}", named.errors);
+    }
+
+    #[test]
+    fn an_interpolation_error_is_the_error() {
+        let report = validate(
+            "default_target: qemux86-64\nruntimes:\n  dev:\n    var: {encrypt: true, hardware: \"{{ config.missing }}\"}\n",
+        );
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(report.errors[0].path, "");
+        assert!(
+            !report.errors[0].message.contains("is not one of"),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]
