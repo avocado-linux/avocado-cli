@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Add-on feeds by name: `distro.feeds: [ros2-jazzy]`.** A `distro.feeds`
+  entry that `repos:` does not define names an add-on the distro feed
+  publishes for the target, and needs no URL. It enables two repos, both off
+  the distro feed's base URL and releasever and both at every stage: the
+  target half `<name>` at `target/<target>-<name>` and the SDK half
+  `<name>-sdk` at `sdk/<target>-<name>`. Its position in the list is its dnf
+  priority, like any other feed. Before the first dnf run the CLI checks the
+  name against the channel's `targets.json` and refuses one the target does
+  not publish, with the nearest published name ("did you mean"), the add-ons
+  the target does publish, and the other targets that carry it. When
+  `targets.json` cannot be read it warns and lets dnf report what is missing.
 - **SBOM extension scopes carry a stable image id.** (ENG-2199)
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry

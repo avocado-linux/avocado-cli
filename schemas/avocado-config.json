@@ -408,10 +408,18 @@
         "feeds": {
           "title": "Feeds",
           "$ref": "#/definitions/stringList",
-          "description": "Names of 'repos' entries to enable, in priority order.",
+          "description": "Feeds to enable, in priority order (first wins). Each name is an entry in 'repos', or, when 'repos' does not define it, an add-on the distro feed publishes for the target (e.g. 'ros2-jazzy'), which enables its target repo (target/<target>-<name>) and its SDK repo (sdk/<target>-<name>). The distro feed is first unless listed.",
           "examples": [
             [
               "acme"
+            ],
+            [
+              "ros2-jazzy"
+            ],
+            [
+              "acme",
+              "avocado",
+              "ros2-jazzy"
             ]
           ]
         }

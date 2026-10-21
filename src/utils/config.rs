@@ -4540,6 +4540,7 @@ impl Config {
         // Mint inside the lock: two stages starting at once must not both mint the
         // same feed, and the second must see the first one's token.
         let mut guard = shared.set.lock().await;
+        guard.check_addons().await?;
         guard.resolve_connect_credentials(stage).await?;
         Ok(Some(guard.materialize_in(stage, &shared.root)?))
     }
