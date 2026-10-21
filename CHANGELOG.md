@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sysroot, and the SDK half `<name>-sdk` at `sdk/<target>-<name>`, used by the
   SDK host. Its position in the list is its dnf priority, like any other feed.
   Before anything is recorded in the lock, the CLI checks the name against the
-  channel's `targets.json` (also under a snapshot pin) and refuses one the
-  target does not publish with both halves, giving the nearest published name
+  channel's `targets.json`, and under a snapshot pin that the pinned snapshot
+  has both halves, and refuses one the target does not publish, giving the
+  nearest published name
   ("did you mean"), the add-ons the target does publish, and the other targets
   that carry it. When `targets.json` cannot be read it warns and lets dnf
   report what is missing. A name close to one `repos:` defines is refused as a

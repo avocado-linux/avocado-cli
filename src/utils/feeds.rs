@@ -389,6 +389,11 @@ pub struct ResolvedFeedSet {
     /// `<distro feed>/<releasever>/targets.json`.
     #[serde(skip)]
     addon_index_url: Option<String>,
+    /// `<distro url>/<releasever>` when the releasever is not the channel itself,
+    /// i.e. a snapshot pin: the add-ons must be in that snapshot, whatever the
+    /// channel's index lists today.
+    #[serde(skip)]
+    addon_pinned_root: Option<String>,
 }
 
 /// What a container run needs to see the resolved feeds. The tempdir holds
@@ -948,6 +953,12 @@ impl ResolvedFeedSet {
             (Some(r), Some(c)) => Some(format!("{r}/{c}")),
             _ => distro_releasever.clone(),
         };
+        let addon_pinned_root = match (&addon_index_root, &distro_releasever) {
+            (Some(channel), Some(rv)) if channel != rv => {
+                Some(format!("{}/{rv}", repo_url.trim_end_matches('/')))
+            }
+            _ => None,
+        };
         let addon_index_url = addon_index_root
             .map(|rv| format!("{}/{rv}/targets.json", repo_url.trim_end_matches('/')));
         Ok(Some(Self {
@@ -955,6 +966,7 @@ impl ResolvedFeedSet {
             minted_key_id: None,
             addons: addon_names,
             addon_index_url,
+            addon_pinned_root,
             version: CANONICAL_VERSION,
             target: target.to_string(),
             any_project_local: feeds.iter().any(|f| f.locality == Locality::ProjectLocal),
@@ -1043,16 +1055,49 @@ impl ResolvedFeedSet {
                 .await
         }
         .await;
-        match fetched {
-            Ok(index) => check_addons_against(&index, &self.target, &self.addons),
+        let index = match fetched {
+            Ok(index) => Some(index),
             Err(e) => {
                 crate::utils::output::print_warning(
                     &format!("could not read {url} to check add-on feeds ({e}); dnf will report any that are missing"),
                     crate::utils::output::OutputLevel::Normal,
                 );
-                Ok(())
+                None
+            }
+        };
+        let Some(pin) = &self.addon_pinned_root else {
+            return index.map_or(Ok(()), |i| {
+                check_addons_against(&i, &self.target, &self.addons)
+            });
+        };
+        // Pinned: what counts is the snapshot, which keeps the add-ons it was published
+        // with even after the channel's index moves on. The index only explains a miss.
+        for addon in &self.addons {
+            for scope in ["target", "sdk"] {
+                let repomd = format!("{pin}/{scope}/{}-{addon}/repodata/repomd.xml", self.target);
+                match client.head(&repomd).send().await {
+                    Ok(r) if r.status().is_success() => continue,
+                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        if let Some(index) = &index {
+                            check_addons_against(index, &self.target, std::slice::from_ref(addon))?;
+                        }
+                        bail!(
+                            "distro.feeds: the pinned snapshot {pin} has no add-on feed '{addon}' for {}; \
+                             `avocado update` moves the pin to the channel's current snapshot",
+                            self.target
+                        );
+                    }
+                    other => {
+                        crate::utils::output::print_warning(
+                            &format!("could not check {repomd} ({other:?}); dnf will report it if it is missing"),
+                            crate::utils::output::OutputLevel::Normal,
+                        );
+                        return Ok(());
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// Exchange the account credential for a short-lived feed token for every
@@ -2335,6 +2380,15 @@ distro:
             set.addon_index_url.as_deref(),
             Some("https://feed.example/2026/next/targets.json")
         );
+        // ... and the pinned snapshot is what must hold the add-on.
+        assert_eq!(
+            set.addon_pinned_root.as_deref(),
+            Some("https://feed.example/2026/next/snapshots/42")
+        );
+        let unpinned = ResolvedFeedSet::resolve(&c, "raspberrypi5", Path::new("."), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unpinned.addon_pinned_root, None);
         // The projection a stage hashes carries only that stage's half.
         let host = set.stage_projection_json(FeedStage::Sdk).unwrap();
         assert!(host.contains("ros2-jazzy-sdk") && !host.contains("\"ros2-jazzy\""));
