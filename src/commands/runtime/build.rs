@@ -2400,34 +2400,9 @@ fi"#
         };
 
         // Build runtime-level var_files section
-        let runtime_var_files_section = {
-            let runtime_var_files = crate::utils::config::get_runtime_var_files(&merged_runtime);
-            if runtime_var_files.is_empty() {
-                "# No runtime var_files to apply".to_string()
-            } else {
-                let commands: Vec<String> = runtime_var_files
-                    .iter()
-                    .map(|mapping| {
-                        format!(
-                            r#"
-if [ -e "/opt/src/{source}" ]; then
-    mkdir -p "$VAR_DIR/{dest}"
-    cp -a "/opt/src/{source}" "$VAR_DIR/{dest}"
-    echo "  Copied runtime var_files: {source} -> {dest}"
-else
-    echo "WARNING: runtime var_files source not found: /opt/src/{source}"
-fi"#,
-                            source = mapping.source,
-                            dest = mapping.dest
-                        )
-                    })
-                    .collect();
-                format!(
-                    "echo \"Applying runtime var files to var partition...\"\n{}",
-                    commands.join("\n")
-                )
-            }
-        };
+        let runtime_var_files_section = runtime_var_files_script(
+            &crate::utils::config::get_runtime_var_files(&merged_runtime),
+        );
 
         // Build Docker image priming section
         // Collect docker_images from all extensions in the runtime
@@ -3410,6 +3385,38 @@ fi
     .to_string()
 }
 
+/// Shell that copies runtime `var_files` from the project (`/opt/src`) into
+/// the var partition staging (`$VAR_DIR`).
+fn runtime_var_files_script(mappings: &[crate::utils::config::VarFileMapping]) -> String {
+    if mappings.is_empty() {
+        return "# No runtime var_files to apply".to_string();
+    }
+    let commands: Vec<String> = mappings
+        .iter()
+        .map(|mapping| {
+            format!(
+                r#"
+if [ -e "/opt/src/{source}" ]; then
+    mkdir -p "$VAR_DIR/{dest}"
+    cp -a "/opt/src/{source}" "$VAR_DIR/{dest}"
+    # Project files show the host owner when /opt/src is a plain mount (the
+    # avocado-vm), and mkfs.btrfs -r keeps owners: make the copy root's.
+    chown -hR root:root "$VAR_DIR/{dest}/$(basename "/opt/src/{source}")"
+    echo "  Copied runtime var_files: {source} -> {dest}"
+else
+    echo "WARNING: runtime var_files source not found: /opt/src/{source}"
+fi"#,
+                source = mapping.source,
+                dest = mapping.dest
+            )
+        })
+        .collect();
+    format!(
+        "echo \"Applying runtime var files to var partition...\"\n{}",
+        commands.join("\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, SdkContainer};
@@ -3531,6 +3538,26 @@ mod tests {
         assert!(err.contains("content delegation staging files"), "{err}");
         assert!(err.contains("runtime 'dev'"), "{err}");
         assert!(staging_dirs(&project).is_empty(), "staging is removed");
+    }
+
+    #[test]
+    fn runtime_var_files_copy_is_made_root_owned() {
+        use crate::utils::config::VarFileMapping;
+        assert_eq!(
+            super::runtime_var_files_script(&[]),
+            "# No runtime var_files to apply"
+        );
+        let s = super::runtime_var_files_script(&[VarFileMapping {
+            source: "var-files/app".to_string(),
+            dest: "lib/app".to_string(),
+        }]);
+        let copy = s
+            .find(r#"cp -a "/opt/src/var-files/app" "$VAR_DIR/lib/app""#)
+            .expect("copy line");
+        let chown = s
+            .find(r#"chown -hR root:root "$VAR_DIR/lib/app/$(basename "/opt/src/var-files/app")""#)
+            .expect("chown of the copied item, not the whole dest");
+        assert!(copy < chown);
     }
 
     #[test]

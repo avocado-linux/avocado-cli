@@ -96,10 +96,41 @@ pub fn is_vm_routing_active() -> bool {
 /// file operations 3 to 15x slower. An explicit `AVOCADO_HOST_UID` still wins
 /// (with `AVOCADO_HOST_GID`, or the host GID); `AVOCADO_HOST_GID` alone does not.
 fn src_mount_uid_gid() -> (u32, u32) {
-    if is_vm_routing_active() && std::env::var_os("AVOCADO_HOST_UID").is_none() {
+    if vm_plain_src_mount() {
         return (0, 0);
     }
     crate::utils::config::resolve_host_uid_gid(None)
+}
+
+fn vm_plain_src_mount() -> bool {
+    is_vm_routing_active() && std::env::var_os("AVOCADO_HOST_UID").is_none()
+}
+
+/// `-e` values for the `/opt/src` mount: the UID/GID the entrypoint maps
+/// (see `src_mount_uid_gid`), and under the plain VM mount a `safe.directory`
+/// for git. Without bindfs, host files show the host UID inside the
+/// container, and git refuses such a repository as root ("detected dubious
+/// ownership"). The entries cover only the project mount and, with a
+/// target, its path-extension mounts. `GIT_CONFIG_*` is command scope,
+/// which git trusts for `safe.directory`.
+fn src_mount_env(target: Option<&str>) -> Vec<String> {
+    let (uid, gid) = src_mount_uid_gid();
+    let mut env = vec![
+        format!("AVOCADO_HOST_UID={uid}"),
+        format!("AVOCADO_HOST_GID={gid}"),
+    ];
+    if vm_plain_src_mount() {
+        let mut dirs = vec!["/opt/src".to_string(), "/opt/src/*".to_string()];
+        if let Some(target) = target {
+            dirs.push(format!("/opt/_avocado/{target}/includes/*"));
+        }
+        env.push(format!("GIT_CONFIG_COUNT={}", dirs.len()));
+        for (i, dir) in dirs.iter().enumerate() {
+            env.push(format!("GIT_CONFIG_KEY_{i}=safe.directory"));
+            env.push(format!("GIT_CONFIG_VALUE_{i}={dir}"));
+        }
+    }
+    env
 }
 
 /// When docker is going to execute inside the avocado-vm, ensure the
@@ -2182,11 +2213,10 @@ impl SdkContainer {
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Pass host UID/GID for bindfs permission translation
-        let (host_uid, host_gid) = src_mount_uid_gid();
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        for kv in src_mount_env(Some(&config.target)) {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -3137,10 +3167,10 @@ impl SdkContainer {
 
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = src_mount_uid_gid();
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        for kv in src_mount_env(None) {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
         // Pass SDK image for error messages
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_SDK_IMAGE={container_image}"));
@@ -4547,7 +4577,7 @@ extensions:
     // Serial: mutates DOCKER_HOST and AVOCADO_HOST_UID/GID.
     #[test]
     #[serial_test::serial]
-    fn src_mount_uid_gid_skips_bindfs_only_under_vm_routing() {
+    fn src_mount_env_skips_bindfs_and_trusts_git_only_under_vm_routing() {
         // Restores the env on drop, so a failed assert does not leak
         // DOCKER_HOST into later tests.
         struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -4583,12 +4613,35 @@ extensions:
             crate::utils::config::resolve_host_uid_gid(None)
         );
 
+        assert!(!src_mount_env(Some("t"))
+            .iter()
+            .any(|e| e.starts_with("GIT_CONFIG")));
+
         std::env::set_var("DOCKER_HOST", &vm_sock);
         assert_eq!(src_mount_uid_gid(), (0, 0));
+        assert_eq!(
+            src_mount_env(Some("qemuarm64")),
+            [
+                "AVOCADO_HOST_UID=0",
+                "AVOCADO_HOST_GID=0",
+                "GIT_CONFIG_COUNT=3",
+                "GIT_CONFIG_KEY_0=safe.directory",
+                "GIT_CONFIG_VALUE_0=/opt/src",
+                "GIT_CONFIG_KEY_1=safe.directory",
+                "GIT_CONFIG_VALUE_1=/opt/src/*",
+                "GIT_CONFIG_KEY_2=safe.directory",
+                "GIT_CONFIG_VALUE_2=/opt/_avocado/qemuarm64/includes/*",
+            ]
+        );
+        assert!(src_mount_env(None).contains(&"GIT_CONFIG_COUNT=2".to_string()));
 
+        // An explicit UID brings bindfs back, so no safe.directory either.
         std::env::set_var("AVOCADO_HOST_UID", "1234");
         std::env::set_var("AVOCADO_HOST_GID", "5678");
         assert_eq!(src_mount_uid_gid(), (1234, 5678));
+        assert!(!src_mount_env(Some("t"))
+            .iter()
+            .any(|e| e.starts_with("GIT_CONFIG")));
     }
 
     // Serial because `build_container_command` reads AVOCADO_SIGNING_KEYS_DIR,
