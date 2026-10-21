@@ -292,11 +292,42 @@ pub struct ResolvedFeed {
     /// stamp hash, so adding a field there would move every hash.
     #[serde(skip)]
     configured_locator: String,
+    /// Which dnf sees the feed. Only an add-on's halves set it: its target half is
+    /// for target installs (rootfs, extensions, the SDK's target sysroot) and its SDK
+    /// half for the SDK host, the same split the distro feed's baked repos have.
+    /// Recorded only when set, so no other feed's canonical document changes.
+    #[serde(skip_serializing_if = "Placement::is_any")]
+    pub placement: Placement,
+}
+
+/// Which side of a stage's dnf a feed is written for. See `ResolvedFeed::placement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    #[default]
+    Any,
+    Host,
+    Target,
+}
+
+impl Placement {
+    fn is_any(&self) -> bool {
+        *self == Placement::Any
+    }
+
+    fn admits(self, stage: FeedStage) -> bool {
+        match self {
+            Placement::Any => true,
+            Placement::Host => stage.is_host(),
+            Placement::Target => !stage.is_host(),
+        }
+    }
 }
 
 impl ResolvedFeed {
     fn applies_to(&self, stage: FeedStage) -> bool {
-        self.stages.is_empty() || self.stages.contains(&stage.scope())
+        (self.stages.is_empty() || self.stages.contains(&stage.scope()))
+            && self.placement.admits(stage)
     }
 
     fn repo_file(&self, ca_in_container: Option<&str>) -> String {
@@ -358,8 +389,6 @@ pub struct ResolvedFeedSet {
     /// `<distro feed>/<releasever>/targets.json`.
     #[serde(skip)]
     addon_index_url: Option<String>,
-    #[serde(skip)]
-    addons_checked: bool,
 }
 
 /// What a container run needs to see the resolved feeds. The tempdir holds
@@ -641,6 +670,7 @@ impl ResolvedFeedSet {
         let mut order: Vec<String> = Vec::new();
         let mut addons: HashMap<String, RepoDef> = HashMap::new();
         let mut addon_names: Vec<String> = Vec::new();
+        let mut addon_placement: HashMap<String, Placement> = HashMap::new();
         for n in feeds_list.cloned().unwrap_or_default() {
             if n == BUILTIN_EXT_FEED {
                 bail!("distro.feeds: '{BUILTIN_EXT_FEED}' is a built-in; re-scope it under repos:, don't list it");
@@ -653,26 +683,60 @@ impl ResolvedFeedSet {
             // publishes beside its own repos: `target/<target>-<name>` and
             // `sdk/<target>-<name>`, always both, so the project names it once
             // and never says where it lives.
+            //
+            // A near-miss of a name `repos:` does define is far likelier a typo than
+            // an add-on, and reading it as one would turn a config error into a 404.
+            let limit = (n.chars().count() / 3).max(1);
+            if let Some(near) = repos
+                .keys()
+                .map(|k| {
+                    (
+                        strsim::osa_distance(&n.to_lowercase(), &k.to_lowercase()),
+                        k,
+                    )
+                })
+                .filter(|(d, _)| *d <= limit)
+                .min()
+                .map(|(_, k)| k)
+            {
+                bail!(
+                    "distro.feeds names '{n}' but repos: does not define it; did you mean '{near}'? \
+                     (A name repos: does not define is read as an add-on feed of the distro.)"
+                );
+            }
             if !is_valid_feed_name(&n) {
                 bail!("distro.feeds: '{n}' must match [A-Za-z0-9][A-Za-z0-9._-]* (it names a repo id and a feed path)");
+            }
+            if let Some(base) = n.strip_suffix(ADDON_SDK_SUFFIX) {
+                bail!("distro.feeds: list the add-on '{base}', not '{n}': an add-on's SDK half comes with it");
+            }
+            if n == "ext" || n.ends_with("-ext") {
+                bail!("distro.feeds: '{n}' is not an add-on name: the <target>-ext repo is the built-in extension feed");
             }
             let sdk = format!("{n}{ADDON_SDK_SUFFIX}");
             if repos.contains_key(&sdk) {
                 bail!("distro.feeds: '{n}' is an add-on feed, whose SDK half is named '{sdk}'; repos: defines '{sdk}' too");
             }
             addon_names.push(n.clone());
-            for (name, scope) in [(&n, "target"), (&sdk, "sdk")] {
+            for (name, scope, placement) in [
+                (&n, "target", Placement::Target),
+                (&sdk, "sdk", Placement::Host),
+            ] {
                 let url = format!(
                     "{}/$releasever/{scope}/$target-{n}",
                     repo_url.trim_end_matches('/')
                 );
+                // Served beside the distro feed, so reached with its TLS settings.
                 addons.insert(
                     name.clone(),
                     RepoDef {
                         url: Some(url),
+                        ca: config.get_repo_ca(),
+                        tls_verify: Some(!config.get_repo_insecure()),
                         ..Default::default()
                     },
                 );
+                addon_placement.insert(name.clone(), placement);
                 order.push(name.clone());
             }
         }
@@ -725,6 +789,7 @@ impl ResolvedFeedSet {
                     ca: None,
                     mount: None,
                     loopback_rewritten: false,
+                    placement: Placement::Any,
                 });
                 continue;
             }
@@ -785,6 +850,7 @@ impl ResolvedFeedSet {
                     ca: def.ca.as_ref().map(|c| resolve_relative(config_dir, c)),
                     mount,
                     loopback_rewritten,
+                    placement: addon_placement.get(name).copied().unwrap_or_default(),
                 }
             };
 
@@ -872,18 +938,23 @@ impl ResolvedFeedSet {
                 ca: None,
                 mount: None,
                 loopback_rewritten: false,
+                placement: Placement::Any,
             });
         }
 
-        let addon_index_url = distro_releasever
-            .as_ref()
+        // The channel's index, not the releasever's: a snapshot pin resolves feeds
+        // under `<release>/<channel>/snapshots/<id>`, which carries no targets.json.
+        let addon_index_root = match (config.get_distro_release(), config.get_distro_channel()) {
+            (Some(r), Some(c)) => Some(format!("{r}/{c}")),
+            _ => distro_releasever.clone(),
+        };
+        let addon_index_url = addon_index_root
             .map(|rv| format!("{}/{rv}/targets.json", repo_url.trim_end_matches('/')));
         Ok(Some(Self {
             minted_tier: None,
             minted_key_id: None,
             addons: addon_names,
             addon_index_url,
-            addons_checked: false,
             version: CANONICAL_VERSION,
             target: target.to_string(),
             any_project_local: feeds.iter().any(|f| f.locality == Locality::ProjectLocal),
@@ -924,6 +995,12 @@ impl ResolvedFeedSet {
                     }
                 }
             }
+            let host = stage.is_host();
+            feeds.retain(|f| match f.get("placement").and_then(|p| p.as_str()) {
+                Some("host") => host,
+                Some("target") => !host,
+                _ => true,
+            });
             feeds.retain(|f| {
                 if f.get("disabled_at_stage").is_some() {
                     return true;
@@ -941,30 +1018,24 @@ impl ResolvedFeedSet {
         serde_json::to_string_pretty(&v).context("serializing feed projection")
     }
 
-    /// Check every add-on feed against the distro feed's `targets.json`, once per
-    /// invocation. The index is advisory: when it cannot be read the check is
-    /// skipped with a warning and dnf reports whatever is really missing.
-    pub async fn check_addons(&mut self) -> Result<()> {
-        if self.addons_checked || self.addons.is_empty() {
+    /// Check every add-on feed against the channel's `targets.json`, with a client
+    /// carrying the distro feed's TLS settings. The index is advisory: when it
+    /// cannot be read the check is skipped with a warning and dnf reports whatever
+    /// is really missing.
+    pub async fn check_addons(&self, client: &reqwest::Client) -> Result<()> {
+        if self.addons.is_empty() {
             return Ok(());
         }
-        self.addons_checked = true;
         let Some(url) = self.addon_index_url.clone() else {
+            crate::utils::output::print_info(
+                "no distro release/channel, so add-on feeds are not checked against targets.json",
+                crate::utils::output::OutputLevel::Normal,
+            );
             return Ok(());
         };
-        let tls_verify = self
-            .feeds
-            .iter()
-            .find(|f| f.kind == FeedKind::Distro)
-            .is_none_or(|f| f.tls_verify);
         let fetched = async {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20))
-                .danger_accept_invalid_certs(!tls_verify)
-                .build()?;
             client
                 .get(&url)
-                .header("User-Agent", user_agent())
                 .send()
                 .await?
                 .error_for_status()?
@@ -1500,15 +1571,17 @@ fn is_valid_feed_name(name: &str) -> bool {
 }
 
 /// The add-on feeds a `targets.json` lists for `target`: every
-/// `target/<target>-<name>` repo except the built-in `-ext`.
+/// `target/<target>-<name>` repo, except the built-in `-ext`, whose SDK half
+/// `sdk/<target>-<name>` is listed too.
 fn published_addons<'a>(index: &'a HashMap<String, Vec<String>>, target: &str) -> Vec<&'a str> {
     let prefix = format!("target/{target}-");
-    let mut names: Vec<&str> = index
-        .get(target)
+    let repos = index.get(target);
+    let mut names: Vec<&str> = repos
         .into_iter()
         .flatten()
         .filter_map(|r| r.strip_prefix(&prefix))
         .filter(|n| *n != "ext")
+        .filter(|n| repos.is_some_and(|rs| rs.iter().any(|r| *r == format!("sdk/{target}-{n}"))))
         .collect();
     names.sort_unstable();
     names
@@ -1526,8 +1599,9 @@ fn check_addons_against(
         if available.contains(&addon.as_str()) {
             continue;
         }
-        let mut msg =
-            format!("distro.feeds: '{addon}' is not an add-on feed published for {target}");
+        let mut msg = format!(
+            "distro.feeds: '{addon}' is not defined in repos: and is not an add-on feed published for {target}"
+        );
         let limit = (addon.chars().count() / 3).max(1);
         if let Some((_, near)) = available
             .iter()
@@ -2225,6 +2299,84 @@ distro:
             .unwrap_err()
             .to_string()
             .contains("x-sdk"));
+    }
+
+    /// Review fixes: each half is placed on its own side of a stage's dnf, both
+    /// carry the distro feed's TLS settings, and the index is the channel's even
+    /// under a snapshot pin.
+    #[test]
+    fn addon_halves_are_placed_and_inherit_distro_tls() {
+        let c = load(&format!(
+            "{BASE}  repo:\n    url: https://feed.example/\n    tls_verify: false\n  feeds: [ros2-jazzy]\n"
+        ));
+        let set = ResolvedFeedSet::resolve(
+            &c,
+            "raspberrypi5",
+            Path::new("."),
+            Some("2026/next/snapshots/42"),
+        )
+        .unwrap()
+        .unwrap();
+        let feed = |n: &str| set.feeds.iter().find(|f| f.name == n).unwrap();
+        assert_eq!(feed("ros2-jazzy").placement, Placement::Target);
+        assert_eq!(feed("ros2-jazzy-sdk").placement, Placement::Host);
+        assert!(feed("ros2-jazzy").applies_to(FeedStage::Rootfs));
+        assert!(feed("ros2-jazzy").applies_to(FeedStage::SdkTarget));
+        assert!(!feed("ros2-jazzy").applies_to(FeedStage::Sdk));
+        assert!(feed("ros2-jazzy-sdk").applies_to(FeedStage::Sdk));
+        assert!(!feed("ros2-jazzy-sdk").applies_to(FeedStage::Ext));
+        assert!(!feed("ros2-jazzy").tls_verify && !feed("ros2-jazzy-sdk").tls_verify);
+        // Pinned feeds come from the snapshot; the index from the channel.
+        assert_eq!(
+            feed("ros2-jazzy").baseurl,
+            "https://feed.example/2026/next/snapshots/42/target/raspberrypi5-ros2-jazzy"
+        );
+        assert_eq!(
+            set.addon_index_url.as_deref(),
+            Some("https://feed.example/2026/next/targets.json")
+        );
+        // The projection a stage hashes carries only that stage's half.
+        let host = set.stage_projection_json(FeedStage::Sdk).unwrap();
+        assert!(host.contains("ros2-jazzy-sdk") && !host.contains("\"ros2-jazzy\""));
+        let target = set.stage_projection_json(FeedStage::Rootfs).unwrap();
+        assert!(target.contains("\"ros2-jazzy\"") && !target.contains("ros2-jazzy-sdk"));
+    }
+
+    /// An undefined name close to one repos: defines is a typo, not an add-on; and
+    /// `<name>-sdk`, `ext` and `<name>-ext` are never add-on names.
+    #[test]
+    fn addon_names_that_are_mistakes_are_refused() {
+        let err = |yaml: String| {
+            ResolvedFeedSet::resolve(&load(&yaml), "t", Path::new("."), None)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = err(format!(
+            "{BASE}  feeds: [acme]\nrepos:\n  acem:\n    url: https://a\n"
+        ));
+        assert!(e.contains("did you mean 'acem'?"), "{e}");
+        let e = err(format!("{BASE}  feeds: [ros2-jazzy-sdk]\n"));
+        assert!(e.contains("list the add-on 'ros2-jazzy'"), "{e}");
+        for bad in ["ext", "foo-ext"] {
+            let e = err(format!("{BASE}  feeds: [{bad}]\n"));
+            assert!(e.contains("built-in extension feed"), "{e}");
+        }
+    }
+
+    /// The index must list both halves for an add-on to pass the check.
+    #[test]
+    fn an_addon_without_its_sdk_half_in_the_index_is_refused() {
+        let idx = index(&[(
+            "raspberrypi5",
+            &["target/raspberrypi5", "target/raspberrypi5-ros2-jazzy"],
+        )]);
+        let e = check_addons_against(&idx, "raspberrypi5", &["ros2-jazzy".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("not defined in repos: and is not an add-on feed"),
+            "{e}"
+        );
     }
 
     fn index(entries: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {

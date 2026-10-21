@@ -4454,6 +4454,7 @@ async fn invocation_feeds(
     target: &str,
     set: crate::utils::feeds::ResolvedFeedSet,
     project_root: &Path,
+    client: &reqwest::Client,
 ) -> Result<std::sync::Arc<InvocationFeeds>> {
     // The map lock is released before the mint starts; it is held only long enough
     // to hand out this target's cell. The single-mint guarantee comes from the
@@ -4467,6 +4468,9 @@ async fn invocation_feeds(
         guard.entry(target.to_string()).or_default().clone()
     };
     cell.get_or_try_init(|| async {
+        // An add-on the target does not publish is refused here, once per target,
+        // and before anything below records the set in the document or the lock.
+        set.check_addons(client).await?;
         // The canonical document describes the set this invocation adopted, so it
         // is written here, where that set is decided, and not by the caller.
         set.write_canonical(project_root)?;
@@ -4536,11 +4540,11 @@ impl Config {
         // `invocation_feeds`, before the mint, so they record what the build
         // depended on (`connect:<org>`) and never the short-lived token or the
         // host it was served from today.
-        let shared = invocation_feeds(target, set, &project_root).await?;
+        let client = crate::utils::snapshot::build_client(self)?;
+        let shared = invocation_feeds(target, set, &project_root, &client).await?;
         // Mint inside the lock: two stages starting at once must not both mint the
         // same feed, and the second must see the first one's token.
         let mut guard = shared.set.lock().await;
-        guard.check_addons().await?;
         guard.resolve_connect_credentials(stage).await?;
         Ok(Some(guard.materialize_in(stage, &shared.root)?))
     }
@@ -14753,7 +14757,7 @@ mod invocation_feeds_tests {
             crate::utils::feeds::ResolvedFeedSet::resolve(&c, "feeds-dir-test", dir.path(), None)
                 .unwrap()
                 .unwrap();
-        let feeds = invocation_feeds("feeds-dir-test", set, dir.path())
+        let feeds = invocation_feeds("feeds-dir-test", set, dir.path(), &reqwest::Client::new())
             .await
             .unwrap();
         let path = feeds.root.path();

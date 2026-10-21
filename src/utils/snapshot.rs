@@ -127,7 +127,7 @@ fn releasever_is_overridden(config: &Config) -> bool {
 
 /// Build an HTTP client honoring the repo's CA bundle / insecure setting,
 /// matching the TLS posture dnf uses for the same endpoint.
-fn build_client(config: &Config) -> Result<reqwest::Client> {
+pub(crate) fn build_client(config: &Config) -> Result<reqwest::Client> {
     // Snapshot resolution reaches the feed on its own, not through
     // `ResolvedFeedSet`, so the credentials-in-the-URL rule has to be enforced
     // here too or it is enforced only on the path that happens to run first.
