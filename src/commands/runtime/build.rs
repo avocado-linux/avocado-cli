@@ -3237,6 +3237,14 @@ if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -z "${AVOCADO_INITRA
     echo "ERROR: kernel.cmdline_extra is set, which on this machine travels in the boot FIT, but this runtime built no initramfs to rebuild the FIT around. Install the initramfs packages, or drop kernel.cmdline_extra." >&2
     exit 1
 fi
+# The root hash reaches the kernel only through a rebuilt FIT, and the FIT is
+# only rebuilt around this runtime's initramfs: with no initramfs the device
+# would boot the feed's FIT, without the hash, unverified.
+if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -z "${AVOCADO_INITRAMFS_IMAGE:-}" ] \
+    && [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
+    echo "ERROR: rootfs.image.verity is on, which on this machine needs the boot FIT rebuilt with the root hash, but this runtime built no initramfs to rebuild the FIT around. Install the initramfs packages, or turn rootfs verity off." >&2
+    exit 1
+fi
 if [ -f "$FIT_ITS" ] && [ -f "$OUTPUT_DIR/linux.bin" ] && [ -n "${AVOCADO_INITRAMFS_IMAGE:-}" ]; then
     if [ -z "${AVOCADO_FIT_KEY_DIR:-}" ] && [ "${AVOCADO_FIT_UNSIGNED:-0}" != "1" ]; then
         if [ -n "${AVOCADO_ROOTFS_ROOTHASH:-}" ]; then
@@ -3503,6 +3511,36 @@ mod tests {
             ("AVOCADO_INITRAMFS_IMAGE", ""),
         ]);
         assert_eq!(rc, 0, "{err}");
+    }
+
+    /// A FIT machine with rootfs verity on and no project initramfs must fail:
+    /// the FIT would not be rebuilt and the root hash would never reach the
+    /// kernel. Without verity the feed's FIT is left alone, as before.
+    #[cfg(unix)]
+    #[test]
+    fn verity_without_an_initramfs_fails_instead_of_booting_unverified() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("fit-image.its"), "/dts-v1/;\n").unwrap();
+        std::fs::write(dir.path().join("linux.bin"), "k").unwrap();
+        let run = |roothash: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(super::generate_fit_assembly_script())
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("OUTPUT_DIR", dir.path())
+                .env("AVOCADO_FIT_UNSIGNED", "1")
+                .env("AVOCADO_ROOTFS_ROOTHASH", roothash)
+                .output()
+                .unwrap()
+        };
+        let o = run("abc123");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{err}");
+        assert!(err.contains("built no initramfs"), "{err}");
+        assert!(!dir.path().join("fitImage").exists());
+        let o = run("");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 
     use super::*;
