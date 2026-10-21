@@ -1020,6 +1020,7 @@ impl ExtImageCommand {
 mkfs.erofs \
   -T "$SOURCE_DATE_EPOCH" \
   -U 00000000-0000-0000-0000-000000000000 \
+  ${{AVOCADO_EROFS_BLOCK_SIZE:+-b "$AVOCADO_EROFS_BLOCK_SIZE"}} \
   -x -1 \
   --all-root \{compress_flag}{exclude_section}
   "$OUTPUT_FILE" \
@@ -1211,6 +1212,19 @@ mod tests {
             None,
             None,
         )
+    }
+
+    /// Extension images mount on the same kernel as the rootfs, so they need
+    /// the same erofs block size (see the rootfs image test of the same name).
+    #[test]
+    fn test_create_build_script_erofs_takes_block_size_from_sdk() {
+        let cmd = make_cmd("my-ext");
+        let script =
+            cmd.create_build_script("1.0.0", "sysext", 0, "erofs", &[], "raw", None, false);
+        assert!(
+            script.contains(r#"${AVOCADO_EROFS_BLOCK_SIZE:+-b "$AVOCADO_EROFS_BLOCK_SIZE"}"#),
+            "mkfs.erofs must take the SDK's erofs block size"
+        );
     }
 
     #[test]
