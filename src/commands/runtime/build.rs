@@ -772,13 +772,19 @@ impl RuntimeBuildCommand {
             "/opt/_avocado/{target_arch}/runtimes/{}/rekeyed",
             self.runtime_name
         );
+        // Then the rootfs dm-verity tree (rootfs.image.verity), which shadows
+        // the zero placeholder the BSP installs under the same name.
+        let rootfs_verity_dir = format!(
+            "/opt/_avocado/{target_arch}/runtimes/{}/rootfs-verity",
+            self.runtime_name
+        );
         let stone_paths = match config.get_stone_include_paths_for_runtime(
             &self.runtime_name,
             target_arch,
             &self.config_path,
         )? {
-            Some(configured) => format!("{rekeyed_dir}:{configured}"),
-            None => rekeyed_dir,
+            Some(configured) => format!("{rekeyed_dir}:{rootfs_verity_dir}:{configured}"),
+            None => format!("{rekeyed_dir}:{rootfs_verity_dir}"),
         };
         env_vars.insert("AVOCADO_STONE_INCLUDE_PATHS".to_string(), stone_paths);
 
@@ -2508,6 +2514,10 @@ fi"#,
             "ROOTFS_IMAGE_REUSE",
             "rootfs",
             image_reuse.rootfs,
+            &crate::commands::rootfs::image::rootfs_verity_sidecars(rootfs_verity)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         );
         let fit_section = generate_fit_assembly_script();
 
@@ -2588,6 +2598,7 @@ fi"#,
             "INITRAMFS_IMAGE_REUSE",
             "initramfs",
             image_reuse.initramfs,
+            &[],
         );
 
         let script = format!(
@@ -2626,6 +2637,10 @@ rm -f "$RUNTIME_EXT_DIR"/*.raw "$RUNTIME_EXT_DIR"/*.kab 2>/dev/null || true
 # no-op because dnf still considers the package installed.
 rm -rf "$OUTPUT_DIR/rekeyed"
 mkdir -p "$OUTPUT_DIR/rekeyed"
+# The rootfs dm-verity tree's directory (rootfs/image.rs): emptied or
+# refilled only by the rootfs section, which a current image skips, so not
+# cleared here; it must exist before stone is handed it as an include path.
+mkdir -p "$OUTPUT_DIR/rootfs-verity"
 
 # Copy required extension images from global output/extensions to runtime-specific location
 echo "Copying required extension images to runtime-specific directory..."
@@ -4203,12 +4218,15 @@ runtimes:
         // It is a dnf install root: the CLI does not own what is in it and
         // cannot put back what it removes -- a reinstall is a no-op, because
         // dnf still considers the package installed.
+        // ROOTFS_OUTPUT is in $OUTPUT_DIR too: a removal spelled through it
+        // (the rootfs hash tree's, once) is the same hazard.
         for line in script.lines().filter(|l| l.trim_start().starts_with("rm ")) {
-            if !line.contains("$OUTPUT_DIR") {
+            if !line.contains("$OUTPUT_DIR") && !line.contains("ROOTFS_OUTPUT") {
                 continue;
             }
             assert!(
                 line.contains("$OUTPUT_DIR/rekeyed")
+                    || line.contains("$OUTPUT_DIR/rootfs-verity")
                     || line.contains("$OUTPUT_DIR/fitImage")
                     || line.contains("$RUNTIME_EXT_DIR"),
                 "removes a path the build does not own from the runtime install root: {line}"
@@ -4437,6 +4455,50 @@ runtimes:
             );
         }
     }
+
+    /// With rootfs verity on, the rootfs reuse gate also requires the hash tree
+    /// and root hash; with it off, it does not.
+    #[test]
+    fn rootfs_reuse_gate_requires_the_verity_tree_when_verity_is_on() {
+        let temp_dir = TempDir::new().unwrap();
+        let gate_for = |content: &str| {
+            let config_path = create_test_config_file(&temp_dir, content);
+            let parsed: serde_yaml::Value = serde_yaml::from_str(content).unwrap();
+            let cmd = RuntimeBuildCommand::new(
+                "test-runtime".to_string(),
+                config_path,
+                false,
+                Some("x86_64".to_string()),
+                None,
+                None,
+            );
+            let config = Config::load(&cmd.config_path).unwrap();
+            let s = cmd
+                .create_build_script(
+                    &config,
+                    &parsed,
+                    "x86_64",
+                    &[],
+                    SysrootImageReuse {
+                        rootfs: true,
+                        initramfs: true,
+                    },
+                )
+                .unwrap();
+            s.lines()
+                .find(|l| l.contains("if [ \"$ROOTFS_IMAGE_REUSE\" = \"1\" ]"))
+                .unwrap()
+                .to_string()
+        };
+        let base = "connect:\n  org: test\n\nruntimes:\n  test-runtime:\n    target: \"x86_64\"\n";
+        let on = gate_for(&format!("{base}\nrootfs:\n  image:\n    verity: true\n"));
+        for sc in crate::commands::rootfs::image::rootfs_verity_sidecars(true) {
+            assert!(on.contains(&format!("[ -s \"{sc}\" ]")), "{on}");
+        }
+        let off = gate_for(base);
+        assert!(!off.contains("rootfs-verity"), "{off}");
+    }
+
     /// `encrypt:` under a `target-<x>:` override is honored like every other
     /// `var:` key; the package union reads the same merged source, so the
     /// marker never ships without cryptsetup-var behind it.
