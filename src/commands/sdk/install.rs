@@ -2236,6 +2236,24 @@ mod tests {
         path
     }
 
+    /// Run a script `write_script` just wrote. Another test thread can fork
+    /// while the script is still open for writing here; until that child execs
+    /// and its close-on-exec copy goes away, exec of the script fails with
+    /// ETXTBSY. Retry on exactly that.
+    #[cfg(unix)]
+    fn run_status(cmd: &mut std::process::Command) -> std::process::ExitStatus {
+        const ETXTBSY: i32 = 26;
+        for _ in 0..100 {
+            match cmd.status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                status => return status.unwrap(),
+            }
+        }
+        cmd.status().unwrap()
+    }
+
     /// OE postinsts write through $D. A command prefixed with the offline
     /// environment sees every variable of the contract name the install root,
     /// so `$D/etc/shells` lands in the sysroot.
@@ -2321,7 +2339,7 @@ mod tests {
             } else {
                 cmd.env_remove("AVOCADO_SYSROOT_SCRIPTS");
             }
-            assert!(cmd.status().unwrap().success());
+            assert!(run_status(&mut cmd).success());
         };
         run(false);
         assert!(!log.exists(), "extensions must not run depmod");
@@ -2368,10 +2386,11 @@ mod tests {
     fn postinst_intercepts_succeed_without_action() {
         let dir = tempfile::tempdir().unwrap();
         let intercept = write_script(dir.path(), "postinst_intercept", POSTINST_INTERCEPT);
-        let status = std::process::Command::new(&intercept)
-            .args(["update_font_cache", "fontconfig-utils", "mlprefix="])
-            .status()
-            .unwrap();
+        let status = run_status(std::process::Command::new(&intercept).args([
+            "update_font_cache",
+            "fontconfig-utils",
+            "mlprefix=",
+        ]));
         assert!(status.success());
     }
 
@@ -2401,7 +2420,7 @@ mod tests {
             } else {
                 cmd.env_remove("AVOCADO_SYSROOT_SCRIPTS");
             }
-            assert!(cmd.status().unwrap().success());
+            assert!(run_status(&mut cmd).success());
             root.path()
                 .join("etc/systemd/system/multi-user.target.wants/demo.service")
                 .symlink_metadata()

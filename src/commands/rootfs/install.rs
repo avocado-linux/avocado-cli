@@ -659,15 +659,22 @@ fn contract_outputs() -> StampOutputs {
     }
 }
 
-/// Whether the sysroot was installed under an older scriptlet contract, going
-/// by the previous install stamp. dnf does not rerun the scriptlets of
-/// packages that are already installed, so such a sysroot has to be rebuilt
-/// from empty. No stamp (a first install, or `--no-stamps`) says nothing.
-fn scriptlet_contract_stale(prev: Option<&Stamp>) -> bool {
-    prev.is_some_and(|stamp| {
-        stamp.outputs.scriptlet_contract.as_deref()
-            != Some(crate::utils::stamps::SCRIPTLET_CONTRACT)
-    })
+/// Whether the sysroot has to be rebuilt from empty before it can be stamped
+/// with the current scriptlet contract. dnf does not rerun the scriptlets of
+/// packages that are already installed, so a sysroot installed under an older
+/// contract keeps their effects.
+///
+/// A stamp from an older contract (or none recorded) means rebuild. So does no
+/// stamp at all: a `--no-stamps` run deletes the stamp without wiping, and the
+/// sysroot it leaves could be from any contract; with no sysroot, the clean is
+/// a no-op. Under `--no-stamps` nothing was read and nothing will be stamped,
+/// so nothing is rebuilt for it.
+fn scriptlet_contract_stale(prev: Option<&Stamp>, no_stamps: bool) -> bool {
+    !no_stamps
+        && prev.is_none_or(|stamp| {
+            stamp.outputs.scriptlet_contract.as_deref()
+                != Some(crate::utils::stamps::SCRIPTLET_CONTRACT)
+        })
 }
 
 /// Write this sysroot's install stamp.
@@ -975,10 +982,13 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         )
     };
 
-    let contract_stale = scriptlet_contract_stale(params.prefetched_stamp.as_ref());
+    let contract_stale =
+        scriptlet_contract_stale(params.prefetched_stamp.as_ref(), params.no_stamps);
     let needs_clean_reinstall =
         kernel_pin_change.is_some() || !removed_packages.is_empty() || contract_stale;
-    if contract_stale {
+    // Only worth saying over a stamp; with none this is a first install, or the
+    // rebuild that follows a `--no-stamps` run.
+    if contract_stale && params.prefetched_stamp.is_some() {
         print_info(
             &format!(
                 "{label}: installed under an older package-scriptlet environment; cleaning sysroot for fresh install"
@@ -1666,17 +1676,28 @@ mod tests {
     /// scriptlet contract: no stamp says nothing, and the current one matches.
     #[test]
     fn sysroot_rebuilds_only_under_an_older_scriptlet_contract() {
-        assert!(!scriptlet_contract_stale(None));
-        assert!(!scriptlet_contract_stale(Some(&install_stamp(Some(
-            crate::utils::stamps::SCRIPTLET_CONTRACT
-        )))));
+        assert!(!scriptlet_contract_stale(
+            Some(&install_stamp(Some(
+                crate::utils::stamps::SCRIPTLET_CONTRACT
+            ))),
+            false
+        ));
         assert!(
-            scriptlet_contract_stale(Some(&install_stamp(None))),
+            scriptlet_contract_stale(Some(&install_stamp(None)), false),
             "a stamp from a CLI before the contract existed must rebuild"
         );
-        assert!(scriptlet_contract_stale(Some(&install_stamp(Some(
-            "offline-root-0"
-        )))));
+        assert!(scriptlet_contract_stale(
+            Some(&install_stamp(Some("offline-root-0"))),
+            false
+        ));
+        // A `--no-stamps` run deletes the stamp without wiping the sysroot; the
+        // next stamped install must not record the current contract over it.
+        assert!(
+            scriptlet_contract_stale(None, false),
+            "no stamp says nothing about the sysroot's contract: rebuild"
+        );
+        // Under --no-stamps nothing is read or stamped, so nothing is rebuilt.
+        assert!(!scriptlet_contract_stale(None, true));
         assert_eq!(
             contract_outputs().scriptlet_contract.as_deref(),
             Some(crate::utils::stamps::SCRIPTLET_CONTRACT),

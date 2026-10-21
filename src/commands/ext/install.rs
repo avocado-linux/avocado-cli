@@ -75,17 +75,50 @@ fn drop_content_stamps_script(ext_name: &str) -> String {
         + &remove_own_stamp_line(&StampRequirement::ext_image(ext_name))
 }
 
-/// Whether the previous install stamp (raw JSON) shows the sysroot was
-/// installed under an older scriptlet contract. dnf does not rerun the
-/// scriptlets of packages already installed, so such a sysroot is rebuilt from
-/// empty. No stamp, or one that does not parse, says nothing.
-fn scriptlet_contract_stale(stamp_json: Option<&str>) -> bool {
-    stamp_json
-        .and_then(|json| Stamp::from_json(json).ok())
-        .is_some_and(|stamp| {
-            stamp.outputs.scriptlet_contract.as_deref()
-                != Some(crate::utils::stamps::SCRIPTLET_CONTRACT)
-        })
+/// What an extension's previous install stamp says about the scriptlet
+/// contract its sysroot was installed under. dnf does not rerun the scriptlets
+/// of packages already installed, so a sysroot from an older contract has to be
+/// rebuilt from empty, and only a sysroot this CLI can vouch for may be stamped
+/// with the current contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorContract {
+    /// The stamp records the current contract.
+    Current,
+    /// The stamp records an older contract, none, or does not parse.
+    Stale,
+    /// There is no stamp: a first install, or one made with `--no-stamps`,
+    /// which removes it.
+    Missing,
+    /// The stamp was not read (`--no-stamps`, `--runs-on`, or a name the batch
+    /// read skips). Nothing is rebuilt for it, and nothing is vouched for.
+    Unknown,
+}
+
+impl PriorContract {
+    /// From a batch stamp read: `None` when the stamp was not read, `Some(None)`
+    /// when it was read and absent.
+    fn from_read(read: Option<Option<&str>>) -> Self {
+        match read {
+            None => PriorContract::Unknown,
+            Some(None) => PriorContract::Missing,
+            Some(Some(json)) => match Stamp::from_json(json) {
+                Ok(stamp)
+                    if stamp.outputs.scriptlet_contract.as_deref()
+                        == Some(crate::utils::stamps::SCRIPTLET_CONTRACT) =>
+                {
+                    PriorContract::Current
+                }
+                _ => PriorContract::Stale,
+            },
+        }
+    }
+
+    /// Whether the sysroot must be rebuilt from empty. A missing stamp over an
+    /// existing sysroot says nothing about how it was installed; over no
+    /// sysroot the clean is a no-op.
+    fn requires_rebuild(self) -> bool {
+        matches!(self, PriorContract::Stale | PriorContract::Missing)
+    }
 }
 
 /// Whether the fast path may skip an install on this stamp read.
@@ -93,9 +126,15 @@ fn scriptlet_contract_stale(stamp_json: Option<&str>) -> bool {
 /// Current, and not written by a transaction whose options the input hash does
 /// not cover (`--dnf-args`, `sdk.disable_weak_dependencies`). The fast path
 /// itself only runs for a standard transaction, so a `nonstandard_options`
-/// stamp is one this invocation would resolve differently -- reinstall.
+/// stamp is one this invocation would resolve differently -- reinstall. And
+/// recording the current scriptlet contract: the input hash folds the contract
+/// in, so a stamp written over a sysroot this CLI could not vouch for (see
+/// [`PriorContract::Unknown`]) would otherwise look current.
 fn stamp_allows_skip(status: &StampStatus) -> bool {
-    matches!(status, StampStatus::Current(stamp) if !stamp.outputs.nonstandard_options)
+    matches!(status, StampStatus::Current(stamp)
+        if !stamp.outputs.nonstandard_options
+            && stamp.outputs.scriptlet_contract.as_deref()
+                == Some(crate::utils::stamps::SCRIPTLET_CONTRACT))
 }
 
 /// Shell that clears an extension's sysroot and drops the stamps that vouch for
@@ -674,45 +713,49 @@ impl ExtInstallCommand {
         // Only fast-path shell-safe names (see `ext_name_stamp_safe`); the rest
         // fall through to a normal install rather than being skipped.
         let stamp_safe = ext_name_stamp_safe;
-        let stamp_reads: std::collections::HashMap<String, Option<String>> = if !fast_path {
-            std::collections::HashMap::new()
-        } else {
-            let reqs: Vec<StampRequirement> = extensions_to_install
-                .iter()
-                .filter(|(name, _)| stamp_safe(name))
-                .map(|(name, _)| StampRequirement::ext_install(name))
-                .collect();
-            // Read the stamps AND probe each sysroot in the same call, so a
-            // surviving stamp over a manually-removed sysroot does not skip a
-            // needed reinstall. The probe is the rpm database, not the
-            // directory: see `ext_sysroot_seeded_test`.
-            let mut command = generate_batch_read_stamps_script(&reqs);
-            for (name, _) in extensions_to_install.iter().filter(|(n, _)| stamp_safe(n)) {
-                command.push_str(&sysroot_probe_line(name));
-            }
-            let run_config = RunConfig {
-                container_image: container_image.to_string(),
-                target: target.to_string(),
-                command,
-                verbose: false,
-                source_environment: true,
-                interactive: false,
-                repo_url: repo_url.cloned(),
-                repo_release: repo_release.cloned(),
-                container_args: merged_container_args.clone(),
-                dnf_args: self.dnf_args.clone(),
-                sdk_arch: self.sdk_arch.clone(),
-                env_vars: self.runtime_env_vars(),
-                ..Default::default()
+        // Read even when the fast path is off: the previous stamp is also what says
+        // which scriptlet contract each sysroot was installed under. Not read under
+        // --no-stamps (the stamps are being bypassed) or --runs-on.
+        let stamp_reads: std::collections::HashMap<String, Option<String>> =
+            if self.no_stamps || runs_on_context.is_some() {
+                std::collections::HashMap::new()
+            } else {
+                let reqs: Vec<StampRequirement> = extensions_to_install
+                    .iter()
+                    .filter(|(name, _)| stamp_safe(name))
+                    .map(|(name, _)| StampRequirement::ext_install(name))
+                    .collect();
+                // Read the stamps AND probe each sysroot in the same call, so a
+                // surviving stamp over a manually-removed sysroot does not skip a
+                // needed reinstall. The probe is the rpm database, not the
+                // directory: see `ext_sysroot_seeded_test`.
+                let mut command = generate_batch_read_stamps_script(&reqs);
+                for (name, _) in extensions_to_install.iter().filter(|(n, _)| stamp_safe(n)) {
+                    command.push_str(&sysroot_probe_line(name));
+                }
+                let run_config = RunConfig {
+                    container_image: container_image.to_string(),
+                    target: target.to_string(),
+                    command,
+                    verbose: false,
+                    source_environment: true,
+                    interactive: false,
+                    repo_url: repo_url.cloned(),
+                    repo_release: repo_release.cloned(),
+                    container_args: merged_container_args.clone(),
+                    dnf_args: self.dnf_args.clone(),
+                    sdk_arch: self.sdk_arch.clone(),
+                    env_vars: self.runtime_env_vars(),
+                    ..Default::default()
+                };
+                match container_helper
+                    .run_in_container_with_output(run_config)
+                    .await
+                {
+                    Ok(output) => parse_batch_stamps_output(output.as_deref().unwrap_or("")),
+                    Err(_) => std::collections::HashMap::new(),
+                }
             };
-            match container_helper
-                .run_in_container_with_output(run_config)
-                .await
-            {
-                Ok(output) => parse_batch_stamps_output(output.as_deref().unwrap_or("")),
-                Err(_) => std::collections::HashMap::new(),
-            }
-        };
 
         // Install each extension
         for (index, (ext_name, ext_location)) in extensions_to_install.iter().enumerate() {
@@ -788,7 +831,16 @@ impl ExtInstallCommand {
                 }
             };
 
-            if !self
+            let prior_contract = PriorContract::from_read(
+                stamp_safe(ext_name)
+                    .then(|| {
+                        stamp_reads
+                            .get(&StampRequirement::ext_install(ext_name).relative_path())
+                            .map(|v| v.as_deref())
+                    })
+                    .flatten(),
+            );
+            let Some(contract_current) = self
                 .install_single_extension(
                     config,
                     parsed,
@@ -808,16 +860,12 @@ impl ExtInstallCommand {
                     effective_tui_context,
                     direct_deps.get(ext_name).map(Vec::as_slice).unwrap_or(&[]),
                     ext_up_to_date,
-                    scriptlet_contract_stale(
-                        stamp_reads
-                            .get(&StampRequirement::ext_install(ext_name).relative_path())
-                            .and_then(|v| v.as_deref()),
-                    ),
+                    prior_contract,
                 )
                 .await?
-            {
+            else {
                 return Err(anyhow::anyhow!("Failed to install extension '{ext_name}'"));
-            }
+            };
 
             // The config-only stamp fingerprints extension config, not the
             // per-invocation transaction: `--dnf-arg` and a disabled
@@ -878,7 +926,12 @@ impl ExtInstallCommand {
                 )?;
                 let outputs = StampOutputs {
                     nonstandard_options: !standard,
-                    scriptlet_contract: Some(crate::utils::stamps::SCRIPTLET_CONTRACT.to_string()),
+                    // Only for a sysroot rebuilt (or first installed) under the
+                    // current contract, or one whose previous stamp already
+                    // carried it. An unread previous stamp vouches for nothing,
+                    // so the next install that can read this one rebuilds.
+                    scriptlet_contract: contract_current
+                        .then(|| crate::utils::stamps::SCRIPTLET_CONTRACT.to_string()),
                     ..Default::default()
                 };
                 let stamp = Stamp::ext_install(ext_name, target, inputs, outputs);
@@ -1008,6 +1061,10 @@ impl ExtInstallCommand {
         true
     }
 
+    /// Install one extension's sysroot. `Ok(None)` when the install failed;
+    /// otherwise `Ok(Some(contract_current))`, whether the sysroot now holds
+    /// packages whose scriptlets ran under the current contract, which decides
+    /// whether its install stamp may record it.
     #[allow(clippy::too_many_arguments)]
     async fn install_single_extension(
         &self,
@@ -1029,8 +1086,8 @@ impl ExtInstallCommand {
         effective_tui_context: &Option<TuiContext>,
         direct_deps: &[String],
         up_to_date: bool,
-        scriptlet_contract_stale: bool,
-    ) -> Result<bool> {
+        prior_contract: PriorContract,
+    ) -> Result<Option<bool>> {
         let sysroot = self.extension_sysroot(extension);
 
         // Record runtime → extension membership upfront when a runtime is in
@@ -1057,7 +1114,8 @@ impl ExtInstallCommand {
                 &format!("Extension '{extension}' is up to date."),
                 OutputLevel::Normal,
             );
-            return Ok(true);
+            // `up_to_date` requires a stamp carrying the current contract.
+            return Ok(Some(true));
         }
 
         // Snapshot the previously-pinned kernel BEFORE the resolver runs: it
@@ -1211,7 +1269,7 @@ impl ExtInstallCommand {
         // stamps are off), so rebuilding a dependent is not extra work in the
         // steady state.
         let reseed_required = !direct_deps.is_empty();
-        if scriptlet_contract_stale {
+        if prior_contract == PriorContract::Stale {
             print_info(
                 &format!(
                     "Extension '{extension}': installed under an older package-scriptlet environment; cleaning sysroot for fresh install"
@@ -1223,7 +1281,7 @@ impl ExtInstallCommand {
             || self.force
             || reseed_required
             || kernel_pin_change.is_some()
-            || scriptlet_contract_stale;
+            || prior_contract.requires_rebuild();
         if clean_first {
             // Clean the sysroot so it will be recreated fresh below, and drop
             // the stamps that vouch for what was in it. `ext build`'s output —
@@ -1344,7 +1402,7 @@ impl ExtInstallCommand {
                     &format!("Failed to create sysroot for extension '{extension}'."),
                     OutputLevel::Normal,
                 );
-                return Ok(false);
+                return Ok(None);
             }
         }
 
@@ -1623,7 +1681,7 @@ $DNF_SDK_HOST \
                         }
                     }
                     install_result?;
-                    return Ok(false);
+                    return Ok(None);
                 }
 
                 // Query installed versions and update lock file
@@ -1710,7 +1768,12 @@ $DNF_SDK_HOST \
         // The one save: kernel pin, package versions and origins land together,
         // and only once the sysroot holds what they describe.
         lock_file.save(src_dir)?;
-        Ok(true)
+        // Rebuilt from empty (or first installed) here, or already under the
+        // current contract before: either way this sysroot ran its scriptlets
+        // with the current environment.
+        Ok(Some(
+            clean_first || prior_contract == PriorContract::Current,
+        ))
     }
 }
 
@@ -1750,13 +1813,49 @@ mod tests {
             .to_json()
             .unwrap()
         };
-        assert!(!scriptlet_contract_stale(None));
-        assert!(!scriptlet_contract_stale(Some("not json")));
-        assert!(!scriptlet_contract_stale(Some(&json(Some(
+        let current = json(Some(crate::utils::stamps::SCRIPTLET_CONTRACT));
+        let old = json(Some("offline-root-0"));
+        let none = json(None);
+        let read = |v: Option<&str>| PriorContract::from_read(Some(v));
+
+        assert_eq!(read(Some(&current)), PriorContract::Current);
+        assert!(!read(Some(&current)).requires_rebuild());
+        for stale in [&old, &none] {
+            assert_eq!(read(Some(stale)), PriorContract::Stale);
+            assert!(read(Some(stale)).requires_rebuild());
+        }
+        assert_eq!(read(Some("not json")), PriorContract::Stale);
+        // No stamp over an existing sysroot (a `--no-stamps` run, an older CLI)
+        // says nothing about how it was installed: rebuild.
+        assert_eq!(read(None), PriorContract::Missing);
+        assert!(read(None).requires_rebuild());
+        // Not read at all (`--runs-on`, a name the batch read skips): nothing is
+        // rebuilt, and the caller must not stamp the sysroot current.
+        assert_eq!(PriorContract::from_read(None), PriorContract::Unknown);
+        assert!(!PriorContract::Unknown.requires_rebuild());
+    }
+
+    /// A stamp whose inputs match but which does not record the current
+    /// contract (written over a sysroot nothing could vouch for) must not let
+    /// the fast path skip the install that would rebuild it.
+    #[test]
+    fn the_fast_path_needs_the_current_contract_on_the_stamp() {
+        let stamp = |contract: Option<&str>| {
+            Stamp::ext_install(
+                "app",
+                "t",
+                crate::utils::stamps::StampInputs::new("h".to_string()),
+                StampOutputs {
+                    scriptlet_contract: contract.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(stamp_allows_skip(&StampStatus::Current(stamp(Some(
             crate::utils::stamps::SCRIPTLET_CONTRACT
         )))));
-        assert!(scriptlet_contract_stale(Some(&json(None))));
-        assert!(scriptlet_contract_stale(Some(&json(Some(
+        assert!(!stamp_allows_skip(&StampStatus::Current(stamp(None))));
+        assert!(!stamp_allows_skip(&StampStatus::Current(stamp(Some(
             "offline-root-0"
         )))));
     }
@@ -1917,9 +2016,18 @@ mod tests {
             Some(&inputs)
         )));
 
-        // A standard transaction's stamp still takes the fast path, and a
-        // stamp written before the field existed reads as standard.
-        let plain = Stamp::ext_install("app", "t", inputs.clone(), StampOutputs::default());
+        // A standard transaction's stamp (which records the current scriptlet
+        // contract) still takes the fast path, and a stamp written before the
+        // nonstandard_options field existed reads as standard.
+        let plain = Stamp::ext_install(
+            "app",
+            "t",
+            inputs.clone(),
+            StampOutputs {
+                scriptlet_contract: Some(crate::utils::stamps::SCRIPTLET_CONTRACT.to_string()),
+                ..Default::default()
+            },
+        );
         let plain_json = serde_json::to_string(&plain).unwrap();
         assert!(!plain_json.contains("nonstandard_options"));
         assert!(stamp_allows_skip(&validate_stamp(
