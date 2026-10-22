@@ -835,17 +835,19 @@ static SIGINT_REAPER: std::sync::Once = std::sync::Once::new();
 
 /// The foreground `docker run` containers this process is waiting on. The
 /// SIGINT reaper exits the process, which skips the caller's own `docker
-/// stop`, so [`SessionContainers::shutdown`] removes these as well.
-static FOREGROUND_RUNS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// stop`, so [`SessionContainers::shutdown`] handles these as well. Each
+/// entry records if the run was started with `--rm`: shutdown removes those
+/// and only stops the others, so a kept container stays kept.
+static FOREGROUND_RUNS: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
 
 /// Keeps a container in [`FOREGROUND_RUNS`] while its run is in progress.
 struct ForegroundRun(Option<String>);
 
 impl ForegroundRun {
-    fn register(name: Option<&str>) -> Self {
+    fn register(name: Option<&str>, rm: bool) -> Self {
         let name = name.map(str::to_string);
         if let (Some(n), Ok(mut runs)) = (&name, FOREGROUND_RUNS.lock()) {
-            runs.push(n.clone());
+            runs.push((n.clone(), rm));
         }
         Self(name)
     }
@@ -854,7 +856,7 @@ impl ForegroundRun {
 impl Drop for ForegroundRun {
     fn drop(&mut self) {
         if let (Some(n), Ok(mut runs)) = (&self.0, FOREGROUND_RUNS.lock()) {
-            runs.retain(|r| r != n);
+            runs.retain(|(r, _)| r != n);
         }
     }
 }
@@ -938,10 +940,24 @@ impl SessionContainers {
     /// container. Best-effort: a container that is already gone is not an
     /// error, and a failure here must not mask the command's own result.
     pub fn shutdown(container_tool: &str) {
-        let mut names: Vec<String> = FOREGROUND_RUNS
+        let foreground: Vec<(String, bool)> = FOREGROUND_RUNS
             .lock()
             .map(|runs| runs.clone())
             .unwrap_or_default();
+        let mut names = Vec::new();
+        for (name, rm) in foreground {
+            if rm {
+                names.push(name);
+            } else {
+                // Started without --rm: the user wants the stopped container kept.
+                let _ = std::process::Command::new(container_tool)
+                    // stdio-flags-ok: docker stop timeout in seconds, not a tty
+                    .args(["stop", "-t", "2", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
         names.extend(Self::active_names());
         for name in names {
             let _ = std::process::Command::new(container_tool)
@@ -1797,6 +1813,7 @@ impl SdkContainer {
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
                 effective_container_name.as_deref(),
+                effective_config.rm,
                 tui_ctx,
             )
             .await
@@ -1806,6 +1823,7 @@ impl SdkContainer {
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
                 effective_container_name.as_deref(),
+                effective_config.rm,
             )
             .await
         }
@@ -2854,6 +2872,7 @@ impl SdkContainer {
         detach: bool,
         verbose: bool,
         container_name: Option<&str>,
+        rm: bool,
     ) -> Result<bool> {
         if verbose {
             print_info(
@@ -2930,7 +2949,7 @@ impl SdkContainer {
                     .stderr(Stdio::inherit());
             }
 
-            let _foreground = ForegroundRun::register(container_name);
+            let _foreground = ForegroundRun::register(container_name, rm);
             let mut child = cmd
                 .spawn()
                 .with_context(|| "Failed to spawn container command")?;
@@ -3074,6 +3093,7 @@ impl SdkContainer {
         detach: bool,
         verbose: bool,
         container_name: Option<&str>,
+        rm: bool,
         tui_ctx: &TuiContext,
     ) -> Result<bool> {
         // tokio::io imports are used by read_output_stream below
@@ -3088,7 +3108,7 @@ impl SdkContainer {
         // For detached mode, fall back to the normal path
         if detach {
             return self
-                .execute_container_command(container_cmd, detach, verbose, container_name)
+                .execute_container_command(container_cmd, detach, verbose, container_name, rm)
                 .await;
         }
 
@@ -3114,7 +3134,7 @@ impl SdkContainer {
             });
         }
 
-        let _foreground = ForegroundRun::register(container_name);
+        let _foreground = ForegroundRun::register(container_name, rm);
         let mut child = cmd
             .spawn()
             .with_context(|| "Failed to spawn container command")?;
@@ -5622,7 +5642,7 @@ extensions:
         fn shutdown_removes_a_foreground_run_in_progress() {
             let dir = tempfile::tempdir().unwrap();
             let tool = stub_tool(dir.path());
-            let run = ForegroundRun::register(Some("avocado-run-shutdown-t"));
+            let run = ForegroundRun::register(Some("avocado-run-shutdown-t"), true);
             SessionContainers::shutdown(&tool);
             drop(run);
             let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
@@ -5634,7 +5654,25 @@ extensions:
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|n| n == "avocado-run-shutdown-t"));
+                .any(|(n, _)| n == "avocado-run-shutdown-t"));
+        }
+
+        #[test]
+        fn shutdown_stops_a_foreground_run_started_without_rm() {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+            let run = ForegroundRun::register(Some("avocado-run-keep-t"), false);
+            SessionContainers::shutdown(&tool);
+            drop(run);
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(
+                log.contains("stop -t 2 avocado-run-keep-t"),
+                "tool calls: {log}"
+            );
+            assert!(
+                !log.contains("rm -f avocado-run-keep-t"),
+                "a run without --rm must keep its container: {log}"
+            );
         }
     }
 }
