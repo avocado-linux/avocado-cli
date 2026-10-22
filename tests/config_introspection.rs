@@ -79,3 +79,43 @@ fn config_validate_exits_1_and_lists_every_error() {
     assert!(paths.contains(&"/runtimes/dev/extensions"), "{payload}");
     assert!(paths.contains(&"/runtimes/dev/var/hardware"), "{payload}");
 }
+
+/// A value read from the environment must not reach any output: not the
+/// JSON report, not the human report, not stderr. The template the user
+/// wrote is shown instead.
+#[test]
+fn config_validate_never_prints_an_env_value() {
+    const SECRET: &str = "ghp_DUMMY_SECRET_VALUE_0123456789";
+    let yaml = "source_date_epoch: \"{{ env.AVOCADO_TEST_SECRET }}\"\nruntimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_SECRET }}\"\n";
+    for json in [true, false] {
+        let mut args = vec!["config", "validate", "-c", "-"];
+        if json {
+            args.extend(["--output", "json"]);
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_avocado"))
+            .args(&args)
+            .env("AVOCADO_TEST_SECRET", SECRET)
+            .current_dir(env!("CARGO_TARGET_TMPDIR"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run `avocado config validate`");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
+        assert!(!stdout.contains(SECRET), "json={json}: {stdout}");
+        assert!(!stderr.contains(SECRET), "json={json}: {stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains("{{ env.AVOCADO_TEST_SECRET }}"),
+            "json={json}: {stdout}{stderr}"
+        );
+    }
+}
