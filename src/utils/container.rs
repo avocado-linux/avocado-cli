@@ -1110,20 +1110,7 @@ impl SessionContainers {
             name.clone(),
         ];
         if with_mounts {
-            for k in [
-                "AVOCADO_TARGET",
-                "AVOCADO_HOST_UID",
-                "AVOCADO_HOST_GID",
-                "AVOCADO_SRC_DIR",
-                "AVOCADO_EXT_PATH_MOUNTS",
-                "AVOCADO_GIT_COMMON_DIR",
-                "AVOCADO_VERBOSE",
-            ] {
-                if let Some(v) = env.get(k) {
-                    cmd.push("-e".to_string());
-                    cmd.push(format!("{k}={v}"));
-                }
-            }
+            cmd.extend(session_create_env(env));
         }
         // shape ends with the image; everything before it is create flags.
         let (flags, image) = shape.split_at(shape.len() - 1);
@@ -1243,6 +1230,30 @@ impl SdkContainer {
     ) -> Result<String> {
         SessionContainers::get_or_create(&self.container_tool, shape, env_vars, true)
     }
+}
+
+/// `-e` args for creating a session container: the variables its mount
+/// block reads, and the git settings, so that every exec into the container
+/// inherits `safe.directory` and the worktree prune guard (see
+/// `src_mount_env`). Per-step variables stay on each exec.
+fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for k in [
+        "AVOCADO_TARGET",
+        "AVOCADO_HOST_UID",
+        "AVOCADO_HOST_GID",
+        "AVOCADO_SRC_DIR",
+        "AVOCADO_EXT_PATH_MOUNTS",
+        "AVOCADO_GIT_COMMON_DIR",
+        "AVOCADO_VERBOSE",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        if let Some(v) = env.get(k) {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+    }
+    args
 }
 
 /// `k=v` pairs, as `split_run_argv` returns them, as a map. The session
@@ -5065,6 +5076,7 @@ extensions:
                 .arg("-C")
                 .arg(&main)
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
                 .args(&args)
                 .status()
                 .unwrap()
@@ -5375,6 +5387,7 @@ extensions:
                 .arg("-C")
                 .arg(&main)
                 .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
                 .args(&args)
                 .status()
                 .unwrap()
@@ -5391,6 +5404,36 @@ extensions:
         // A plain repo or a non-git dir never needs the share check.
         assert_eq!(git_common_mount_for(&main, Some(&wt)), Ok(None));
         assert_eq!(git_common_mount_for(tmp.path(), Some(&wt)), Ok(None));
+    }
+
+    /// The session container's own environment must hold the git settings,
+    /// so that any exec into it (not only the SDK's step execs) gets
+    /// `safe.directory` and the worktree prune guard.
+    #[test]
+    fn session_create_env_carries_the_git_settings() {
+        let env: HashMap<String, String> = [
+            ("AVOCADO_HOST_UID", "0"),
+            ("AVOCADO_GIT_COMMON_DIR", "/h/.git"),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'safe.directory'='*' 'gc.worktreePruneExpire'='never'",
+            ),
+            ("AVOCADO_RUNTIME", "dev"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let args = session_create_env(&env);
+        for want in [
+            "AVOCADO_HOST_UID=0",
+            "AVOCADO_GIT_COMMON_DIR=/h/.git",
+            "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'",
+        ] {
+            let i = args.iter().position(|a| a == want).expect(want);
+            assert_eq!(args[i - 1], "-e");
+        }
+        // Per-step variables stay on the exec.
+        assert!(!args.iter().any(|a| a.starts_with("AVOCADO_RUNTIME")));
     }
 
     /// The session container runs the mount block once, at creation, so the
