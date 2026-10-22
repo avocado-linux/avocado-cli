@@ -85,8 +85,8 @@ fn config_validate_exits_1_and_lists_every_error() {
 /// wrote is shown instead.
 #[test]
 fn config_validate_never_prints_an_env_value() {
-    const SECRET: &str = "ghp_DUMMY_SECRET_VALUE_0123456789";
-    let yaml = "source_date_epoch: \"{{ env.AVOCADO_TEST_SECRET }}\"\nruntimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_SECRET }}\"\n";
+    const MARKER: &str = "AVOCADO_LEAK_MARKER_0123456789";
+    let yaml = "source_date_epoch: \"{{ env.AVOCADO_TEST_MARKER }}\"\nruntimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_MARKER }}\"\n";
     for json in [true, false] {
         let mut args = vec!["config", "validate", "-c", "-"];
         if json {
@@ -94,7 +94,7 @@ fn config_validate_never_prints_an_env_value() {
         }
         let mut child = Command::new(env!("CARGO_BIN_EXE_avocado"))
             .args(&args)
-            .env("AVOCADO_TEST_SECRET", SECRET)
+            .env("AVOCADO_TEST_MARKER", MARKER)
             .current_dir(env!("CARGO_TARGET_TMPDIR"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -111,10 +111,10 @@ fn config_validate_never_prints_an_env_value() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stdout}{stderr}");
-        assert!(!stdout.contains(SECRET), "json={json}: {stdout}");
-        assert!(!stderr.contains(SECRET), "json={json}: {stderr}");
+        assert!(!stdout.contains(MARKER), "json={json}: {stdout}");
+        assert!(!stderr.contains(MARKER), "json={json}: {stderr}");
         assert!(
-            format!("{stdout}{stderr}").contains("{{ env.AVOCADO_TEST_SECRET }}"),
+            format!("{stdout}{stderr}").contains("{{ env.AVOCADO_TEST_MARKER }}"),
             "json={json}: {stdout}{stderr}"
         );
     }
