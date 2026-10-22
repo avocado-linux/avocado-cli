@@ -71,6 +71,289 @@ pub struct SdkInstallCommand {
     pub tui_context: Option<TuiContext>,
 }
 
+/// Minimal offline `systemctl` for rootfs/initramfs scriptlets (enable,
+/// disable, preset, mask). Installed into the SDK by `sdk install`.
+const SYSTEMCTL_WRAPPER: &str = r#"#!/bin/bash
+# Minimal offline systemctl for sysroot enable/disable/preset operations.
+# Parses [Install] sections and creates symlinks directly — no running systemd needed.
+
+ROOT=""
+ACTION=""
+UNITS=()
+PRESET_MODE=""
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root=*) ROOT="${1#--root=}" ;;
+        --root) shift; ROOT="$1" ;;
+        --preset-mode=*) PRESET_MODE="${1#--preset-mode=}" ;;
+        --no-block|--no-reload|--force|-f|--now) ;; # ignore
+        enable|disable|preset|preset-all|mask|unmask|daemon-reload|restart|start|stop|reload|is-enabled)
+            ACTION="$1" ;;
+        -*) ;; # ignore unknown flags
+        *) UNITS+=("$1") ;;
+    esac
+    shift
+done
+
+# Extension installs never enable units from a scriptlet: which services run is
+# the runtime's choice (enable_services). OE's postinst passes --root=$D, so this
+# has to come before --root is honoured.
+if [ -n "$AVOCADO_EXT_INSTALLROOT" ] && [ "$AVOCADO_SYSROOT_SCRIPTS" != "1" ]; then
+    exit 0
+fi
+
+# For rootfs/initramfs scriptlets, use AVOCADO_EXT_INSTALLROOT as root if --root not given
+if [ "$AVOCADO_SYSROOT_SCRIPTS" = "1" ] && [ -z "$ROOT" ] && [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
+    ROOT="$AVOCADO_EXT_INSTALLROOT"
+fi
+
+# Noop for actions we don't handle offline, or if no root is set
+case "$ACTION" in
+    enable|disable|preset|preset-all|mask|unmask) ;;
+    *) exit 0 ;;
+esac
+
+[ -z "$ROOT" ] && exit 0
+
+UNIT_DIR="$ROOT/usr/lib/systemd/system"
+ETC_DIR="$ROOT/etc/systemd/system"
+
+# Parse WantedBy/RequiredBy/Alias from a unit file's [Install] section
+parse_install_section() {
+    local unit_file="$1"
+    local key="$2"
+    [ -f "$unit_file" ] || return
+    local in_install=false
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"  # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
+        [ -z "$line" ] && continue
+        case "$line" in
+            \[Install\]*) in_install=true; continue ;;
+            \[*) in_install=false; continue ;;
+        esac
+        if $in_install; then
+            case "$line" in
+                ${key}=*)
+                    local val="${line#*=}"
+                    val="${val#"${val%%[![:space:]]*}"}"
+                    echo "$val"
+                    ;;
+            esac
+        fi
+    done < "$unit_file"
+}
+
+do_enable() {
+    local unit="$1"
+    local unit_file="$UNIT_DIR/$unit"
+    [ -f "$unit_file" ] || return 0
+
+    # Process WantedBy
+    for target in $(parse_install_section "$unit_file" "WantedBy"); do
+        local wants_dir="$ETC_DIR/${target}.wants"
+        mkdir -p "$wants_dir"
+        ln -sf "/usr/lib/systemd/system/$unit" "$wants_dir/$unit"
+    done
+
+    # Process RequiredBy
+    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
+        local requires_dir="$ETC_DIR/${target}.requires"
+        mkdir -p "$requires_dir"
+        ln -sf "/usr/lib/systemd/system/$unit" "$requires_dir/$unit"
+    done
+
+    # Process Alias
+    for alias in $(parse_install_section "$unit_file" "Alias"); do
+        ln -sf "/usr/lib/systemd/system/$unit" "$ETC_DIR/$alias"
+    done
+
+    # Process Also (recursive enable)
+    for also in $(parse_install_section "$unit_file" "Also"); do
+        do_enable "$also"
+    done
+}
+
+do_disable() {
+    local unit="$1"
+    local unit_file="$UNIT_DIR/$unit"
+    [ -f "$unit_file" ] || return 0
+
+    for target in $(parse_install_section "$unit_file" "WantedBy"); do
+        rm -f "$ETC_DIR/${target}.wants/$unit"
+    done
+    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
+        rm -f "$ETC_DIR/${target}.requires/$unit"
+    done
+    for alias in $(parse_install_section "$unit_file" "Alias"); do
+        rm -f "$ETC_DIR/$alias"
+    done
+}
+
+do_mask() {
+    local unit="$1"
+    ln -sf /dev/null "$ETC_DIR/$unit"
+}
+
+do_unmask() {
+    local unit="$1"
+    local link="$ETC_DIR/$unit"
+    [ -L "$link" ] && [ "$(readlink "$link")" = "/dev/null" ] && rm -f "$link"
+}
+
+# Load preset rules: returns lines like "enable <pattern>" or "disable <pattern>"
+load_presets() {
+    local preset_dirs=("$ROOT/etc/systemd/system-preset" "$ROOT/usr/lib/systemd/system-preset")
+    # In initrd mode, also check initrd-preset
+    if [ -f "$ROOT/etc/initrd-release" ]; then
+        preset_dirs=("$ROOT/usr/lib/systemd/initrd-preset" "${preset_dirs[@]}")
+    fi
+    for dir in "${preset_dirs[@]}"; do
+        [ -d "$dir" ] || continue
+        # LC_ALL=C to match systemd's own C-collation ordering: preset rules are
+        # first-match-wins, so this order decides which units end up enabled.
+        for f in $(ls "$dir"/*.preset 2>/dev/null | LC_ALL=C sort); do
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line%%#*}"
+                line="${line#"${line%%[![:space:]]*}"}"
+                [ -z "$line" ] && continue
+                echo "$line"
+            done < "$f"
+        done
+    done
+}
+
+check_preset() {
+    local unit="$1"
+    local rules
+    rules=$(load_presets)
+    while IFS= read -r rule; do
+        local action pattern
+        action="${rule%% *}"
+        pattern="${rule#* }"
+        pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+        [ -z "$pattern" ] && continue
+        # fnmatch-style: check if unit matches pattern
+        case "$unit" in
+            $pattern) echo "$action"; return ;;
+        esac
+    done <<< "$rules"
+    # Default: enable
+    echo "enable"
+}
+
+case "$ACTION" in
+    enable)
+        for unit in "${UNITS[@]}"; do do_enable "$unit"; done ;;
+    disable)
+        for unit in "${UNITS[@]}"; do do_disable "$unit"; done ;;
+    mask)
+        for unit in "${UNITS[@]}"; do do_mask "$unit"; done ;;
+    unmask)
+        for unit in "${UNITS[@]}"; do do_unmask "$unit"; done ;;
+    preset)
+        for unit in "${UNITS[@]}"; do
+            result=$(check_preset "$unit")
+            if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
+                do_enable "$unit"
+            elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
+                do_disable "$unit"
+            fi
+        done ;;
+    preset-all)
+        if [ -d "$UNIT_DIR" ]; then
+            for unit_file in "$UNIT_DIR"/*.service "$UNIT_DIR"/*.socket "$UNIT_DIR"/*.timer "$UNIT_DIR"/*.path "$UNIT_DIR"/*.target; do
+                [ -f "$unit_file" ] || continue
+                unit="$(basename "$unit_file")"
+                result=$(check_preset "$unit")
+                if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
+                    do_enable "$unit"
+                elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
+                    do_disable "$unit"
+                fi
+            done
+        fi ;;
+esac
+exit 0
+"#;
+
+/// Interpreter for target-package scriptlets (`%__sh`/`%__bash`).
+const SCRIPTLET_SHELL: &str = r#"#!/bin/bash
+# Shell wrapper for RPM scriptlets
+# Set OPT=--opt to make Yocto scriptlets skip user/group management
+# This is the proper way to tell Yocto scripts we're in a sysroot environment
+
+# Set PATH to find our command wrappers first, but explicitly exclude the installroot
+# Only include: wrapper bin, SDK utilities, and container system paths
+export PATH="${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:${AVOCADO_SDK_PREFIX}/usr/bin:/usr/bin:/bin"
+
+# Tell Yocto scriptlets we're in OPT mode (skip user/group creation)
+export OPT="--opt"
+
+exec ${AVOCADO_SDK_PREFIX}/usr/bin/bash "$@"
+"#;
+
+/// Environment assignments that give target-package scriptlets OE's
+/// offline-install contract, for prefixing a no-chroot dnf invocation.
+///
+/// Scriptlets run outside a chroot (`RPM_NO_CHROOT_FOR_SCRIPTS`), and rpm runs
+/// them with the interpreter the package names, so the environment has to be
+/// set on the dnf command itself. An OE `pkg_postinst` finds its target root
+/// through `$D`, as it does in an OE image build, which exports these same
+/// variables; without them a postinst that writes to `$D/...` acts on the SDK
+/// container instead of the sysroot being installed.
+/// Shell that refuses to run target scriptlets against wrappers written by an
+/// older CLI. The wrappers live in the SDK volume and only `sdk install`
+/// rewrites them, so an install run straight after a CLI upgrade would
+/// otherwise pair the new environment (`$D`) with old wrappers, e.g. a
+/// `systemctl` that honours `--root=$D` inside an extension.
+pub(crate) fn scriptlet_contract_check() -> String {
+    format!(
+        r#"if [ "$(cat "$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/contract" 2>/dev/null)" != "{contract}" ]; then
+    echo "[ERROR] The SDK's package scriptlet wrappers were set up by an older avocado. Run 'avocado sdk install' to refresh them." >&2
+    exit 1
+fi
+"#,
+        contract = crate::utils::stamps::SCRIPTLET_CONTRACT
+    )
+}
+
+pub(crate) fn offline_scriptlet_env(installroot: &str) -> String {
+    format!(
+        "D={installroot} \\\nOFFLINE_ROOT={installroot} \\\nOPKG_OFFLINE_ROOT={installroot} \\\nIPKG_OFFLINE_ROOT={installroot} \\\nINTERCEPT_DIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts \\\n"
+    )
+}
+
+/// OE's offline `depmodwrapper`, which kernel and module postinsts call as
+/// `depmodwrapper -a -b <root> <kernel version> [<kernel package>]` when `$D`
+/// is set. Same scope as the depmod wrapper: rootfs and initramfs installs.
+const DEPMODWRAPPER: &str = r#"#!/bin/bash
+[ "$AVOCADO_SYSROOT_SCRIPTS" = "1" ] || exit 0
+ROOT=""
+KVER=""
+FLAGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b) shift; ROOT="$1" ;;
+        -*) FLAGS+=("$1") ;;
+        *) [ -z "$KVER" ] && KVER="$1" ;;
+    esac
+    shift
+done
+[ -n "$ROOT" ] && [ -n "$KVER" ] && [ -d "$ROOT/usr/lib/modules/$KVER" ] || exit 0
+exec "${AVOCADO_DEPMOD:-/sbin/depmod}" "${FLAGS[@]}" -b "$ROOT" "$KVER"
+"#;
+
+/// `$INTERCEPT_DIR/postinst_intercept` for target-package scriptlets.
+const POSTINST_INTERCEPT: &str = r#"#!/bin/sh
+# OE postinsts defer some work to an intercept when they run offline ($D set):
+# font, icon and GIO caches, and the like. A sysroot or extension install has
+# nothing to do for them, so every intercept succeeds without action.
+exit 0
+"#;
+
 impl SdkInstallCommand {
     /// Create a new SdkInstallCommand instance
     pub fn new(
@@ -1283,6 +1566,11 @@ exit 0
 DEPMOD_EOF
 chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/depmod
 
+# OE's offline depmod, which kernel and module postinsts call when $D is set.
+cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/depmodwrapper << 'DEPMODWRAPPER_EOF'
+@DEPMODWRAPPER@DEPMODWRAPPER_EOF
+chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/depmodwrapper
+
 # ldconfig is noop'd during install — ldconfig -r requires chroot which doesn't
 # work cross-arch. Instead, ldconfig is run during the rootfs/initramfs build step
 # against the work copy so ld.so.cache is baked into the final image.
@@ -1293,223 +1581,24 @@ ln -sf noop-command $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/ldconfig
 # This is a minimal offline implementation (like Yocto's systemd-systemctl-native)
 # because the SDK's systemctl has hardcoded sysconfdir paths that break --root.
 cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl << 'SYSTEMCTL_EOF'
-#!/bin/bash
-# Minimal offline systemctl for sysroot enable/disable/preset operations.
-# Parses [Install] sections and creates symlinks directly — no running systemd needed.
-
-ROOT=""
-ACTION=""
-UNITS=()
-PRESET_MODE=""
-
-# Parse arguments
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --root=*) ROOT="${1#--root=}" ;;
-        --root) shift; ROOT="$1" ;;
-        --preset-mode=*) PRESET_MODE="${1#--preset-mode=}" ;;
-        --no-block|--no-reload|--force|-f|--now) ;; # ignore
-        enable|disable|preset|preset-all|mask|unmask|daemon-reload|restart|start|stop|reload|is-enabled)
-            ACTION="$1" ;;
-        -*) ;; # ignore unknown flags
-        *) UNITS+=("$1") ;;
-    esac
-    shift
-done
-
-# For scriptlet calls, use AVOCADO_EXT_INSTALLROOT as root if --root not given
-if [ "$AVOCADO_SYSROOT_SCRIPTS" = "1" ] && [ -z "$ROOT" ] && [ -n "$AVOCADO_EXT_INSTALLROOT" ]; then
-    ROOT="$AVOCADO_EXT_INSTALLROOT"
-fi
-
-# Noop for actions we don't handle offline, or if no root is set
-case "$ACTION" in
-    enable|disable|preset|preset-all|mask|unmask) ;;
-    *) exit 0 ;;
-esac
-
-[ -z "$ROOT" ] && exit 0
-
-UNIT_DIR="$ROOT/usr/lib/systemd/system"
-ETC_DIR="$ROOT/etc/systemd/system"
-
-# Parse WantedBy/RequiredBy/Alias from a unit file's [Install] section
-parse_install_section() {
-    local unit_file="$1"
-    local key="$2"
-    [ -f "$unit_file" ] || return
-    local in_install=false
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"  # strip comments
-        line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
-        [ -z "$line" ] && continue
-        case "$line" in
-            \[Install\]*) in_install=true; continue ;;
-            \[*) in_install=false; continue ;;
-        esac
-        if $in_install; then
-            case "$line" in
-                ${key}=*)
-                    local val="${line#*=}"
-                    val="${val#"${val%%[![:space:]]*}"}"
-                    echo "$val"
-                    ;;
-            esac
-        fi
-    done < "$unit_file"
-}
-
-do_enable() {
-    local unit="$1"
-    local unit_file="$UNIT_DIR/$unit"
-    [ -f "$unit_file" ] || return 0
-
-    # Process WantedBy
-    for target in $(parse_install_section "$unit_file" "WantedBy"); do
-        local wants_dir="$ETC_DIR/${target}.wants"
-        mkdir -p "$wants_dir"
-        ln -sf "/usr/lib/systemd/system/$unit" "$wants_dir/$unit"
-    done
-
-    # Process RequiredBy
-    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
-        local requires_dir="$ETC_DIR/${target}.requires"
-        mkdir -p "$requires_dir"
-        ln -sf "/usr/lib/systemd/system/$unit" "$requires_dir/$unit"
-    done
-
-    # Process Alias
-    for alias in $(parse_install_section "$unit_file" "Alias"); do
-        ln -sf "/usr/lib/systemd/system/$unit" "$ETC_DIR/$alias"
-    done
-
-    # Process Also (recursive enable)
-    for also in $(parse_install_section "$unit_file" "Also"); do
-        do_enable "$also"
-    done
-}
-
-do_disable() {
-    local unit="$1"
-    local unit_file="$UNIT_DIR/$unit"
-    [ -f "$unit_file" ] || return 0
-
-    for target in $(parse_install_section "$unit_file" "WantedBy"); do
-        rm -f "$ETC_DIR/${target}.wants/$unit"
-    done
-    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
-        rm -f "$ETC_DIR/${target}.requires/$unit"
-    done
-    for alias in $(parse_install_section "$unit_file" "Alias"); do
-        rm -f "$ETC_DIR/$alias"
-    done
-}
-
-do_mask() {
-    local unit="$1"
-    ln -sf /dev/null "$ETC_DIR/$unit"
-}
-
-do_unmask() {
-    local unit="$1"
-    local link="$ETC_DIR/$unit"
-    [ -L "$link" ] && [ "$(readlink "$link")" = "/dev/null" ] && rm -f "$link"
-}
-
-# Load preset rules: returns lines like "enable <pattern>" or "disable <pattern>"
-load_presets() {
-    local preset_dirs=("$ROOT/etc/systemd/system-preset" "$ROOT/usr/lib/systemd/system-preset")
-    # In initrd mode, also check initrd-preset
-    if [ -f "$ROOT/etc/initrd-release" ]; then
-        preset_dirs=("$ROOT/usr/lib/systemd/initrd-preset" "${preset_dirs[@]}")
-    fi
-    for dir in "${preset_dirs[@]}"; do
-        [ -d "$dir" ] || continue
-        # LC_ALL=C to match systemd's own C-collation ordering: preset rules are
-        # first-match-wins, so this order decides which units end up enabled.
-        for f in $(ls "$dir"/*.preset 2>/dev/null | LC_ALL=C sort); do
-            while IFS= read -r line || [[ -n "$line" ]]; do
-                line="${line%%#*}"
-                line="${line#"${line%%[![:space:]]*}"}"
-                [ -z "$line" ] && continue
-                echo "$line"
-            done < "$f"
-        done
-    done
-}
-
-check_preset() {
-    local unit="$1"
-    local rules
-    rules=$(load_presets)
-    while IFS= read -r rule; do
-        local action pattern
-        action="${rule%% *}"
-        pattern="${rule#* }"
-        pattern="${pattern#"${pattern%%[![:space:]]*}"}"
-        [ -z "$pattern" ] && continue
-        # fnmatch-style: check if unit matches pattern
-        case "$unit" in
-            $pattern) echo "$action"; return ;;
-        esac
-    done <<< "$rules"
-    # Default: enable
-    echo "enable"
-}
-
-case "$ACTION" in
-    enable)
-        for unit in "${UNITS[@]}"; do do_enable "$unit"; done ;;
-    disable)
-        for unit in "${UNITS[@]}"; do do_disable "$unit"; done ;;
-    mask)
-        for unit in "${UNITS[@]}"; do do_mask "$unit"; done ;;
-    unmask)
-        for unit in "${UNITS[@]}"; do do_unmask "$unit"; done ;;
-    preset)
-        for unit in "${UNITS[@]}"; do
-            result=$(check_preset "$unit")
-            if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
-                do_enable "$unit"
-            elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
-                do_disable "$unit"
-            fi
-        done ;;
-    preset-all)
-        if [ -d "$UNIT_DIR" ]; then
-            for unit_file in "$UNIT_DIR"/*.service "$UNIT_DIR"/*.socket "$UNIT_DIR"/*.timer "$UNIT_DIR"/*.path "$UNIT_DIR"/*.target; do
-                [ -f "$unit_file" ] || continue
-                unit="$(basename "$unit_file")"
-                result=$(check_preset "$unit")
-                if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
-                    do_enable "$unit"
-                elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
-                    do_disable "$unit"
-                fi
-            done
-        fi ;;
-esac
-exit 0
-SYSTEMCTL_EOF
+@SYSTEMCTL_WRAPPER@SYSTEMCTL_EOF
 chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/bin/systemctl
 
 # Create shell wrapper for scriptlet interpreter
 cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh << 'SHELL_EOF'
-#!/bin/bash
-# Shell wrapper for RPM scriptlets
-# Set OPT=--opt to make Yocto scriptlets skip user/group management
-# This is the proper way to tell Yocto scripts we're in a sysroot environment
-
-# Set PATH to find our command wrappers first, but explicitly exclude the installroot
-# Only include: wrapper bin, SDK utilities, and container system paths
-export PATH="${AVOCADO_SDK_PREFIX}/ext-rpm-config-scripts/bin:${AVOCADO_SDK_PREFIX}/usr/bin:/usr/bin:/bin"
-
-# Tell Yocto scriptlets we're in OPT mode (skip user/group creation)
-export OPT="--opt"
-
-exec ${AVOCADO_SDK_PREFIX}/usr/bin/bash "$@"
-SHELL_EOF
+@SCRIPTLET_SHELL@SHELL_EOF
 chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
+
+# OE scriptlets hand deferred work (font and icon caches, and so on) to
+# $INTERCEPT_DIR/postinst_intercept when $D is set. None of it applies here.
+mkdir -p $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts
+cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept << 'INTERCEPT_EOF'
+@POSTINST_INTERCEPT@INTERCEPT_EOF
+chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept
+
+# The scriptlet contract these wrappers implement; installs check it before
+# running scriptlets (scriptlet_contract_check).
+echo "@SCRIPTLET_CONTRACT@" > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/contract
 
 # Update macros for extension scriptlets
 sed -i "s|^%_dbpath[[:space:]]*%{_var}/lib/rpm$|%_dbpath                %{_var}/lib/rpm|" $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros
@@ -1521,7 +1610,12 @@ cat >> $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/macros << 'MACROS_EOF'
 %__bash                 $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
 %__sh                   $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/scriptlet-shell.sh
 MACROS_EOF
-"#;
+"#
+        .replace("@SYSTEMCTL_WRAPPER@", SYSTEMCTL_WRAPPER)
+        .replace("@DEPMODWRAPPER@", DEPMODWRAPPER)
+        .replace("@SCRIPTLET_SHELL@", SCRIPTLET_SHELL)
+        .replace("@POSTINST_INTERCEPT@", POSTINST_INTERCEPT)
+        .replace("@SCRIPTLET_CONTRACT@", crate::utils::stamps::SCRIPTLET_CONTRACT);
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
@@ -2131,6 +2225,210 @@ mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    /// Write `body` to `dir/name` as an executable script.
+    #[cfg(unix)]
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Run a script `write_script` just wrote. Another test thread can fork
+    /// while the script is still open for writing here; until that child execs
+    /// and its close-on-exec copy goes away, exec of the script fails with
+    /// ETXTBSY. Retry on exactly that.
+    #[cfg(unix)]
+    fn run_status(cmd: &mut std::process::Command) -> std::process::ExitStatus {
+        const ETXTBSY: i32 = 26;
+        for _ in 0..100 {
+            match cmd.status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                status => return status.unwrap(),
+            }
+        }
+        cmd.status().unwrap()
+    }
+
+    /// OE postinsts write through $D. A command prefixed with the offline
+    /// environment sees every variable of the contract name the install root,
+    /// so `$D/etc/shells` lands in the sysroot.
+    #[cfg(unix)]
+    #[test]
+    fn offline_scriptlet_env_names_the_install_root() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path().display().to_string();
+        let script = format!(
+            "{}sh -c 'echo \"$D|$OFFLINE_ROOT|$OPKG_OFFLINE_ROOT|$IPKG_OFFLINE_ROOT|$INTERCEPT_DIR\"; mkdir -p \"$D/etc\"; echo /usr/bin/bash >> \"$D/etc/shells\"'",
+            offline_scriptlet_env(&r)
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_SDK_PREFIX", "/sdk")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("{r}|{r}|{r}|{r}|/sdk/ext-rpm-config-scripts/intercepts")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("etc/shells")).unwrap(),
+            "/usr/bin/bash\n"
+        );
+    }
+
+    /// Every dnf invocation that runs target scriptlets outside a chroot must
+    /// carry the offline environment, or those scriptlets act on the SDK
+    /// container. A new call site that copies the env block without it fails
+    /// here.
+    #[test]
+    fn every_no_chroot_install_carries_the_offline_env() {
+        for (file, src) in [
+            ("ext/install.rs", include_str!("../ext/install.rs")),
+            ("ext/dnf.rs", include_str!("../ext/dnf.rs")),
+            ("rootfs/install.rs", include_str!("../rootfs/install.rs")),
+        ] {
+            let no_chroot = src.matches("RPM_NO_CHROOT_FOR_SCRIPTS=1 \\").count();
+            let offline = src.matches("{offline_env}").count();
+            let checked = src.matches("{contract_check}").count();
+            assert!(no_chroot > 0, "{file}: no no-chroot install found");
+            assert_eq!(
+                no_chroot, offline,
+                "{file}: a no-chroot install lacks the offline env"
+            );
+            assert_eq!(
+                no_chroot, checked,
+                "{file}: a no-chroot install skips the scriptlet contract check"
+            );
+        }
+    }
+
+    /// The kernel postinst's offline call runs depmod against the root and
+    /// kernel version, not the trailing package name, and only for sysroots.
+    #[cfg(unix)]
+    #[test]
+    fn depmodwrapper_runs_depmod_on_the_sysroot_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("usr/lib/modules/6.12.0")).unwrap();
+        let log = dir.path().join("depmod.log");
+        let stub = write_script(
+            dir.path(),
+            "depmod",
+            &format!("#!/bin/sh\necho \"$*\" >> {}\n", log.display()),
+        );
+        let wrapper = write_script(dir.path(), "depmodwrapper", DEPMODWRAPPER);
+        let run = |sysroot_scripts: bool| {
+            let mut cmd = std::process::Command::new(&wrapper);
+            cmd.args(["-a", "-b"])
+                .arg(&root)
+                .args(["6.12.0", "kernel"])
+                .env("AVOCADO_DEPMOD", &stub);
+            if sysroot_scripts {
+                cmd.env("AVOCADO_SYSROOT_SCRIPTS", "1");
+            } else {
+                cmd.env_remove("AVOCADO_SYSROOT_SCRIPTS");
+            }
+            assert!(run_status(&mut cmd).success());
+        };
+        run(false);
+        assert!(!log.exists(), "extensions must not run depmod");
+        run(true);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().trim(),
+            format!("-a -b {} 6.12.0", root.display())
+        );
+    }
+
+    /// Installs refuse to run scriptlets against wrappers an older CLI wrote
+    /// (no contract file, or a different one), and run against current ones.
+    #[cfg(unix)]
+    #[test]
+    fn scriptlet_contract_check_refuses_old_wrappers() {
+        let prefix = tempfile::tempdir().unwrap();
+        let dir = prefix.path().join("ext-rpm-config-scripts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{}echo ran", scriptlet_contract_check()))
+                .env("AVOCADO_SDK_PREFIX", prefix.path())
+                .output()
+                .unwrap()
+        };
+        let missing = run();
+        assert!(!missing.status.success());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("avocado sdk install"));
+        std::fs::write(dir.join("contract"), "offline-root-0\n").unwrap();
+        assert!(!run().status.success(), "an older contract must be refused");
+        std::fs::write(
+            dir.join("contract"),
+            format!("{}\n", crate::utils::stamps::SCRIPTLET_CONTRACT),
+        )
+        .unwrap();
+        let current = run();
+        assert!(current.status.success());
+        assert_eq!(String::from_utf8_lossy(&current.stdout).trim(), "ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postinst_intercepts_succeed_without_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let intercept = write_script(dir.path(), "postinst_intercept", POSTINST_INTERCEPT);
+        let status = run_status(std::process::Command::new(&intercept).args([
+            "update_font_cache",
+            "fontconfig-utils",
+            "mlprefix=",
+        ]));
+        assert!(status.success());
+    }
+
+    /// OE's systemd postinst runs `systemctl --root=$D enable <unit>`. For a
+    /// rootfs install that enables the unit; for an extension it must not,
+    /// because the runtime's enable_services decides what runs.
+    #[cfg(unix)]
+    #[test]
+    fn systemctl_enables_for_sysroots_but_never_for_extensions() {
+        let bin = tempfile::tempdir().unwrap();
+        let systemctl = write_script(bin.path(), "systemctl", SYSTEMCTL_WRAPPER);
+        let enable = |sysroot_scripts: bool| {
+            let root = tempfile::tempdir().unwrap();
+            let units = root.path().join("usr/lib/systemd/system");
+            std::fs::create_dir_all(&units).unwrap();
+            std::fs::write(
+                units.join("demo.service"),
+                "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+            )
+            .unwrap();
+            let mut cmd = std::process::Command::new(&systemctl);
+            cmd.arg(format!("--root={}", root.path().display()))
+                .args(["enable", "demo.service"])
+                .env("AVOCADO_EXT_INSTALLROOT", root.path());
+            if sysroot_scripts {
+                cmd.env("AVOCADO_SYSROOT_SCRIPTS", "1");
+            } else {
+                cmd.env_remove("AVOCADO_SYSROOT_SCRIPTS");
+            }
+            assert!(run_status(&mut cmd).success());
+            root.path()
+                .join("etc/systemd/system/multi-user.target.wants/demo.service")
+                .symlink_metadata()
+                .is_ok()
+        };
+        assert!(enable(true), "rootfs install must enable the unit");
+        assert!(!enable(false), "extension install must not enable the unit");
+    }
 
     /// A feed rebuilt in place advances avocado-sdk-target, which arrives
     /// transitively and so is never named on the install line. Without the
