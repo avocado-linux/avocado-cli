@@ -504,10 +504,9 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
 /// `modules.dep` is empty. Without this pass that empty file is what the
 /// rootfs and the initramfs boot with.
 ///
-/// Runs for each kernel version in the sysroot, after the distro-sync (which
-/// can change module packages too) and before the overlay, so an overlay can
-/// still replace the generated files. Rootfs and initramfs only: extensions
-/// run depmod on the device when they merge (`AVOCADO_ON_MERGE`).
+/// Runs for each kernel version in the sysroot. Rootfs and initramfs only:
+/// extensions run depmod on the device when they merge (`AVOCADO_ON_MERGE`).
+/// [`post_dnf_steps`] gives its place in the install script.
 fn kernel_module_deps_step(sysroot_dir: &str) -> String {
     format!(
         r#"
@@ -522,6 +521,17 @@ for kdir in $AVOCADO_PREFIX/{sysroot_dir}/usr/lib/modules/*/; do
 done
 "#
     )
+}
+
+/// What a sysroot install runs after its dnf transactions: the overlay, then
+/// the depmod pass.
+///
+/// depmod goes last for two reasons. The overlay prune removes files that an
+/// earlier overlay placed and that no package owns, and a generated
+/// `modules.dep` is such a file: run before the prune, depmod's output can be
+/// removed again. An overlay can also add a `.ko`, and depmod has to see it.
+fn post_dnf_steps(overlay_snippet: &str, sysroot_dir: &str) -> String {
+    format!("{overlay_snippet}{}", kernel_module_deps_step(sysroot_dir))
 }
 
 /// Detect package removals by comparing the **effective** package set for
@@ -1316,7 +1326,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
-    let module_deps_step = kernel_module_deps_step(sysroot_dir);
+    let post_dnf = post_dnf_steps(&overlay_snippet, sysroot_dir);
     let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
     let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
         "$AVOCADO_PREFIX/{sysroot_dir}"
@@ -1338,7 +1348,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
-{sync_snippet}{module_deps_step}{overlay_snippet}"#
+{sync_snippet}{post_dnf}"#
     );
     if params.no_stamps {
         // See remove_own_stamp_line: an unrecorded install must not leave the
@@ -2747,14 +2757,60 @@ mod tests {
         assert_eq!(calls.len(), 1);
     }
 
-    /// The pass has to follow both dnf transactions (the install and the
-    /// distro-sync) in the one install script that rootfs and initramfs share.
+    /// The post-dnf steps have to follow both dnf transactions (the install
+    /// and the distro-sync) in the one install script that rootfs and
+    /// initramfs share. Only the code before the test module is searched, so
+    /// this test's own strings cannot satisfy it.
     #[test]
-    fn module_deps_step_follows_the_dnf_transactions() {
+    fn post_dnf_steps_follow_the_dnf_transactions() {
         let src = include_str!("install.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("file has a production part");
+        assert_ne!(production.len(), src.len(), "test module marker not found");
         assert!(
-            src.contains("{sync_snippet}{module_deps_step}{overlay_snippet}"),
-            "the depmod pass moved out of the sysroot install script"
+            production.contains("{sync_snippet}{post_dnf}\"#"),
+            "the post-dnf steps moved in the sysroot install script"
+        );
+        assert!(production.contains("post_dnf_steps(&overlay_snippet, sysroot_dir)"));
+    }
+
+    /// An earlier overlay placed `modules.dep` and the current one does not.
+    /// The prune removes that file, and depmod has to write it again after.
+    #[test]
+    #[cfg(unix)]
+    fn depmod_output_survives_the_overlay_prune() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dep = "usr/lib/modules/6.12.87/modules.dep";
+        overlay_fixture(
+            root,
+            &["usr/lib/modules/6.12.87/kernel/zram.ko", dep],
+            &["etc/hello.conf"],
+            Some(&[dep]),
+        );
+        let stub = root.join("depmod-stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho regenerated > \"$3/usr/lib/modules/$4/modules.dep\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "set -e\nexport AVOCADO_DEPMOD='{}'\n{}",
+            stub.display(),
+            super::post_dnf_steps(
+                &build_overlay_script(Some(("overlay", "overlay", false)), "rootfs"),
+                "rootfs"
+            )
+        );
+        let out = run_overlay_script(&script, root, None);
+        assert!(out.contains(&format!("Removed /{dep}")), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("prefix/rootfs").join(dep)).unwrap(),
+            "regenerated\n"
         );
     }
 }
