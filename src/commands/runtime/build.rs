@@ -2400,34 +2400,10 @@ fi"#
         };
 
         // Build runtime-level var_files section
-        let runtime_var_files_section = {
-            let runtime_var_files = crate::utils::config::get_runtime_var_files(&merged_runtime);
-            if runtime_var_files.is_empty() {
-                "# No runtime var_files to apply".to_string()
-            } else {
-                let commands: Vec<String> = runtime_var_files
-                    .iter()
-                    .map(|mapping| {
-                        format!(
-                            r#"
-if [ -e "/opt/src/{source}" ]; then
-    mkdir -p "$VAR_DIR/{dest}"
-    cp -a "/opt/src/{source}" "$VAR_DIR/{dest}"
-    echo "  Copied runtime var_files: {source} -> {dest}"
-else
-    echo "WARNING: runtime var_files source not found: /opt/src/{source}"
-fi"#,
-                            source = mapping.source,
-                            dest = mapping.dest
-                        )
-                    })
-                    .collect();
-                format!(
-                    "echo \"Applying runtime var files to var partition...\"\n{}",
-                    commands.join("\n")
-                )
-            }
-        };
+        let runtime_var_files_section = runtime_var_files_script(
+            &crate::utils::config::get_runtime_var_files(&merged_runtime),
+            "/opt/src",
+        );
 
         // Build Docker image priming section
         // Collect docker_images from all extensions in the runtime
@@ -3410,6 +3386,47 @@ fi
     .to_string()
 }
 
+/// Shell that copies runtime `var_files` from the project (`src_root`, which
+/// is `/opt/src` in the container) into the var partition staging (`$VAR_DIR`).
+fn runtime_var_files_script(
+    mappings: &[crate::utils::config::VarFileMapping],
+    src_root: &str,
+) -> String {
+    if mappings.is_empty() {
+        return "# No runtime var_files to apply".to_string();
+    }
+    let commands: Vec<String> = mappings
+        .iter()
+        .map(|mapping| {
+            format!(
+                r#"
+if [ -e "{src_root}/{source}" ]; then
+    mkdir -p "$VAR_DIR/{dest}"
+    # Project files show the host owner when /opt/src is a plain mount (the
+    # avocado-vm), and mkfs.btrfs -r keeps owners. Make the project's copy
+    # root's in a temp dir, then merge it: cp -a merges into an existing
+    # dest, and files the project did not provide keep their owners.
+    # No set -e here: an empty _vf_tmp would make the cp below target /.
+    _vf_tmp=$(mktemp -d) || exit 1
+    cp -a "{src_root}/{source}" "$_vf_tmp/"
+    chown -hR root:root "$_vf_tmp"
+    cp -a "$_vf_tmp/$(basename "{src_root}/{source}")" "$VAR_DIR/{dest}"
+    rm -rf "$_vf_tmp"
+    echo "  Copied runtime var_files: {source} -> {dest}"
+else
+    echo "WARNING: runtime var_files source not found: {src_root}/{source}"
+fi"#,
+                source = mapping.source,
+                dest = mapping.dest
+            )
+        })
+        .collect();
+    format!(
+        "echo \"Applying runtime var files to var partition...\"\n{}",
+        commands.join("\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, SdkContainer};
@@ -3531,6 +3548,109 @@ mod tests {
         assert!(err.contains("content delegation staging files"), "{err}");
         assert!(err.contains("runtime 'dev'"), "{err}");
         assert!(staging_dirs(&project).is_empty(), "staging is removed");
+    }
+
+    #[test]
+    fn runtime_var_files_with_nothing_configured() {
+        assert_eq!(
+            super::runtime_var_files_script(&[], "/opt/src"),
+            "# No runtime var_files to apply"
+        );
+    }
+
+    /// The project's copy is made root's before it is merged into var
+    /// staging, so files already in the dest (an extension's service-owned
+    /// cache) keep their owners. Runs the script with a `chown` stub that
+    /// records its targets, so it needs no root: no chown may point into
+    /// `$VAR_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_var_files_never_chowns_what_is_already_in_var_staging() {
+        use crate::utils::config::VarFileMapping;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, var, bin) = (
+            tmp.path().join("src"),
+            tmp.path().join("var"),
+            tmp.path().join("bin"),
+        );
+        std::fs::create_dir_all(src.join("seed/app")).unwrap();
+        std::fs::write(src.join("seed/app/settings"), "s").unwrap();
+        std::fs::create_dir_all(var.join("lib/app/cache")).unwrap();
+        std::fs::write(var.join("lib/app/cache/state"), "c").unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = tmp.path().join("chown.log");
+        let stub = bin.join("chown");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = super::runtime_var_files_script(
+            &[VarFileMapping {
+                source: "seed/app".to_string(),
+                dest: "lib".to_string(),
+            }],
+            src.to_str().unwrap(),
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("VAR_DIR", &var)
+            .env("PATH", path)
+            .env("TMPDIR", tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(var.join("lib/app/settings")).unwrap(),
+            "s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(var.join("lib/app/cache/state")).unwrap(),
+            "c"
+        );
+        let chowned = std::fs::read_to_string(&log).unwrap();
+        assert!(chowned.contains("root:root"), "{chowned}");
+        assert!(
+            !chowned.contains(var.to_str().unwrap()),
+            "chown reached var staging: {chowned}"
+        );
+
+        // If mktemp fails the script stops: an empty temp dir would make the
+        // cp target `/`.
+        let cp_log = tmp.path().join("cp.log");
+        for (tool, body) in [
+            ("mktemp", "#!/bin/sh\nexit 1\n".to_string()),
+            (
+                "cp",
+                format!("#!/bin/sh\necho \"$@\" >> '{}'\n", cp_log.display()),
+            ),
+        ] {
+            let p = bin.join(tool);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("VAR_DIR", &var)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "script went on after mktemp failed");
+        assert!(!cp_log.exists(), "cp ran after mktemp failed");
     }
 
     #[test]

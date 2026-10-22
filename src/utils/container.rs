@@ -89,6 +89,52 @@ pub fn is_vm_routing_active() -> bool {
     host == format!("unix://{}", paths.docker_socket().display())
 }
 
+/// Host UID/GID passed to the container entrypoint, which bindfs-maps them to
+/// root on `/opt/src`. Under VM routing this returns 0:0, so the entrypoint
+/// uses a plain bind mount, and bindfs on top of 9p made file operations 2 to
+/// 18x slower. An explicit `AVOCADO_HOST_UID` still wins (with
+/// `AVOCADO_HOST_GID`, or the host GID); `AVOCADO_HOST_GID` alone does not.
+///
+/// bindfs exists so that root in the container does not write root-owned
+/// files into the host's project dir. Under the VM that cannot happen without
+/// it: QEMU writes the host files, as the user who started the VM, and
+/// `security_model=mapped-xattr` (`vm::share::qemu_args_for`) keeps the
+/// guest's owner in an xattr. If either changes (another security model, or
+/// QEMU run as root), container writes reach the host with the guest owner
+/// and this needs bindfs again.
+fn src_mount_uid_gid() -> (u32, u32) {
+    if vm_plain_src_mount() {
+        return (0, 0);
+    }
+    crate::utils::config::resolve_host_uid_gid(None)
+}
+
+fn vm_plain_src_mount() -> bool {
+    is_vm_routing_active() && std::env::var_os("AVOCADO_HOST_UID").is_none()
+}
+
+/// `-e` values for the `/opt/src` mount: the UID/GID the entrypoint maps
+/// (see `src_mount_uid_gid`), and under the plain VM mount
+/// `safe.directory=*` for git. Without bindfs, host files show the host UID
+/// inside the container, and git refuses such a repository as root
+/// ("detected dubious ownership"). With bindfs every project repo looked
+/// root-owned, so git trusted all of them, nested repos and path-extension
+/// mounts included; `*` keeps that. Narrower `<dir>/*` entries need git 2.46,
+/// and the 2024 SDK ships 2.44. `GIT_CONFIG_PARAMETERS` is how `git -c`
+/// reaches child processes (command scope, which git honors for
+/// `safe.directory`), and it does not touch a project's own `GIT_CONFIG_COUNT`.
+fn src_mount_env() -> Vec<String> {
+    let (uid, gid) = src_mount_uid_gid();
+    let mut env = vec![
+        format!("AVOCADO_HOST_UID={uid}"),
+        format!("AVOCADO_HOST_GID={gid}"),
+    ];
+    if vm_plain_src_mount() {
+        env.push("GIT_CONFIG_PARAMETERS='safe.directory'='*'".to_string());
+    }
+    env
+}
+
 /// When docker is going to execute inside the avocado-vm, ensure the
 /// 9p workspace share is actually mounted in the guest before we issue
 /// any bind mounts. Lazy on purpose: we only pay the SSH probe right
@@ -492,7 +538,7 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
                     mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (plain bind mount)" >&2; fi
                 else
                     _map="--map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0"
                     # Keep both attempts' stderr and print neither unless the
@@ -2169,11 +2215,10 @@ impl SdkContainer {
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Pass host UID/GID for bindfs permission translation
-        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        for kv in src_mount_env() {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -3075,28 +3120,14 @@ impl SdkContainer {
         result
     }
 
-    /// Run a simple command in the container without the full SDK entrypoint.
-    ///
-    /// This is useful for quick one-off operations like chown, cp, etc.
-    /// that don't need the SDK environment setup.
-    ///
-    /// # Arguments
-    /// * `container_image` - The container image to use
-    /// * `command` - The bash command to run
-    /// * `rm` - Whether to remove the container after exit
-    ///
-    /// # Returns
-    /// `true` if the command succeeded, `false` otherwise
-    pub async fn run_simple_command(
+    /// The `docker run` argv for `run_simple_command`, without running it.
+    fn simple_command_argv(
         &self,
         container_image: &str,
         command: &str,
         rm: bool,
-    ) -> Result<bool> {
-        // Get or create docker volume for persistent state
-        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
-        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
-
+        volume_name: &str,
+    ) -> Vec<String> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
         if rm {
@@ -3120,14 +3151,14 @@ impl SdkContainer {
             translate_bind_for_vm(src_path).display()
         ));
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+        container_cmd.push(format!("{volume_name}:/opt/_avocado:rw"));
 
         // Pass host UID/GID for bindfs permission translation
-        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        let (host_uid, host_gid) = src_mount_uid_gid();
+        for kv in src_mount_env() {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
         // Pass SDK image for error messages
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_SDK_IMAGE={container_image}"));
@@ -3159,6 +3190,34 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             )
         };
         container_cmd.push(full_command);
+        container_cmd
+    }
+
+    /// Run a simple command in the container without the full SDK entrypoint.
+    ///
+    /// This is useful for quick one-off operations like chown, cp, etc.
+    /// that don't need the SDK environment setup.
+    ///
+    /// # Arguments
+    /// * `container_image` - The container image to use
+    /// * `command` - The bash command to run
+    /// * `rm` - Whether to remove the container after exit
+    ///
+    /// # Returns
+    /// `true` if the command succeeded, `false` otherwise
+    pub async fn run_simple_command(
+        &self,
+        container_image: &str,
+        command: &str,
+        rm: bool,
+    ) -> Result<bool> {
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let container_cmd =
+            self.simple_command_argv(container_image, command, rm, &volume_state.volume_name);
+        let src_path = self.mounted_src_dir();
 
         if self.verbose {
             print_info(
@@ -3243,10 +3302,10 @@ if ! command -v bindfs >/dev/null 2>&1; then
 fi
 
 if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-    # If host user is already root (UID 0), no mapping needed - just bind mount
+    # Host UID/GID 0:0 (host is root, or the avocado-vm): plain bind mount, no mapping
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (plain bind mount, no UID mapping)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
@@ -3490,10 +3549,10 @@ if ! command -v bindfs >/dev/null 2>&1; then
 fi
 
 if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-    # If host user is already root (UID 0), no mapping needed - just bind mount
+    # Host UID/GID 0:0 (host is root, or the avocado-vm): plain bind mount, no mapping
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (plain bind mount, no UID mapping)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
@@ -4529,6 +4588,134 @@ extensions:
     fn test_sdk_container_verbose() {
         let container = SdkContainer::new().verbose(true);
         assert!(container.verbose);
+    }
+
+    /// Restores the env on drop, so a failed assert does not leak
+    /// DOCKER_HOST into later tests.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Saves and clears the env that decides the `/opt/src` mount, and
+    /// returns the `DOCKER_HOST` value that turns VM routing on. Tests that
+    /// use it must be `#[serial]`.
+    fn vm_routing_env() -> (RestoreEnv, String) {
+        let restore = RestoreEnv(
+            ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect(),
+        );
+        for k in ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"] {
+            std::env::remove_var(k);
+        }
+        let vm_sock = format!(
+            "unix://{}",
+            crate::utils::vm::state::VmPaths::resolve()
+                .unwrap()
+                .docker_socket()
+                .display()
+        );
+        (restore, vm_sock)
+    }
+
+    /// Both container start sites must take the plain mount and the git
+    /// trust under VM routing, and neither without it. Guards the call sites,
+    /// not only `src_mount_env`.
+    #[test]
+    #[serial_test::serial]
+    fn container_start_sites_use_the_plain_mount_only_under_vm_routing() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, vm_sock) = vm_routing_env();
+        let container = SdkContainer::new();
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let build = |c: &SdkContainer| {
+            c.build_container_command(
+                &config,
+                &["true".to_string()],
+                &HashMap::new(),
+                &volume_state,
+            )
+            .unwrap()
+        };
+        let simple = |c: &SdkContainer| c.simple_command_argv("test-image", "true", true, "vol");
+        let git = "GIT_CONFIG_PARAMETERS='safe.directory'='*'".to_string();
+        let (uid, gid) = crate::utils::config::resolve_host_uid_gid(None);
+        let host_uid = format!("AVOCADO_HOST_UID={uid}");
+        let host_gid = format!("AVOCADO_HOST_GID={gid}");
+
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&host_uid) && cmd.contains(&host_gid),
+                "{name}: {cmd:?}"
+            );
+            assert!(!cmd.contains(&git), "{name}: git trust without VM routing");
+        }
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_UID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_GID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(cmd.contains(&git), "{name}: no git trust under VM routing");
+        }
+        // run_simple_command builds its own mount script from the same UID.
+        let script = simple(&container).pop().unwrap();
+        assert!(
+            script.contains("mount --bind /mnt/src /opt/src"),
+            "{script}"
+        );
+        assert!(!script.contains("bindfs --map"), "{script}");
+    }
+
+    // Serial: mutates DOCKER_HOST and AVOCADO_HOST_UID/GID.
+    #[test]
+    #[serial_test::serial]
+    fn src_mount_env_skips_bindfs_and_trusts_git_only_under_vm_routing() {
+        let (_restore, vm_sock) = vm_routing_env();
+
+        std::env::remove_var("DOCKER_HOST");
+        assert_eq!(
+            src_mount_uid_gid(),
+            crate::utils::config::resolve_host_uid_gid(None)
+        );
+
+        assert!(!src_mount_env().iter().any(|e| e.starts_with("GIT_CONFIG")));
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        assert_eq!(src_mount_uid_gid(), (0, 0));
+        assert_eq!(
+            src_mount_env(),
+            [
+                "AVOCADO_HOST_UID=0",
+                "AVOCADO_HOST_GID=0",
+                "GIT_CONFIG_PARAMETERS='safe.directory'='*'",
+            ]
+        );
+
+        // An explicit UID brings bindfs back, so no safe.directory either.
+        std::env::set_var("AVOCADO_HOST_UID", "1234");
+        std::env::set_var("AVOCADO_HOST_GID", "5678");
+        assert_eq!(src_mount_uid_gid(), (1234, 5678));
+        assert!(!src_mount_env().iter().any(|e| e.starts_with("GIT_CONFIG")));
     }
 
     // Serial because `build_container_command` reads AVOCADO_SIGNING_KEYS_DIR,

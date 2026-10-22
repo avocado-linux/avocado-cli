@@ -27,6 +27,18 @@ use super::state::VmPaths;
 pub const VM_MOUNT_POINT: &str = "/run/workspace";
 /// 9p `mount_tag` matched at QEMU launch.
 pub const SHARE_TAG: &str = "workspace";
+/// Guest mount options for the share.
+///
+/// `cache=mmap` lets reads and writes use the guest page cache. Without it
+/// the client sends one 4 KiB request per page: 256 MiB took about 60 s to
+/// read and 100 s to write, against under 0.2 s with it. It does not cache
+/// metadata, so edits, deletes and renames made on the host show up at once.
+/// The metadata cache modes (`loose`, or any value with bit 0x2) are much
+/// faster for small files but serve stale data after host edits, and some
+/// guest readers (`sdk run -i` shells, the in-VM agent) never get a chance
+/// to drop caches. `msize=512000` is the largest value the virtio transport
+/// accepts; the kernel caps larger values to it.
+pub const MOUNT_OPTS: &str = "trans=virtio,version=9p2000.L,access=any,msize=512000,cache=mmap";
 /// Filename under `~/.avocado/vm/` that records the workspace root.
 const WORKSPACE_FILE: &str = "workspace";
 
@@ -77,9 +89,9 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
 /// QEMU arg fragments declaring the workspace 9p export.
 /// Append these to the rest of the `-fsdev` / `-device` lines.
 ///
-/// Unused on macOS — the spawn step is delegated to Avocado.app, which
-/// has its own copy of the arg-building logic in `VMSupervisor.swift`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// `mapped-xattr` makes QEMU create host files as its own user and keep the
+/// guest's owner in an xattr. The plain `/opt/src` mount under the VM
+/// (`container::src_mount_uid_gid`) depends on that; change both together.
 pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
     vec![
         "-fsdev".to_string(),
@@ -105,7 +117,7 @@ pub async fn ensure_mounted_in_guest(target: &SshTarget) -> Result<()> {
     }
     let cmd = format!(
         "mkdir -p {VM_MOUNT_POINT} && \
-         mount -t 9p -o trans=virtio,version=9p2000.L,access=any {SHARE_TAG} {VM_MOUNT_POINT}"
+         mount -t 9p -o {MOUNT_OPTS} {SHARE_TAG} {VM_MOUNT_POINT}"
     );
     target
         .exec(&cmd)
@@ -162,6 +174,13 @@ mod tests {
         assert!(joined.contains("mount_tag=workspace"));
         assert!(joined.contains("path=/Users/foo"));
         assert!(joined.contains("security_model=mapped-xattr"));
+    }
+
+    #[test]
+    fn mount_opts_use_page_cache_without_metadata_cache() {
+        assert!(MOUNT_OPTS.contains("cache=mmap"));
+        assert!(MOUNT_OPTS.contains("msize=512000"));
+        assert!(!MOUNT_OPTS.contains("loose"));
     }
 
     #[test]
