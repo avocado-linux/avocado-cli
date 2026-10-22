@@ -91,10 +91,17 @@ pub fn is_vm_routing_active() -> bool {
 
 /// Host UID/GID passed to the container entrypoint, which bindfs-maps them to
 /// root on `/opt/src`. Under VM routing this returns 0:0, so the entrypoint
-/// uses a plain bind mount: the 9p share already stores new files as the
-/// host user (`security_model=mapped-xattr`), and bindfs on top of 9p made
-/// file operations 3 to 15x slower. An explicit `AVOCADO_HOST_UID` still wins
-/// (with `AVOCADO_HOST_GID`, or the host GID); `AVOCADO_HOST_GID` alone does not.
+/// uses a plain bind mount, and bindfs on top of 9p made file operations 2 to
+/// 18x slower. An explicit `AVOCADO_HOST_UID` still wins (with
+/// `AVOCADO_HOST_GID`, or the host GID); `AVOCADO_HOST_GID` alone does not.
+///
+/// bindfs exists so that root in the container does not write root-owned
+/// files into the host's project dir. Under the VM that cannot happen without
+/// it: QEMU writes the host files, as the user who started the VM, and
+/// `security_model=mapped-xattr` (`vm::share::qemu_args_for`) keeps the
+/// guest's owner in an xattr. If either changes (another security model, or
+/// QEMU run as root), container writes reach the host with the guest owner
+/// and this needs bindfs again.
 fn src_mount_uid_gid() -> (u32, u32) {
     if vm_plain_src_mount() {
         return (0, 0);

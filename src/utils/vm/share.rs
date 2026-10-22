@@ -88,6 +88,10 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
 
 /// QEMU arg fragments declaring the workspace 9p export.
 /// Append these to the rest of the `-fsdev` / `-device` lines.
+///
+/// `mapped-xattr` makes QEMU create host files as its own user and keep the
+/// guest's owner in an xattr. The plain `/opt/src` mount under the VM
+/// (`container::src_mount_uid_gid`) depends on that; change both together.
 pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
     vec![
         "-fsdev".to_string(),
