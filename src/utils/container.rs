@@ -833,6 +833,32 @@ static TOOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ATEXIT: std::sync::Once = std::sync::Once::new();
 static SIGINT_REAPER: std::sync::Once = std::sync::Once::new();
 
+/// The foreground `docker run` containers this process is waiting on. The
+/// SIGINT reaper exits the process, which skips the caller's own `docker
+/// stop`, so [`SessionContainers::shutdown`] removes these as well.
+static FOREGROUND_RUNS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a container in [`FOREGROUND_RUNS`] while its run is in progress.
+struct ForegroundRun(Option<String>);
+
+impl ForegroundRun {
+    fn register(name: Option<&str>) -> Self {
+        let name = name.map(str::to_string);
+        if let (Some(n), Ok(mut runs)) = (&name, FOREGROUND_RUNS.lock()) {
+            runs.push(n.clone());
+        }
+        Self(name)
+    }
+}
+
+impl Drop for ForegroundRun {
+    fn drop(&mut self) {
+        if let (Some(n), Ok(mut runs)) = (&self.0, FOREGROUND_RUNS.lock()) {
+            runs.retain(|r| r != n);
+        }
+    }
+}
+
 /// Teardown registered with libc `atexit`.
 ///
 /// Nine call sites reach `std::process::exit` directly — a stamp failure, a
@@ -912,7 +938,12 @@ impl SessionContainers {
     /// container. Best-effort: a container that is already gone is not an
     /// error, and a failure here must not mask the command's own result.
     pub fn shutdown(container_tool: &str) {
-        for name in Self::active_names() {
+        let mut names: Vec<String> = FOREGROUND_RUNS
+            .lock()
+            .map(|runs| runs.clone())
+            .unwrap_or_default();
+        names.extend(Self::active_names());
+        for name in names {
             let _ = std::process::Command::new(container_tool)
                 .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
@@ -2892,14 +2923,14 @@ impl SdkContainer {
                 }
             } else {
                 // Inherit all three so the user can interact with prompts
-                // (e.g. dnf "Is this ok [y/N]:").  Ctrl-C propagates
-                // naturally through the process group — Docker forwards
-                // SIGINT to the container which exits, then Docker exits.
+                // (e.g. dnf "Is this ok [y/N]:").  The docker client stays in
+                // the terminal's process group; Ctrl-C handling is below.
                 cmd.stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
             }
 
+            let _foreground = ForegroundRun::register(container_name);
             let mut child = cmd
                 .spawn()
                 .with_context(|| "Failed to spawn container command")?;
@@ -2967,45 +2998,69 @@ impl SdkContainer {
                         Ok(status.success())
                     }
                     _ = tokio::signal::ctrl_c() => {
-                        // Stop the container gracefully
-                        if let Some(name) = container_name {
-                            let stop_result = AsyncCommand::new(&self.container_tool)
-                                // stdio-flags-ok: docker stop timeout in seconds, not a tty
-                                .args(["stop", "-t", "2", name])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status()
-                                .await;
-                            if stop_result.is_err()
-                                || !stop_result.as_ref().unwrap().success()
-                            {
-                                let _ = AsyncCommand::new(&self.container_tool)
-                                    .args(["kill", name])
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .status()
-                                    .await;
-                            }
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        self.stop_interrupted_container(&mut child, container_name).await;
                         Err(anyhow::anyhow!("Interrupted by user"))
                     }
                 }
             } else {
-                // Interactive/inherited stdio: let Ctrl-C propagate
-                // naturally through the process group.  SIGINT goes to
-                // Docker and the container — no need to intercept.
-                // Avoiding tokio::signal::ctrl_c() here keeps the default
-                // SIGINT handler in place.
-                let status = child
-                    .wait()
+                // Inherited stdio: SIGINT also reaches the docker client,
+                // which forwards it to the container's shell. That shell runs
+                // its trap only once the foreground command returns, which
+                // may be never (an ssh to a peer that is gone). So stop the
+                // container here as well.
+                self.wait_or_stop_on_interrupt(&mut child, container_name, tokio::signal::ctrl_c())
                     .await
-                    .with_context(|| "Failed to wait for container command")?;
-                Ok(status.success())
             }
         }
+    }
+
+    /// Wait for a foreground container command. If `interrupt` completes
+    /// first, stop the container and return an "Interrupted by user" error.
+    async fn wait_or_stop_on_interrupt(
+        &self,
+        child: &mut tokio::process::Child,
+        container_name: Option<&str>,
+        interrupt: impl std::future::Future,
+    ) -> Result<bool> {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| "Failed to wait for container command")?;
+                Ok(status.success())
+            }
+            _ = interrupt => {
+                self.stop_interrupted_container(child, container_name).await;
+                Err(anyhow::anyhow!("Interrupted by user"))
+            }
+        }
+    }
+
+    /// Stop the container (`docker kill` if the stop fails), or kill the
+    /// client process when the container is not known, then reap the client.
+    async fn stop_interrupted_container(
+        &self,
+        child: &mut tokio::process::Child,
+        container_name: Option<&str>,
+    ) {
+        if let Some(name) = container_name {
+            let stop_result = AsyncCommand::new(&self.container_tool)
+                // stdio-flags-ok: docker stop timeout in seconds, not a tty
+                .args(["stop", "-t", "2", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            if !matches!(&stop_result, Ok(s) if s.success()) {
+                let _ = AsyncCommand::new(&self.container_tool)
+                    .args(["kill", name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+        } else {
+            let _ = child.kill().await;
+        }
+        let _ = child.wait().await;
     }
 
     /// Execute a container command with TUI output capture.
@@ -3059,6 +3114,7 @@ impl SdkContainer {
             });
         }
 
+        let _foreground = ForegroundRun::register(container_name);
         let mut child = cmd
             .spawn()
             .with_context(|| "Failed to spawn container command")?;
@@ -5475,5 +5531,110 @@ extensions:
             container.mounted_src_dir(),
             env::current_dir().unwrap().as_path()
         );
+    }
+
+    mod foreground_interrupt {
+        use super::*;
+
+        /// A container tool that logs each call. `stop` also ends the
+        /// process whose pid is in `pid`, as a real stop ends the client.
+        fn stub_tool(dir: &Path) -> String {
+            let tool = dir.join("tool");
+            std::fs::write(
+                &tool,
+                format!(
+                    "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
+                    log = dir.join("log").display(),
+                    pid = dir.join("pid").display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            tool.display().to_string()
+        }
+
+        fn container_with_tool(tool: String) -> SdkContainer {
+            SdkContainer {
+                container_tool: tool,
+                ..SdkContainer::new()
+            }
+        }
+
+        #[tokio::test]
+        async fn interrupt_stops_the_container() {
+            let dir = tempfile::tempdir().unwrap();
+            let container = container_with_tool(stub_tool(dir.path()));
+            let pid_file = dir.path().join("pid");
+            let mut child = AsyncCommand::new("sh")
+                .arg("-c")
+                .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
+                .spawn()
+                .unwrap();
+            let interrupt = async {
+                while std::fs::read_to_string(&pid_file)
+                    .map(|p| !p.ends_with('\n'))
+                    .unwrap_or(true)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                container.wait_or_stop_on_interrupt(&mut child, Some("avocado-run-t"), interrupt),
+            )
+            .await
+            .expect("the wait must end once the container is stopped");
+            let err = result.expect_err("an interrupt is an error");
+            assert!(err.to_string().contains("Interrupted by user"), "{err}");
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(log.contains("stop -t 2 avocado-run-t"), "tool calls: {log}");
+        }
+
+        #[tokio::test]
+        async fn a_finished_container_returns_its_status() {
+            let dir = tempfile::tempdir().unwrap();
+            let container = container_with_tool(stub_tool(dir.path()));
+            let mut child = AsyncCommand::new("sh")
+                .arg("-c")
+                .arg("exit 3")
+                .spawn()
+                .unwrap();
+            let ok = container
+                .wait_or_stop_on_interrupt(
+                    &mut child,
+                    Some("avocado-run-t"),
+                    std::future::pending::<()>(),
+                )
+                .await
+                .unwrap();
+            assert!(!ok);
+            assert!(
+                !dir.path().join("log").exists(),
+                "no stop for a finished run"
+            );
+        }
+
+        #[test]
+        fn shutdown_removes_a_foreground_run_in_progress() {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+            let run = ForegroundRun::register(Some("avocado-run-shutdown-t"));
+            SessionContainers::shutdown(&tool);
+            drop(run);
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(
+                log.contains("rm -f avocado-run-shutdown-t"),
+                "tool calls: {log}"
+            );
+            assert!(!FOREGROUND_RUNS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == "avocado-run-shutdown-t"));
+        }
     }
 }

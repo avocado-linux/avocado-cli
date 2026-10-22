@@ -843,6 +843,37 @@ echo "TUF repository assembled at $REPO_DIR"
 ls -la "$REPO_DIR/metadata/"
 ls -la "$REPO_DIR/targets/"
 
+repo_port_open() {{
+    python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1])))==0 else 1)' "$PORT" 2>/dev/null
+}}
+
+# The device would fetch from whatever server holds the port. If an earlier
+# deploy's server still holds it, the new server cannot bind and the device
+# gets the old repo, which reads as a successful deploy.
+if repo_port_open; then
+    echo "ERROR: port $PORT is already in use, so the update repository cannot be served." >&2
+    echo "       A deploy container from an earlier run may still be running. Stop it," >&2
+    echo "       or set AVOCADO_DEPLOY_REPO_PORT to a free port." >&2
+    exit 1
+fi
+
+# The readiness wait fetches this file, so it passes only for this run's
+# server and never for some other listener on the port.
+DEPLOY_NONCE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+printf '%s' "$DEPLOY_NONCE" > "$REPO_DIR/.avocado-deploy-nonce"
+
+repo_serves_nonce() {{
+    python3 -c '
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
+try:
+    body = opener.open("http://127.0.0.1:%s/.avocado-deploy-nonce" % sys.argv[1], timeout=1).read()
+except Exception:
+    sys.exit(1)
+sys.exit(0 if body.decode() == sys.argv[2] else 1)
+' "$PORT" "$DEPLOY_NONCE" 2>/dev/null
+}}
+
 # Start HTTP server bound to all interfaces so the device can reach it.
 # Use an inline server rather than `python3 -m http.server`: the latter calls
 # socket.getfqdn() in server_bind() BEFORE listen(), and on hosts with slow
@@ -858,25 +889,25 @@ http.server.HTTPServer(("0.0.0.0", int(sys.argv[1])), handler).serve_forever()
 ' "$PORT" "$REPO_DIR" &
 HTTP_PID=$!
 
-cleanup() {{
+stop_repo_server() {{
     kill "$HTTP_PID" 2>/dev/null || true
     wait "$HTTP_PID" 2>/dev/null || true
     rm -rf "$REPO_DIR"
 }}
-trap cleanup EXIT
+trap stop_repo_server EXIT
 
-# Wait until the repo server actually accepts connections before pointing the
-# device at it. A fixed sleep races server startup latency; poll the port so
-# any bind delay is tolerated (bounded to ~30s). The server is backgrounded, so
-# `set -e` cannot catch a bind failure -- check the process is still alive each
-# iteration and fail fast with an actionable message if it dies or never binds.
+# Wait until this run's repo server answers before pointing the device at it.
+# A fixed sleep races server startup latency; poll so any bind delay is
+# tolerated (bounded to ~30s). The server is backgrounded, so `set -e` cannot
+# catch a bind failure -- check the process is still alive each iteration and
+# fail fast with an actionable message if it dies or never binds.
 REPO_READY=
 for _ in $(seq 1 60); do
     if ! kill -0 "$HTTP_PID" 2>/dev/null; then
         echo "ERROR: repo server (pid $HTTP_PID) exited before listening on port $PORT" >&2
         exit 1
     fi
-    if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1])))==0 else 1)' "$PORT" 2>/dev/null; then
+    if repo_serves_nonce; then
         REPO_READY=1
         break
     fi
@@ -924,6 +955,8 @@ set +e
 ssh -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=10 \
+    -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=3 \
     -o LogLevel=ERROR \
     $SSH_PORT_ARGS \
     "$SSH_DEST" \
@@ -934,6 +967,12 @@ set -e
 
 if [ $UPDATE_EXIT -eq 0 ]; then
     echo "Device update completed successfully."
+elif [ $UPDATE_EXIT -eq 255 ]; then
+    echo "ERROR: the SSH connection to $SSH_DEST failed or was lost (ssh exit code 255)." >&2
+    echo "       If the update had started, the device may have changed its IP address" >&2
+    echo "       or restarted its network. The new runtime may already be active." >&2
+    echo "       Check on the device with: avocadoctl status" >&2
+    exit 255
 else
     echo "ERROR: Device update failed with exit code $UPDATE_EXIT" >&2
     exit $UPDATE_EXIT
@@ -1635,7 +1674,7 @@ mod tests {
 
         let script = cmd.create_deploy_script("x86_64", "test-uuid").unwrap();
 
-        assert!(script.contains("trap cleanup EXIT"));
+        assert!(script.contains("trap stop_repo_server EXIT"));
         assert!(script.contains("kill \"$HTTP_PID\""));
     }
 
@@ -1728,5 +1767,240 @@ mod tests {
         )
         .with_connect_sign(true);
         assert!(cmd.connect_sign);
+    }
+
+    // --- deploy script behaviour, run under sh ---
+
+    fn have_python3() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn deploy_script() -> String {
+        RuntimeDeployCommand::new(
+            "rt".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            "root@192.0.2.10".to_string(),
+            None,
+            None,
+        )
+        .create_deploy_script("x86_64", "test-uuid")
+        .unwrap()
+    }
+
+    /// The text of `script` from `start` up to `end` (exclusive). An `end`
+    /// of `None` runs to the end of the script.
+    fn script_section(script: &str, start: &str, end: Option<&str>) -> String {
+        let from = script.find(start).expect("section start");
+        let to = match end {
+            Some(e) => script[from..].find(e).expect("section end") + from,
+            None => script.len(),
+        };
+        script[from..to].to_string()
+    }
+
+    fn run_sh(script: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap()
+    }
+
+    /// Runs the ssh step of the deploy script with a stub `ssh` that records
+    /// its arguments and exits with `ssh_exit`.
+    fn run_ssh_step(ssh_exit: i32) -> (std::process::Output, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let args_file = dir.path().join("ssh-args");
+        let stub = bin.join("ssh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {ssh_exit}\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let section = script_section(&deploy_script(), "# SSH into device", None);
+        let script = format!(
+            "set -e\nPATH='{}':\"$PATH\"\nSSH_DEST=root@192.0.2.10\nSSH_PORT_ARGS=\nREPO_URL=http://192.0.2.1:1\n{section}",
+            bin.display()
+        );
+        let out = run_sh(&script);
+        let args = std::fs::read_to_string(&args_file).unwrap_or_default();
+        (out, args)
+    }
+
+    #[test]
+    fn deploy_ssh_sends_keepalives_so_a_lost_link_ends_the_session() {
+        let (out, args) = run_ssh_step(0);
+        assert!(out.status.success(), "{out:?}");
+        let args: Vec<&str> = args.lines().collect();
+        assert!(
+            args.contains(&"ServerAliveInterval=5"),
+            "ssh args: {args:?}"
+        );
+        assert!(
+            args.contains(&"ServerAliveCountMax=3"),
+            "ssh args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_reports_a_lost_ssh_link_and_how_to_check_the_device() {
+        let (out, _) = run_ssh_step(255);
+        assert_eq!(out.status.code(), Some(255));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("SSH connection"), "stderr: {err}");
+        assert!(err.contains("avocadoctl status"), "stderr: {err}");
+        assert!(!err.contains("Device update failed"), "stderr: {err}");
+    }
+
+    /// Runs the repo server start and readiness wait on `port`, with an
+    /// empty repo. Prints REACHED_READY when the wait passes.
+    fn run_repo_server_step(port: u16) -> std::process::Output {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("metadata")).unwrap();
+        std::fs::create_dir_all(repo.join("targets")).unwrap();
+        let section = script_section(
+            &deploy_script(),
+            "echo \"TUF repository assembled",
+            Some("# Determine the IP the device should use"),
+        );
+        let script = format!(
+            "set -e\nPORT={port}\nREPO_DIR='{}'\n{section}\necho REACHED_READY\n",
+            repo.display()
+        );
+        run_sh(&script)
+    }
+
+    #[test]
+    fn deploy_refuses_a_repo_port_that_an_old_server_still_holds() {
+        if !have_python3() {
+            return;
+        }
+        // An earlier deploy container's server, still bound to the port.
+        let stale = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = stale.local_addr().unwrap().port();
+        let out = run_repo_server_step(port);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains("REACHED_READY"),
+            "the readiness wait accepted a server from another run\nstderr: {stderr}"
+        );
+        assert!(!out.status.success());
+        assert!(stderr.contains("already in use"), "stderr: {stderr}");
+        assert!(
+            stderr.contains("AVOCADO_DEPLOY_REPO_PORT"),
+            "stderr: {stderr}"
+        );
+        drop(stale);
+    }
+
+    #[test]
+    fn deploy_repo_server_becomes_ready_on_a_free_port() {
+        if !have_python3() {
+            return;
+        }
+        let port = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let out = run_repo_server_step(port);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("REACHED_READY"),
+            "stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn deploy_readiness_probe_accepts_only_this_runs_server() {
+        if !have_python3() {
+            return;
+        }
+        let script = deploy_script();
+        let probe = script_section(&script, "repo_serves_nonce() {", Some("\n}\n")) + "\n}\n";
+        let probe_with = |port: u16, nonce: &str| {
+            run_sh(&format!(
+                "PORT={port}\nDEPLOY_NONCE={nonce}\n{probe}\nrepo_serves_nonce"
+            ))
+            .status
+            .success()
+        };
+
+        // A listener that accepts and never answers, like a stuck old server.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!probe_with(silent.local_addr().unwrap().port(), "abc"));
+
+        // A real server that serves another run's nonce, then this run's.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".avocado-deploy-nonce"), "abc").unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut server = std::process::Command::new("python3")
+            .args(["-m", "http.server", "--bind", "127.0.0.1"])
+            .arg(port.to_string())
+            .arg("--directory")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut up = false;
+        for _ in 0..100 {
+            if probe_with(port, "abc") {
+                up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let other = probe_with(port, "xyz");
+        let _ = server.kill();
+        let _ = server.wait();
+        assert!(up, "the probe never saw this run's nonce");
+        assert!(!other, "the probe accepted another run's nonce");
+    }
+
+    #[test]
+    fn deploy_interrupt_still_exits_once_the_repo_server_cleanup_is_set() {
+        // In the container the entrypoint's INT/TERM traps come first, then
+        // the deploy script sets its own EXIT cleanup. The INT trap must
+        // still end the script.
+        let entry = crate::utils::container::SdkContainer::new()
+            .create_entrypoint_script(true, None, None, "x86_64", false, false, false);
+        let traps = script_section(&entry, "cleanup() {", Some("trap 'cleanup 130' INT"))
+            + "trap 'cleanup 130' INT\n";
+        let server_cleanup =
+            script_section(&deploy_script(), "HTTP_PID=$!", Some("\nREPO_READY=\n"));
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "{traps}\nREPO_DIR='{}'\n{server_cleanup}\nkill -INT $$\nsleep 1\necho AFTER_INT\n",
+            dir.path().join("repo").display()
+        );
+        let out = run_sh(&script);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("AFTER_INT"),
+            "the script kept running after SIGINT"
+        );
+        assert_eq!(out.status.code(), Some(130), "{out:?}");
     }
 }
