@@ -64,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Containers no longer run bindfs on top of the share under the VM, which
     made file operations 2 to 18x slower. The share already stores new files
     as the Mac user. Project files now show the Mac UID inside the container,
-    so the CLI passes git a `safe.directory` for `/opt/src` and the
-    path-extension mounts, and runtime `var_files` copied from the project
+    so the CLI passes git `safe.directory=*` in those containers (as bindfs
+    did, every project repo is trusted), and runtime `var_files` copied from the project
     are made root's before the var partition is built. Set `AVOCADO_HOST_UID`
     to get bindfs back.
 

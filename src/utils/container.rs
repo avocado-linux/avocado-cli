@@ -114,28 +114,23 @@ fn vm_plain_src_mount() -> bool {
 }
 
 /// `-e` values for the `/opt/src` mount: the UID/GID the entrypoint maps
-/// (see `src_mount_uid_gid`), and under the plain VM mount a `safe.directory`
-/// for git. Without bindfs, host files show the host UID inside the
-/// container, and git refuses such a repository as root ("detected dubious
-/// ownership"). The entries cover only the project mount and, with a
-/// target, its path-extension mounts. `GIT_CONFIG_*` is command scope,
-/// which git trusts for `safe.directory`.
-fn src_mount_env(target: Option<&str>) -> Vec<String> {
+/// (see `src_mount_uid_gid`), and under the plain VM mount
+/// `safe.directory=*` for git. Without bindfs, host files show the host UID
+/// inside the container, and git refuses such a repository as root
+/// ("detected dubious ownership"). With bindfs every project repo looked
+/// root-owned, so git trusted all of them, nested repos and path-extension
+/// mounts included; `*` keeps that. Narrower `<dir>/*` entries need git 2.46,
+/// and the 2024 SDK ships 2.44. `GIT_CONFIG_PARAMETERS` is how `git -c`
+/// reaches child processes (command scope, which git honors for
+/// `safe.directory`), and it does not touch a project's own `GIT_CONFIG_COUNT`.
+fn src_mount_env() -> Vec<String> {
     let (uid, gid) = src_mount_uid_gid();
     let mut env = vec![
         format!("AVOCADO_HOST_UID={uid}"),
         format!("AVOCADO_HOST_GID={gid}"),
     ];
     if vm_plain_src_mount() {
-        let mut dirs = vec!["/opt/src".to_string(), "/opt/src/*".to_string()];
-        if let Some(target) = target {
-            dirs.push(format!("/opt/_avocado/{target}/includes/*"));
-        }
-        env.push(format!("GIT_CONFIG_COUNT={}", dirs.len()));
-        for (i, dir) in dirs.iter().enumerate() {
-            env.push(format!("GIT_CONFIG_KEY_{i}=safe.directory"));
-            env.push(format!("GIT_CONFIG_VALUE_{i}={dir}"));
-        }
+        env.push("GIT_CONFIG_PARAMETERS='safe.directory'='*'".to_string());
     }
     env
 }
@@ -2220,7 +2215,7 @@ impl SdkContainer {
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Pass host UID/GID for bindfs permission translation
-        for kv in src_mount_env(Some(&config.target)) {
+        for kv in src_mount_env() {
             container_cmd.push("-e".to_string());
             container_cmd.push(kv);
         }
@@ -3174,7 +3169,7 @@ impl SdkContainer {
 
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = src_mount_uid_gid();
-        for kv in src_mount_env(None) {
+        for kv in src_mount_env() {
             container_cmd.push("-e".to_string());
             container_cmd.push(kv);
         }
@@ -4620,35 +4615,24 @@ extensions:
             crate::utils::config::resolve_host_uid_gid(None)
         );
 
-        assert!(!src_mount_env(Some("t"))
-            .iter()
-            .any(|e| e.starts_with("GIT_CONFIG")));
+        assert!(!src_mount_env().iter().any(|e| e.starts_with("GIT_CONFIG")));
 
         std::env::set_var("DOCKER_HOST", &vm_sock);
         assert_eq!(src_mount_uid_gid(), (0, 0));
         assert_eq!(
-            src_mount_env(Some("qemuarm64")),
+            src_mount_env(),
             [
                 "AVOCADO_HOST_UID=0",
                 "AVOCADO_HOST_GID=0",
-                "GIT_CONFIG_COUNT=3",
-                "GIT_CONFIG_KEY_0=safe.directory",
-                "GIT_CONFIG_VALUE_0=/opt/src",
-                "GIT_CONFIG_KEY_1=safe.directory",
-                "GIT_CONFIG_VALUE_1=/opt/src/*",
-                "GIT_CONFIG_KEY_2=safe.directory",
-                "GIT_CONFIG_VALUE_2=/opt/_avocado/qemuarm64/includes/*",
+                "GIT_CONFIG_PARAMETERS='safe.directory'='*'",
             ]
         );
-        assert!(src_mount_env(None).contains(&"GIT_CONFIG_COUNT=2".to_string()));
 
         // An explicit UID brings bindfs back, so no safe.directory either.
         std::env::set_var("AVOCADO_HOST_UID", "1234");
         std::env::set_var("AVOCADO_HOST_GID", "5678");
         assert_eq!(src_mount_uid_gid(), (1234, 5678));
-        assert!(!src_mount_env(Some("t"))
-            .iter()
-            .any(|e| e.starts_with("GIT_CONFIG")));
+        assert!(!src_mount_env().iter().any(|e| e.starts_with("GIT_CONFIG")));
     }
 
     // Serial because `build_container_command` reads AVOCADO_SIGNING_KEYS_DIR,
