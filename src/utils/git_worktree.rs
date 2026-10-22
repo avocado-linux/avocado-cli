@@ -53,15 +53,17 @@ pub fn git_common_dir_mount(
         .ok_or_else(|| format!("{} has no `gitdir:` line", dot_git.display()))?;
     let gitdir = Path::new(gitdir);
 
-    let host_gitdir = normalize(&project_dir.join(gitdir));
-    let container_gitdir = normalize(&container_src.join(gitdir));
-    if !host_gitdir.is_dir() {
-        return Err(format!(
+    // On the host, resolve through the file system as git does, so that `..`
+    // after a symlinked project dir leaves the symlink's target. In the
+    // container nothing on the path is a symlink, so `..` is lexical.
+    let host_gitdir = project_dir.join(gitdir).canonicalize().map_err(|_| {
+        format!(
             "{} points at {}, which does not exist",
             dot_git.display(),
-            host_gitdir.display()
-        ));
-    }
+            normalize(&project_dir.join(gitdir)).display()
+        )
+    })?;
+    let container_gitdir = normalize(&container_src.join(gitdir));
 
     // A submodule's git dir sets core.worktree to a path relative to itself.
     // Inside the container that path does not lead back to the source mount,
@@ -77,8 +79,10 @@ pub fn git_common_dir_mount(
         match std::fs::read_to_string(host_gitdir.join("commondir")) {
             Ok(c) => {
                 let c = Path::new(c.trim());
+                let host = host_gitdir.join(c);
                 (
-                    normalize(&host_gitdir.join(c)),
+                    host.canonicalize()
+                        .map_err(|e| format!("could not resolve {}: {e}", host.display()))?,
                     normalize(&container_gitdir.join(c)),
                 )
             }
@@ -92,8 +96,22 @@ pub fn git_common_dir_mount(
             host_common.display()
         ));
     }
+    // Already in the container when the common dir is inside the project and
+    // git looks for it at the same place under the source mount.
+    let project = project_dir
+        .canonicalize()
+        .map_err(|e| format!("could not resolve {}: {e}", project_dir.display()))?;
+    if let Ok(rel) = host_common.strip_prefix(&project) {
+        if container_common == container_src.join(rel) {
+            return Ok(None);
+        }
+    }
     if container_common.starts_with(container_src) {
-        return Ok(None);
+        return Err(format!(
+            "git looks for the common dir {} at {}, which is inside the project mount",
+            host_common.display(),
+            container_common.display()
+        ));
     }
     if !container_common.has_root() {
         return Err(format!(
@@ -101,12 +119,21 @@ pub fn git_common_dir_mount(
             container_common.display()
         ));
     }
+    // Submodule links in a linked worktree are relative paths between the
+    // worktree and the common dir. In the container the worktree is at the
+    // source mount and the common dir is somewhere else, so git cannot follow
+    // links made on the host, and links that `git submodule update --init`
+    // makes in the container are wrong on the host.
+    if project_dir.join(".gitmodules").is_file() {
+        return Err(
+            "the worktree has submodules, and their links do not resolve in the \
+             container. Build from the main checkout to use git there"
+                .to_string(),
+        );
+    }
 
-    let host = host_common
-        .canonicalize()
-        .map_err(|e| format!("could not resolve {}: {e}", host_common.display()))?;
     Ok(Some(GitCommonMount {
-        host,
+        host: host_common,
         container: container_common,
     }))
 }
@@ -169,7 +196,12 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-            .args(["-c", "protocol.file.allow=always"])
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .output()
             .expect("git runs");
@@ -266,6 +298,68 @@ mod tests {
         std::fs::write(tmp.path().join(".git"), "gitdir: /nonexistent/.git/x\n").unwrap();
         let err = git_common_dir_mount(tmp.path(), Path::new(SRC)).unwrap_err();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// git resolves a relative gitdir through the file system, so `..`
+    /// after a symlinked project dir leaves the symlink's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_dir_resolves_a_relative_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        std::fs::create_dir(&repos).unwrap();
+        let main = repo(&repos);
+        let wt = repos.join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+
+        let m = git_common_dir_mount(&alias, Path::new(SRC))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.host, main.join(".git").canonicalize().unwrap());
+        assert_eq!(m.container, PathBuf::from("/opt/main/.git"));
+    }
+
+    /// A common dir whose container path falls inside the source mount, but
+    /// is not the same place on the host, cannot be mounted there: the
+    /// container's mount holds the worktree, not the host dir of that name.
+    #[test]
+    fn a_common_dir_that_only_looks_inside_the_mount_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = repo(&root);
+        let wt = root.join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // As if the container mounted the worktree at the host dir that holds
+        // the main checkout.
+        let err = git_common_dir_mount(&wt, &root).unwrap_err();
+        assert!(err.contains("inside the project mount"), "{err}");
+    }
+
+    /// git in the container cannot use the submodules of a linked worktree,
+    /// and `git submodule update --init` there writes container paths into
+    /// links that stay on the host. No mount keeps the host checkout safe.
+    #[test]
+    fn a_worktree_with_submodules_is_reported_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        std::fs::write(
+            main.join(".gitmodules"),
+            "[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n",
+        )
+        .unwrap();
+        git(&main, &["add", ".gitmodules"]);
+        git(&main, &["commit", "-qm", "submodule"]);
+        let wt = tmp.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        let err = git_common_dir_mount(&wt, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("submodules"), "{err}");
+        // The main checkout has a `.git` dir and needs nothing.
+        assert_eq!(git_common_dir_mount(&main, Path::new(SRC)), Ok(None));
     }
 
     #[test]
