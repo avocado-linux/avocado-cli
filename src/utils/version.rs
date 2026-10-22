@@ -87,14 +87,19 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
 /// so without this fallback an ordinary range like ">=0.25" or "^1" would
 /// reject every RC build.
 ///
-/// The fallback is skipped when any comparator is an exact `=` pin. A pin is
-/// a request for one build, and reading `1.0.0-rc.5` as `1.0.0` would let
-/// "=1.0.0" accept every `1.0.0-rc.N`.
+/// The fallback is skipped when any comparator is a full `=MAJOR.MINOR.PATCH`
+/// pin. A full pin is a request for one build, and reading `1.0.0-rc.5` as
+/// `1.0.0` would let "=1.0.0" accept every `1.0.0-rc.N`. A partial `=1.0` or
+/// `=1` is a range to semver (`>=1.0.0, <1.1.0-0`), so it keeps the fallback,
+/// as `~1.0` does.
 fn requirement_matches(req: &VersionReq, running: &Version) -> bool {
     if req.matches(running) {
         return true;
     }
-    let has_exact_pin = req.comparators.iter().any(|c| c.op == semver::Op::Exact);
+    let has_exact_pin = req
+        .comparators
+        .iter()
+        .any(|c| c.op == semver::Op::Exact && c.patch.is_some());
     if has_exact_pin {
         return false;
     }
@@ -239,6 +244,15 @@ mod tests {
         assert!(!matches("=1.0.0-rc.5", "1.0.0"));
         // A pin inside a compound requirement is still a pin.
         assert!(!matches(">=0.25, =1.0.0", "1.0.0-rc.5"));
+    }
+
+    #[test]
+    fn partial_exact_requirements_are_ranges() {
+        assert!(matches("=1.0", "1.0.0-rc.5"));
+        assert!(matches("=1.0", "1.0.3-rc.1"));
+        assert!(matches("=1", "1.2.0-rc.1"));
+        assert!(!matches("=1.0", "1.1.0-rc.1"));
+        assert!(!matches("=1", "2.0.0-rc.1"));
     }
 
     #[test]
