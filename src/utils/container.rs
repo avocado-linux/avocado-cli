@@ -138,16 +138,25 @@ fn src_mount_env() -> Vec<String> {
 /// When docker is going to execute inside the avocado-vm, ensure the
 /// 9p workspace share is actually mounted in the guest before we issue
 /// any bind mounts. Lazy on purpose: we only pay the SSH probe right
-/// before container start, and only when VM routing is active. The
-/// SSH-driven mount (`share::ensure_mounted_in_guest`) is idempotent,
-/// so cycles of "already mounted → no-op" are cheap.
+/// before container start, and only when VM routing is active.
+///
+/// Every container start site calls this, so a command can call it many
+/// times. Each probe is one SSH connection (about 100 to 200 ms), so the
+/// first success is kept for the rest of the process. A failure is not kept,
+/// and the next container start tries again.
 ///
 /// Failure is non-fatal: we warn and let the container start proceed.
 /// Without the mount, `/opt/src` will be empty inside the container —
 /// the surface error (compile script not found, bind mount source
 /// missing, etc.) is loud enough that the user can tell what's wrong.
 async fn ensure_workspace_mounted_if_routed() {
+    static MOUNTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    #[cfg(test)]
+    tests::workspace_mount_check::record_call();
     if !is_vm_routing_active() {
+        return;
+    }
+    if MOUNTED.initialized() {
         return;
     }
     let paths = match crate::utils::vm::state::VmPaths::resolve() {
@@ -161,7 +170,11 @@ async fn ensure_workspace_mounted_if_routed() {
         return;
     };
     let target = crate::utils::vm::ssh::SshTarget::local(&paths, port);
-    if let Err(e) = crate::utils::vm::share::ensure_mounted_in_guest(&target).await {
+    // One probe at a time: two concurrent mounts of the same 9p tag fail.
+    let mounted = MOUNTED
+        .get_or_try_init(|| crate::utils::vm::share::ensure_mounted_in_guest(&target))
+        .await;
+    if let Err(e) = mounted {
         crate::utils::output::print_warning(
             &format!(
                 "could not mount workspace 9p share inside the avocado-vm: {e:#}. \
@@ -1651,11 +1664,11 @@ impl SdkContainer {
 
         // If docker is routed through the avocado-vm, the 9p workspace
         // share has to be mounted inside the guest before we issue a
-        // bind mount under the workspace root — otherwise the container
+        // bind mount under the workspace root. If not, the container
         // sees empty tmpfs. `avocado vm start` (CLI) mounts during boot,
         // but when Avocado.app launches QEMU directly the mount step
-        // is skipped. Call it just-in-time here; the SSH probe + mount
-        // is idempotent (no-op when already mounted).
+        // is skipped. Call it just-in-time here. After the first success
+        // the result is cached for the rest of the process.
         ensure_workspace_mounted_if_routed().await;
 
         // Get or create docker volume for persistent state
@@ -2356,6 +2369,10 @@ impl SdkContainer {
         if let Some(ref arch) = config.sdk_arch {
             ensure_cross_arch_emulation(&self.container_tool, arch).await?;
         }
+
+        // The same check as `run_in_container`: a command whose first
+        // container step is a capture step must not see an empty /opt/src.
+        ensure_workspace_mounted_if_routed().await;
 
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
@@ -3287,6 +3304,9 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
         command: &str,
         rm: bool,
     ) -> Result<bool> {
+        // The same check as `run_in_container`: this binds the project dir too.
+        ensure_workspace_mounted_if_routed().await;
+
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
@@ -4138,6 +4158,104 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every container start site must check the avocado-vm workspace mount
+    /// first. If Avocado.app starts QEMU, or the share is unmounted, the
+    /// mount made at `avocado vm start` is missing, and a step that skips the
+    /// check runs on an empty `/opt/src`.
+    pub(super) mod workspace_mount_check {
+        use super::*;
+        use std::cell::Cell;
+
+        thread_local! {
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// Called by `ensure_workspace_mounted_if_routed`. Thread-local, so
+        /// tests that run in parallel do not see each other's calls.
+        pub(in crate::utils::container) fn record_call() {
+            CALLS.with(|c| c.set(c.get() + 1));
+        }
+
+        fn calls() -> usize {
+            CALLS.with(Cell::get)
+        }
+
+        /// A container tool that does not exist, so each start site stops at
+        /// the volume lookup, after the point where the mount check belongs.
+        /// No docker command runs. The volume state file goes to `dir`.
+        fn container_without_tool(dir: &Path) -> SdkContainer {
+            SdkContainer {
+                container_tool: dir.join("no-such-container-tool").display().to_string(),
+                cwd: dir.to_path_buf(),
+                ..SdkContainer::new()
+            }
+        }
+
+        fn run_config() -> RunConfig {
+            RunConfig {
+                container_image: "test-image".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "true".to_string(),
+                ..Default::default()
+            }
+        }
+
+        // `#[tokio::test]` runs on the current thread, so the count is this
+        // test's own. Serial, with `DOCKER_HOST` cleared: VM routing stays
+        // off, so the check returns at once and never reaches a real VM.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_capture_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container_capture(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_with_output_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container_with_output(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_simple_command_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_simple_command("test-image", "true", true)
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+    }
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.
     /// The rootfs script reads `${SOURCE_DATE_EPOCH:-0}` for `mkfs.erofs -T` but
@@ -5514,7 +5632,9 @@ extensions:
         // the same strings, and counting them made the guard compare its own
         // source against itself.
         let whole = include_str!("container.rs");
-        let src = &whole[..whole.find("#[cfg(test)]").expect("test module marker")];
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module marker")];
         let reads = src
             .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release"#)
             .count();
