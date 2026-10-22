@@ -44,6 +44,7 @@ pub struct ProvisionConfig {
 /// Implementation of the 'provision' command that calls through to runtime provision.
 pub struct ProvisionCommand {
     config: ProvisionConfig,
+    pack: Option<std::path::PathBuf>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -53,8 +54,14 @@ impl ProvisionCommand {
     pub fn new(config: ProvisionConfig) -> Self {
         Self {
             config,
+            pack: None,
             composed_config: None,
         }
+    }
+
+    pub fn with_pack(mut self, out: Option<std::path::PathBuf>) -> Self {
+        self.pack = out;
+        self
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -111,7 +118,8 @@ impl ProvisionCommand {
                 sdk_arch: self.config.sdk_arch.clone(),
             },
         )
-        .with_composed_config(composed);
+        .with_composed_config(composed)
+        .with_pack(self.pack.clone());
 
         runtime_provision_cmd.execute().await
     }

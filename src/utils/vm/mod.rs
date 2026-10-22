@@ -27,6 +27,7 @@ pub mod client;
 pub mod config;
 pub mod fdt;
 pub mod forward;
+pub mod hub;
 pub mod lifecycle;
 pub mod manifest;
 pub mod qemu;
