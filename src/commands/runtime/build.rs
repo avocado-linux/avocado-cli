@@ -3406,7 +3406,8 @@ if [ -e "{src_root}/{source}" ]; then
     # avocado-vm), and mkfs.btrfs -r keeps owners. Make the project's copy
     # root's in a temp dir, then merge it: cp -a merges into an existing
     # dest, and files the project did not provide keep their owners.
-    _vf_tmp=$(mktemp -d)
+    # No set -e here: an empty _vf_tmp would make the cp below target /.
+    _vf_tmp=$(mktemp -d) || exit 1
     cp -a "{src_root}/{source}" "$_vf_tmp/"
     chown -hR root:root "$_vf_tmp"
     cp -a "$_vf_tmp/$(basename "{src_root}/{source}")" "$VAR_DIR/{dest}"
@@ -3623,6 +3624,33 @@ mod tests {
             !chowned.contains(var.to_str().unwrap()),
             "chown reached var staging: {chowned}"
         );
+
+        // If mktemp fails the script stops: an empty temp dir would make the
+        // cp target `/`.
+        let cp_log = tmp.path().join("cp.log");
+        for (tool, body) in [
+            ("mktemp", "#!/bin/sh\nexit 1\n".to_string()),
+            (
+                "cp",
+                format!("#!/bin/sh\necho \"$@\" >> '{}'\n", cp_log.display()),
+            ),
+        ] {
+            let p = bin.join(tool);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("VAR_DIR", &var)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "script went on after mktemp failed");
+        assert!(!cp_log.exists(), "cp ran after mktemp failed");
     }
 
     #[test]

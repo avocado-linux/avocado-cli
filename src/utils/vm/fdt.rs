@@ -359,6 +359,11 @@ fn strprop(s: &str) -> Vec<u8> {
     v
 }
 
+/// Version of what `patch_idle_states` writes. Part of the cached DTB's file
+/// name (`vm::qemu`), so bump it whenever the patch changes and cached DTBs
+/// rebuild on the next VM start.
+pub const IDLE_STATES_VERSION: u32 = 3;
+
 /// Splice a single PSCI idle-state node into the root and add
 /// `cpu-idle-states = <phandle>` to each `/cpus/cpu@N` for N in 0..smp.
 ///

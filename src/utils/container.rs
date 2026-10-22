@@ -3120,28 +3120,14 @@ impl SdkContainer {
         result
     }
 
-    /// Run a simple command in the container without the full SDK entrypoint.
-    ///
-    /// This is useful for quick one-off operations like chown, cp, etc.
-    /// that don't need the SDK environment setup.
-    ///
-    /// # Arguments
-    /// * `container_image` - The container image to use
-    /// * `command` - The bash command to run
-    /// * `rm` - Whether to remove the container after exit
-    ///
-    /// # Returns
-    /// `true` if the command succeeded, `false` otherwise
-    pub async fn run_simple_command(
+    /// The `docker run` argv for `run_simple_command`, without running it.
+    fn simple_command_argv(
         &self,
         container_image: &str,
         command: &str,
         rm: bool,
-    ) -> Result<bool> {
-        // Get or create docker volume for persistent state
-        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
-        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
-
+        volume_name: &str,
+    ) -> Vec<String> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
         if rm {
@@ -3165,7 +3151,7 @@ impl SdkContainer {
             translate_bind_for_vm(src_path).display()
         ));
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+        container_cmd.push(format!("{volume_name}:/opt/_avocado:rw"));
 
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = src_mount_uid_gid();
@@ -3204,6 +3190,34 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             )
         };
         container_cmd.push(full_command);
+        container_cmd
+    }
+
+    /// Run a simple command in the container without the full SDK entrypoint.
+    ///
+    /// This is useful for quick one-off operations like chown, cp, etc.
+    /// that don't need the SDK environment setup.
+    ///
+    /// # Arguments
+    /// * `container_image` - The container image to use
+    /// * `command` - The bash command to run
+    /// * `rm` - Whether to remove the container after exit
+    ///
+    /// # Returns
+    /// `true` if the command succeeded, `false` otherwise
+    pub async fn run_simple_command(
+        &self,
+        container_image: &str,
+        command: &str,
+        rm: bool,
+    ) -> Result<bool> {
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let container_cmd =
+            self.simple_command_argv(container_image, command, rm, &volume_state.volume_name);
+        let src_path = self.mounted_src_dir();
 
         if self.verbose {
             print_info(
@@ -4576,29 +4590,33 @@ extensions:
         assert!(container.verbose);
     }
 
-    // Serial: mutates DOCKER_HOST and AVOCADO_HOST_UID/GID.
-    #[test]
-    #[serial_test::serial]
-    fn src_mount_env_skips_bindfs_and_trusts_git_only_under_vm_routing() {
-        // Restores the env on drop, so a failed assert does not leak
-        // DOCKER_HOST into later tests.
-        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                for (k, v) in &self.0 {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
+    /// Restores the env on drop, so a failed assert does not leak
+    /// DOCKER_HOST into later tests.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
                 }
             }
         }
-        let _restore = RestoreEnv(
+    }
+
+    /// Saves and clears the env that decides the `/opt/src` mount, and
+    /// returns the `DOCKER_HOST` value that turns VM routing on. Tests that
+    /// use it must be `#[serial]`.
+    fn vm_routing_env() -> (RestoreEnv, String) {
+        let restore = RestoreEnv(
             ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"]
                 .iter()
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect(),
         );
+        for k in ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"] {
+            std::env::remove_var(k);
+        }
         let vm_sock = format!(
             "unix://{}",
             crate::utils::vm::state::VmPaths::resolve()
@@ -4606,8 +4624,73 @@ extensions:
                 .docker_socket()
                 .display()
         );
-        std::env::remove_var("AVOCADO_HOST_UID");
-        std::env::remove_var("AVOCADO_HOST_GID");
+        (restore, vm_sock)
+    }
+
+    /// Both container start sites must take the plain mount and the git
+    /// trust under VM routing, and neither without it. Guards the call sites,
+    /// not only `src_mount_env`.
+    #[test]
+    #[serial_test::serial]
+    fn container_start_sites_use_the_plain_mount_only_under_vm_routing() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, vm_sock) = vm_routing_env();
+        let container = SdkContainer::new();
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let build = |c: &SdkContainer| {
+            c.build_container_command(
+                &config,
+                &["true".to_string()],
+                &HashMap::new(),
+                &volume_state,
+            )
+            .unwrap()
+        };
+        let simple = |c: &SdkContainer| c.simple_command_argv("test-image", "true", true, "vol");
+        let git = "GIT_CONFIG_PARAMETERS='safe.directory'='*'".to_string();
+        let (uid, gid) = crate::utils::config::resolve_host_uid_gid(None);
+        let host_uid = format!("AVOCADO_HOST_UID={uid}");
+        let host_gid = format!("AVOCADO_HOST_GID={gid}");
+
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&host_uid) && cmd.contains(&host_gid),
+                "{name}: {cmd:?}"
+            );
+            assert!(!cmd.contains(&git), "{name}: git trust without VM routing");
+        }
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_UID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_GID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(cmd.contains(&git), "{name}: no git trust under VM routing");
+        }
+        // run_simple_command builds its own mount script from the same UID.
+        let script = simple(&container).pop().unwrap();
+        assert!(
+            script.contains("mount --bind /mnt/src /opt/src"),
+            "{script}"
+        );
+        assert!(!script.contains("bindfs --map"), "{script}");
+    }
+
+    // Serial: mutates DOCKER_HOST and AVOCADO_HOST_UID/GID.
+    #[test]
+    #[serial_test::serial]
+    fn src_mount_env_skips_bindfs_and_trusts_git_only_under_vm_routing() {
+        let (_restore, vm_sock) = vm_routing_env();
 
         std::env::remove_var("DOCKER_HOST");
         assert_eq!(
