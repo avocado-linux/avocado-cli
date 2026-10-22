@@ -143,7 +143,84 @@ pub fn validate(content: &str) -> Report {
             });
         }
     }
+
+    // Messages quote the value after interpolation, which for `{{ env.X }}`
+    // is whatever the environment holds, a token included. Show the template
+    // the user wrote instead: it names the line to fix and reveals nothing.
+    let mut templated = Vec::new();
+    templated_values(&doc, &interpolated, &mut templated);
+    for e in &mut report.errors {
+        e.message = show_templates(&e.message, &templated);
+    }
     report
+}
+
+/// Every scalar that interpolation changed, as `(expanded, template)`, found
+/// by walking the raw and the interpolated document together. A templated
+/// mapping key is removed and reinserted at the end, so entries pair by key
+/// first and the leftover (renamed) entries pair in order.
+fn templated_values(
+    raw: &serde_yaml::Value,
+    expanded: &serde_yaml::Value,
+    out: &mut Vec<(serde_yaml::Value, String)>,
+) {
+    use serde_yaml::Value;
+    match (raw, expanded) {
+        (Value::String(template), value) if template.contains("{{") && raw != value => {
+            out.push((value.clone(), template.clone()));
+        }
+        (Value::Sequence(r), Value::Sequence(x)) => {
+            for (r, x) in r.iter().zip(x) {
+                templated_values(r, x, out);
+            }
+        }
+        (Value::Mapping(r), Value::Mapping(x)) => {
+            let mut raw_left = Vec::new();
+            for (k, rv) in r {
+                match x.get(k) {
+                    Some(xv) => templated_values(rv, xv, out),
+                    None => raw_left.push((k, rv)),
+                }
+            }
+            let x_left = x.iter().filter(|(k, _)| !r.contains_key(*k));
+            for ((rk, rv), (xk, xv)) in raw_left.into_iter().zip(x_left) {
+                templated_values(rk, xk, out);
+                templated_values(rv, xv, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `message` with each expanded value replaced by its template. JSON-quoted
+/// forms (how the schema errors print values) are replaced for every value;
+/// bare forms (the loader's messages) only for values of four or more
+/// characters, so a short value cannot rewrite unrelated words.
+fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (value, template) in templated {
+        let bare = match value {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        if bare.is_empty() {
+            continue;
+        }
+        let quoted = serde_json::to_string(&bare).unwrap_or_default();
+        pairs.push((quoted, serde_json::to_string(template).unwrap_or_default()));
+        if bare.chars().count() >= 4 {
+            pairs.push((bare, template.clone()));
+        }
+    }
+    // Longest first, so a value that contains another is replaced whole.
+    pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    let mut out = message.to_string();
+    for (from, to) in pairs {
+        out = out.replace(&from, &to);
+    }
+    out
 }
 
 /// A JSON pointer as the dotted key path the lint warnings use.
@@ -424,6 +501,70 @@ mod tests {
             .into_iter()
             .map(|e| format!("{} {}", e.path, e.message))
             .collect()
+    }
+
+    const SECRET: &str = "ghp_DUMMY_SECRET_VALUE_0123456789";
+
+    /// Run `f` with `AVOCADO_TEST_VALIDATE_SECRET` set to a dummy secret.
+    fn with_secret<T>(f: impl FnOnce() -> T) -> T {
+        std::env::set_var("AVOCADO_TEST_VALIDATE_SECRET", SECRET);
+        let out = f();
+        std::env::remove_var("AVOCADO_TEST_VALIDATE_SECRET");
+        out
+    }
+
+    /// A value read from the environment never appears in a message; the
+    /// template the user wrote does, so the message still names the line.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_is_shown_as_its_template_not_its_value() {
+        let errors = with_secret(|| {
+            errors(
+                "source_date_epoch: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\nruntimes:\n  dev:\n    extensions: []\n",
+            )
+        });
+        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("{{ env.AVOCADO_TEST_VALIDATE_SECRET }}")),
+            "{errors:?}"
+        );
+    }
+
+    /// An error on a parent prints the whole value, children included.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_inside_a_wrong_typed_parent_is_not_shown() {
+        let errors = with_secret(|| {
+            errors(
+                "runtimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\n",
+            )
+        });
+        assert!(!errors.is_empty());
+        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+    }
+
+    /// A templated key is renamed by interpolation; its value still pairs.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_under_a_templated_key_is_not_shown() {
+        let errors = with_secret(|| {
+            errors(
+                "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: []\nextensions:\n  \"app-{{ avocado.target }}\":\n    types: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\n",
+            )
+        });
+        assert!(!errors.is_empty());
+        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+    }
+
+    #[test]
+    fn a_short_value_does_not_rewrite_unrelated_words() {
+        let templated = vec![(serde_yaml::Value::String("is".into()), "{{ env.X }}".into())];
+        assert_eq!(
+            show_templates("5 is not of type \"is\"", &templated),
+            "5 is not of type \"{{ env.X }}\""
+        );
     }
 
     #[test]
