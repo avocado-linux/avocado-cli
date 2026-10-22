@@ -11,6 +11,7 @@ pub mod ext_fetch;
 pub mod ext_source_reader;
 pub mod ext_version_source;
 pub mod feeds;
+pub mod git_worktree;
 pub mod host_copy;
 pub mod image_signing;
 pub mod install_method;
