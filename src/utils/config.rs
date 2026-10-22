@@ -1637,6 +1637,13 @@ pub struct Config {
     /// `/etc/passwd|shadow|group` during build.
     #[serde(default, deserialize_with = "deserialize_permissions_map")]
     pub permissions: Option<HashMap<String, PermissionsConfig>>,
+    /// The feed snapshot that `avocado.lock` pins for the loaded target, as
+    /// `{release}/{channel}/snapshots/<id>`. [`Self::load_composed`] sets it
+    /// and [`Self::get_releasever`] returns it, so every command fetches from
+    /// the snapshot that `avocado install` used. `None` when there is no pin,
+    /// the pin is for another feed, or the user sets releasever explicitly.
+    #[serde(skip)]
+    pub locked_releasever: Option<String>,
 }
 
 impl Config {
@@ -2147,8 +2154,9 @@ impl Config {
             .with_context(|| "Failed to interpolate composed configuration")?;
 
         // Deserialize the merged config into the Config struct
-        let config: Config = serde_yaml::from_value(main_config.clone())
+        let mut config: Config = serde_yaml::from_value(main_config.clone())
             .with_context(|| "Failed to deserialize composed configuration")?;
+        config.locked_releasever = config.read_locked_releasever(path, target);
 
         config.validate_cli_requirement()?;
         // `avocado build` and `avocado install` load exclusively through this
@@ -2356,6 +2364,7 @@ impl Config {
                 connect: None,
                 kernel: None,
                 permissions: None,
+                locked_releasever: None,
             });
 
         // Resolve target: CLI arg > env var > config default
@@ -4568,14 +4577,21 @@ impl Config {
 
     /// Get the releasever for DNF --releasever.
     /// Priority: AVOCADO_RELEASEVER > AVOCADO_SDK_REPO_RELEASE (legacy)
+    ///         > snapshot pinned in avocado.lock
     ///         > distro.repo.releasever > sdk.repo_release (legacy)
     ///         > derived {release}/{channel}
+    ///
+    /// The lock pin is only set when none of the explicit values is, so its
+    /// place in this order only matters against the env vars.
     pub fn get_releasever(&self) -> Option<String> {
         if let Ok(rv) = env::var("AVOCADO_RELEASEVER") {
             return Some(rv);
         }
         if let Ok(rv) = env::var("AVOCADO_SDK_REPO_RELEASE") {
             return Some(rv);
+        }
+        if let Some(rv) = &self.locked_releasever {
+            return Some(rv.clone());
         }
         if let Some(rv) = self
             .distro
@@ -4601,6 +4617,18 @@ impl Config {
         let release = self.get_distro_release()?;
         let channel = self.get_distro_channel()?;
         Some(format!("{release}/{channel}"))
+    }
+
+    /// The releasever that `avocado.lock` pins for `target` (or the target
+    /// that `resolve_target` picks), read with no network access and no
+    /// write. Install commands export the same value through
+    /// `AVOCADO_RELEASEVER`; this gives it to the commands that do not call
+    /// `snapshot::resolve_and_apply`. An unreadable lock gives `None`, and
+    /// the install that reads it next reports the error.
+    fn read_locked_releasever(&self, config_path: &Path, target: Option<&str>) -> Option<String> {
+        let target = crate::utils::target::resolve_target(target, self)?;
+        let lock = crate::utils::lockfile::LockFile::load(&self.project_root(config_path)).ok()?;
+        crate::utils::snapshot::pinned_releasever(self, &lock, &target)
     }
 
     /// Get distro release (feed year).
@@ -14855,5 +14883,179 @@ mod invocation_feeds_tests {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(&format!("avocado-feeds-{}-", std::process::id())));
         assert!(FEED_DIRS.lock().unwrap().iter().any(|d| d == path));
+    }
+}
+
+#[cfg(test)]
+mod locked_releasever_tests {
+    use super::*;
+    use crate::utils::lockfile::{LockFile, RepoSnapshot};
+    use serial_test::serial;
+
+    const PROJECT: &str = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+  - qemuarm64
+distro:
+  release: 2026
+  channel: next
+sdk:
+  image: docker.io/avocadolinux/sdk:2026
+"#;
+
+    /// Clear every env var that takes part in releasever or target resolution,
+    /// so the result depends only on the config and the lock.
+    fn clear_env() {
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_TARGET",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
+    /// Write `yaml` as avocado.yaml and, when given, a lock that pins
+    /// `channel` to snapshot 320 for `target`.
+    fn project(yaml: &str, pin: Option<(&str, &str)>) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("avocado.yaml");
+        fs::write(&config_path, yaml).unwrap();
+        if let Some((target, channel)) = pin {
+            let mut lock = LockFile::new();
+            lock.set_repo_snapshot(
+                target,
+                RepoSnapshot {
+                    release: "2026".to_string(),
+                    channel: channel.to_string(),
+                    snapshot: "320".to_string(),
+                    repo_url: None,
+                    created: None,
+                },
+            );
+            lock.save(dir.path()).unwrap();
+        }
+        (dir, config_path.to_string_lossy().to_string())
+    }
+
+    /// `sdk dnf`, `sdk run`, `sdk compile`, `ext build` and `build` read the
+    /// releasever from a config loaded with `load_composed`. With a pin in
+    /// avocado.lock it has to be the pinned snapshot, the value `avocado
+    /// install` used, and not the live head of the channel.
+    #[test]
+    #[serial]
+    fn a_locked_snapshot_is_the_releasever_after_load() {
+        clear_env();
+        let (_dir, path) = project(PROJECT, Some(("qemux86-64", "next")));
+
+        let explicit = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        assert_eq!(
+            explicit.config.get_sdk_repo_release().as_deref(),
+            Some("2026/next/snapshots/320")
+        );
+
+        // No --target: the default target selects the pin, as it does for
+        // resolve_target_required in the commands.
+        let default = Config::load_composed(&path, None).unwrap();
+        assert_eq!(
+            default.config.get_releasever().as_deref(),
+            Some("2026/next/snapshots/320")
+        );
+    }
+
+    /// The distro feed's baseurl in a named feed set takes the same value, so
+    /// `sdk dnf` and `sdk run` fetch custom feeds from the pinned snapshot too.
+    #[test]
+    #[serial]
+    fn the_distro_feed_uses_the_locked_snapshot() {
+        clear_env();
+        let yaml = PROJECT.replace("  channel: next\n", "  channel: next\n  feeds: [extra]\n")
+            + "repos:\n  extra:\n    url: https://extra.example/repo\n";
+        let (dir, path) = project(&yaml, Some(("qemux86-64", "next")));
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        let set = crate::utils::feeds::ResolvedFeedSet::resolve(
+            &composed.config,
+            "qemux86-64",
+            dir.path(),
+            None,
+        )
+        .unwrap()
+        .expect("feeds declared");
+        let doc = format!("{set:?}");
+        assert!(
+            doc.contains("https://repo.avocadolinux.org/2026/next/snapshots/320"),
+            "distro feed must use the pinned snapshot: {doc}"
+        );
+    }
+
+    /// A project with no lock, or a lock with no snapshot, tracks the channel
+    /// head exactly as before.
+    #[test]
+    #[serial]
+    fn no_pin_tracks_the_channel_head() {
+        clear_env();
+        let (_dir, path) = project(PROJECT, None);
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        assert_eq!(
+            composed.config.get_sdk_repo_release().as_deref(),
+            Some("2026/next")
+        );
+    }
+
+    /// Snapshot pins are per target. A pin for one target does not apply to
+    /// a command that runs for another.
+    #[test]
+    #[serial]
+    fn a_pin_for_another_target_is_not_used() {
+        clear_env();
+        let (_dir, path) = project(PROJECT, Some(("qemux86-64", "next")));
+        let composed = Config::load_composed(&path, Some("qemuarm64")).unwrap();
+        assert_eq!(
+            composed.config.get_sdk_repo_release().as_deref(),
+            Some("2026/next")
+        );
+    }
+
+    /// When the config moves to another channel, install warns and tracks the
+    /// new head. The other commands must do the same.
+    #[test]
+    #[serial]
+    fn a_pin_for_another_channel_is_not_used() {
+        clear_env();
+        let (_dir, path) = project(PROJECT, Some(("qemux86-64", "edge")));
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        assert_eq!(
+            composed.config.get_sdk_repo_release().as_deref(),
+            Some("2026/next")
+        );
+    }
+
+    /// An explicit releasever (config or env) turns snapshot pinning off for
+    /// install, so it must win here too. This includes the legacy
+    /// `sdk.repo_release`.
+    #[test]
+    #[serial]
+    fn an_explicit_releasever_wins_over_the_lock() {
+        clear_env();
+        let yaml = PROJECT.replace(
+            "sdk:\n  image: docker.io/avocadolinux/sdk:2026\n",
+            "sdk:\n  image: docker.io/avocadolinux/sdk:2026\n  repo_release: custom/rv\n",
+        );
+        let (_dir, path) = project(&yaml, Some(("qemux86-64", "next")));
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        assert_eq!(
+            composed.config.get_sdk_repo_release().as_deref(),
+            Some("custom/rv")
+        );
+
+        let (_dir, path) = project(PROJECT, Some(("qemux86-64", "next")));
+        std::env::set_var("AVOCADO_RELEASEVER", "env/rv");
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        let got = composed.config.get_sdk_repo_release();
+        std::env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(got.as_deref(), Some("env/rv"));
     }
 }
