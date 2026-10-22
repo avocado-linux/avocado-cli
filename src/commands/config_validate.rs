@@ -503,13 +503,14 @@ mod tests {
             .collect()
     }
 
-    const SECRET: &str = "ghp_DUMMY_SECRET_VALUE_0123456789";
+    const MARKER: &str = "AVOCADO_LEAK_MARKER_0123456789";
 
-    /// Run `f` with `AVOCADO_TEST_VALIDATE_SECRET` set to a dummy secret.
-    fn with_secret<T>(f: impl FnOnce() -> T) -> T {
-        std::env::set_var("AVOCADO_TEST_VALIDATE_SECRET", SECRET);
+    /// Run `f` with `AVOCADO_TEST_VALIDATE_MARKER` set to a marker value that
+    /// stands in for a secret.
+    fn with_marker<T>(f: impl FnOnce() -> T) -> T {
+        std::env::set_var("AVOCADO_TEST_VALIDATE_MARKER", MARKER);
         let out = f();
-        std::env::remove_var("AVOCADO_TEST_VALIDATE_SECRET");
+        std::env::remove_var("AVOCADO_TEST_VALIDATE_MARKER");
         out
     }
 
@@ -518,16 +519,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_env_value_is_shown_as_its_template_not_its_value() {
-        let errors = with_secret(|| {
+        let errors = with_marker(|| {
             errors(
-                "source_date_epoch: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\nruntimes:\n  dev:\n    extensions: []\n",
+                "source_date_epoch: \"{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\"\nruntimes:\n  dev:\n    extensions: []\n",
             )
         });
-        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+        assert!(!errors.iter().any(|e| e.contains(MARKER)), "{errors:?}");
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("{{ env.AVOCADO_TEST_VALIDATE_SECRET }}")),
+                .any(|e| e.contains("{{ env.AVOCADO_TEST_VALIDATE_MARKER }}")),
             "{errors:?}"
         );
     }
@@ -536,26 +537,26 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_env_value_inside_a_wrong_typed_parent_is_not_shown() {
-        let errors = with_secret(|| {
+        let errors = with_marker(|| {
             errors(
-                "runtimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\n",
+                "runtimes:\n  dev:\n    extensions:\n      app: \"{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\"\n",
             )
         });
         assert!(!errors.is_empty());
-        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+        assert!(!errors.iter().any(|e| e.contains(MARKER)), "{errors:?}");
     }
 
     /// A templated key is renamed by interpolation; its value still pairs.
     #[test]
     #[serial_test::serial]
     fn an_env_value_under_a_templated_key_is_not_shown() {
-        let errors = with_secret(|| {
+        let errors = with_marker(|| {
             errors(
-                "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: []\nextensions:\n  \"app-{{ avocado.target }}\":\n    types: \"{{ env.AVOCADO_TEST_VALIDATE_SECRET }}\"\n",
+                "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: []\nextensions:\n  \"app-{{ avocado.target }}\":\n    types: \"{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\"\n",
             )
         });
         assert!(!errors.is_empty());
-        assert!(!errors.iter().any(|e| e.contains(SECRET)), "{errors:?}");
+        assert!(!errors.iter().any(|e| e.contains(MARKER)), "{errors:?}");
     }
 
     #[test]
