@@ -1149,7 +1149,7 @@ mod tests {
         assert!(content.contains("cli_requirement: \">=0.41.0\""));
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: edge"));
-        assert!(content.contains("release: 2024"));
+        assert!(content.contains("release: 2026"));
         assert!(content.contains("runtimes:"));
         assert!(content.contains("dev:"));
         assert!(content.contains("packages:"));
