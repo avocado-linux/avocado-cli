@@ -495,6 +495,35 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     )
 }
 
+/// The depmod pass that runs after every package is in the sysroot, as OE's
+/// `image.bbclass` does after a rootfs install.
+///
+/// With `$D` set (see `offline_scriptlet_env`), a `kernel-module-*` postinst
+/// does nothing and leaves depmod to the image build. The `kernel-<kver>`
+/// postinst runs depmod, but rpm installs it before the modules, so its
+/// `modules.dep` is empty. Without this pass that empty file is what the
+/// rootfs and the initramfs boot with.
+///
+/// Runs for each kernel version in the sysroot, after the distro-sync (which
+/// can change module packages too) and before the overlay, so an overlay can
+/// still replace the generated files. Rootfs and initramfs only: extensions
+/// run depmod on the device when they merge (`AVOCADO_ON_MERGE`).
+fn kernel_module_deps_step(sysroot_dir: &str) -> String {
+    format!(
+        r#"
+# Build the kernel module index now that every module is installed.
+for kdir in $AVOCADO_PREFIX/{sysroot_dir}/usr/lib/modules/*/; do
+    [ -d "$kdir" ] || continue
+    kver=$(basename "$kdir")
+    "${{AVOCADO_DEPMOD:-/sbin/depmod}}" -a -b $AVOCADO_PREFIX/{sysroot_dir} "$kver" || {{
+        echo "[ERROR] depmod failed for kernel $kver in the {sysroot_dir} sysroot." >&2
+        exit 1
+    }}
+done
+"#
+    )
+}
+
 /// Detect package removals by comparing the **effective** package set for
 /// this sysroot against what the lockfile recorded. A non-empty result means
 /// the sysroot must be cleaned and reinstalled from scratch, because dnf
@@ -1287,6 +1316,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         yes,
         &sync_exclude_str,
     );
+    let module_deps_step = kernel_module_deps_step(sysroot_dir);
     let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
     let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&format!(
         "$AVOCADO_PREFIX/{sysroot_dir}"
@@ -1308,7 +1338,7 @@ RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/ext-rpm-config-scripts \
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
     {dnf_args_str} {refresh} {yes} {exclude_str} --installroot $AVOCADO_PREFIX/{sysroot_dir} install {pkg}
-{sync_snippet}{overlay_snippet}"#
+{sync_snippet}{module_deps_step}{overlay_snippet}"#
     );
     if params.no_stamps {
         // See remove_own_stamp_line: an unrecorded install must not leave the
@@ -2632,5 +2662,99 @@ mod tests {
             "{out}"
         );
         assert_eq!(recorded_list(root), vec!["etc/new\nname"]);
+    }
+
+    /// Run the depmod pass under bash with `$AVOCADO_DEPMOD` stubbed. The stub
+    /// logs its arguments and exits with `depmod_exit`. Returns the exit
+    /// status and the logged calls.
+    #[cfg(unix)]
+    fn run_module_deps_step(
+        prefix: &std::path::Path,
+        sysroot_dir: &str,
+        depmod_exit: i32,
+    ) -> (bool, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = prefix.join("depmod.log");
+        let stub = prefix.join("depmod-stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit {depmod_exit}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -e\n{}",
+                super::kernel_module_deps_step(sysroot_dir)
+            ))
+            .env("AVOCADO_PREFIX", prefix)
+            .env("AVOCADO_DEPMOD", &stub)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("bash on PATH");
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (status.success(), calls)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn module_deps_step_runs_depmod_for_each_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let modules = prefix.join("initramfs/usr/lib/modules");
+        std::fs::create_dir_all(modules.join("6.12.87-v8-16k/kernel")).unwrap();
+        std::fs::create_dir_all(modules.join("6.12.90-v8")).unwrap();
+        std::fs::write(modules.join("stray-file"), "").unwrap();
+
+        let (ok, mut calls) = run_module_deps_step(prefix, "initramfs", 0);
+        calls.sort();
+        let root = prefix.join("initramfs");
+        assert!(ok);
+        assert_eq!(
+            calls,
+            vec![
+                format!("-a -b {} 6.12.87-v8-16k", root.display()),
+                format!("-a -b {} 6.12.90-v8", root.display()),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn module_deps_step_is_a_no_op_without_kernel_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("rootfs/usr/lib")).unwrap();
+        let (ok, calls) = run_module_deps_step(tmp.path(), "rootfs", 0);
+        assert!(ok);
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn module_deps_step_fails_the_install_when_depmod_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("rootfs/usr/lib/modules/6.12.87")).unwrap();
+        let (ok, calls) = run_module_deps_step(tmp.path(), "rootfs", 1);
+        assert!(!ok);
+        assert_eq!(calls.len(), 1);
+    }
+
+    /// The pass has to follow both dnf transactions (the install and the
+    /// distro-sync) in the one install script that rootfs and initramfs share.
+    #[test]
+    fn module_deps_step_follows_the_dnf_transactions() {
+        let src = include_str!("install.rs");
+        assert!(
+            src.contains("{sync_snippet}{module_deps_step}{overlay_snippet}"),
+            "the depmod pass moved out of the sysroot install script"
+        );
     }
 }

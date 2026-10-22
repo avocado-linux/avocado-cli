@@ -116,6 +116,16 @@ impl fmt::Display for StampComponent {
 /// instead of trusted.
 pub const SCRIPTLET_CONTRACT: &str = "offline-root-1";
 
+/// Version of the steps a rootfs or initramfs install runs after its dnf
+/// transaction. Bump it whenever those steps change what lands in the
+/// sysroot: it is part of the sysroot install input hash, so a sysroot
+/// installed without the change is installed again. Unlike
+/// [`SCRIPTLET_CONTRACT`] it does not touch the SDK or extensions.
+///
+/// `kernel-module-deps-1`: depmod runs once after all packages are in place.
+/// Sysroots from CLIs before it can have an empty `modules.dep`.
+pub const SYSROOT_POST_INSTALL: &str = "kernel-module-deps-1";
+
 /// Input hashes that determine if a stamp is stale
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StampInputs {
@@ -2404,6 +2414,10 @@ fn compute_sysroot_install_input_hash(
     hash_data.insert(
         serde_yaml::Value::String("scriptlet_contract".to_string()),
         serde_yaml::Value::String(SCRIPTLET_CONTRACT.to_string()),
+    );
+    hash_data.insert(
+        serde_yaml::Value::String("sysroot_post_install".to_string()),
+        serde_yaml::Value::String(SYSROOT_POST_INSTALL.to_string()),
     );
 
     // The effective set, not the raw `<section>.packages` node — an absent
