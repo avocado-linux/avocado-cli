@@ -2402,6 +2402,7 @@ fi"#
         // Build runtime-level var_files section
         let runtime_var_files_section = runtime_var_files_script(
             &crate::utils::config::get_runtime_var_files(&merged_runtime),
+            "/opt/src",
         );
 
         // Build Docker image priming section
@@ -3385,9 +3386,12 @@ fi
     .to_string()
 }
 
-/// Shell that copies runtime `var_files` from the project (`/opt/src`) into
-/// the var partition staging (`$VAR_DIR`).
-fn runtime_var_files_script(mappings: &[crate::utils::config::VarFileMapping]) -> String {
+/// Shell that copies runtime `var_files` from the project (`src_root`, which
+/// is `/opt/src` in the container) into the var partition staging (`$VAR_DIR`).
+fn runtime_var_files_script(
+    mappings: &[crate::utils::config::VarFileMapping],
+    src_root: &str,
+) -> String {
     if mappings.is_empty() {
         return "# No runtime var_files to apply".to_string();
     }
@@ -3396,15 +3400,20 @@ fn runtime_var_files_script(mappings: &[crate::utils::config::VarFileMapping]) -
         .map(|mapping| {
             format!(
                 r#"
-if [ -e "/opt/src/{source}" ]; then
+if [ -e "{src_root}/{source}" ]; then
     mkdir -p "$VAR_DIR/{dest}"
-    cp -a "/opt/src/{source}" "$VAR_DIR/{dest}"
     # Project files show the host owner when /opt/src is a plain mount (the
-    # avocado-vm), and mkfs.btrfs -r keeps owners: make the copy root's.
-    chown -hR root:root "$VAR_DIR/{dest}/$(basename "/opt/src/{source}")"
+    # avocado-vm), and mkfs.btrfs -r keeps owners. Make the project's copy
+    # root's in a temp dir, then merge it: cp -a merges into an existing
+    # dest, and files the project did not provide keep their owners.
+    _vf_tmp=$(mktemp -d)
+    cp -a "{src_root}/{source}" "$_vf_tmp/"
+    chown -hR root:root "$_vf_tmp"
+    cp -a "$_vf_tmp/$(basename "{src_root}/{source}")" "$VAR_DIR/{dest}"
+    rm -rf "$_vf_tmp"
     echo "  Copied runtime var_files: {source} -> {dest}"
 else
-    echo "WARNING: runtime var_files source not found: /opt/src/{source}"
+    echo "WARNING: runtime var_files source not found: {src_root}/{source}"
 fi"#,
                 source = mapping.source,
                 dest = mapping.dest
@@ -3541,23 +3550,79 @@ mod tests {
     }
 
     #[test]
-    fn runtime_var_files_copy_is_made_root_owned() {
-        use crate::utils::config::VarFileMapping;
+    fn runtime_var_files_with_nothing_configured() {
         assert_eq!(
-            super::runtime_var_files_script(&[]),
+            super::runtime_var_files_script(&[], "/opt/src"),
             "# No runtime var_files to apply"
         );
-        let s = super::runtime_var_files_script(&[VarFileMapping {
-            source: "var-files/app".to_string(),
-            dest: "lib/app".to_string(),
-        }]);
-        let copy = s
-            .find(r#"cp -a "/opt/src/var-files/app" "$VAR_DIR/lib/app""#)
-            .expect("copy line");
-        let chown = s
-            .find(r#"chown -hR root:root "$VAR_DIR/lib/app/$(basename "/opt/src/var-files/app")""#)
-            .expect("chown of the copied item, not the whole dest");
-        assert!(copy < chown);
+    }
+
+    /// The project's copy is made root's before it is merged into var
+    /// staging, so files already in the dest (an extension's service-owned
+    /// cache) keep their owners. Runs the script with a `chown` stub that
+    /// records its targets, so it needs no root: no chown may point into
+    /// `$VAR_DIR`.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_var_files_never_chowns_what_is_already_in_var_staging() {
+        use crate::utils::config::VarFileMapping;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, var, bin) = (
+            tmp.path().join("src"),
+            tmp.path().join("var"),
+            tmp.path().join("bin"),
+        );
+        std::fs::create_dir_all(src.join("seed/app")).unwrap();
+        std::fs::write(src.join("seed/app/settings"), "s").unwrap();
+        std::fs::create_dir_all(var.join("lib/app/cache")).unwrap();
+        std::fs::write(var.join("lib/app/cache/state"), "c").unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = tmp.path().join("chown.log");
+        let stub = bin.join("chown");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = super::runtime_var_files_script(
+            &[VarFileMapping {
+                source: "seed/app".to_string(),
+                dest: "lib".to_string(),
+            }],
+            src.to_str().unwrap(),
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("VAR_DIR", &var)
+            .env("PATH", path)
+            .env("TMPDIR", tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(var.join("lib/app/settings")).unwrap(),
+            "s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(var.join("lib/app/cache/state")).unwrap(),
+            "c"
+        );
+        let chowned = std::fs::read_to_string(&log).unwrap();
+        assert!(chowned.contains("root:root"), "{chowned}");
+        assert!(
+            !chowned.contains(var.to_str().unwrap()),
+            "chown reached var staging: {chowned}"
+        );
     }
 
     #[test]
