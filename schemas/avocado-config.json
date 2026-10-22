@@ -1279,7 +1279,7 @@
                 "merge",
                 "opaque"
               ],
-              "description": "'merge' (default) copies with cp -a, preserving attributes. 'opaque' copies with cp -r, so timestamps and ownership are not preserved, and for extensions top-level dotfiles are skipped. Both modes copy the overlay over the extension sysroot and remove the files the overlay no longer has. Files from packages or hooks are left alone."
+              "description": "'merge' (default) copies with cp -a, preserving attributes. 'opaque' copies with cp -r, so timestamps and ownership are not preserved, and for extensions top-level dotfiles are skipped. Both modes copy the overlay over the sysroot and remove the files the overlay no longer has. Files from packages or hooks are left alone."
             },
             "preprocess": {
               "description": "Run template interpolation over overlay files: true for all files, or a list of globs matched against paths relative to the overlay. Only UTF-8 files are templated. Ignored for remote extensions.",
