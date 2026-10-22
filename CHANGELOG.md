@@ -34,6 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claim `boot_config` fails the runtime build instead of ignoring the lines. The
   SDK compile wrapper is installed only when an overlay has a `src`; the
   delivery hook is installed for any of the three.
+- **A board can say which boot settings it delivers.** A BSP that ships a
+  delivery hook may also ship `usr/libexec/avocado/boot-settings.json`
+  (`{"version": 1, "kinds": [...]}`, kinds `dt_overlay`, `dt_overlay_stock`,
+  `boot_config`, `kernel_args`). When it is there, a runtime build that
+  declares a hook kind the board does not list fails before anything is
+  compiled, naming every such kind and the kinds the board supports; a file it
+  cannot read fails the build too. With `kernel.cmdline` or
+  `kernel.cmdline_extra` set and `kernel_args` not listed, the build warns that
+  the setting may be ignored and carries on. A board with no file behaves as
+  before. The error for a board with no hook now names the declared kinds
+  instead of saying only "device-tree overlays". The file ships in the hook
+  package, which `sdk install` adds only while an extension declares overlays or
+  `boot_config`, so the kernel-arguments warning appears only for such projects,
+  and a project whose `avocado.lock` pins an older build of the package keeps
+  the check off until the lock is refreshed. A hook can still refuse one
+  declaration after the early check, since the file lists kinds and not every
+  restriction.
 - **SBOM extension scopes carry a stable image id.** (ENG-2199)
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry
