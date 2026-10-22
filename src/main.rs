@@ -435,7 +435,8 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Skip warnings and confirmation prompts. A raw SD card write from the
+        /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
         /// Runtime name to provision (deprecated, use positional argument)
@@ -1823,7 +1824,8 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Skip warnings and confirmation prompts. A raw SD card write from the
+        /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
