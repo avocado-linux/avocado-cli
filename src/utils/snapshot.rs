@@ -411,6 +411,20 @@ mod tests {
         assert_eq!(pin_status(None, "2026", "edge"), PinStatus::None);
     }
 
+    /// The pin that `Config::load_composed` reads from the lock is not an
+    /// explicit releasever. If it were, install would skip the check that the
+    /// snapshot is still served, and `avocado update` could not advance it.
+    #[test]
+    #[serial_test::serial]
+    fn a_pin_read_at_load_is_not_an_override() {
+        env::remove_var("AVOCADO_RELEASEVER");
+        env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+        let mut config: Config =
+            serde_yaml::from_str("distro:\n  release: 2026\n  channel: next\n").unwrap();
+        config.locked_releasever = Some(effective_releasever("2026", "next", "320"));
+        assert!(!releasever_is_overridden(&config));
+    }
+
     #[test]
     fn pin_status_matches_same_feed() {
         let p = snap("2026", "edge", "X");

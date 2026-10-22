@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::utils::feeds::FeedStage;
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer},
@@ -24,6 +25,13 @@ fn join_argv(argv: &[String]) -> String {
         .map(|a| shell_escape(a))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The feed URL and releasever for the SDK container. These are the values
+/// `sdk install` and `sdk dnf` use, so a pinned snapshot in avocado.lock
+/// applies here too.
+fn sdk_repo(config: &Config) -> (Option<String>, Option<String>) {
+    (config.get_sdk_repo_url(), config.get_sdk_repo_release())
 }
 
 /// Implementation of the 'sdk run' command.
@@ -293,9 +301,17 @@ impl SdkRunCommand {
         // Get merged SDK configuration for the target
         let merged_sdk_config = config.get_merged_sdk_config(&target, &self.config_path)?;
 
-        // Get repo_url and repo_release from merged config
-        let repo_url = merged_sdk_config.repo_url.as_ref();
-        let repo_release = merged_sdk_config.repo_release.as_ref();
+        let (repo_url, repo_release) = sdk_repo(config);
+        // The generated .repo files live in a host tempdir that a remote
+        // daemon cannot mount, and the remote path refuses named feeds. A
+        // `--runs-on` shell keeps running without them, as it did before.
+        let feeds = if self.runs_on.is_some() {
+            None
+        } else {
+            config
+                .materialize_feeds(&target, FeedStage::Sdk, &self.config_path)
+                .await?
+        };
 
         // Merge container args from merged config with CLI args
         let config_container_args = merged_sdk_config.container_args.as_ref();
@@ -365,8 +381,9 @@ impl SdkRunCommand {
             verbose: self.verbose,
             source_environment: self.env,
             interactive: self.interactive,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url,
+            repo_release,
+            feeds,
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             extension_sysroot: self.extension.clone(),
@@ -403,6 +420,53 @@ impl SdkRunCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sdk run` used to read the legacy `sdk.repo_release` only, so the
+    /// container fell back to the image codename. It must use the configured
+    /// feed and the snapshot that avocado.lock pins, like `sdk dnf`.
+    #[test]
+    #[serial_test::serial]
+    fn sdk_run_uses_the_locked_snapshot() {
+        use crate::utils::lockfile::{LockFile, RepoSnapshot};
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_TARGET",
+        ] {
+            std::env::remove_var(var);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &config_path,
+            "default_target: qemux86-64\ndistro:\n  release: 2026\n  channel: next\nsdk:\n  image: docker.io/avocadolinux/sdk:2026\n",
+        )
+        .unwrap();
+        let config_path = config_path.to_string_lossy().to_string();
+
+        let unpinned = Config::load_composed(&config_path, None).unwrap();
+        assert_eq!(sdk_repo(&unpinned.config).1.as_deref(), Some("2026/next"));
+
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "next".to_string(),
+                snapshot: "320".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        lock.save(dir.path()).unwrap();
+        let pinned = Config::load_composed(&config_path, None).unwrap();
+        assert_eq!(
+            sdk_repo(&pinned.config).1.as_deref(),
+            Some("2026/next/snapshots/320")
+        );
+    }
 
     #[test]
     fn test_new() {
