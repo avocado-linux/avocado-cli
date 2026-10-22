@@ -91,7 +91,7 @@
       "examples": [
         {
           "acme": {
-            "url": "https://repo.example.com",
+            "url": "https://repo.example.com/$releasever/target/$target",
             "release": "2024",
             "channel": "stable",
             "stages": [
@@ -107,7 +107,43 @@
       "type": "object",
       "description": "Runtime configurations for different deployment scenarios. Each runtime can specify extensions, packages, and target-specific settings.",
       "additionalProperties": {
-        "$ref": "#/definitions/runtimeConfig"
+        "$ref": "#/definitions/runtimeConfig",
+        "$comment": "The var rules live here, not in varConfig, so they bind a complete runtime and not a partial 'target-<name>:' override, which reuses runtimeConfig. The CLI validates the base var block before it merges overrides.",
+        "properties": {
+          "var": {
+            "dependentSchemas": {
+              "recovery": {
+                "properties": {
+                  "encrypt": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "encrypt"
+                ]
+              },
+              "hardware": {
+                "if": {
+                  "properties": {
+                    "hardware": {
+                      "const": "none"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "recovery": {
+                      "pattern": "\\S"
+                    }
+                  },
+                  "required": [
+                    "recovery"
+                  ]
+                }
+              }
+            }
+          }
+        }
       },
       "examples": [
         {
@@ -475,7 +511,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Local directory of RPMs (with repodata/), relative to the config file."
+          "description": "Local directory of RPMs (with repodata/), relative to the project root (`src_dir` when set, else the directory of avocado.yaml)."
         },
         "release": {
           "anyOf": [
@@ -532,7 +568,7 @@
         },
         "ca": {
           "type": "string",
-          "description": "Path to a CA certificate bundle for the feed's TLS certificate, relative to the config file."
+          "description": "Path to a CA certificate bundle for the feed's TLS certificate, relative to the project root (`src_dir` when set, else the directory of avocado.yaml)."
         },
         "tls_verify": {
           "type": "boolean",
@@ -1169,6 +1205,23 @@
         "fit_key_in_bootloader": {
           "type": "boolean",
           "description": "When 'fit_key' is set, also rebuild the feed's bootloader so it enforces that key. Defaults to true."
+        }
+      },
+      "if": {
+        "properties": {
+          "fit_key": {
+            "pattern": "\\S"
+          }
+        },
+        "required": [
+          "fit_key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "fit_unsigned": {
+            "const": false
+          }
         }
       },
       "additionalProperties": false
