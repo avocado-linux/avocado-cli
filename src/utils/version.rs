@@ -66,16 +66,7 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
         )
     })?;
 
-    // First try the exact running version, so a requirement that explicitly
-    // pins a pre-release (e.g. "=1.0.0-rc.1") is still satisfiable when running
-    // that build. Then fall back to the running version with pre-release/build
-    // metadata stripped: semver only lets a pre-release satisfy a comparator
-    // that carries a matching pre-release tag, so without this fallback an
-    // ordinary requirement like ">=0.25" or "^1" would spuriously reject every
-    // RC build. The full version is still shown in the error message below.
-    let running_release = Version::new(running.major, running.minor, running.patch);
-
-    if !req.matches(&running) && !req.matches(&running_release) {
+    if !requirement_matches(&req, &running) {
         anyhow::bail!(
             "This project requires avocado CLI version '{requirement}', \
              but you are running version {running}.\n\n\
@@ -84,6 +75,31 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `running` satisfies `req`, with pre-release builds read as their
+/// release for range requirements.
+///
+/// The exact running version is tried first, so a requirement that pins a
+/// pre-release (e.g. "=1.0.0-rc.1") matches that build. Then the running
+/// version is tried with pre-release/build metadata stripped: semver only lets
+/// a pre-release satisfy a comparator that has a matching pre-release tag,
+/// so without this fallback an ordinary range like ">=0.25" or "^1" would
+/// reject every RC build.
+///
+/// The fallback is skipped when any comparator is an exact `=` pin. A pin is
+/// a request for one build, and reading `1.0.0-rc.5` as `1.0.0` would let
+/// "=1.0.0" accept every `1.0.0-rc.N`.
+fn requirement_matches(req: &VersionReq, running: &Version) -> bool {
+    if req.matches(running) {
+        return true;
+    }
+    let has_exact_pin = req.comparators.iter().any(|c| c.op == semver::Op::Exact);
+    if has_exact_pin {
+        return false;
+    }
+    let running_release = Version::new(running.major, running.minor, running.patch);
+    req.matches(&running_release)
 }
 
 /// Convert a semver version string into an RPM-compatible `Version:` value.
@@ -205,6 +221,34 @@ mod tests {
         assert!(check_cli_requirement(&format!("^{major}")).is_ok());
         // Wildcard that matches anything
         assert!(check_cli_requirement("*").is_ok());
+    }
+
+    fn matches(req: &str, running: &str) -> bool {
+        requirement_matches(
+            &VersionReq::parse(req).unwrap(),
+            &Version::parse(running).unwrap(),
+        )
+    }
+
+    #[test]
+    fn exact_pin_matches_only_the_full_version() {
+        assert!(!matches("=1.0.0", "1.0.0-rc.5"));
+        assert!(matches("=1.0.0", "1.0.0"));
+        assert!(matches("=1.0.0-rc.5", "1.0.0-rc.5"));
+        assert!(!matches("=1.0.0-rc.5", "1.0.0-rc.6"));
+        assert!(!matches("=1.0.0-rc.5", "1.0.0"));
+        // A pin inside a compound requirement is still a pin.
+        assert!(!matches(">=0.25, =1.0.0", "1.0.0-rc.5"));
+    }
+
+    #[test]
+    fn range_requirements_read_a_prerelease_as_its_release() {
+        assert!(matches(">=1.0.0-rc.5", "1.0.0"));
+        assert!(matches(">=1.0.0", "1.0.0-rc.5"));
+        assert!(matches("^1", "1.0.0-rc.5"));
+        assert!(matches("~1.0", "1.0.0-rc.5"));
+        assert!(matches(">=0.41.0", "1.0.0-rc.5"));
+        assert!(!matches(">=1.0.1", "1.0.0-rc.5"));
     }
 
     #[test]
