@@ -1158,9 +1158,6 @@ impl RuntimeBuildCommand {
         // modes, so it would otherwise vanish exactly where builds usually
         // run. TUI queues it above the task region; JSON mode writes it to
         // stderr without corrupting the NDJSON stream.
-        let project_dir = std::path::Path::new(&self.config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
         if let Err(e) = self
             .generate_tuf_staging(
                 config,
@@ -1171,7 +1168,6 @@ impl RuntimeBuildCommand {
                 repo_release,
                 container_helper,
                 runs_on_context,
-                project_dir,
             )
             .await
         {
@@ -1271,7 +1267,6 @@ echo -n '}}'
         repo_release: Option<&String>,
         container_helper: &SdkContainer,
         runs_on_context: Option<&RunsOnContext>,
-        project_dir: &std::path::Path,
     ) -> Result<()> {
         // Resolve signing keys. At Level 0 (Connect, no local key), skip TUF staging entirely.
         let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
@@ -1313,7 +1308,6 @@ echo -n '}}'
                         repo_release,
                         container_helper,
                         runs_on_context,
-                        project_dir,
                         &content_signer,
                     )
                     .await;
@@ -1394,37 +1388,9 @@ echo -n '}}'
         )?;
 
         // Phase 3: Write signed files into the build volume via a container run.
-        // We write them to a temp dir under the project directory (accessible inside
-        // the container as /opt/src/.tuf-staging-tmp/), then copy into the volume.
-        let tmp_dir = project_dir.join(".tuf-staging-tmp");
-        let tmp_delegations = tmp_dir.join("delegations");
-        std::fs::create_dir_all(&tmp_delegations)
-            .context("Failed to create TUF staging temp directory")?;
-
-        std::fs::write(tmp_dir.join("targets.json"), &repo_metadata.targets_json)
-            .context("Failed to write targets.json to temp dir")?;
-        std::fs::write(
-            tmp_delegations.join(format!("runtime-{}.json", collection.runtime_uuid)),
-            &repo_metadata.delegated_targets_json,
-        )
-        .context("Failed to write delegated targets to temp dir")?;
-
-        let runtime_name = &self.runtime_name;
-        let runtime_uuid = &collection.runtime_uuid;
-        let copy_script = format!(
-            r#"set -euo pipefail
-DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
-mkdir -p "$DEST/delegations"
-cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
-cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
-   "$DEST/delegations/runtime-{runtime_uuid}.json"
-"#
-        );
-
         let copy_run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.to_string(),
-            command: copy_script,
             verbose: false,
             source_environment: true,
             interactive: false,
@@ -1436,10 +1402,25 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
-
-        // Clean up host temp files.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        stage_into_volume(
+            container_helper,
+            &self.runtime_name,
+            &collection.runtime_uuid,
+            &repo_metadata.targets_json,
+            &repo_metadata.delegated_targets_json,
+            "delegation",
+            |command| {
+                run_container_command(
+                    container_helper,
+                    RunConfig {
+                        command,
+                        ..copy_run_config
+                    },
+                    runs_on_context,
+                )
+            },
+        )
+        .await?;
 
         print_info(
             &format!(
@@ -1465,7 +1446,6 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         repo_release: Option<&String>,
         container_helper: &SdkContainer,
         runs_on_context: Option<&RunsOnContext>,
-        project_dir: &std::path::Path,
         content_signer: &crate::utils::update_signing::TufSigner,
     ) -> Result<()> {
         // Phase 1: Collect artifact hashes from inside the build volume.
@@ -1513,35 +1493,9 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
         )?;
 
         // Phase 3: Write files into the build volume.
-        let tmp_dir = project_dir.join(".tuf-staging-tmp");
-        let tmp_delegations = tmp_dir.join("delegations");
-        std::fs::create_dir_all(&tmp_delegations)
-            .context("Failed to create TUF staging temp directory")?;
-
-        std::fs::write(tmp_dir.join("targets.json"), &metadata.targets_json)
-            .context("Failed to write targets.json to temp dir")?;
-        std::fs::write(
-            tmp_delegations.join(format!("runtime-{}.json", collection.runtime_uuid)),
-            &metadata.delegated_targets_json,
-        )
-        .context("Failed to write delegated targets to temp dir")?;
-
-        let runtime_name = &self.runtime_name;
-        let runtime_uuid = &collection.runtime_uuid;
-        let copy_script = format!(
-            r#"set -euo pipefail
-DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
-mkdir -p "$DEST/delegations"
-cp /opt/src/.tuf-staging-tmp/targets.json "$DEST/targets.json"
-cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
-   "$DEST/delegations/runtime-{runtime_uuid}.json"
-"#
-        );
-
         let copy_run_config = RunConfig {
             container_image: container_image.to_string(),
             target: target_arch.to_string(),
-            command: copy_script,
             verbose: false,
             source_environment: true,
             interactive: false,
@@ -1553,9 +1507,25 @@ cp /opt/src/.tuf-staging-tmp/delegations/runtime-{runtime_uuid}.json \
             env_vars: self.runtime_env_vars(),
             ..Default::default()
         };
-        run_container_command(container_helper, copy_run_config, runs_on_context).await?;
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        stage_into_volume(
+            container_helper,
+            &self.runtime_name,
+            &collection.runtime_uuid,
+            &metadata.targets_json,
+            &metadata.delegated_targets_json,
+            "content delegation",
+            |command| {
+                run_container_command(
+                    container_helper,
+                    RunConfig {
+                        command,
+                        ..copy_run_config
+                    },
+                    runs_on_context,
+                )
+            },
+        )
+        .await?;
 
         print_info(
             &format!(
@@ -3172,6 +3142,78 @@ fn collect_runtime_compile_entries(merged_runtime: &serde_yaml::Value) -> Vec<Ru
     out
 }
 
+/// A fresh staging directory under `root` for one copy into the volume.
+/// Unique per call, so two builds sharing a `src_dir` cannot overwrite or
+/// delete each other's files; removed when the handle drops. Returns the
+/// handle and the directory's name.
+fn tuf_staging_dir(root: &std::path::Path) -> Result<(tempfile::TempDir, String)> {
+    let staging = tempfile::Builder::new()
+        .prefix(".tuf-staging-")
+        .tempdir_in(root)
+        .context("Failed to create TUF staging temp directory")?;
+    let name = staging
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("TUF staging temp directory has no name")?
+        .to_string();
+    Ok((staging, name))
+}
+
+/// Write the signed `targets.json` and delegated targets under the host
+/// directory the container mounts at `/opt/src`, then hand `copy` the script
+/// that moves them into the build volume. `copy` returns whether the
+/// container run succeeded; a failed copy is an error naming the runtime.
+async fn stage_into_volume<F, Fut>(
+    container_helper: &SdkContainer,
+    runtime_name: &str,
+    runtime_uuid: &str,
+    targets_json: &str,
+    delegated_targets_json: &str,
+    kind: &str,
+    copy: F,
+) -> Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let (staging, staging_dir) = tuf_staging_dir(container_helper.mounted_src_dir())?;
+    let tmp_dir = staging.path();
+    let tmp_delegations = tmp_dir.join("delegations");
+    std::fs::create_dir_all(&tmp_delegations)
+        .context("Failed to create TUF staging temp directory")?;
+
+    std::fs::write(tmp_dir.join("targets.json"), targets_json)
+        .context("Failed to write targets.json to temp dir")?;
+    std::fs::write(
+        tmp_delegations.join(format!("runtime-{runtime_uuid}.json")),
+        delegated_targets_json,
+    )
+    .context("Failed to write delegated targets to temp dir")?;
+
+    let copy_script = format!(
+        r#"set -euo pipefail
+DEST="$AVOCADO_PREFIX/runtimes/{runtime_name}/var-staging/lib/avocado/tuf-staging"
+mkdir -p "$DEST/delegations"
+cp "/opt/src/{staging_dir}/targets.json" "$DEST/targets.json"
+cp "/opt/src/{staging_dir}/delegations/runtime-{runtime_uuid}.json" \
+   "$DEST/delegations/runtime-{runtime_uuid}.json"
+"#
+    );
+
+    let copied = copy(copy_script).await?;
+
+    // Clean up host temp files.
+    drop(staging);
+
+    if !copied {
+        return Err(anyhow::anyhow!(
+            "failed to copy the {kind} staging files into the build volume for runtime '{runtime_name}'"
+        ));
+    }
+    Ok(())
+}
+
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
@@ -3370,6 +3412,127 @@ fi
 
 #[cfg(test)]
 mod tests {
+    use super::{Config, SdkContainer};
+
+    /// Each staging call gets its own directory under the project root, so
+    /// two builds sharing a `src_dir` never write or delete each other's
+    /// files. The name is what the copy script appends to `/opt/src`.
+    #[test]
+    fn tuf_staging_dir_is_unique_per_call_and_removed_on_drop() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (a, a_name) = super::tuf_staging_dir(root.path()).unwrap();
+        let (b, b_name) = super::tuf_staging_dir(root.path()).unwrap();
+        assert_ne!(a_name, b_name);
+        assert!(a_name.starts_with(".tuf-staging-"));
+        assert_eq!(a.path(), root.path().join(&a_name));
+        assert!(a.path().is_dir() && b.path().is_dir());
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(
+            !a_path.exists(),
+            "dropping the handle removes the directory"
+        );
+        assert!(b.path().is_dir(), "the other call's directory is untouched");
+    }
+
+    /// A project whose config sits in `<root>/project/avocado/` with
+    /// `src_dir: ..`. The container mounts `<root>/project` at `/opt/src`.
+    fn src_dir_above_config_dir() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().canonicalize().unwrap().join("project");
+        let config_dir = project.join("avocado");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("avocado.yaml");
+        (root, project, config_path)
+    }
+
+    fn staging_dirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".tuf-staging-"))
+            })
+            .collect()
+    }
+
+    /// The copy script reads `/opt/src/<staging>/`, so the files must be on
+    /// the host under the directory the container mounts there: `src_dir`
+    /// when set, else the working directory. Never the config file's
+    /// directory unless one of those is it.
+    #[tokio::test]
+    async fn stage_into_volume_writes_under_the_mounted_src_dir() {
+        let (_root, project, config_path) = src_dir_above_config_dir();
+        let config_str = config_path.to_str().unwrap();
+        let config = Config::load_from_yaml_str("src_dir: ..\nextensions: {}\n").unwrap();
+        let with_src_dir = SdkContainer::from_config(config_str, &config).unwrap();
+
+        // No `src_dir`, run from the parent with `-C project/avocado/avocado.yaml`.
+        let config = Config::load_from_yaml_str("extensions: {}\n").unwrap();
+        let mut from_parent = SdkContainer::from_config(config_str, &config).unwrap();
+        from_parent.cwd = project.clone();
+
+        for container in [with_src_dir, from_parent] {
+            super::stage_into_volume(
+                &container,
+                "dev",
+                "uuid-1",
+                "{\"targets\":1}",
+                "{\"delegated\":1}",
+                "delegation",
+                |script| {
+                    let staged = staging_dirs(&project);
+                    assert_eq!(
+                        staged.len(),
+                        1,
+                        "one staging dir under {}",
+                        project.display()
+                    );
+                    let name = staged[0].file_name().unwrap().to_str().unwrap();
+                    assert!(script.contains(&format!("/opt/src/{name}/targets.json")));
+                    assert_eq!(
+                        std::fs::read_to_string(staged[0].join("targets.json")).unwrap(),
+                        "{\"targets\":1}"
+                    );
+                    assert!(staged[0].join("delegations/runtime-uuid-1.json").is_file());
+                    assert!(staging_dirs(config_path.parent().unwrap()).is_empty());
+                    async { Ok(true) }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(staging_dirs(&project).is_empty(), "staging is removed");
+        }
+    }
+
+    /// A failed copy leaves the runtime without `tuf-staging/`, so it must
+    /// be an error naming the runtime and not a success line.
+    #[tokio::test]
+    async fn stage_into_volume_fails_when_the_copy_fails() {
+        let (_root, project, config_path) = src_dir_above_config_dir();
+        let config_str = config_path.to_str().unwrap();
+        let config = Config::load_from_yaml_str("src_dir: ..\nextensions: {}\n").unwrap();
+        let container = SdkContainer::from_config(config_str, &config).unwrap();
+
+        let err = super::stage_into_volume(
+            &container,
+            "dev",
+            "uuid-1",
+            "{}",
+            "{}",
+            "content delegation",
+            |_| async { Ok(false) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("content delegation staging files"), "{err}");
+        assert!(err.contains("runtime 'dev'"), "{err}");
+        assert!(staging_dirs(&project).is_empty(), "staging is removed");
+    }
+
     #[test]
     fn fit_assembly_script_is_gated_and_handles_signing_both_ways() {
         let s = super::generate_fit_assembly_script();

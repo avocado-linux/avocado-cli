@@ -1347,6 +1347,12 @@ impl SdkContainer {
         self
     }
 
+    /// The host directory the container mounts at `/opt/src`: `src_dir` when
+    /// set, else the working directory.
+    pub fn mounted_src_dir(&self) -> &Path {
+        self.src_dir.as_deref().unwrap_or(&self.cwd)
+    }
+
     /// Create a new SdkContainer with configuration from config file
     pub fn from_config(config_path: &str, config: &crate::utils::config::Config) -> Result<Self> {
         let src_dir = config.get_resolved_src_dir(config_path);
@@ -1517,7 +1523,7 @@ impl SdkContainer {
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
 
-        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        let src_dir = self.mounted_src_dir();
 
         print_info(
             &format!("Setting up remote execution on {runs_on}..."),
@@ -1739,7 +1745,7 @@ impl SdkContainer {
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
         let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
 
-        let src_dir = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        let src_dir = self.mounted_src_dir();
 
         print_info(
             &format!("Setting up remote execution on {runs_on}..."),
@@ -2027,7 +2033,7 @@ impl SdkContainer {
         // Volume mounts: docker volume for persistent state, bind mount for source
         // Source is mounted to /mnt/src, then bindfs remounts it to /opt/src with permission translation
         container_cmd.push("-v".to_string());
-        let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        let src_path = self.mounted_src_dir();
         // Every host-path bind goes through translate_bind_for_vm: when VM
         // routing is active it rewrites the host path to its in-VM
         // /run/workspace/<rel> equivalent; otherwise it's a pass-through.
@@ -3108,7 +3114,7 @@ impl SdkContainer {
         // Volume mounts: docker volume for persistent state, bind mount for source.
         // Host path is translated to /run/workspace/<rel> when VM routing is on.
         container_cmd.push("-v".to_string());
-        let src_path = self.src_dir.as_ref().unwrap_or(&self.cwd);
+        let src_path = self.mounted_src_dir();
         container_cmd.push(format!(
             "{}:/mnt/src:rw",
             translate_bind_for_vm(src_path).display()
@@ -5256,6 +5262,31 @@ extensions:
         assert_eq!(
             reads, anchored,
             "every os-release read must pipe through `tail -n 1`"
+        );
+    }
+
+    /// `/opt/src` is `src_dir` when the config sets one, resolved against the
+    /// config file's directory, and the working directory otherwise.
+    #[test]
+    #[serial_test::serial]
+    fn mounted_src_dir_is_src_dir_or_the_working_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let project = root.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(project.join("avocado")).unwrap();
+        let config_path = project.join("avocado").join("avocado.yaml");
+        let config_str = config_path.to_str().unwrap();
+
+        let config =
+            crate::utils::config::Config::load_from_yaml_str("src_dir: ..\nextensions: {}\n")
+                .unwrap();
+        let container = SdkContainer::from_config(config_str, &config).unwrap();
+        assert_eq!(container.mounted_src_dir(), project);
+
+        let config = crate::utils::config::Config::load_from_yaml_str("extensions: {}\n").unwrap();
+        let container = SdkContainer::from_config(config_str, &config).unwrap();
+        assert_eq!(
+            container.mounted_src_dir(),
+            env::current_dir().unwrap().as_path()
         );
     }
 }

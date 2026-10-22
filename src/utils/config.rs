@@ -2382,14 +2382,15 @@ impl Config {
             return Ok(RemoteExtensionMerge::default());
         }
 
-        // Get src_dir for loading volume state
+        // `src_dir` is the base for `path:` sources. The volume state is keyed
+        // on the working directory, not on `src_dir`.
         let config_path_str = config_path.to_string_lossy();
         let src_dir = temp_config
             .get_resolved_src_dir::<&str>(config_path_str.as_ref())
             .unwrap_or_else(|| config_file_dir(config_path).to_path_buf());
 
         // Try to load volume state for container-based config reading
-        let volume_state = crate::utils::volume::VolumeState::load_from_dir(&src_dir)
+        let volume_state = crate::utils::volume::VolumeState::load_from_current_dir()
             .ok()
             .flatten();
 
@@ -5510,8 +5511,9 @@ impl Config {
                 .to_path_buf()
         });
 
-        // Try to load volume state and get the mountpoint
-        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_dir(&src_dir) {
+        // Try to load volume state and get the mountpoint. The state file is
+        // keyed on the working directory, not on `src_dir`.
+        if let Ok(Some(volume_state)) = crate::utils::volume::VolumeState::load_from_current_dir() {
             // Use synchronous Docker inspect to get the mountpoint
             if let Ok(mountpoint) =
                 crate::utils::ext_source_reader::volume_mountpoint(&volume_state)
@@ -6897,6 +6899,95 @@ mod tests {
         assert_eq!(
             config.project_root("nested/dir/avocado.yaml"),
             std::path::PathBuf::from("nested/dir")
+        );
+    }
+
+    /// A `src_dir: ..` project run from its config directory: the config and
+    /// the `.avocado-state` that `get_or_create_volume` wrote sit in
+    /// `<root>/project/avocado`, and `src_dir` is `<root>/project`. The state
+    /// names a fake container tool whose `volume inspect` prints
+    /// `<root>/mount`, which holds a fetched `remote-ext`. Returns the root,
+    /// the config dir and the config path.
+    #[cfg(unix)]
+    fn state_in_config_dir_below_src_dir(
+        target: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let config_dir = base.join("project").join("avocado");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("avocado.yaml");
+
+        let mount = base.join("mount");
+        let ext_dir = mount.join(target).join("includes").join("remote-ext");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("avocado.yaml"),
+            "extensions:\n  remote-ext:\n    types: [sysext]\n",
+        )
+        .unwrap();
+
+        let tool = base.join("fake-docker");
+        std::fs::write(&tool, format!("#!/bin/sh\necho {}\n", mount.display())).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::utils::volume::VolumeState::new(
+            config_dir.clone(),
+            tool.to_string_lossy().to_string(),
+        )
+        .save_to_dir(&config_dir)
+        .unwrap();
+
+        (root, config_dir, config_path)
+    }
+
+    /// The extensions dir comes from the volume named in the working
+    /// directory's state file, not the `src_dir` fallback.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn get_extensions_dir_reads_the_volume_state_from_the_working_directory() {
+        let target = "qemux86-64";
+        let (root, config_dir, config_path) = state_in_config_dir_below_src_dir(target);
+        let config = super::Config::load_from_yaml_str("src_dir: ..\nextensions: {}\n").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&config_dir).unwrap();
+        let dir = config.get_extensions_dir(config_path.to_str().unwrap(), target);
+        std::env::set_current_dir(prev).unwrap();
+
+        let base = root.path().canonicalize().unwrap();
+        assert_eq!(dir, base.join("mount").join(target).join("includes"));
+    }
+
+    /// A fetched remote extension is read out of the volume named in the
+    /// working directory's state file, so install does not stop with "has
+    /// not been merged".
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn remote_extensions_merge_from_the_volume_in_the_working_directory() {
+        let target = "qemux86-64";
+        let (_root, config_dir, config_path) = state_in_config_dir_below_src_dir(target);
+        let mut main_config: serde_yaml::Value = serde_yaml::from_str(
+            "src_dir: ..\nextensions:\n  remote-ext:\n    source: { type: package, version: \"1.0.0\" }\n",
+        )
+        .unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&config_dir).unwrap();
+        let merged = super::Config::merge_installed_remote_extensions(
+            &mut main_config,
+            &config_path,
+            Some(target),
+        );
+        std::env::set_current_dir(prev).unwrap();
+
+        let merged = merged.unwrap();
+        assert!(
+            merged.extension_sources.contains_key("remote-ext"),
+            "remote-ext was not read from the volume: {:?}",
+            merged.extension_sources
         );
     }
 

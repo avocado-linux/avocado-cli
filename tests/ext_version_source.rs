@@ -166,7 +166,10 @@ fn path_sourced_extension_resolves_a_bare_version_file() {
 ///
 /// The dev-fallback root (`<src_dir>/.avocado/<target>/includes/<ext>`) stands
 /// in for the installed payload; it is the same directory layout DNF produces.
+/// The fallback is taken only when the working directory has no
+/// `.avocado-state`, so the loads run from an empty directory of their own.
 #[test]
+#[serial_test::serial]
 fn package_sourced_payload_resolves_to_the_same_version_as_a_path_source() {
     let dir = TestDir::new("package_parity");
     write_cargo_extension(&dir, "my-ext", "avocado-ext-prog", "3.1.4");
@@ -189,6 +192,9 @@ fn package_sourced_payload_resolves_to_the_same_version_as_a_path_source() {
                type: path\n      \
                path: ../my-ext\n",
     );
+    let cwd = tempfile::TempDir::new().unwrap();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(cwd.path()).unwrap();
     let path_version = composed_ext_version(&via_path, "avocado-ext-prog");
 
     let via_package = dir.write(
@@ -202,20 +208,22 @@ fn package_sourced_payload_resolves_to_the_same_version_as_a_path_source() {
     );
     let package_version = composed_ext_version(&via_package, "avocado-ext-prog");
 
-    assert_eq!(path_version.as_deref(), Some("3.1.4"));
-    assert_eq!(
-        path_version, package_version,
-        "switching source kind changed the composed version"
-    );
-
     // Prove the package leg really read the installed payload rather than
     // happening to agree with the sibling checkout: bump only the payload.
     dir.write(
         "project/.avocado/qemux86-64/includes/avocado-ext-prog/Cargo.toml",
         "[package]\nname = \"prog\"\nversion = \"3.2.0\"\nedition = \"2021\"\n",
     );
+    let bumped_version = composed_ext_version(&via_package, "avocado-ext-prog");
+    std::env::set_current_dir(prev).unwrap();
+
+    assert_eq!(path_version.as_deref(), Some("3.1.4"));
     assert_eq!(
-        composed_ext_version(&via_package, "avocado-ext-prog").as_deref(),
+        path_version, package_version,
+        "switching source kind changed the composed version"
+    );
+    assert_eq!(
+        bumped_version.as_deref(),
         Some("3.2.0"),
         "package source did not resolve from the installed payload"
     );
