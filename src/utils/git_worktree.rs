@@ -256,8 +256,14 @@ mod tests {
 
     const SRC: &str = "/opt/src";
 
+    /// Run git in `dir` with none of the user's or the system's config, so
+    /// a global `worktree.useRelativePaths` or `commit.gpgsign` cannot change
+    /// what the fixtures write.
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "worktree.useRelativePaths=false"])
             .arg("-C")
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
