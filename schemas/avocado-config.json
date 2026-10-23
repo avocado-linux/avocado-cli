@@ -2100,7 +2100,7 @@
               },
               "src": {
                 "type": "string",
-                "description": "Overlay source file."
+                "description": "Overlay source file. Omit it to name a stock overlay the BSP already ships: it is delivered and selected like any other, but nothing is compiled."
               },
               "params": {
                 "type": "object",
@@ -2109,9 +2109,15 @@
             },
             "additionalProperties": false,
             "required": [
-              "name",
-              "src"
+              "name"
             ]
+          }
+        },
+        "boot_config": {
+          "type": "array",
+          "description": "Boot configuration lines the BSP delivery hook writes to the boot medium, for settings an overlay source cannot express, such as a base device-tree parameter (dtparam=i2c_arm=on) or a firmware option (usb_max_current_enable=1). Each entry is one key=value line. A target whose hook does not support boot_config fails the runtime build instead of ignoring the lines.",
+          "items": {
+            "type": "string"
           }
         },
         "stone_include_paths": {
