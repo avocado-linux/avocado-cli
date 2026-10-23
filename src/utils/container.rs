@@ -144,16 +144,24 @@ fn src_mount_env(git_common: bool, caller_git: Option<&str>) -> Vec<String> {
         .filter(|v| !v.is_empty())
         .into_iter()
         .collect();
+    git_config.extend(generated_git_config(git_common));
+    if !git_config.is_empty() {
+        env.push(format!("GIT_CONFIG_PARAMETERS={}", git_config.join(" ")));
+    }
+    env
+}
+
+/// The git settings the CLI adds itself (see `src_mount_env`), without any
+/// caller setting.
+fn generated_git_config(git_common: bool) -> Vec<&'static str> {
+    let mut git_config = Vec::new();
     if vm_plain_src_mount() {
         git_config.push("'safe.directory'='*'");
     }
     if git_common {
         git_config.push("'gc.worktreePruneExpire'='never'");
     }
-    if !git_config.is_empty() {
-        env.push(format!("GIT_CONFIG_PARAMETERS={}", git_config.join(" ")));
-    }
-    env
+    git_config
 }
 
 /// Container paths that `build_container_command` and the mount block use. A
@@ -1327,9 +1335,16 @@ impl SdkContainer {
 }
 
 /// `-e` args for creating a session container: the variables its mount
-/// block reads, and the git settings, so that every exec into the container
-/// inherits `safe.directory` and the worktree prune guard (see
-/// `src_mount_env`). Per-step variables stay on each exec.
+/// block reads, and the generated git settings, so that a plain
+/// `docker exec` into the container still gets `safe.directory` and the
+/// worktree prune guard (see `src_mount_env`).
+///
+/// A caller's own git settings are not stored. The session key does not
+/// include the env, so a later step of the same shape would inherit them.
+/// Each SDK exec passes its own merged `GIT_CONFIG_PARAMETERS` instead, and
+/// a step with no caller setting has only the generated settings, which is
+/// what the container holds. Steps of one shape share the generated part,
+/// because the git common dir mount is part of the shape.
 fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
     let mut args = Vec::new();
     for k in [
@@ -1340,12 +1355,16 @@ fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
         "AVOCADO_EXT_PATH_MOUNTS",
         "AVOCADO_GIT_COMMON_DIR",
         "AVOCADO_VERBOSE",
-        "GIT_CONFIG_PARAMETERS",
     ] {
         if let Some(v) = env.get(k) {
             args.push("-e".to_string());
             args.push(format!("{k}={v}"));
         }
+    }
+    let git_config = generated_git_config(env.contains_key("AVOCADO_GIT_COMMON_DIR"));
+    if !git_config.is_empty() {
+        args.push("-e".to_string());
+        args.push(format!("GIT_CONFIG_PARAMETERS={}", git_config.join(" ")));
     }
     args
 }
@@ -5712,8 +5731,16 @@ extensions:
         assert_eq!(values, [want], "{cmd:?}");
 
         let (_, pairs) = split_run_argv(&cmd, 1).unwrap();
+        // The step's exec gets the merged value; the session container holds
+        // only the generated part (see `session_create_env`).
+        assert!(pairs.iter().any(|p| p == want), "{pairs:?}");
         let create = session_create_env(&env_map(&pairs));
-        assert!(create.iter().any(|a| a == want), "{create:?}");
+        assert!(
+            create
+                .iter()
+                .any(|a| a == "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'"),
+            "{create:?}"
+        );
 
         // A caller cannot move the mount: only the detected path is passed.
         let caller: HashMap<String, String> =
@@ -5736,6 +5763,66 @@ extensions:
             !cmd.iter().any(|a| a.starts_with("AVOCADO_GIT_COMMON_DIR=")),
             "{cmd:?}"
         );
+    }
+
+    /// Steps of the same shape share one session container, and its env is
+    /// set once, at creation. A caller's git setting from the first step must
+    /// not stay there for later steps: the container holds only the generated
+    /// settings, and each exec passes its own merged value.
+    #[test]
+    #[serial_test::serial]
+    fn a_session_container_does_not_keep_a_callers_git_config() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        fixture_git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+
+        let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
+        let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let step = |env: &HashMap<String, String>| {
+            let cmd = container
+                .build_container_command(&config, &["true".to_string()], env, &volume_state)
+                .unwrap();
+            split_run_argv(&cmd, 1).unwrap()
+        };
+        let guard = "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'";
+
+        let first: HashMap<String, String> = [(
+            "GIT_CONFIG_PARAMETERS".to_string(),
+            "'core.bare'='true'".to_string(),
+        )]
+        .into();
+        let (shape1, pairs1) = step(&first);
+        let create = session_create_env(&env_map(&pairs1));
+        assert!(create.iter().any(|a| a == guard), "{create:?}");
+        assert!(
+            !create.iter().any(|a| a.contains("core.bare")),
+            "{create:?}"
+        );
+        // The first step's own exec still gets its setting.
+        assert!(
+            pairs1.iter().any(|p| p
+                == "GIT_CONFIG_PARAMETERS='core.bare'='true' 'gc.worktreePruneExpire'='never'"),
+            "{pairs1:?}"
+        );
+
+        // A second step of the same shape, with no caller setting, gets the
+        // guard and nothing from the first step.
+        let (shape2, pairs2) = step(&HashMap::new());
+        assert_eq!(shape1, shape2);
+        let exec = build_exec_command("docker", "sess", &pairs2, "true");
+        assert!(exec.iter().any(|a| a == guard), "{exec:?}");
     }
 
     #[test]
@@ -5845,34 +5932,46 @@ extensions:
         assert_eq!(remote_git_warning(tmp.path()), None);
     }
 
-    /// The session container's own environment must hold the git settings,
-    /// so that any exec into it (not only the SDK's step execs) gets
-    /// `safe.directory` and the worktree prune guard.
+    /// The session container's own environment must hold the generated git
+    /// settings, so that any exec into it (not only the SDK's step execs)
+    /// gets `safe.directory` and the worktree prune guard. A caller's
+    /// setting is not kept there.
     #[test]
+    #[serial_test::serial]
     fn session_create_env_carries_the_git_settings() {
+        let (_restore, vm_sock) = vm_routing_env();
         let env: HashMap<String, String> = [
             ("AVOCADO_HOST_UID", "0"),
             ("AVOCADO_GIT_COMMON_DIR", "/h/.git"),
             (
                 "GIT_CONFIG_PARAMETERS",
-                "'safe.directory'='*' 'gc.worktreePruneExpire'='never'",
+                "'core.bare'='true' 'gc.worktreePruneExpire'='never'",
             ),
             ("AVOCADO_RUNTIME", "dev"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let args = session_create_env(&env);
-        for want in [
-            "AVOCADO_HOST_UID=0",
-            "AVOCADO_GIT_COMMON_DIR=/h/.git",
-            "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'",
-        ] {
+        let has = |args: &[String], want: &str| {
             let i = args.iter().position(|a| a == want).expect(want);
             assert_eq!(args[i - 1], "-e");
-        }
+        };
+        let args = session_create_env(&env);
+        has(&args, "AVOCADO_HOST_UID=0");
+        has(&args, "AVOCADO_GIT_COMMON_DIR=/h/.git");
+        has(
+            &args,
+            "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'",
+        );
         // Per-step variables stay on the exec.
         assert!(!args.iter().any(|a| a.starts_with("AVOCADO_RUNTIME")));
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        let args = session_create_env(&env);
+        has(
+            &args,
+            "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'",
+        );
     }
 
     /// The session container runs the mount block once, at creation, so the
