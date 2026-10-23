@@ -1370,9 +1370,9 @@ fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
 }
 
 /// Remove every `GIT_CONFIG_PARAMETERS` setting from docker args and return
-/// their values in order. Takes `-e K=V`, `--env K=V`, `--env=K=V` and
-/// `-eK=V`, and the same forms with no `=V`, which make docker pass the
-/// value from the CLI's own environment.
+/// their values in order. Reads env flags with [`docker_env_flag`]. A flag
+/// with no value takes the value from the CLI's own environment, as docker
+/// would.
 fn take_git_config_args(args: &mut Vec<String>) -> Option<String> {
     take_git_config_args_with(args, |k| std::env::var(k).ok())
 }
@@ -1383,41 +1383,45 @@ fn take_git_config_args_with(
     host_env: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     const KEY: &str = "GIT_CONFIG_PARAMETERS";
-    // The value an `-e` operand gives: its own after `=`, or the host's.
-    let value_of = |kv: &str| -> Option<Option<String>> {
-        let rest = kv.strip_prefix(KEY)?;
-        match rest.strip_prefix('=') {
-            Some(v) => Some(Some(v.to_string())),
-            None if rest.is_empty() => Some(host_env(KEY)),
-            None => None,
-        }
-    };
     let mut values = Vec::new();
     let mut kept = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        if a == "-e" || a == "--env" {
-            if let Some(v) = args.get(i + 1).and_then(|n| value_of(n)) {
-                values.extend(v);
-                i += 2;
+        if let Some((used, operand)) = docker_env_flag(args, i) {
+            let (key, value) = match operand.split_once('=') {
+                Some((k, v)) => (k, Some(v.to_string())),
+                None => (operand, None),
+            };
+            if key == KEY {
+                values.extend(value.or_else(|| host_env(KEY)));
+                i += used;
                 continue;
             }
         }
-        if let Some(v) = a
-            .strip_prefix("--env=")
-            .or_else(|| a.strip_prefix("-e").filter(|r| !r.is_empty()))
-            .and_then(value_of)
-        {
-            values.extend(v);
-            i += 1;
-            continue;
-        }
-        kept.push(a.clone());
+        kept.push(args[i].clone());
         i += 1;
     }
     *args = kept;
     (!values.is_empty()).then(|| values.join(" "))
+}
+
+/// The env flag at `args[i]`, in any form docker accepts: `-e X`, `--env X`,
+/// `-eX`, `-e=X`, `--env=X`. Returns how many args it takes and its operand,
+/// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
+///
+/// Not handled: `--env-file`, which docker reads itself (an explicit `-e`
+/// wins over it, so the generated git settings still apply), and short
+/// flags packed together with `-e` (`-ie K=V`).
+fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
+    let a = args.get(i)?.as_str();
+    if a == "-e" || a == "--env" {
+        return args.get(i + 1).map(|v| (2, v.as_str()));
+    }
+    let operand = a
+        .strip_prefix("--env=")
+        .or_else(|| a.strip_prefix("-e="))
+        .or_else(|| a.strip_prefix("-e"))?;
+    (!operand.is_empty()).then_some((1, operand))
 }
 
 /// `k=v` pairs, as `split_run_argv` returns them, as a map. The session
@@ -1601,14 +1605,16 @@ fn split_run_argv(argv: &[String], command_len: usize) -> Option<(Vec<String>, V
             // AVOCADO_TARGET, the host uid/gid, the signing and extension-mount
             // variables. Reading them back here is what guarantees an exec sees
             // exactly what the equivalent run would have.
-            "-e" | "--env" if i + 1 < image_idx => {
-                env.push(argv[i + 1].clone());
-                i += 2;
-            }
-            other => {
-                shape.push(other.to_string());
-                i += 1;
-            }
+            other => match docker_env_flag(&argv[..image_idx], i) {
+                Some((used, operand)) => {
+                    env.push(operand.to_string());
+                    i += used;
+                }
+                None => {
+                    shape.push(other.to_string());
+                    i += 1;
+                }
+            },
         }
     }
     shape.push(image);
@@ -5660,6 +5666,84 @@ extensions:
             Some("'h.x'='9' 'a.b'='1'")
         );
         assert_eq!(args, ["-e", "GIT_CONFIG_PARAMETERS_OTHER=1"]);
+    }
+
+    /// Every form docker accepts for an env flag, with a value and without
+    /// one (docker then passes the CLI's own value). Each must be taken out
+    /// and merged, and a near-miss name must be kept.
+    #[test]
+    fn every_docker_env_flag_form_is_taken_out_of_container_args() {
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        let forms: &[&[&str]] = &[
+            &["-e", "GIT_CONFIG_PARAMETERS=V"],
+            &["-e", "GIT_CONFIG_PARAMETERS"],
+            &["-eGIT_CONFIG_PARAMETERS=V"],
+            &["-eGIT_CONFIG_PARAMETERS"],
+            &["-e=GIT_CONFIG_PARAMETERS=V"],
+            &["-e=GIT_CONFIG_PARAMETERS"],
+            &["--env", "GIT_CONFIG_PARAMETERS=V"],
+            &["--env", "GIT_CONFIG_PARAMETERS"],
+            &["--env=GIT_CONFIG_PARAMETERS=V"],
+            &["--env=GIT_CONFIG_PARAMETERS"],
+        ];
+        for form in forms {
+            let mut args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            args.push("--privileged".to_string());
+            let want = if form.concat().ends_with("=V") {
+                "V"
+            } else {
+                "'h.x'='9'"
+            };
+            assert_eq!(
+                take_git_config_args_with(&mut args, host).as_deref(),
+                Some(want),
+                "{form:?}"
+            );
+            assert_eq!(args, ["--privileged"], "{form:?}");
+
+            // The same form with a near-miss name is not ours.
+            let near: Vec<String> = form
+                .iter()
+                .map(|s| s.replace("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_PARAMETERS_X"))
+                .collect();
+            let mut args = near.clone();
+            assert_eq!(take_git_config_args_with(&mut args, host), None, "{near:?}");
+            assert_eq!(args, near);
+        }
+        // `--env-file` is left for docker, which lets `-e` win over it.
+        let mut args: Vec<String> = ["--env-file", "x.env", "--entrypoint", "sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(take_git_config_args_with(&mut args, host), None);
+        assert_eq!(args.len(), 4);
+    }
+
+    /// The session split takes env flags in every docker form, so a compact
+    /// `-eK=V` from container args goes to the exec, not into the shape.
+    #[test]
+    fn split_run_argv_takes_every_env_flag_form() {
+        let argv: Vec<String> = [
+            "docker",
+            "run",
+            "-eA=1",
+            "-e=B=2",
+            "--env=C=3",
+            "--env",
+            "D=4",
+            "-e",
+            "E",
+            "--env-file",
+            "f.env",
+            "img",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (shape, env) = split_run_argv(&argv, 1).unwrap();
+        assert_eq!(env, ["A=1", "B=2", "C=3", "D=4", "E"]);
+        assert_eq!(shape, ["--env-file", "f.env", "img"]);
     }
 
     #[test]
