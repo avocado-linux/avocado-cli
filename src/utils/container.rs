@@ -148,6 +148,18 @@ fn src_mount_env(git_common: bool) -> Vec<String> {
     env
 }
 
+/// Container paths that `build_container_command` and the mount block use. A
+/// git common dir mount must not cover any of them or land inside one.
+const CONTAINER_MOUNT_PATHS: &[&str] = &[
+    "/opt/src",
+    "/opt/_avocado",
+    "/opt/signing-keys",
+    "/mnt",
+    "/run/avocado",
+    "/run/avocado-agent.sock",
+    "/usr/local/bin/avocado-sign-request",
+];
+
 /// Where the container stages a linked worktree's git common dir before the
 /// mount block binds it at `$AVOCADO_GIT_COMMON_DIR`.
 const GIT_COMMON_STAGING: &str = "/mnt/git-common";
@@ -215,6 +227,23 @@ fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
         .unwrap_or_else(|| src_path.to_path_buf())
 }
 
+/// What a mount at `dest` would hide in the container, if anything. git needs
+/// the common dir at exactly the path it resolves, so the mount cannot be
+/// moved under a safe prefix. Instead a path is refused when it would cover
+/// one of the container's own mounts (a worktree in a bare repo with relative
+/// paths lands on `/opt`), sit inside one of them, or replace a top-level
+/// system dir such as `/usr`.
+fn hidden_container_path(dest: &Path) -> Option<PathBuf> {
+    let feeds = Path::new(crate::utils::feeds::CONTAINER_FEEDS_DIR);
+    CONTAINER_MOUNT_PATHS
+        .iter()
+        .map(Path::new)
+        .chain(std::iter::once(feeds))
+        .find(|p| p.starts_with(dest) || dest.starts_with(p))
+        .map(Path::to_path_buf)
+        .or_else(|| (dest.components().count() < 3).then(|| dest.to_path_buf()))
+}
+
 /// The git common dir mount for `src` (see `utils::git_worktree`), checked
 /// against the avocado-vm share when docker runs in the VM (`workspace`).
 /// Under the VM a bind source must be inside the share, so a common dir
@@ -227,6 +256,14 @@ fn git_common_mount_for(
     else {
         return Ok(None);
     };
+    if let Some(hidden) = hidden_container_path(&mount.container) {
+        return Err(format!(
+            "git looks for the common dir {} at {} in the container, which would hide {}",
+            mount.host.display(),
+            mount.container.display(),
+            hidden.display()
+        ));
+    }
     if let Some(ws) = workspace {
         if crate::utils::vm::share::translate_to_vm(&mount.host, ws).is_err() {
             return Err(format!(
@@ -5404,6 +5441,73 @@ extensions:
         // A plain repo or a non-git dir never needs the share check.
         assert_eq!(git_common_mount_for(&main, Some(&wt)), Ok(None));
         assert_eq!(git_common_mount_for(tmp.path(), Some(&wt)), Ok(None));
+    }
+
+    #[test]
+    fn hidden_container_path_guards_the_container_layout() {
+        for (dest, hidden) in [
+            ("/", "/opt/src"),
+            ("/opt", "/opt/src"),
+            ("/opt/_avocado/x/.git", "/opt/_avocado"),
+            ("/mnt/git-common", "/mnt"),
+            ("/run/avocado-feeds/paths/x", "/run/avocado-feeds"),
+            ("/usr", "/usr/local/bin/avocado-sign-request"),
+            ("/etc", "/etc"),
+            ("/home", "/home"),
+        ] {
+            assert_eq!(
+                hidden_container_path(Path::new(dest)),
+                Some(PathBuf::from(hidden)),
+                "{dest}"
+            );
+        }
+        for dest in ["/opt/main/.git", "/home/u/repo/.git", "/run/avocado-x/.git"] {
+            assert_eq!(hidden_container_path(Path::new(dest)), None, "{dest}");
+        }
+    }
+
+    /// A worktree inside a bare repo, with relative paths, puts the common
+    /// dir at `/opt` in the container. A mount there would hide `/opt/src`
+    /// and `/opt/_avocado`, so it gets a warning and no mount.
+    #[test]
+    fn a_common_dir_over_the_container_layout_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let src = root.join("src");
+        let bare = root.join("bare");
+        std::fs::create_dir(&src).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&src, &["init", "-q"]);
+        git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&root, &["clone", "-q", "--bare", "src", "bare"]);
+        let wt = bare.join("wt");
+        git(
+            &bare,
+            &[
+                "-c",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
+                "-q",
+                "wt",
+            ],
+        );
+        let line = std::fs::read_to_string(wt.join(".git")).unwrap();
+        assert_eq!(line.trim(), "gitdir: ../worktrees/wt");
+
+        let err = git_common_mount_for(&wt, None).unwrap_err();
+        assert!(err.contains("would hide"), "{err}");
     }
 
     /// The session container's own environment must hold the git settings,
