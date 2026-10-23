@@ -129,13 +129,21 @@ fn vm_plain_src_mount() -> bool {
 /// container cannot see the other worktrees of that repository, so `git gc`
 /// in the container would think they were deleted and prune their metadata
 /// on the host. `gc.worktreePruneExpire=never` stops that.
-fn src_mount_env(git_common: bool) -> Vec<String> {
+///
+/// `caller_git` is a `GIT_CONFIG_PARAMETERS` the caller set. It comes first
+/// in the one merged value, so the generated settings come last and win, and
+/// the caller must not emit its own copy (docker keeps the last `-e`).
+fn src_mount_env(git_common: bool, caller_git: Option<&str>) -> Vec<String> {
     let (uid, gid) = src_mount_uid_gid();
     let mut env = vec![
         format!("AVOCADO_HOST_UID={uid}"),
         format!("AVOCADO_HOST_GID={gid}"),
     ];
-    let mut git_config = Vec::new();
+    let mut git_config: Vec<&str> = caller_git
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .into_iter()
+        .collect();
     if vm_plain_src_mount() {
         git_config.push("'safe.directory'='*'");
     }
@@ -1355,6 +1363,36 @@ fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
     args
 }
 
+/// Remove every `GIT_CONFIG_PARAMETERS` setting from docker args (`-e K=V`,
+/// `--env K=V`, `--env=K=V`, `-eK=V`) and return their values in order.
+fn take_git_config_args(args: &mut Vec<String>) -> Option<String> {
+    const KEY: &str = "GIT_CONFIG_PARAMETERS=";
+    let mut values = Vec::new();
+    let mut kept = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if (a == "-e" || a == "--env") && args.get(i + 1).is_some_and(|v| v.starts_with(KEY)) {
+            values.push(args[i + 1][KEY.len()..].to_string());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a
+            .strip_prefix("--env=")
+            .or_else(|| a.strip_prefix("-e"))
+            .and_then(|kv| kv.strip_prefix(KEY))
+        {
+            values.push(v.to_string());
+            i += 1;
+            continue;
+        }
+        kept.push(a.clone());
+        i += 1;
+    }
+    *args = kept;
+    (!values.is_empty()).then(|| values.join(" "))
+}
+
 /// `k=v` pairs, as `split_run_argv` returns them, as a map. The session
 /// container's mount block reads the mount variables that
 /// `build_container_command` adds (`AVOCADO_HOST_UID`,
@@ -2521,7 +2559,24 @@ impl SdkContainer {
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Pass host UID/GID for bindfs permission translation
-        for kv in src_mount_env(git_common.is_some()) {
+        // `sdk.container_args` come after the env in the argv, so a
+        // GIT_CONFIG_PARAMETERS there would replace the merged value. Take it
+        // out and merge it like the env one.
+        let mut extra_args: Vec<String> = config
+            .container_args
+            .iter()
+            .flatten()
+            .flat_map(|arg| Self::parse_container_arg(arg))
+            .collect();
+        let caller_git = [
+            env_vars.get("GIT_CONFIG_PARAMETERS").cloned(),
+            take_git_config_args(&mut extra_args),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        for kv in src_mount_env(git_common.is_some(), Some(&caller_git)) {
             container_cmd.push("-e".to_string());
             container_cmd.push(kv);
         }
@@ -2565,16 +2620,18 @@ impl SdkContainer {
         }
 
         for (key, value) in env_vars {
+            // Merged into the one value `src_mount_env` emits, or set only
+            // from the detected mount: a caller's AVOCADO_GIT_COMMON_DIR comes
+            // later in the argv and would move the mount anywhere.
+            if key == "GIT_CONFIG_PARAMETERS" || key == "AVOCADO_GIT_COMMON_DIR" {
+                continue;
+            }
             container_cmd.push("-e".to_string());
             container_cmd.push(format!("{key}={value}"));
         }
 
         // Add additional container arguments if provided
-        if let Some(args) = &config.container_args {
-            for arg in args {
-                container_cmd.extend(Self::parse_container_arg(arg));
-            }
-        }
+        container_cmd.extend(extra_args);
 
         // Add the container image
         container_cmd.push(config.container_image.to_string());
@@ -3497,7 +3554,7 @@ impl SdkContainer {
 
         // Pass host UID/GID for bindfs permission translation
         let (host_uid, host_gid) = src_mount_uid_gid();
-        for kv in src_mount_env(false) {
+        for kv in src_mount_env(false, None) {
             container_cmd.push("-e".to_string());
             container_cmd.push(kv);
         }
@@ -5146,14 +5203,14 @@ extensions:
             crate::utils::config::resolve_host_uid_gid(None)
         );
 
-        assert!(!src_mount_env(false)
+        assert!(!src_mount_env(false, None)
             .iter()
             .any(|e| e.starts_with("GIT_CONFIG")));
 
         std::env::set_var("DOCKER_HOST", &vm_sock);
         assert_eq!(src_mount_uid_gid(), (0, 0));
         assert_eq!(
-            src_mount_env(false),
+            src_mount_env(false, None),
             [
                 "AVOCADO_HOST_UID=0",
                 "AVOCADO_HOST_GID=0",
@@ -5165,11 +5222,11 @@ extensions:
         std::env::set_var("AVOCADO_HOST_UID", "1234");
         std::env::set_var("AVOCADO_HOST_GID", "5678");
         assert_eq!(src_mount_uid_gid(), (1234, 5678));
-        assert!(!src_mount_env(false)
+        assert!(!src_mount_env(false, None)
             .iter()
             .any(|e| e.starts_with("GIT_CONFIG")));
         assert_eq!(
-            src_mount_env(true).last().unwrap(),
+            src_mount_env(true, None).last().unwrap(),
             "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'"
         );
 
@@ -5177,7 +5234,7 @@ extensions:
         std::env::remove_var("AVOCADO_HOST_UID");
         std::env::remove_var("AVOCADO_HOST_GID");
         assert_eq!(
-            src_mount_env(true).last().unwrap(),
+            src_mount_env(true, None).last().unwrap(),
             "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'"
         );
     }
@@ -5648,6 +5705,97 @@ extensions:
             .prefix("git-worktree-test-")
             .tempdir_in(target)
             .unwrap()
+    }
+
+    #[test]
+    fn git_config_args_are_taken_out_of_container_args() {
+        let mut args: Vec<String> = [
+            "--privileged",
+            "-e",
+            "GIT_CONFIG_PARAMETERS='a.b'='1'",
+            "--env=GIT_CONFIG_PARAMETERS='c.d'='2'",
+            "-eGIT_CONFIG_PARAMETERS='e.f'='3'",
+            "-e",
+            "OTHER=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            take_git_config_args(&mut args).as_deref(),
+            Some("'a.b'='1' 'c.d'='2' 'e.f'='3'")
+        );
+        assert_eq!(args, ["--privileged", "-e", "OTHER=1"]);
+        assert_eq!(take_git_config_args(&mut args), None);
+    }
+
+    /// A caller's own `GIT_CONFIG_PARAMETERS` must not replace the prune
+    /// guard. The run gets one value, the caller's settings first and the
+    /// generated ones last, and the session container gets the same value.
+    #[test]
+    #[serial_test::serial]
+    fn a_caller_git_config_keeps_the_prune_guard() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let tmp = fixture_root();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        fixture_git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
+        let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            container_args: Some(vec![
+                "-e GIT_CONFIG_PARAMETERS='color.ui'='never'".to_string()
+            ]),
+            ..Default::default()
+        };
+        let caller: HashMap<String, String> = [(
+            "GIT_CONFIG_PARAMETERS".to_string(),
+            "'core.abbrev'='12'".to_string(),
+        )]
+        .into();
+        let cmd = container
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        let want = "GIT_CONFIG_PARAMETERS='core.abbrev'='12' 'color.ui'='never' \
+                    'gc.worktreePruneExpire'='never'";
+        let values: Vec<&String> = cmd
+            .iter()
+            .filter(|a| a.starts_with("GIT_CONFIG_PARAMETERS="))
+            .collect();
+        assert_eq!(values, [want], "{cmd:?}");
+
+        let (_, pairs) = split_run_argv(&cmd, 1).unwrap();
+        let create = session_create_env(&env_map(&pairs));
+        assert!(create.iter().any(|a| a == want), "{create:?}");
+
+        // A caller cannot move the mount: only the detected path is passed.
+        let caller: HashMap<String, String> =
+            [("AVOCADO_GIT_COMMON_DIR".to_string(), "/usr".to_string())].into();
+        let cmd = container
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        let dirs: Vec<&String> = cmd
+            .iter()
+            .filter(|a| a.starts_with("AVOCADO_GIT_COMMON_DIR="))
+            .collect();
+        assert_eq!(dirs.len(), 1, "{cmd:?}");
+        assert_ne!(dirs[0], "AVOCADO_GIT_COMMON_DIR=/usr");
+        // And with no worktree, the caller's value never reaches the run.
+        let plain = SdkContainer::new().with_src_dir(Some(main.clone()));
+        let cmd = plain
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        assert!(
+            !cmd.iter().any(|a| a.starts_with("AVOCADO_GIT_COMMON_DIR=")),
+            "{cmd:?}"
+        );
     }
 
     #[test]
