@@ -1363,26 +1363,47 @@ fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
     args
 }
 
-/// Remove every `GIT_CONFIG_PARAMETERS` setting from docker args (`-e K=V`,
-/// `--env K=V`, `--env=K=V`, `-eK=V`) and return their values in order.
+/// Remove every `GIT_CONFIG_PARAMETERS` setting from docker args and return
+/// their values in order. Takes `-e K=V`, `--env K=V`, `--env=K=V` and
+/// `-eK=V`, and the same forms with no `=V`, which make docker pass the
+/// value from the CLI's own environment.
 fn take_git_config_args(args: &mut Vec<String>) -> Option<String> {
-    const KEY: &str = "GIT_CONFIG_PARAMETERS=";
+    take_git_config_args_with(args, |k| std::env::var(k).ok())
+}
+
+/// [`take_git_config_args`] with the host environment as `host_env`.
+fn take_git_config_args_with(
+    args: &mut Vec<String>,
+    host_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    const KEY: &str = "GIT_CONFIG_PARAMETERS";
+    // The value an `-e` operand gives: its own after `=`, or the host's.
+    let value_of = |kv: &str| -> Option<Option<String>> {
+        let rest = kv.strip_prefix(KEY)?;
+        match rest.strip_prefix('=') {
+            Some(v) => Some(Some(v.to_string())),
+            None if rest.is_empty() => Some(host_env(KEY)),
+            None => None,
+        }
+    };
     let mut values = Vec::new();
     let mut kept = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if (a == "-e" || a == "--env") && args.get(i + 1).is_some_and(|v| v.starts_with(KEY)) {
-            values.push(args[i + 1][KEY.len()..].to_string());
-            i += 2;
-            continue;
+        if a == "-e" || a == "--env" {
+            if let Some(v) = args.get(i + 1).and_then(|n| value_of(n)) {
+                values.extend(v);
+                i += 2;
+                continue;
+            }
         }
         if let Some(v) = a
             .strip_prefix("--env=")
-            .or_else(|| a.strip_prefix("-e"))
-            .and_then(|kv| kv.strip_prefix(KEY))
+            .or_else(|| a.strip_prefix("-e").filter(|r| !r.is_empty()))
+            .and_then(value_of)
         {
-            values.push(v.to_string());
+            values.extend(v);
             i += 1;
             continue;
         }
@@ -5694,6 +5715,50 @@ extensions:
             .unwrap()
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    /// `-e GIT_CONFIG_PARAMETERS` with no `=` makes docker pass the host's
+    /// value. It must be taken out too, or it lands after the merged value.
+    #[test]
+    fn git_config_pass_through_args_are_taken_out_of_container_args() {
+        let host_has_it = std::env::var_os("GIT_CONFIG_PARAMETERS").is_some();
+        let mut args: Vec<String> = [
+            "-e",
+            "GIT_CONFIG_PARAMETERS",
+            "--env",
+            "GIT_CONFIG_PARAMETERS",
+            "--env=GIT_CONFIG_PARAMETERS",
+            "-eGIT_CONFIG_PARAMETERS",
+            "--privileged",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let taken = take_git_config_args(&mut args);
+        assert_eq!(args, ["--privileged"]);
+        if !host_has_it {
+            assert_eq!(taken, None);
+        }
+    }
+
+    #[test]
+    fn git_config_pass_through_args_take_the_host_value() {
+        let mut args: Vec<String> = [
+            "-e",
+            "GIT_CONFIG_PARAMETERS",
+            "--env=GIT_CONFIG_PARAMETERS='a.b'='1'",
+            "-e",
+            "GIT_CONFIG_PARAMETERS_OTHER=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        assert_eq!(
+            take_git_config_args_with(&mut args, host).as_deref(),
+            Some("'h.x'='9' 'a.b'='1'")
+        );
+        assert_eq!(args, ["-e", "GIT_CONFIG_PARAMETERS_OTHER=1"]);
     }
 
     #[test]
