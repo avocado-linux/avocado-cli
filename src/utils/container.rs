@@ -227,21 +227,51 @@ fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
         .unwrap_or_else(|| src_path.to_path_buf())
 }
 
-/// What a mount at `dest` would hide in the container, if anything. git needs
-/// the common dir at exactly the path it resolves, so the mount cannot be
-/// moved under a safe prefix. Instead a path is refused when it would cover
-/// one of the container's own mounts (a worktree in a bare repo with relative
-/// paths lands on `/opt`), sit inside one of them, or replace a top-level
-/// system dir such as `/usr`.
-fn hidden_container_path(dest: &Path) -> Option<PathBuf> {
+/// Container paths where a git common dir may be mounted, besides the
+/// avocado-vm share. git needs the common dir at exactly the path it
+/// resolves, so the mount cannot be moved somewhere safe. A list of paths to
+/// avoid always misses one (`/usr/bin`, `/var/lib/...`), so this is a list of
+/// paths to allow:
+///
+/// - `/opt/<name>`: a relative gitdir resolves under `/opt`, next to
+///   `/opt/src`, for a worktree next to its main checkout.
+/// - `/Users/<name>` and `/home/<name>`: an absolute gitdir keeps its host
+///   path, and projects live in a user's home on macOS and Linux. The SDK
+///   image has nothing there.
+///
+/// A common dir anywhere else (`/srv`, `/data`, `/var/lib/jenkins`) gets a
+/// warning and no mount, and git in the container fails as it does without
+/// this feature.
+const GIT_COMMON_ALLOWED_ROOTS: &[&str] = &["/opt", "/Users", "/home"];
+
+/// Whether a git common dir mount at `dest` is safe in the container. It must
+/// be strictly under an allowed root (see [`GIT_COMMON_ALLOWED_ROOTS`]) or
+/// under the avocado-vm share (`workspace`), and it must not cover or sit
+/// inside one of the container's own mounts.
+fn check_container_dest(dest: &Path, workspace: Option<&Path>) -> Result<(), String> {
     let feeds = Path::new(crate::utils::feeds::CONTAINER_FEEDS_DIR);
-    CONTAINER_MOUNT_PATHS
+    if let Some(hidden) = CONTAINER_MOUNT_PATHS
         .iter()
         .map(Path::new)
         .chain(std::iter::once(feeds))
         .find(|p| p.starts_with(dest) || dest.starts_with(p))
-        .map(Path::to_path_buf)
-        .or_else(|| (dest.components().count() < 3).then(|| dest.to_path_buf()))
+    {
+        return Err(format!("it would hide {}", hidden.display()));
+    }
+    let under = |root: &Path| dest.starts_with(root) && dest != root;
+    let allowed = GIT_COMMON_ALLOWED_ROOTS
+        .iter()
+        .map(Path::new)
+        .chain(workspace)
+        .any(under);
+    if !allowed {
+        return Err(
+            "the CLI mounts a git common dir only under /opt, /Users, /home or the \
+             avocado-vm share"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The git common dir mount for `src` (see `utils::git_worktree`), checked
@@ -256,12 +286,11 @@ fn git_common_mount_for(
     else {
         return Ok(None);
     };
-    if let Some(hidden) = hidden_container_path(&mount.container) {
+    if let Err(why) = check_container_dest(&mount.container, workspace) {
         return Err(format!(
-            "git looks for the common dir {} at {} in the container, which would hide {}",
+            "git looks for the common dir {} at {} in the container, and {why}",
             mount.host.display(),
-            mount.container.display(),
-            hidden.display()
+            mount.container.display()
         ));
     }
     if let Some(ws) = workspace {
@@ -5124,7 +5153,7 @@ extensions:
     fn a_linked_worktree_mounts_its_git_common_dir() {
         use crate::utils::volume::VolumeState;
         let (_restore, _vm_sock) = vm_routing_env();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = fixture_root();
         let main = tmp.path().join("main");
         let wt = tmp.path().join("wt");
         std::fs::create_dir(&main).unwrap();
@@ -5437,7 +5466,7 @@ extensions:
     /// dir outside it gets no mount (and a warning), not a failed `docker run`.
     #[test]
     fn a_git_common_dir_outside_the_vm_share_is_not_mounted() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = fixture_root();
         let root = tmp.path().canonicalize().unwrap();
         let main = root.join("main");
         let wt = root.join("wt");
@@ -5473,66 +5502,97 @@ extensions:
         assert_eq!(git_common_mount_for(tmp.path(), Some(&wt)), Ok(None));
     }
 
+    /// git run for a test fixture, with none of the user's or system's config.
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(["-c", "worktree.useRelativePaths=false"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A temp dir under this crate's `target/`. The common dir mount accepts
+    /// only home-like container paths, and the system temp dir (`/tmp`,
+    /// `/var/folders`) is not one, while a checkout is under `/home` or
+    /// `/Users` on every CI and dev host this repo builds on.
+    fn fixture_root() -> tempfile::TempDir {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        tempfile::Builder::new()
+            .prefix("git-worktree-test-")
+            .tempdir_in(target)
+            .unwrap()
+    }
+
     #[test]
-    fn hidden_container_path_guards_the_container_layout() {
-        for (dest, hidden) in [
-            ("/", "/opt/src"),
-            ("/opt", "/opt/src"),
-            ("/opt/_avocado/x/.git", "/opt/_avocado"),
-            ("/mnt/git-common", "/mnt"),
-            ("/run/avocado-feeds/paths/x", "/run/avocado-feeds"),
-            ("/usr", "/usr/local/bin/avocado-sign-request"),
-            ("/etc", "/etc"),
-            ("/home", "/home"),
+    fn the_common_dir_lands_only_on_allowed_container_paths() {
+        for dest in [
+            "/usr/bin",
+            "/usr/lib/x",
+            "/etc/x",
+            "/var/lib/x",
+            "/root/x",
+            "/tmp/x",
+            "/srv/x/.git",
+            "/home",
+            "/Users",
+            "/opt",
+            "/opt/src/x",
+            "/opt/_avocado/x/.git",
+            "/mnt/git-common",
+            "/",
         ] {
-            assert_eq!(
-                hidden_container_path(Path::new(dest)),
-                Some(PathBuf::from(hidden)),
+            assert!(
+                check_container_dest(Path::new(dest), None).is_err(),
                 "{dest}"
             );
         }
-        for dest in ["/opt/main/.git", "/home/u/repo/.git", "/run/avocado-x/.git"] {
-            assert_eq!(hidden_container_path(Path::new(dest)), None, "{dest}");
+        for dest in ["/Users/u/repo/.git", "/home/u/repo/.git", "/opt/main/.git"] {
+            assert_eq!(
+                check_container_dest(Path::new(dest), None),
+                Ok(()),
+                "{dest}"
+            );
         }
+        // Under the avocado-vm, the share is allowed too.
+        let ws = Path::new("/Volumes/work");
+        assert_eq!(
+            check_container_dest(Path::new("/Volumes/work/r/.git"), Some(ws)),
+            Ok(())
+        );
+        assert!(check_container_dest(Path::new("/Volumes/work/r/.git"), None).is_err());
     }
 
-    /// A worktree inside a bare repo, with relative paths, puts the common
-    /// dir at `/opt` in the container. A mount there would hide `/opt/src`
-    /// and `/opt/_avocado`, so it gets a warning and no mount.
+    /// A bare repo at `<root>/usr/bin` and a relative worktree at
+    /// `<root>/projects/wt` put the common dir at `/usr/bin` in the
+    /// container. A mount there would hide the SDK's programs.
     #[test]
-    fn a_common_dir_over_the_container_layout_is_not_mounted() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn a_common_dir_at_a_system_path_is_not_mounted() {
+        let tmp = fixture_root();
         let root = tmp.path().canonicalize().unwrap();
         let src = root.join("src");
-        let bare = root.join("bare");
         std::fs::create_dir(&src).unwrap();
-        let git = |dir: &Path, args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
-                .args(["-c", "commit.gpgsign=false"])
-                .args(["-c", "worktree.useRelativePaths=false"])
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .args(args)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
-        };
-        git(&src, &["init", "-q"]);
-        git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&root, &["clone", "-q", "--bare", "src", "bare"]);
-        let wt = bare.join("wt");
-        git(&bare, &["worktree", "add", "-q", "wt"]);
-        // What `worktree.useRelativePaths` (git 2.48+) writes, set by hand so
-        // older host git can run this. git always writes `commondir` as
-        // `../..`.
-        std::fs::write(wt.join(".git"), "gitdir: ../worktrees/wt\n").unwrap();
+        fixture_git(&src, &["init", "-q"]);
+        fixture_git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        std::fs::create_dir(root.join("usr")).unwrap();
+        fixture_git(&root, &["clone", "-q", "--bare", "src", "usr/bin"]);
+        let wt = root.join("projects/wt");
+        fixture_git(
+            &root.join("usr/bin"),
+            &["worktree", "add", "-q", wt.to_str().unwrap()],
+        );
+        std::fs::write(wt.join(".git"), "gitdir: ../../usr/bin/worktrees/wt\n").unwrap();
 
         let err = git_common_mount_for(&wt, None).unwrap_err();
-        assert!(err.contains("would hide"), "{err}");
+        assert!(err.contains("/usr/bin"), "{err}");
     }
 
     /// `--runs-on` cannot mount the common dir. A worktree, and a worktree
