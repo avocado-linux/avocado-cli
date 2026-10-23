@@ -95,10 +95,12 @@ impl DiskWriter {
         );
         println!();
 
-        if !self.confirm("Are you sure you want to write to this device? (y/N): ")? {
-            println!("Operation cancelled.");
-            return Ok(());
-        }
+        // A write that did not happen must not look like success. The
+        // provision command prints success and writes its stamp on Ok.
+        require_consent(
+            self.confirm("Are you sure you want to write to this device? (y/N): ")?,
+            &disk.identifier,
+        )?;
 
         // Unmount
         println!();
@@ -323,18 +325,22 @@ impl DiskWriter {
         }
     }
 
-    fn confirm(&self, prompt: &str) -> Result<bool> {
+    fn confirm(&self, prompt: &str) -> Result<Consent> {
         // No terminal means no consent. This gates a destructive raw-device
         // write, so an unanswerable prompt must read as "no", never as a
         // default yes.
         if !crate::utils::interactivity::can_prompt_user() {
-            return Ok(false);
+            return Ok(Consent::NoTerminal);
         }
         print!("{}", prompt);
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().lock().read_line(&mut input)?;
-        Ok(input.trim().eq_ignore_ascii_case("y"))
+        if input.trim().eq_ignore_ascii_case("y") {
+            Ok(Consent::Yes)
+        } else {
+            Ok(Consent::Declined)
+        }
     }
 
     /// Write image to raw device with progress reporting.
@@ -415,6 +421,35 @@ impl DiskWriter {
         );
 
         Ok(())
+    }
+}
+
+/// The answer to the write confirmation prompt.
+#[derive(Debug, Clone, Copy)]
+enum Consent {
+    Yes,
+    Declined,
+    /// There was no terminal to ask. This is never consent.
+    NoTerminal,
+}
+
+/// Turn the confirmation answer into an error when the write must not go on.
+///
+/// The no-terminal case has its own message, so that an agent or a script
+/// can tell the user to run the command in a terminal.
+fn require_consent(consent: Consent, disk_id: &str) -> Result<()> {
+    match consent {
+        Consent::Yes => Ok(()),
+        Consent::Declined => Err(anyhow::anyhow!(
+            "Write to /dev/{disk_id} cancelled. The device was not changed."
+        )),
+        Consent::NoTerminal => Err(anyhow::anyhow!(
+            "Write to /dev/{disk_id} cancelled: no terminal to confirm the write \
+             (stdin is not a terminal, AVOCADO_NONINTERACTIVE is set, or JSON output is on). \
+             The device was not changed.\n\
+             Run the command in a terminal and answer 'y' to write the image. \
+             --force does not skip this confirmation."
+        )),
     }
 }
 
@@ -638,6 +673,30 @@ mod tests {
     fn test_plist_value_u64() {
         let plist = "    <key>TotalSize</key>\n    <integer>15931539456</integer>";
         assert_eq!(plist_value_u64(plist, "TotalSize"), Some(15931539456));
+    }
+
+    #[test]
+    fn test_require_consent_yes_allows_the_write() {
+        assert!(require_consent(Consent::Yes, "disk4").is_ok());
+    }
+
+    #[test]
+    fn test_require_consent_declined_is_an_error() {
+        let msg = require_consent(Consent::Declined, "disk4")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("/dev/disk4 cancelled"), "{msg}");
+        assert!(!msg.contains("no terminal"), "{msg}");
+    }
+
+    #[test]
+    fn test_require_consent_no_terminal_is_a_distinct_error() {
+        let msg = require_consent(Consent::NoTerminal, "disk4")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("/dev/disk4 cancelled"), "{msg}");
+        assert!(msg.contains("no terminal"), "{msg}");
+        assert!(msg.contains("Run the command in a terminal"), "{msg}");
     }
 
     #[test]
