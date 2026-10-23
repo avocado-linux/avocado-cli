@@ -50,9 +50,11 @@ pub fn git_common_dir_mount(
     }
     let raw = std::fs::read_to_string(&dot_git)
         .map_err(|e| format!("could not read {}: {e}", dot_git.display()))?;
+    // git reads only the first line.
     let gitdir = raw
         .lines()
-        .find_map(|l| l.strip_prefix("gitdir:"))
+        .next()
+        .and_then(|l| l.strip_prefix("gitdir:"))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{} has no `gitdir:` line", dot_git.display()))?;
@@ -94,9 +96,15 @@ pub fn git_common_dir_mount(
         None => (host_gitdir.clone(), container_gitdir.clone()),
     };
 
-    if !container_gitdir.starts_with(&container_common) {
+    // The container sees the git dir through the common dir mount, so it must
+    // sit at the same place under the common dir on both sides. A symlink in
+    // the gitdir path can make the host and container paths differ.
+    let host_rel = host_gitdir.strip_prefix(&host_common).ok();
+    let container_rel = container_gitdir.strip_prefix(&container_common).ok();
+    if host_rel.is_none() || host_rel != container_rel {
         return Err(format!(
-            "git dir {} is not inside its common dir {}",
+            "git dir {} is not inside its common dir {} at the same place on the \
+             host and in the container",
             host_gitdir.display(),
             host_common.display()
         ));
@@ -242,7 +250,9 @@ fn config_value(config: &Path, section: &str, key: &str) -> Option<String> {
         if in_section {
             let (k, v) = line.split_once('=').unwrap_or((line, ""));
             if k.trim().eq_ignore_ascii_case(key) {
-                return Some(v.trim().to_string());
+                // Drop a trailing comment and surrounding quotes.
+                let v = v.split(['#', ';']).next().unwrap_or("").trim();
+                return Some(v.trim_matches('"').to_string());
             }
         }
     }
@@ -526,6 +536,54 @@ mod tests {
         let m = git_common_dir_mount(&wt, Path::new(SRC)).unwrap().unwrap();
         assert!(m.relative_worktrees);
         assert_eq!(m.container, PathBuf::from("/opt/main/.git"));
+    }
+
+    /// A symlink in an absolute gitdir path can put the git dir at a
+    /// different place under the common dir on the host and in the
+    /// container. Then the mount cannot serve it, so it is reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_gitdir_that_moves_under_a_symlink_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = repo(&root);
+        let wt = root.join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::os::unix::fs::symlink(main.join(".git/worktrees"), root.join("a/b")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", root.join("a/b/wt").display()),
+        )
+        .unwrap();
+
+        let err = git_common_dir_mount(&wt, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("at the same place"), "{err}");
+    }
+
+    /// git reads only the first line of `.git`.
+    #[test]
+    fn only_the_first_line_of_the_git_file_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "junk\ngitdir: /\n").unwrap();
+        let err = git_common_dir_mount(tmp.path(), Path::new(SRC)).unwrap_err();
+        assert!(err.contains("no `gitdir:` line"), "{err}");
+    }
+
+    #[test]
+    fn config_values_drop_comments_and_quotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        std::fs::write(
+            &config,
+            "[core]\n\tbare = false\n[Extensions]\n\trelativeWorktrees = \"true\" # set by git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config_value(&config, "extensions", "relativeworktrees").as_deref(),
+            Some("true")
+        );
+        assert_eq!(config_value(&config, "core", "worktree"), None);
     }
 
     #[test]
