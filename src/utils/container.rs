@@ -278,6 +278,26 @@ fn git_common_mount_for(
     Ok(Some(mount))
 }
 
+/// Why git will not work on `/opt/src` in a `--runs-on` container, when `src`
+/// is a linked worktree. A worktree the local path would refuse gets that
+/// reason, so the user learns about it on a remote run too.
+fn remote_git_warning(src: &Path) -> Option<String> {
+    match crate::utils::git_worktree::git_common_dir_mount(src, Path::new("/opt/src")) {
+        Ok(None) => None,
+        Ok(Some(m)) => Some(format!(
+            "{} is a git worktree. --runs-on shares only the project dir, not the git \
+             common dir {}, so git commands on /opt/src will not work on the remote.",
+            src.display(),
+            m.host.display()
+        )),
+        Err(reason) => Some(format!(
+            "Could not use the git dir of {} on the remote: {reason}. git commands on \
+             /opt/src will not work on the remote.",
+            src.display()
+        )),
+    }
+}
+
 /// Ensure QEMU binfmt_misc is registered for cross-architecture container emulation.
 ///
 /// When `--sdk-arch` specifies an architecture different from the host, Docker needs
@@ -1574,6 +1594,23 @@ impl SdkContainer {
         static WARNED: std::sync::Once = std::sync::Once::new();
         let src = self.mounted_src_dir();
         match git_common_mount_for(src, vm_workspace().as_deref()) {
+            Ok(Some(m)) if m.relative_worktrees => {
+                static RELATIVE: std::sync::Once = std::sync::Once::new();
+                RELATIVE.call_once(|| {
+                    crate::utils::output::print_warning(
+                        &format!(
+                            "The git repository of {} uses relative worktree paths \
+                             (extensions.relativeWorktrees). git in the SDK container \
+                             needs version 2.48 or newer to read it. The 2024 SDK has \
+                             git 2.44 and fails with \"unknown repository extension\"; \
+                             the 2026 SDK has git 2.53.",
+                            src.display()
+                        ),
+                        OutputLevel::Normal,
+                    )
+                });
+                Some(m)
+            }
             Ok(m) => m,
             Err(reason) => {
                 WARNED.call_once(|| {
@@ -1592,25 +1629,12 @@ impl SdkContainer {
     }
 
     /// `--runs-on` shares only the project dir over NFS, so a linked
-    /// worktree's git common dir cannot reach the remote container. Warns once.
+    /// worktree's git common dir cannot reach the remote container. Warns once
+    /// (see [`remote_git_warning`]).
     fn warn_git_worktree_remote(&self) {
         static WARNED: std::sync::Once = std::sync::Once::new();
-        let src = self.mounted_src_dir();
-        if let Ok(Some(m)) =
-            crate::utils::git_worktree::git_common_dir_mount(src, Path::new("/opt/src"))
-        {
-            WARNED.call_once(|| {
-                crate::utils::output::print_warning(
-                    &format!(
-                        "{} is a git worktree. --runs-on shares only the project dir, \
-                         not the git common dir {}, so git commands on /opt/src will \
-                         not work on the remote.",
-                        src.display(),
-                        m.host.display()
-                    ),
-                    OutputLevel::Normal,
-                )
-            });
+        if let Some(msg) = remote_git_warning(self.mounted_src_dir()) {
+            WARNED.call_once(|| crate::utils::output::print_warning(&msg, OutputLevel::Normal));
         }
     }
 
@@ -5492,22 +5516,55 @@ extensions:
         git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&root, &["clone", "-q", "--bare", "src", "bare"]);
         let wt = bare.join("wt");
-        git(
-            &bare,
-            &[
-                "-c",
-                "worktree.useRelativePaths=true",
-                "worktree",
-                "add",
-                "-q",
-                "wt",
-            ],
-        );
-        let line = std::fs::read_to_string(wt.join(".git")).unwrap();
-        assert_eq!(line.trim(), "gitdir: ../worktrees/wt");
+        git(&bare, &["worktree", "add", "-q", "wt"]);
+        // What `worktree.useRelativePaths` (git 2.48+) writes, set by hand so
+        // older host git can run this. git always writes `commondir` as
+        // `../..`.
+        std::fs::write(wt.join(".git"), "gitdir: ../worktrees/wt\n").unwrap();
 
         let err = git_common_mount_for(&wt, None).unwrap_err();
         assert!(err.contains("would hide"), "{err}");
+    }
+
+    /// `--runs-on` cannot mount the common dir. A worktree, and a worktree
+    /// the local path would also refuse, both get a reason, not silence.
+    #[test]
+    fn remote_runs_explain_why_git_will_not_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let wt = tmp.path().join("wt");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // A plain worktree: the common dir is not shared with the remote.
+        let msg = remote_git_warning(&wt).unwrap();
+        assert!(
+            msg.contains("--runs-on shares only the project dir"),
+            "{msg}"
+        );
+
+        // A refused worktree: the reason reaches the user.
+        std::fs::write(wt.join(".gitmodules"), "").unwrap();
+        let msg = remote_git_warning(&wt).unwrap();
+        assert!(msg.contains("submodules"), "{msg}");
+
+        // The main checkout and a non-git dir need no warning.
+        assert_eq!(remote_git_warning(&main), None);
+        assert_eq!(remote_git_warning(tmp.path()), None);
     }
 
     /// The session container's own environment must hold the git settings,
