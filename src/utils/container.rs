@@ -5328,7 +5328,7 @@ extensions:
     fn a_linked_worktree_mounts_its_git_common_dir() {
         use crate::utils::volume::VolumeState;
         let (_restore, _vm_sock) = vm_routing_env();
-        let tmp = fixture_root();
+        let tmp = tempfile::tempdir().unwrap();
         let main = tmp.path().join("main");
         let wt = tmp.path().join("wt");
         std::fs::create_dir(&main).unwrap();
@@ -5351,13 +5351,11 @@ extensions:
                 .success();
             assert!(ok, "git {args:?}");
         }
-        let gitdir = std::fs::read_to_string(wt.join(".git")).unwrap();
-        let gitdir = gitdir.trim().strip_prefix("gitdir: ").unwrap().to_string();
-        let in_container = Path::new(&gitdir)
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        let in_container = PathBuf::from("/opt/main/.git");
         let host = main.join(".git").canonicalize().unwrap();
 
         let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
@@ -5641,7 +5639,7 @@ extensions:
     /// dir outside it gets no mount (and a warning), not a failed `docker run`.
     #[test]
     fn a_git_common_dir_outside_the_vm_share_is_not_mounted() {
-        let tmp = fixture_root();
+        let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let main = root.join("main");
         let wt = root.join("wt");
@@ -5665,6 +5663,10 @@ extensions:
                 .success();
             assert!(ok, "git {args:?}");
         }
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
 
         let inside = git_common_mount_for(&wt, Some(&root)).unwrap().unwrap();
         assert_eq!(inside.host, main.join(".git"));
@@ -5692,19 +5694,6 @@ extensions:
             .unwrap()
             .success();
         assert!(ok, "git {args:?}");
-    }
-
-    /// A temp dir under this crate's `target/`. The common dir mount accepts
-    /// only home-like container paths, and the system temp dir (`/tmp`,
-    /// `/var/folders`) is not one, while a checkout is under `/home` or
-    /// `/Users` on every CI and dev host this repo builds on.
-    fn fixture_root() -> tempfile::TempDir {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        tempfile::Builder::new()
-            .prefix("git-worktree-test-")
-            .tempdir_in(target)
-            .unwrap()
     }
 
     #[test]
@@ -5737,13 +5726,17 @@ extensions:
     fn a_caller_git_config_keeps_the_prune_guard() {
         use crate::utils::volume::VolumeState;
         let (_restore, _vm_sock) = vm_routing_env();
-        let tmp = fixture_root();
+        let tmp = tempfile::tempdir().unwrap();
         let main = tmp.path().join("main");
         let wt = tmp.path().join("wt");
         std::fs::create_dir(&main).unwrap();
         fixture_git(&main, &["init", "-q"]);
         fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
         fixture_git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
 
         let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
         let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
@@ -5842,7 +5835,7 @@ extensions:
     /// container. A mount there would hide the SDK's programs.
     #[test]
     fn a_common_dir_at_a_system_path_is_not_mounted() {
-        let tmp = fixture_root();
+        let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let src = root.join("src");
         std::fs::create_dir(&src).unwrap();
