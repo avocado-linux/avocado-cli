@@ -23,6 +23,10 @@ pub struct GitCommonMount {
     pub host: PathBuf,
     /// The absolute path git in the container resolves the common dir to.
     pub container: PathBuf,
+    /// The repository sets `extensions.relativeWorktrees` (written by
+    /// `worktree.useRelativePaths`). git before 2.48 refuses such a
+    /// repository; the 2024 SDK ships 2.44, the 2026 SDK 2.53.
+    pub relative_worktrees: bool,
 }
 
 /// The common dir mount `project_dir` needs, when its `.git` is a file that
@@ -157,9 +161,21 @@ pub fn git_common_dir_mount(
         );
     }
 
+    let relative_worktrees = config_value(
+        &host_common.join("config"),
+        "extensions",
+        "relativeworktrees",
+    )
+    .is_some_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1" | ""
+        )
+    });
     Ok(Some(GitCommonMount {
         host: host_common,
         container: container_common,
+        relative_worktrees,
     }))
 }
 
@@ -204,28 +220,33 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Whether a git config file sets `worktree` in its `[core]` section.
 fn has_core_worktree(config: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(config) else {
-        return false;
-    };
-    let mut in_core = false;
+    config_value(config, "core", "worktree").is_some()
+}
+
+/// The value of `key` in `[section]` of a git config file, if it is set.
+/// Section and key names are case-insensitive, as in git. A key with no
+/// `=` (a bare boolean) gives an empty value.
+fn config_value(config: &Path, section: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config).ok()?;
+    let mut in_section = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_core = line
+            in_section = line
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim()
-                .eq_ignore_ascii_case("core");
+                .eq_ignore_ascii_case(section);
             continue;
         }
-        if in_core {
-            let key = line.split('=').next().unwrap_or("").trim();
-            if key.eq_ignore_ascii_case("worktree") {
-                return true;
+        if in_section {
+            let (k, v) = line.split_once('=').unwrap_or((line, ""));
+            if k.trim().eq_ignore_ascii_case(key) {
+                return Some(v.trim().to_string());
             }
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -475,6 +496,30 @@ mod tests {
 
         let err = git_common_dir_mount(&wt, Path::new(SRC)).unwrap_err();
         assert!(err.contains("not a git dir"), "{err}");
+    }
+
+    /// `worktree.useRelativePaths` also turns on `extensions.relativeWorktrees`
+    /// in the common config, which git before 2.48 refuses. The mount still
+    /// happens (newer SDKs read it) and the caller is told.
+    #[test]
+    fn the_relative_worktrees_extension_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let wt = tmp.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let m = git_common_dir_mount(&wt, Path::new(SRC)).unwrap().unwrap();
+        assert!(!m.relative_worktrees);
+
+        // What git 2.48+ writes, set by hand so older host git can run this.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        let config = main.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[extensions]\n\trelativeWorktrees = true\n");
+        std::fs::write(&config, text).unwrap();
+
+        let m = git_common_dir_mount(&wt, Path::new(SRC)).unwrap().unwrap();
+        assert!(m.relative_worktrees);
+        assert_eq!(m.container, PathBuf::from("/opt/main/.git"));
     }
 
     #[test]
