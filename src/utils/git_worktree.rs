@@ -34,7 +34,8 @@ pub struct GitCommonMount {
 ///   directory, or the git dir is already inside the project.
 /// - `Ok(Some(_))`: mount `host` read-write at `container`.
 /// - `Err(reason)`: `.git` is a file, but a mount would not give a working
-///   repository in the container. The caller warns and mounts nothing.
+///   repository in the container, or the dir it names is not this
+///   worktree's git dir. The caller warns and mounts nothing.
 pub fn git_common_dir_mount(
     project_dir: &Path,
     container_src: &Path,
@@ -75,19 +76,19 @@ pub fn git_common_dir_mount(
         ));
     }
 
-    let (host_common, container_common) =
-        match std::fs::read_to_string(host_gitdir.join("commondir")) {
-            Ok(c) => {
-                let c = Path::new(c.trim());
-                let host = host_gitdir.join(c);
-                (
-                    host.canonicalize()
-                        .map_err(|e| format!("could not resolve {}: {e}", host.display()))?,
-                    normalize(&container_gitdir.join(c)),
-                )
-            }
-            Err(_) => (host_gitdir.clone(), container_gitdir.clone()),
-        };
+    let commondir = std::fs::read_to_string(host_gitdir.join("commondir")).ok();
+    let (host_common, container_common) = match &commondir {
+        Some(c) => {
+            let c = Path::new(c.trim());
+            let host = host_gitdir.join(c);
+            (
+                host.canonicalize()
+                    .map_err(|e| format!("could not resolve {}: {e}", host.display()))?,
+                normalize(&container_gitdir.join(c)),
+            )
+        }
+        None => (host_gitdir.clone(), container_gitdir.clone()),
+    };
 
     if !container_gitdir.starts_with(&container_common) {
         return Err(format!(
@@ -105,6 +106,30 @@ pub fn git_common_dir_mount(
         if container_common == container_src.join(rel) {
             return Ok(None);
         }
+    }
+    // From here on the common dir is mounted read-write into a root
+    // container, so it must be this worktree's repository. A `.git` file from
+    // a tarball or a copied tree can name any dir, `/` or `$HOME` included.
+    // git writes a linked worktree's git dir with a `commondir` file and a
+    // `gitdir` file that points back at `<worktree>/.git`.
+    if commondir.is_none() {
+        return Err(format!(
+            "{} is not a linked worktree git dir (it has no commondir file)",
+            host_gitdir.display()
+        ));
+    }
+    if !points_back_at(&host_gitdir, &dot_git) {
+        return Err(format!(
+            "{} belongs to another worktree or to none: its gitdir file does not point at {}",
+            host_gitdir.display(),
+            dot_git.display()
+        ));
+    }
+    if !looks_like_git_dir(&host_common) {
+        return Err(format!(
+            "{} is not a git dir (it needs HEAD, objects and refs)",
+            host_common.display()
+        ));
     }
     if container_common.starts_with(container_src) {
         return Err(format!(
@@ -136,6 +161,25 @@ pub fn git_common_dir_mount(
         host: host_common,
         container: container_common,
     }))
+}
+
+/// Whether the `gitdir` file in a linked worktree's git dir names `dot_git`.
+/// git writes it as an absolute path, or relative to the git dir with
+/// `worktree.useRelativePaths`.
+fn points_back_at(gitdir: &Path, dot_git: &Path) -> bool {
+    let Ok(back) = std::fs::read_to_string(gitdir.join("gitdir")) else {
+        return false;
+    };
+    let back = gitdir.join(back.trim());
+    match (back.canonicalize(), dot_git.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The files and dirs every git dir has.
+fn looks_like_git_dir(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
 }
 
 /// Remove `.` and `..` without touching the file system, as git does when it
@@ -360,6 +404,77 @@ mod tests {
         assert!(err.contains("submodules"), "{err}");
         // The main checkout has a `.git` dir and needs nothing.
         assert_eq!(git_common_dir_mount(&main, Path::new(SRC)), Ok(None));
+    }
+
+    /// A `.git` file from a tarball or a copied tree can name any dir. Only a
+    /// linked worktree's own git dir is mounted, never `/`.
+    #[test]
+    fn a_gitdir_of_root_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: /\n").unwrap();
+        let err = git_common_dir_mount(tmp.path(), Path::new(SRC)).unwrap_err();
+        assert!(err.contains("not a linked worktree"), "{err}");
+    }
+
+    #[test]
+    fn a_gitdir_of_a_home_dir_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::write(home.join(".profile"), "x\n").unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", home.display()),
+        )
+        .unwrap();
+        let err = git_common_dir_mount(&project, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("not a linked worktree"), "{err}");
+
+        // A commondir file alone does not make it a worktree git dir.
+        std::fs::write(home.join("commondir"), "..\n").unwrap();
+        let err = git_common_dir_mount(&project, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("belongs to"), "{err}");
+    }
+
+    /// The git dir of another worktree points back at that worktree, not at
+    /// this project, so this project gets no mount.
+    #[test]
+    fn a_gitdir_of_another_worktree_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let wt = tmp.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::copy(wt.join(".git"), other.join(".git")).unwrap();
+
+        let err = git_common_dir_mount(&other, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("belongs to"), "{err}");
+        // The real worktree still mounts.
+        assert!(git_common_dir_mount(&wt, Path::new(SRC)).unwrap().is_some());
+    }
+
+    /// The common dir a worktree names must be a git dir.
+    #[test]
+    fn a_common_dir_that_is_not_a_git_dir_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        let wt = tmp.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let admin = main.join(".git/worktrees/wt");
+        let fake = tmp.path().join("fake");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(admin.join("commondir"), format!("{}\n", fake.display())).unwrap();
+        // Keep the gitdir inside its common dir so only the git dir check fails.
+        let moved = fake.join("worktrees/wt");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&admin, &moved).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", moved.display())).unwrap();
+
+        let err = git_common_dir_mount(&wt, Path::new(SRC)).unwrap_err();
+        assert!(err.contains("not a git dir"), "{err}");
     }
 
     #[test]
