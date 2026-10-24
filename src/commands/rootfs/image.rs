@@ -268,8 +268,8 @@ pub fn render_exports_file(output_expr: &str, vars: &[&str]) -> String {
 
 /// Wrap an image build section in a reuse gate. When `reuse` is true — the
 /// host found the section's stamp current for every input, including the
-/// install step's content digest — and both the image and its `.exports` file
-/// exist, the section is replaced by sourcing the exports; otherwise the full
+/// install step's content digest — and the image and a non-empty `.exports`
+/// file exist, the section is replaced by sourcing the exports; otherwise the full
 /// section runs. The existence checks are in the container, where the files
 /// are: a current stamp whose image is gone must still rebuild.
 ///
@@ -298,7 +298,7 @@ pub fn gate_image_section(
     format!(
         r#"
 {var}="{flag}"
-if [ "${var}" = "1" ] && [ -f "{output_expr}" ] && [ -f "{output_expr}.exports" ]{sidecar_checks}; then
+if [ "${var}" = "1" ] && [ -f "{output_expr}" ] && [ -s "{output_expr}.exports" ]{sidecar_checks}; then
     echo "{label} image is up to date; reusing {output_expr}"
     . "{output_expr}.exports"
 else
@@ -563,18 +563,20 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
             ;;
     esac
 
-    # Keep the image's own os-release beside it, for `stone bundle
-    # --os-release` and the manifest's os_build_id. The reuse gate requires
-    # this file, so a reused image always comes with the one it was built with.
-    cp -f "$ROOTFS_WORK/usr/lib/os-release" "$ROOTFS_OS_RELEASE" \
-        || {{ echo "ERROR: could not copy the rootfs os-release to $ROOTFS_OS_RELEASE" >&2; exit 1; }}
-
-    rm -rf "$ROOTFS_WORK"
     export AVOCADO_ROOTFS_IMAGE="$ROOTFS_OUTPUT"
     export AVOCADO_ROOTFS_OS_RELEASE="$ROOTFS_OS_RELEASE"
 {verity_step}    export AVOCADO_ROOTFS_FILESYSTEM="$ROOTFS_FS"
     export AVOCADO_OS_BUILD_ID="$OS_BUILD_ID"
 {exports_file}
+
+    # Keep the image's own os-release beside it, for `stone bundle
+    # --os-release` and the manifest's os_build_id. The reuse gate requires
+    # this file to be non-empty, so it is written last, after the verity tree
+    # and .exports: a build that stops before this line leaves it empty, and
+    # the next build images again instead of reusing a half-finished set.
+    cp -f "$ROOTFS_WORK/usr/lib/os-release" "$ROOTFS_OS_RELEASE" \
+        || {{ echo "ERROR: could not copy the rootfs os-release to $ROOTFS_OS_RELEASE" >&2; exit 1; }}
+    rm -rf "$ROOTFS_WORK"
     echo "Built rootfs: $ROOTFS_OUTPUT (AVOCADO_OS_BUILD_ID=$OS_BUILD_ID)"
 else
     echo "No rootfs sysroot found — skipping rootfs image build."
@@ -1443,6 +1445,25 @@ mod tests {
             s.contains(" AVOCADO_ROOTFS_OS_RELEASE "),
             "listed in .exports"
         );
+        // The sidecar is the gate's proof that the section finished, so it
+        // is written after everything else the gate replays: .exports, and
+        // the verity tree when verity is on.
+        assert!(
+            exports_file < copy,
+            "sidecar must be written after .exports"
+        );
+        let v = generate_rootfs_build_script(
+            "00000000-0000-0000-0000-000000000000",
+            "erofs-lz4",
+            None,
+            "",
+            true,
+        );
+        let v_copy = v
+            .find(r#"cp -f "$ROOTFS_WORK/usr/lib/os-release" "$ROOTFS_OS_RELEASE""#)
+            .unwrap();
+        assert!(v.find("veritysetup format").unwrap() < v_copy);
+        assert!(v.rfind(r#": > "$ROOTFS_OUTPUT.exports""#).unwrap() < v_copy);
     }
 
     /// The reuse gate requires the os-release sidecar with or without verity,
@@ -1489,6 +1510,10 @@ mod tests {
         assert!(run().contains("FULL-SECTION"), "no sidecar: rebuild");
         std::fs::write(&sidecars[0], "AVOCADO_OS_BUILD_ID=abc\n").unwrap();
         assert!(!run().contains("FULL-SECTION"), "sidecar present: reuse");
+        // A build that stopped after emptying .exports: the image and the
+        // sidecar are there, but nothing would set the image's id.
+        std::fs::write(format!("{out_s}.exports"), "").unwrap();
+        assert!(run().contains("FULL-SECTION"), "empty .exports: rebuild");
     }
 
     #[test]
