@@ -124,6 +124,11 @@ rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
 
 # Clean runtime stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
+
+# Clean this runtime's rootfs and initramfs image stamps. The images were in
+# the runtime build directory above. The install stamps stay: the sysroots are
+# shared by every runtime.
+rm -rf "$AVOCADO_PREFIX/.stamps/rootfs/{runtime}" "$AVOCADO_PREFIX/.stamps/initramfs/{runtime}"
 "#,
             runtime = self.runtime
         );
@@ -178,6 +183,11 @@ rm -rf "$AVOCADO_PREFIX/runtimes/{runtime}"
 
 # Clean runtime stamps (install and build)
 rm -rf "$AVOCADO_PREFIX/.stamps/runtime/{runtime}"
+
+# Clean this runtime's rootfs and initramfs image stamps. The images were in
+# the runtime build directory above. The install stamps stay: the sysroots are
+# shared by every runtime.
+rm -rf "$AVOCADO_PREFIX/.stamps/rootfs/{runtime}" "$AVOCADO_PREFIX/.stamps/initramfs/{runtime}"
 "#,
             runtime = self.runtime
         )
@@ -321,6 +331,55 @@ mod tests {
         );
         let script = cmd.generate_clean_script();
         assert!(script.contains(".stamps/runtime/dev"));
+    }
+
+    /// The runtime's own rootfs/initramfs image stamps go with its images;
+    /// the per-target install stamps and other runtimes' image stamps stay.
+    #[test]
+    fn test_clean_removes_this_runtimes_image_stamps_only() {
+        use crate::utils::stamps::StampRequirement;
+
+        let cmd = RuntimeCleanCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+        let script = cmd.generate_clean_script();
+        for req in [
+            StampRequirement::rootfs_image("dev"),
+            StampRequirement::initramfs_image("dev"),
+        ] {
+            let dir = req.relative_path().replace("/image.stamp", "");
+            assert!(
+                script.contains(&format!("\"$AVOCADO_PREFIX/.stamps/{dir}\"")),
+                "{dir} not cleaned:\n{script}"
+            );
+        }
+        for kept in [
+            StampRequirement::rootfs_install(),
+            StampRequirement::initramfs_install(),
+            StampRequirement::rootfs_image("other"),
+        ] {
+            let path = kept.relative_path();
+            let dir = path.rsplit_once('/').unwrap().0;
+            assert!(
+                !script.contains(&format!("\"$AVOCADO_PREFIX/.stamps/{dir}\"")),
+                "{path} must survive a clean of 'dev'"
+            );
+        }
+        // Every rootfs/initramfs stamp path the script touches is this
+        // runtime's directory, never the parent that holds the install stamps.
+        for parent in [".stamps/rootfs", ".stamps/initramfs"] {
+            for (i, _) in script.match_indices(parent) {
+                assert!(
+                    script[i + parent.len()..].starts_with("/dev\""),
+                    "{parent} touched outside 'dev':\n{script}"
+                );
+            }
+        }
     }
 
     #[test]

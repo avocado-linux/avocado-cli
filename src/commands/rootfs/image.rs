@@ -278,7 +278,8 @@ pub fn render_exports_file(output_expr: &str, vars: &[&str]) -> String {
 /// gates the script already carries.
 ///
 /// `sidecars` are further files the section writes that downstream steps
-/// need (the rootfs dm-verity tree and root hash). Each must exist and be
+/// need (the rootfs os-release copy, and the dm-verity tree and root hash when
+/// verity is on). Each must exist and be
 /// non-empty, or the section rebuilds: a current stamp with a deleted or
 /// half-written tree must never ship without it.
 pub fn gate_image_section(
@@ -311,8 +312,32 @@ fi"#
 /// them and the reuse gate that requires them.
 const ROOTFS_VERITY_BASE: &str = "$OUTPUT_DIR/rootfs-verity/avocado-image-rootfs-$TARGET_ARCH";
 
-/// Files the rootfs section must leave behind for its image to be reused:
-/// the dm-verity tree and root hash when verity is on, nothing otherwise.
+/// Suffix of the rootfs image's own os-release copy, beside the image as
+/// `<image>.os-release` (the same way `.exports` sits beside it). One
+/// spelling for the section that writes it and the reuse gate that requires it.
+///
+/// `stone bundle --os-release` and the manifest's `os_bundle.os_build_id`
+/// must point at the image that ships. The shared sysroot cannot tell them that:
+/// every runtime images it, so it only knows the last one built.
+const ROOTFS_OS_RELEASE_SUFFIX: &str = ".os-release";
+
+/// Shell path of the os-release sidecar for the image at `output_expr`.
+pub fn rootfs_os_release_sidecar(output_expr: &str) -> String {
+    format!("{output_expr}{ROOTFS_OS_RELEASE_SUFFIX}")
+}
+
+/// Every file the rootfs section must leave behind for the image at
+/// `output_expr` to be reused: its os-release sidecar always, and the
+/// dm-verity tree and root hash when verity is on. A missing os-release
+/// sidecar forces a rebuild, which is also how an image from a CLI that did
+/// not write one gets its sidecar.
+pub fn rootfs_image_sidecars(output_expr: &str, verity: bool) -> Vec<String> {
+    let mut sidecars = vec![rootfs_os_release_sidecar(output_expr)];
+    sidecars.extend(rootfs_verity_sidecars(verity));
+    sidecars
+}
+
+/// The dm-verity tree and root hash when verity is on, nothing otherwise.
 pub fn rootfs_verity_sidecars(verity: bool) -> Vec<String> {
     if verity {
         vec![
@@ -338,6 +363,8 @@ pub fn rootfs_verity_sidecars(verity: bool) -> Vec<String> {
 /// - `$AVOCADO_ROOTFS_IMAGE` — path to built image
 /// - `$AVOCADO_ROOTFS_FILESYSTEM` — filesystem format used
 /// - `$AVOCADO_OS_BUILD_ID` — deterministic build ID
+/// - `$AVOCADO_ROOTFS_OS_RELEASE`: the image's own os-release, a copy kept
+///   beside the image (see [`rootfs_os_release_sidecar`])
 ///
 /// `post_install` is a project-relative script path (resolved against
 /// `/opt/src` inside the SDK container). When set, the build splices
@@ -486,20 +513,26 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
 
 {build_id_block}
 
-    # Inject identity into os-release (work copy for the image, sysroot for stone).
+    # Inject identity into the work copy's os-release, which the image ships.
     # The work copy was canonicalized (AVOCADO_* stripped) during id derivation,
-    # so these appends land in a clean file.
+    # so these appends land in a clean file. The shared sysroot is not written:
+    # every runtime images it, so an id there belongs to whichever runtime built
+    # last. Consumers read the sidecar copied out below.
     echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_NAME=$RUNTIME_NAME" >> "$ROOTFS_WORK/usr/lib/os-release"
     echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >> "$ROOTFS_WORK/usr/lib/os-release"
 
-    # Also write AVOCADO_OS_BUILD_ID to the sysroot so stone bundle can read it
-    sed -i '/^AVOCADO_OS_BUILD_ID=/d' "$ROOTFS_SYSROOT/usr/lib/os-release"
-    echo "AVOCADO_OS_BUILD_ID=$OS_BUILD_ID" >> "$ROOTFS_SYSROOT/usr/lib/os-release"
-
     # Build rootfs image using configured filesystem format
     ROOTFS_FS="{rootfs_filesystem}"
     ROOTFS_OUTPUT="$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.$ROOTFS_FS"
+    ROOTFS_OS_RELEASE="$ROOTFS_OUTPUT{os_release_suffix}"
+    # mkfs overwrites the image in place. Empty the files that describe the
+    # previous image first, so a build that stops part way can never leave a
+    # new image beside the old id: the reuse gate requires a non-empty
+    # os-release sidecar. Emptied, not removed: $OUTPUT_DIR is the runtime's
+    # dnf install root, and nothing is deleted from its top level.
+    : > "$ROOTFS_OUTPUT.exports"
+    : > "$ROOTFS_OS_RELEASE"
     echo "Building rootfs image: $ROOTFS_FS"
     case "$ROOTFS_FS" in
         erofs-zst)
@@ -530,8 +563,15 @@ if [ -d "$ROOTFS_SYSROOT/usr" ]; then
             ;;
     esac
 
+    # Keep the image's own os-release beside it, for `stone bundle
+    # --os-release` and the manifest's os_build_id. The reuse gate requires
+    # this file, so a reused image always comes with the one it was built with.
+    cp -f "$ROOTFS_WORK/usr/lib/os-release" "$ROOTFS_OS_RELEASE" \
+        || {{ echo "ERROR: could not copy the rootfs os-release to $ROOTFS_OS_RELEASE" >&2; exit 1; }}
+
     rm -rf "$ROOTFS_WORK"
     export AVOCADO_ROOTFS_IMAGE="$ROOTFS_OUTPUT"
+    export AVOCADO_ROOTFS_OS_RELEASE="$ROOTFS_OS_RELEASE"
 {verity_step}    export AVOCADO_ROOTFS_FILESYSTEM="$ROOTFS_FS"
     export AVOCADO_OS_BUILD_ID="$OS_BUILD_ID"
 {exports_file}
@@ -542,10 +582,12 @@ fi"#,
         rootfs_filesystem = rootfs_filesystem,
         post_install_block = post_install_block,
         verity_step = verity_step,
+        os_release_suffix = ROOTFS_OS_RELEASE_SUFFIX,
         exports_file = render_exports_file(
             "$ROOTFS_OUTPUT",
             &[
                 "AVOCADO_ROOTFS_IMAGE",
+                "AVOCADO_ROOTFS_OS_RELEASE",
                 "AVOCADO_ROOTFS_FILESYSTEM",
                 "AVOCADO_OS_BUILD_ID",
                 "AVOCADO_ROOTFS_ROOTHASH",
@@ -1338,6 +1380,115 @@ mod tests {
             !BUILD_STATE_PATHS.iter().any(|p| p.starts_with("var/log")),
             "purging var/log would delete hook-written logs that ship in the image"
         );
+    }
+
+    /// Every runtime images the one shared sysroot, so an id written there
+    /// belongs to whichever runtime built last. The build must not write it.
+    #[test]
+    fn test_rootfs_build_does_not_write_the_shared_sysroot() {
+        let s = rootfs_script();
+        assert!(
+            !s.contains(r#">> "$ROOTFS_SYSROOT"#),
+            "nothing is appended to the sysroot"
+        );
+        assert!(
+            !s.lines()
+                .any(|l| l.contains("sed -i") && l.contains("$ROOTFS_SYSROOT")),
+            "nothing is edited in the sysroot"
+        );
+    }
+
+    fn mkfs_pos(s: &str) -> usize {
+        s.find("mkfs.erofs").expect("mkfs present")
+    }
+
+    /// The image's own os-release is copied out after the identity is
+    /// appended and before the work copy is removed, exported, and recorded
+    /// in `.exports` so a reused image replays it.
+    #[test]
+    fn test_rootfs_os_release_sidecar_is_written_and_exported() {
+        let s = rootfs_script();
+        let append = s
+            .find(r#"echo "AVOCADO_RUNTIME_VERSION=$RUNTIME_VERSION" >>"#)
+            .expect("identity append present");
+        let sidecar = format!(r#"ROOTFS_OS_RELEASE="$ROOTFS_OUTPUT{ROOTFS_OS_RELEASE_SUFFIX}""#);
+        let set = s.find(&sidecar).expect("sidecar path set");
+        let copy = s
+            .find(r#"cp -f "$ROOTFS_WORK/usr/lib/os-release" "$ROOTFS_OS_RELEASE""#)
+            .expect("sidecar copy present");
+        let rm_work = s
+            .rfind(r#"rm -rf "$ROOTFS_WORK""#)
+            .expect("work copy removed after imaging");
+        assert!(
+            append < set && set < copy && copy < rm_work,
+            "order must be: append identity -> copy sidecar -> remove work copy"
+        );
+        // The previous image's id files go before mkfs overwrites the image,
+        // so a build that stops part way leaves nothing for the gate to reuse.
+        let clear = s
+            .find(r#": > "$ROOTFS_OS_RELEASE""#)
+            .expect("old id file emptied");
+        assert!(s.find(r#": > "$ROOTFS_OUTPUT.exports""#).unwrap() < mkfs_pos(&s));
+        let mkfs = s.find("mkfs.erofs").expect("mkfs present");
+        assert!(
+            set < clear && clear < mkfs,
+            "old id files must go before mkfs"
+        );
+        let export = s
+            .find(r#"export AVOCADO_ROOTFS_OS_RELEASE="$ROOTFS_OS_RELEASE""#)
+            .expect("sidecar exported");
+        let exports_file = s.rfind(r#": > "$ROOTFS_OUTPUT.exports""#).unwrap();
+        assert!(export < exports_file);
+        assert!(
+            s.contains(" AVOCADO_ROOTFS_OS_RELEASE "),
+            "listed in .exports"
+        );
+    }
+
+    /// The reuse gate requires the os-release sidecar with or without verity,
+    /// spelled the same way the section writes it.
+    #[test]
+    fn rootfs_image_sidecars_always_include_the_os_release() {
+        let out = "$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.erofs-lz4";
+        let os_release = format!("{out}.os-release");
+        assert_eq!(rootfs_os_release_sidecar(out), os_release);
+        assert_eq!(rootfs_image_sidecars(out, false), [os_release.as_str()]);
+        let with = rootfs_image_sidecars(out, true);
+        assert_eq!(with[0], os_release);
+        assert_eq!(with[1..], rootfs_verity_sidecars(true)[..]);
+    }
+
+    /// A reused image with no os-release sidecar (an image from a CLI that did
+    /// not write one) must rebuild, so the bundle never falls back to a file
+    /// that does not describe it.
+    #[cfg(unix)]
+    #[test]
+    fn image_gate_rebuilds_without_the_os_release_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("img.erofs-lz4");
+        let out_s = out.display().to_string();
+        std::fs::write(&out, "x").unwrap();
+        std::fs::write(format!("{out_s}.exports"), "export Y=1\n").unwrap();
+        let sidecars = rootfs_image_sidecars(&out_s, false);
+        let run = || {
+            let script = gate_image_section(
+                "    echo FULL-SECTION",
+                &out_s,
+                "ROOTFS_IMAGE_REUSE",
+                "rootfs",
+                true,
+                &sidecars.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert!(run().contains("FULL-SECTION"), "no sidecar: rebuild");
+        std::fs::write(&sidecars[0], "AVOCADO_OS_BUILD_ID=abc\n").unwrap();
+        assert!(!run().contains("FULL-SECTION"), "sidecar present: reuse");
     }
 
     #[test]
