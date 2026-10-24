@@ -363,12 +363,9 @@ impl RuntimeBuildCommand {
             let required = resolve_required_stamps_for_runtime_build(&self.runtime_name, &ext_deps);
 
             // Batch all stamp reads into a single container invocation for
-            // performance. The same round-trip reads the two sysroot image
-            // stamps this build owns, so it can decide whether to rebuild them.
-            let image_reqs = [
-                crate::utils::stamps::StampRequirement::rootfs_image(),
-                crate::utils::stamps::StampRequirement::initramfs_image(),
-            ];
+            // performance. The same round-trip reads the two image stamps
+            // this runtime owns, so it can decide whether to rebuild them.
+            let image_reqs = image_stamp_requirements(&self.runtime_name);
             let batch_script = format!(
                 "{}\n{}",
                 generate_batch_read_stamps_script(&required),
@@ -1096,15 +1093,12 @@ impl RuntimeBuildCommand {
                     "$AVOCADO_PREFIX/runtimes/{}/avocado-image-{section}-{target_arch}.{filesystem}",
                     self.runtime_name
                 );
-                let image_stamp = if *section == "rootfs" {
-                    Stamp::rootfs_image(target_arch, image_inputs.clone(), StampOutputs::default())
-                } else {
-                    Stamp::initramfs_image(
-                        target_arch,
-                        image_inputs.clone(),
-                        StampOutputs::default(),
-                    )
-                };
+                let image_stamp = image_stamp(
+                    section,
+                    &self.runtime_name,
+                    target_arch,
+                    image_inputs.clone(),
+                );
                 stamp_script.push_str(&format!(
                     "\nif [ -f \"{image}\" ]; then\n{}\nfi\n",
                     crate::utils::stamps::generate_write_stamp_script_with_digest(
@@ -2448,6 +2442,7 @@ fi"#
             .context("rootfs")?
             .unwrap_or(false);
         let rootfs_fs = config.get_rootfs_filesystem();
+        let rootfs_output = format!("$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{rootfs_fs}");
         let rootfs_build_section = crate::commands::rootfs::image::gate_image_section(
             &generate_rootfs_build_script(
                 NAMESPACE_UUID,
@@ -2456,11 +2451,11 @@ fi"#
                 &rootfs_permissions_section,
                 rootfs_verity,
             ),
-            &format!("$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{rootfs_fs}"),
+            &rootfs_output,
             "ROOTFS_IMAGE_REUSE",
             "rootfs",
             image_reuse.rootfs,
-            &crate::commands::rootfs::image::rootfs_verity_sidecars(rootfs_verity)
+            &crate::commands::rootfs::image::rootfs_image_sidecars(&rootfs_output, rootfs_verity)
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
@@ -3088,6 +3083,32 @@ struct RuntimeCompileEntry {
     name: String,
     compile_section: String,
     install_script: String,
+}
+
+/// The rootfs and initramfs image stamps a runtime build reads. Each runtime
+/// has its own images, so each has its own stamps: a stamp shared across
+/// runtimes would let one runtime reuse a stale image because another runtime
+/// rebuilt its own.
+fn image_stamp_requirements(runtime_name: &str) -> [crate::utils::stamps::StampRequirement; 2] {
+    [
+        crate::utils::stamps::StampRequirement::rootfs_image(runtime_name),
+        crate::utils::stamps::StampRequirement::initramfs_image(runtime_name),
+    ]
+}
+
+/// The image stamp a runtime build writes for `section` ("rootfs" or
+/// "initramfs"). The counterpart of [`image_stamp_requirements`].
+fn image_stamp(
+    section: &str,
+    runtime_name: &str,
+    target_arch: &str,
+    inputs: crate::utils::stamps::StampInputs,
+) -> Stamp {
+    if section == "rootfs" {
+        Stamp::rootfs_image(runtime_name, target_arch, inputs, StampOutputs::default())
+    } else {
+        Stamp::initramfs_image(runtime_name, target_arch, inputs, StampOutputs::default())
+    }
 }
 
 /// Walk `runtimes.<n>.packages` and pull out the sdk-compile entries.
@@ -4777,6 +4798,29 @@ runtimes:
         }
     }
 
+    /// A runtime build reads and writes only its own image stamps. A shared
+    /// stamp let a second runtime reuse its stale image after the first
+    /// runtime rebuilt.
+    #[test]
+    fn runtime_build_reads_and_writes_its_own_image_stamps() {
+        use crate::utils::stamps::StampInputs;
+        for rt in ["alpha", "beta"] {
+            let [rootfs_req, initramfs_req] = image_stamp_requirements(rt);
+            assert_eq!(
+                rootfs_req.relative_path(),
+                format!("rootfs/{rt}/image.stamp")
+            );
+            assert_eq!(
+                initramfs_req.relative_path(),
+                format!("initramfs/{rt}/image.stamp")
+            );
+            for (section, req) in [("rootfs", &rootfs_req), ("initramfs", &initramfs_req)] {
+                let stamp = image_stamp(section, rt, "qemux86-64", StampInputs::new("h".into()));
+                assert_eq!(stamp.relative_path(), req.relative_path(), "{section} {rt}");
+            }
+        }
+    }
+
     /// With rootfs verity on, the rootfs reuse gate also requires the hash tree
     /// and root hash; with it off, it does not.
     #[test]
@@ -4818,6 +4862,16 @@ runtimes:
         }
         let off = gate_for(base);
         assert!(!off.contains("rootfs-verity"), "{off}");
+
+        // The image's own os-release is required either way: the bundle and
+        // the manifest take the build id from it, never from the sysroot.
+        let fs = Config::load_from_str(base).unwrap().get_rootfs_filesystem();
+        let sidecar = crate::commands::rootfs::image::rootfs_os_release_sidecar(&format!(
+            "$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{fs}"
+        ));
+        for gate in [&on, &off] {
+            assert!(gate.contains(&format!("[ -s \"{sidecar}\" ]")), "{gate}");
+        }
     }
 
     /// `encrypt:` under a `target-<x>:` override is honored like every other
