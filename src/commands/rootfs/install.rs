@@ -14,9 +14,10 @@ use crate::utils::overlay_preprocess::parse_overlay_config;
 /// config has no overlay. `sysroot_dir` is the sysroot subdirectory name
 /// (e.g., "rootfs", "initramfs").
 ///
-/// Uses `cp -a` (preserve attrs + symlinks + recursive) followed by
-/// `chown -R root:root` rather than `rsync -a` so we don't depend on rsync
-/// being present in the SDK image (some SDK variants don't ship it).
+/// The copy is `overlay_copy_command`, shared with the extension overlay merge:
+/// new paths are root:root, existing directories keep their package mode and
+/// owner, and nothing else in the sysroot is touched. It needs only GNU tar,
+/// not rsync, which some SDK variants don't ship.
 ///
 /// The sysroot persists between installs and the copy is additive, so the
 /// snippet records every file and symlink the overlay placed, NUL-delimited,
@@ -29,13 +30,9 @@ use crate::utils::overlay_preprocess::parse_overlay_config;
 fn build_overlay_script(overlay: Option<(&str, &str, bool)>, sysroot_dir: &str) -> String {
     let (overlay_src, check, copy, record, reason) = match overlay {
         Some((copy_dir, overlay_dir, opaque)) => {
-            let (mode, cp) = if opaque {
-                // cp -r copies without preserving timestamps or ownership.
-                ("opaque", "cp -r")
-            } else {
-                // cp -a copies and preserves attrs, merging into the existing tree.
-                ("merge", "cp -a")
-            };
+            // Opaque copies with the umask-filtered mode and a fresh mtime
+            // (`cp -r` semantics); merge keeps the working-tree mode.
+            let mode = if opaque { "opaque" } else { "merge" };
             (
                 format!("${{AVOCADO_SRC_DIR:-/opt/src}}/{copy_dir}"),
                 format!(
@@ -45,10 +42,14 @@ fn build_overlay_script(overlay: Option<(&str, &str, bool)>, sysroot_dir: &str) 
 fi"#
                 ),
                 format!(
-                    r#"# Apply overlay ({mode} mode); chown -R then resets ownership to root:root.
+                    r#"# Apply overlay ({mode} mode). It sets attributes only on paths it creates.
 echo "Applying overlay '{overlay_dir}' to {sysroot_dir} sysroot ({mode} mode)"
-{cp} "$overlay_src/." "$sysroot/"
-chown -R root:root "$sysroot/""#
+{copy}"#,
+                    copy = crate::utils::overlay_preprocess::overlay_copy_command(
+                        "$overlay_src",
+                        "$sysroot",
+                        !opaque
+                    ),
                 ),
                 r#"(cd "$overlay_src" && find . \( -type f -o -type l \) -print0) > "$overlay_list.tmp""#
                     .to_string(),
@@ -2180,28 +2181,37 @@ mod tests {
     }
 
     #[test]
-    fn overlay_script_uses_cp_a_in_merge_mode() {
-        // Merge mode now uses `cp -a` + `chown -R` (universally available
-        // POSIX tools) instead of `rsync -a --chown` — the SDK doesn't
-        // always ship rsync.
+    fn overlay_script_uses_the_shared_copy_in_merge_mode() {
+        // Merge mode keeps the working-tree mode. The copy needs only GNU tar,
+        // not rsync, which the SDK doesn't always ship.
         let script =
             build_overlay_script(Some(("overlays/dev", "overlays/dev", false)), "initramfs");
         assert!(
-            script.contains("cp -a"),
-            "merge-mode overlay script must use cp -a; got:\n{script}"
+            script.contains(&crate::utils::overlay_preprocess::overlay_copy_command(
+                "$overlay_src",
+                "$sysroot",
+                true
+            )),
+            "merge-mode overlay script must use the shared overlay copy; got:\n{script}"
         );
         assert!(
-            script.contains("chown -R root:root"),
-            "merge-mode overlay script must chown the result; got:\n{script}"
+            !script.contains("chown -R"),
+            "a recursive chown strips setuid from package files; got:\n{script}"
         );
         assert!(script.contains("(merge mode)"));
         assert!(!script.contains("rsync"), "rsync should be gone");
     }
 
     #[test]
-    fn overlay_script_uses_cp_r_in_opaque_mode() {
+    fn overlay_script_uses_the_shared_copy_in_opaque_mode() {
         let script = build_overlay_script(Some(("overlays/dev", "overlays/dev", true)), "rootfs");
-        assert!(script.contains("cp -r"));
+        assert!(
+            script.contains(&crate::utils::overlay_preprocess::overlay_copy_command(
+                "$overlay_src",
+                "$sysroot",
+                false
+            ))
+        );
         assert!(script.contains("(opaque mode)"));
     }
 
