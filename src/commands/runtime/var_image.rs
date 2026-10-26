@@ -577,12 +577,26 @@ sign_amf "$AVOCADO_MANIFEST_PATH"
 /// Runs standalone from `provision`, so it emits its own preamble and resolves
 /// the manifest the build produced.
 pub fn render_var_image(ctx: &VarImageContext) -> Result<String> {
+    render(ctx, true)
+}
+
+/// The same rendering without Docker priming: for replaying a provisionable
+/// bundle, whose `var-staging` was captured after priming (so it already
+/// holds the images, and the replaying host needs no registry access).
+pub fn render_var_image_from_staging(ctx: &VarImageContext) -> Result<String> {
+    render(ctx, false)
+}
+
+fn render(ctx: &VarImageContext, prime_docker: bool) -> Result<String> {
     let VarImageContext {
         runtime_name,
         target_arch,
         ..
     } = *ctx;
-    let r = prepare(ctx)?;
+    let mut r = prepare(ctx)?;
+    if !prime_docker {
+        r.docker_section = "# Docker images: primed when the bundle was packed".to_string();
+    }
     Ok(format!(
         r#"
 # --- provisioning tail: var image and OS bundle -------------------------

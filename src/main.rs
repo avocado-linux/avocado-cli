@@ -469,6 +469,21 @@ enum Commands {
         /// to have run.
         #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
         list: bool,
+        /// Write a provisionable bundle directory (bundle.json + content-
+        /// addressed blobs) instead of provisioning: everything the
+        /// provisioning hook needs, deduplicated. Given an existing
+        /// directory, writes `<runtime>-<target>.bundle` inside it.
+        #[arg(long = "pack", conflicts_with_all = ["list", "bundle"])]
+        pack: Option<std::path::PathBuf>,
+        /// Provision from a bundle with only the SDK installed (no build
+        /// tree): a bundle directory made by `--pack`, or a job's spec.json
+        /// (bundle.json + blob URLs). Blobs are cached by sha256 under
+        /// `.avocado-bundle/` in the current directory.
+        #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
+        bundle: Option<String>,
+        /// Remote provisioning through an avocado-vm hub (--rubicon ...).
+        #[command(flatten)]
+        remote: Box<ProvisionRemoteArgs>,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -654,6 +669,15 @@ enum ConnectCommands {
         #[command(subcommand)]
         command: ConnectAuthCommands,
     },
+    /// Provisionable runtime bundles (from `avocado provision --pack`)
+    Bundle {
+        #[command(subcommand)]
+        command: ConnectBundleCommands,
+    },
+    /// Provision a bundle onto the DUT behind a site VM's Rubicon, through
+    /// Connect. Records the job's origin; with --wait, streams the log and
+    /// exits non-zero unless the job passed (for CI).
+    Provision(Box<ConnectProvisionArgs>),
     /// Initialize connect settings in avocado.yaml (org, project, server key, extensions, claim token, device config)
     Init {
         /// Organization ID (skip interactive prompt)
@@ -759,6 +783,12 @@ enum ConnectCommands {
         /// Publish the runtime immediately after upload (draft → published)
         #[arg(long)]
         publish: bool,
+        /// Also make the runtime provisionable: pack the provisioning
+        /// assets (boot chain, flash tools, var-staging, ...) and attach
+        /// them to the uploaded runtime. Content Connect already has, such
+        /// as the runtime's own images, is not sent again.
+        #[arg(long, conflicts_with = "file")]
+        provisionable: bool,
         /// Deploy after upload: cohort ID to target
         #[arg(long)]
         deploy_cohort: Option<String>,
@@ -2501,8 +2531,32 @@ async fn main() -> Result<()> {
             container_args,
             dnf_args,
             list,
+            pack,
+            bundle,
+            remote,
             output,
         } => {
+            let ProvisionRemoteArgs {
+                rubicon,
+                via,
+                vm,
+                connect_profile,
+            } = *remote;
+            if rubicon.is_some() && (list || pack.is_some() || bundle.is_some() || out.is_some()) {
+                anyhow::bail!(
+                    "--rubicon cannot be combined with --list, --pack, --bundle or --out"
+                );
+            }
+            if let Some(source) = bundle {
+                return crate::commands::provision_bundle::BundleProvision {
+                    source,
+                    profile: provision_profile.clone(),
+                    env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
+                    verbose,
+                }
+                .execute()
+                .await;
+            }
             // `--list` short-circuits the run: instead of provisioning,
             // we read the stone manifest out of the installed SDK
             // volume and return the profiles available for the
@@ -2525,6 +2579,11 @@ async fn main() -> Result<()> {
             );
             // No JSON-implies-force coercion here either (see the `Install`
             // arm above for why both of its reasons are gone).
+            let src_dir = std::path::Path::new(&config)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .canonicalize()?;
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -2544,7 +2603,20 @@ async fn main() -> Result<()> {
                     runs_on: cli.runs_on.clone(),
                     nfs_port: cli.nfs_port,
                     sdk_arch: cli.sdk_arch.clone(),
-                });
+                })
+                .with_pack(pack);
+            if let Some(rubicon) = rubicon {
+                return crate::commands::provision_remote::RemoteProvision {
+                    rubicon,
+                    via,
+                    vm,
+                    connect_profile,
+                    provision_profile,
+                    src_dir,
+                }
+                .execute(provision_cmd)
+                .await;
+            }
             provision_cmd.execute().await?;
             Ok(())
         }
@@ -3517,6 +3589,45 @@ async fn main() -> Result<()> {
                 .execute()
                 .await
             }
+            VmCommands::Connect {
+                org,
+                name,
+                force,
+                status,
+                disconnect,
+                profile,
+            } => {
+                use commands::vm::connect::{ConnectAction, VmConnectCommand};
+                let action = if status {
+                    ConnectAction::Status
+                } else if disconnect {
+                    ConnectAction::Disconnect
+                } else {
+                    ConnectAction::Connect { org, name, force }
+                };
+                VmConnectCommand { action, profile }.execute().await
+            }
+            VmCommands::Rubicon { command } => {
+                use commands::vm::rubicon::{RubiconAction, RubiconCommand};
+                let action = match command {
+                    VmRubiconCommands::Add { address, label } => {
+                        RubiconAction::Add { address, label }
+                    }
+                    VmRubiconCommands::List => RubiconAction::List,
+                    VmRubiconCommands::Remove { address } => RubiconAction::Remove { address },
+                };
+                RubiconCommand { action }.execute().await
+            }
+            #[cfg(target_os = "linux")]
+            VmCommands::Service { command } => {
+                use commands::vm::service::{ServiceAction, ServiceCommand};
+                let action = match command {
+                    VmServiceCommands::Install => ServiceAction::Install,
+                    VmServiceCommands::Uninstall => ServiceAction::Uninstall,
+                    VmServiceCommands::Status => ServiceAction::Status,
+                };
+                ServiceCommand { action }.execute().await
+            }
             VmCommands::Reset { yes } => {
                 commands::vm::reset::ResetCommand { assume_yes: yes }
                     .execute()
@@ -3803,6 +3914,43 @@ async fn main() -> Result<()> {
         },
         Commands::Login(args) => args.run().await,
         Commands::Connect { command } => match command {
+            ConnectCommands::Bundle {
+                command:
+                    ConnectBundleCommands::Upload {
+                        file,
+                        name,
+                        org,
+                        profile,
+                    },
+            } => {
+                crate::commands::connect::hub::BundleUploadCommand {
+                    file,
+                    name,
+                    org,
+                    profile,
+                }
+                .execute()
+                .await
+            }
+            ConnectCommands::Provision(a) => {
+                let a = *a;
+                crate::commands::connect::hub::ProvisionJobCommand {
+                    vm: a.vm,
+                    rubicon: a.rubicon,
+                    bundle: a.bundle,
+                    runtime: a.runtime,
+                    profile: a.profile,
+                    repository: a.repository,
+                    pr_url: a.pr_url,
+                    commit: a.commit,
+                    run_url: a.run_url,
+                    wait: a.wait,
+                    org: a.org,
+                    profile_name: a.profile_name,
+                }
+                .execute()
+                .await
+            }
             ConnectCommands::Auth { command } => match command {
                 ConnectAuthCommands::Login(args) => args.run().await,
                 ConnectAuthCommands::Logout { profile, output } => {
@@ -4295,6 +4443,7 @@ async fn main() -> Result<()> {
                 no_sbom,
                 profile,
                 publish,
+                provisionable,
                 deploy_cohort,
                 deploy_name,
                 deploy_tag,
@@ -4321,6 +4470,7 @@ async fn main() -> Result<()> {
                     no_sbom,
                     profile: profile.clone(),
                     publish,
+                    provisionable,
                     deploy_cohort,
                     deploy_name,
                     deploy_tags: deploy_tag,
@@ -5067,6 +5217,39 @@ enum VmCommands {
         #[command(subcommand)]
         command: VmConfigCommands,
     },
+    /// Associate this VM with a Connect org (claims it as a VM hub).
+    Connect {
+        /// Organization ID (default: the profile's org).
+        #[arg(long)]
+        org: Option<String>,
+        /// Name for the claim token / VM (default: vm-<hostname>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Claim again even if the VM is already connected.
+        #[arg(long)]
+        force: bool,
+        /// Show the connection state instead of connecting.
+        #[arg(long, conflicts_with_all = ["disconnect", "org", "name", "force"])]
+        status: bool,
+        /// Stop avocado-conn and remove its local credentials.
+        #[arg(long, conflicts_with_all = ["org", "name", "force"])]
+        disconnect: bool,
+        /// Connect profile to use.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Manage the Rubicon USB/IP boards this VM hub drives.
+    Rubicon {
+        #[command(subcommand)]
+        command: VmRubiconCommands,
+    },
+    /// Run the VM headless under a systemd user unit (hibernation off),
+    /// so it stays up across logout and reboot.
+    #[cfg(target_os = "linux")]
+    Service {
+        #[command(subcommand)]
+        command: VmServiceCommands,
+    },
     /// Long-lived hibernation supervisor. Internal — spawned by `vm start`,
     /// not for direct use. Owns the user-facing SSH port AND docker
     /// socket, proxies to QEMU's internal hostfwd / SSH tunnel, and
@@ -5141,6 +5324,107 @@ enum ContainerDevCommands {
     /// Garbage-collect this project's Container Dev Mode registry store
     /// (distinct from the top-level `prune`, which removes Docker volumes).
     Prune,
+}
+
+#[derive(Subcommand)]
+enum VmRubiconCommands {
+    /// Add a board by address (or update its label).
+    Add {
+        address: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List configured boards with their live state.
+    List,
+    /// Stop managing a board.
+    Remove { address: String },
+}
+
+/// `avocado connect provision` (boxed: the derived parser's frames grow
+/// with each variant's size, and debug test threads have 2 MiB of stack).
+#[derive(clap::Args)]
+struct ConnectProvisionArgs {
+    /// VM id (Connect's VMs page)
+    #[arg(long)]
+    pub vm: String,
+    /// Rubicon address on that VM
+    #[arg(long)]
+    pub rubicon: String,
+    /// Bundle id
+    #[arg(long, required_unless_present = "runtime", conflicts_with = "runtime")]
+    pub bundle: Option<String>,
+    /// Runtime id: provision its attached provisioning assets (uploaded
+    /// with `connect upload --provisionable`)
+    #[arg(long)]
+    pub runtime: Option<String>,
+    /// Provision profile
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Source repository (e.g. owner/name)
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Pull request URL
+    #[arg(long = "pr")]
+    pub pr_url: Option<String>,
+    /// Commit SHA
+    #[arg(long)]
+    pub commit: Option<String>,
+    /// CI run URL
+    #[arg(long)]
+    pub run_url: Option<String>,
+    /// Wait for the result, stream the log, fail unless it passed
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long)]
+    pub org: Option<String>,
+    #[arg(long = "profile-name")]
+    pub profile_name: Option<String>,
+}
+
+/// `avocado provision --rubicon ...` (boxed: the derived parser's frames
+/// grow with each variant's size, and debug test threads have 2 MiB).
+#[derive(clap::Args)]
+struct ProvisionRemoteArgs {
+    /// Provision the device behind this Rubicon (label, name or
+    /// address) through the avocado-vm that drives it: this machine's
+    /// VM if it has the board, otherwise through Connect. Syncs what the
+    /// hub lacks, runs there, streams the log back.
+    #[arg(long)]
+    pub rubicon: Option<String>,
+    /// With --rubicon: force the hub (auto: local VM first, then Connect).
+    #[arg(long, value_enum, default_value_t = crate::commands::provision_remote::Via::Auto, requires = "rubicon")]
+    pub via: crate::commands::provision_remote::Via,
+    /// With --rubicon via Connect: the VM, when several know the board.
+    #[arg(long, requires = "rubicon")]
+    pub vm: Option<String>,
+    /// With --rubicon via Connect: Connect profile to use.
+    #[arg(long, requires = "rubicon")]
+    pub connect_profile: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ConnectBundleCommands {
+    /// Upload a bundle file to Connect
+    Upload {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum VmServiceCommands {
+    /// Write ~/.config/systemd/user/avocado-vm.service, enable and start it.
+    Install,
+    /// Stop, disable and remove the unit.
+    Uninstall,
+    /// Show the unit's state, lingering, and `vm status`.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -5407,13 +5691,25 @@ mod tests {
         }
     }
 
+    /// Parse on a thread with a binary's 8 MiB main-thread stack: a debug
+    /// build's clap parse of the full `Cli` overflows a test thread's 2 MiB.
+    fn parse_cli(args: &[&str]) -> Commands {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || {
+                Cli::try_parse_from(args)
+                    .expect("args should parse")
+                    .command
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[test]
     fn needs_vm_routing_gates_connect_upload_only() {
-        let cmd = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let cmd = |args: &[&str]| parse_cli(args);
 
         // connect upload → routes
         assert!(needs_vm_routing(&cmd(&[
@@ -5451,11 +5747,7 @@ mod tests {
     /// to the VM, which could auto-start it for a login.
     #[test]
     fn login_is_a_shortcut_for_connect_auth_login() {
-        let parse = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let parse = |args: &[&str]| parse_cli(args);
         let short = parse(&[
             "avocado",
             "login",
@@ -5525,11 +5817,7 @@ mod tests {
     /// boot a virtual machine.
     #[test]
     fn needs_vm_routing_gates_engine_driving_container_dev_subcommands() {
-        let cmd = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let cmd = |args: &[&str]| parse_cli(args);
 
         for sub in ["up", "sync", "down", "prune"] {
             assert!(

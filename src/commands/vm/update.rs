@@ -60,6 +60,28 @@ use crate::utils::vm::staging::StagingDir;
 use crate::utils::vm::state::VmPaths;
 use crate::utils::vm_update_check::{check_for_vm_update, VmUpdateStatus, DEFAULT_BASE};
 
+/// Whether the VM runs under `vm service`, the systemd user unit, which only
+/// exists on Linux.
+#[cfg(target_os = "linux")]
+fn vm_service_active() -> bool {
+    crate::commands::vm::service::service_active()
+}
+#[cfg(not(target_os = "linux"))]
+fn vm_service_active() -> bool {
+    false
+}
+
+/// `systemctl --user <verb>` on the VM's unit (Linux only; never reached
+/// elsewhere, since `vm_service_active` is false there).
+#[cfg(target_os = "linux")]
+fn vm_service(verb: &str) -> Result<()> {
+    crate::commands::vm::service::systemctl(&[verb, crate::commands::vm::service::UNIT_NAME])
+}
+#[cfg(not(target_os = "linux"))]
+fn vm_service(_verb: &str) -> Result<()> {
+    Ok(())
+}
+
 /// CLI surface — keep this in sync with the clap variant in main.rs.
 pub struct UpdateCommand {
     pub channel: Option<String>,
@@ -280,9 +302,17 @@ impl UpdateCommand {
 
         // Stop the VM if running. We hold the staging dir open across
         // this so a crash here leaves staging in place for retry.
+        // A VM under `vm service` is stopped and started through systemd: a
+        // plain restart would leave it outside the unit, with the unit's
+        // settings gone (idle hibernation back on, which freezes a hub mid-job).
+        let under_service = was_running && vm_service_active();
         if was_running {
             println!("avocado vm update: stopping VM…");
-            crate::utils::vm::lifecycle::stop(false).await.ok();
+            if under_service {
+                vm_service("stop").ok();
+            } else {
+                crate::utils::vm::lifecycle::stop(false).await.ok();
+            }
         }
 
         // Commit all staged files into install_dir.
@@ -355,7 +385,10 @@ impl UpdateCommand {
 
         stage.cleanup();
 
-        if was_running {
+        if under_service {
+            println!("avocado vm update: restarting VM (service)…");
+            vm_service("start")?;
+        } else if was_running {
             println!("avocado vm update: restarting VM…");
             // Minimal start opts — None for cpus/memory means lifecycle::start
             // reads `runtime.*` from ~/.avocado/vm/config.yaml (or falls back
