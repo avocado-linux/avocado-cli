@@ -471,9 +471,12 @@ impl RuntimeInstallCommand {
 
         let installroot_path = format!("$AVOCADO_PREFIX/runtimes/{runtime}");
 
-        if needs_clean_reinstall {
+        // A failed clean must abort the reinstall. If the rm step fails and we
+        // continue, the installroot check below sees the stale tree, skips the
+        // reseed, and dnf installs against a dirty installroot, which is the exact
+        // state needs_clean_reinstall exists to prevent (ENG-2352).
+        let may_reinstall = clean_installroot_before_reinstall(needs_clean_reinstall, runtime, {
             let clean_command = format!(r#"rm -rf "{installroot_path}""#);
-
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.clone(),
@@ -490,21 +493,11 @@ impl RuntimeInstallCommand {
                 tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
-            // A failed clean must abort the reinstall. If the rm step fails and
-            // we continue, the installroot check below sees the stale tree, skips
-            // the reseed, and dnf installs against a dirty installroot, which is
-            // the exact state needs_clean_reinstall exists to prevent (ENG-2352).
-            let cleaned =
-                run_container_command(container_helper, run_config, runs_on_context).await?;
-            if !cleaned {
-                print_error(
-                    &format!(
-                        "Failed to clean installroot for runtime '{runtime}' before reinstall."
-                    ),
-                    OutputLevel::Normal,
-                );
-                return Ok(false);
-            }
+            || run_container_command(container_helper, run_config, runs_on_context)
+        })
+        .await?;
+        if !may_reinstall {
+            return Ok(false);
         }
 
         // Seed the runtime's rpm database from the rootfs unless it is already
@@ -919,6 +912,38 @@ async fn run_container_command(
     }
 }
 
+/// Run the pre-reinstall installroot clean when needed, and report whether the
+/// caller may proceed to the dnf reinstall.
+///
+/// When `needs_clean_reinstall` is false, `run_clean` is never called and the
+/// caller proceeds. When a required clean fails (`run_clean` resolves to
+/// `Ok(false)`), this prints an error and reports `Ok(false)` so the caller
+/// aborts before dnf, which is the exact state `needs_clean_reinstall` exists to
+/// prevent (ENG-2352). The clean runner is a parameter so this decision can be
+/// tested without a container.
+async fn clean_installroot_before_reinstall<F, Fut>(
+    needs_clean_reinstall: bool,
+    runtime: &str,
+    run_clean: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    if !needs_clean_reinstall {
+        return Ok(true);
+    }
+    let cleaned = run_clean().await?;
+    if !cleaned {
+        print_error(
+            &format!("Failed to clean installroot for runtime '{runtime}' before reinstall."),
+            OutputLevel::Normal,
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// The shell test for "is this runtime's rpm database already seeded".
 ///
 /// Named rather than inlined so the test below asserts the string production
@@ -991,6 +1016,37 @@ $DNF_SDK_HOST \
 
 #[cfg(test)]
 mod tests {
+    /// A failed pre-reinstall clean must abort before dnf. Before ENG-2352 the
+    /// clean result was ignored, so a failed `rm -rf` fell through to dnf against
+    /// a dirty installroot. This drives the clean step with a fake runner so the
+    /// decision is exercised without a container; it fails if the abort is
+    /// reverted.
+    #[tokio::test]
+    async fn failed_pre_reinstall_clean_aborts_before_dnf() {
+        // Clean needed and it fails: must not proceed to dnf.
+        let proceed =
+            super::clean_installroot_before_reinstall(true, "dev", || async { Ok(false) })
+                .await
+                .expect("decision is infallible here");
+        assert!(!proceed, "a failed clean must abort before dnf");
+
+        // Clean needed and it succeeds: proceed.
+        let proceed = super::clean_installroot_before_reinstall(true, "dev", || async { Ok(true) })
+            .await
+            .unwrap();
+        assert!(proceed, "a successful clean must proceed to dnf");
+
+        // No clean needed: the clean runner must not run at all.
+        let proceed = super::clean_installroot_before_reinstall(false, "dev", || async {
+            panic!("clean must not run when no reinstall clean is needed");
+            #[allow(unreachable_code)]
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        assert!(proceed, "with no clean needed the reinstall proceeds");
+    }
+
     #[test]
     fn the_rpmdb_seed_test_is_the_database_not_its_parent() {
         // Asserts the production string, not a copy of it: SDK init recreates

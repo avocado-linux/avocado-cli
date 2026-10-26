@@ -480,22 +480,43 @@ impl SdkRunCommand {
         // Cleanup signing service
         self.cleanup_signing_service().await?;
 
-        if success {
-            print_success("SDK command completed successfully.", OutputLevel::Normal);
-            Ok(())
-        } else {
-            // The in-container command exited non-zero. Return an error so the
-            // CLI also exits non-zero. Without this, a failed command (or a
-            // failed in-container build) still exits 0, and scripts and CI
-            // cannot see the failure. See ENG-2352 and bug report B-7.
-            anyhow::bail!("SDK command failed")
-        }
+        result_from_container_success(success)
+    }
+}
+
+/// Map the in-container exit status onto the CLI result.
+///
+/// A `false` success means the in-container command exited non-zero, so the
+/// CLI must also exit non-zero. Without this, a failed command (or a failed
+/// in-container build) still exited 0, and scripts and CI could not see the
+/// failure. See ENG-2352 and bug report B-7.
+fn result_from_container_success(success: bool) -> Result<()> {
+    if success {
+        print_success("SDK command completed successfully.", OutputLevel::Normal);
+        Ok(())
+    } else {
+        anyhow::bail!("SDK command failed")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed in-container command must surface as an error so the CLI exits
+    /// non-zero; a success must stay `Ok`. On `main` the failure branch returned
+    /// `Ok(())`, so this test fails there and guards the ENG-2352 / B-7 fix.
+    #[test]
+    fn container_failure_becomes_error() {
+        assert!(
+            result_from_container_success(false).is_err(),
+            "a failed container command must return an error"
+        );
+        assert!(
+            result_from_container_success(true).is_ok(),
+            "a successful container command must return Ok"
+        );
+    }
 
     /// A typo'd `-r` must error and list the defined runtimes, not fall through
     /// to an unsigned run that exits 0 (ENG-2352).
