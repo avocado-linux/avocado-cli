@@ -1195,10 +1195,8 @@ impl ExtBuildCommand {
 # Merge overlay directory into extension sysroot
 if [ -d "{src_path}/{overlay_dir}" ]; then
     echo "Merging overlay directory '{overlay_dir}' into extension sysroot with root:root ownership"
-    # cp -a preserves attrs/symlinks while merging into the existing tree;
-    # chown -R sets ownership to root:root. Avoids depending on rsync.
-    cp -a "{src_path}/{overlay_dir}/." "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
-    chown -R root:root "$AVOCADO_EXT_SYSROOTS/{ext_name}/"
+    # Sets attributes only on paths the overlay creates (overlay_copy_command).
+    {copy}
 else
     echo "Error: Overlay directory '{overlay_dir}' not found in source"
     exit 1
@@ -1206,7 +1204,11 @@ fi
 "#,
                     src_path = ext_src_path,
                     overlay_dir = overlay_config.dir,
-                    ext_name = self.extension,
+                    copy = crate::utils::overlay_preprocess::overlay_copy_command(
+                        &format!("{ext_src_path}/{}", overlay_config.dir),
+                        &format!("$AVOCADO_EXT_SYSROOTS/{}", self.extension),
+                        true,
+                    ),
                 ),
                 OverlayMode::Opaque => format!(
                     r#"
@@ -2496,9 +2498,16 @@ extensions:
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
         assert!(
-            script.contains("cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\"")
+            script.contains(&crate::utils::overlay_preprocess::overlay_copy_command(
+                "/opt/src/peridio",
+                "$AVOCADO_EXT_SYSROOTS/overlay-ext",
+                true,
+            ))
         );
-        assert!(script.contains("chown -R root:root \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(
+            !script.contains("chown -R"),
+            "a recursive chown strips setuid from package files"
+        );
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
         assert!(script.contains("exit 1"));
     }
@@ -2539,9 +2548,16 @@ extensions:
         assert!(script.contains("if [ -d \"/opt/src/peridio\" ]; then"));
         assert!(script.contains("echo \"Merging overlay directory 'peridio' into extension sysroot with root:root ownership\""));
         assert!(
-            script.contains("cp -a \"/opt/src/peridio/.\" \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\"")
+            script.contains(&crate::utils::overlay_preprocess::overlay_copy_command(
+                "/opt/src/peridio",
+                "$AVOCADO_EXT_SYSROOTS/overlay-ext",
+                true,
+            ))
         );
-        assert!(script.contains("chown -R root:root \"$AVOCADO_EXT_SYSROOTS/overlay-ext/\""));
+        assert!(
+            !script.contains("chown -R"),
+            "a recursive chown strips setuid from package files"
+        );
         assert!(script.contains("echo \"Error: Overlay directory 'peridio' not found in source\""));
         assert!(script.contains("exit 1"));
     }
