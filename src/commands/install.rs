@@ -413,13 +413,42 @@ impl InstallCommand {
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
             // Phase 2d.3 dual-write: when the project has exactly one target-relevant
-            // runtime, ext installs can mirror their lockfile state under
-            // `runtimes.<r>.extensions.<ext>`. Multi-runtime projects skip the mirror
-            // for now (per-extension membership lookup lands in a follow-up commit).
+            // runtime, ext installs mirror their lockfile state under
+            // `runtimes.<r>.extensions.<ext>` and install straight into that
+            // runtime's per-runtime sysroot. Multi-runtime projects install into
+            // the per-target tree and seed each runtime's per-runtime sysroot from
+            // it afterward (see `ext_seed_runtimes` below), so a later
+            // `build -r <rt>` finds a populated tree.
             let dual_write_runtime = if target_runtimes.len() == 1 {
                 target_runtimes.first().cloned()
             } else {
                 None
+            };
+
+            // Multi-runtime install: `dual_write_runtime` is `None`, so each ext
+            // installs into the per-target tree only. Map each extension to the
+            // runtimes that list it (the `depends_on` closure, matching what
+            // `build -r` resolves) so the ext install can seed each runtime's
+            // per-runtime sysroot from that per-target tree. Without it, a later
+            // `build -r <rt>` fails the package-database probe (ENG-2691 / B-8).
+            // Empty for a single-runtime project, which dual-writes instead.
+            let ext_seed_runtimes: Arc<HashMap<String, Vec<String>>> = if target_runtimes.len() > 1
+            {
+                let mut map: HashMap<String, Vec<String>> = HashMap::new();
+                for rt in &target_runtimes {
+                    let members = crate::utils::ext_deps::runtime_members(
+                        &composed,
+                        rt,
+                        &_target,
+                        &self.config_path,
+                    )?;
+                    for ext in members {
+                        map.entry(ext).or_default().push(rt.clone());
+                    }
+                }
+                Arc::new(map)
+            } else {
+                Arc::new(HashMap::new())
             };
 
             let sched_renderer = renderer
@@ -438,6 +467,7 @@ impl InstallCommand {
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
                     let dual_write_runtime = dual_write_runtime.clone();
+                    let ext_seed_runtimes = Arc::clone(&ext_seed_runtimes);
 
                     Box::pin(async move {
                         let tui_ctx = renderer.as_ref().map(|r| TuiContext {
@@ -461,6 +491,9 @@ impl InstallCommand {
                                 .with_sdk_arch(sdk_arch)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime)
+                                .with_seed_runtimes(
+                                    ext_seed_runtimes.get(name).cloned().unwrap_or_default(),
+                                )
                                 // The DAG above scheduled every dependency as
                                 // its own task, ordered ahead of this one.
                                 .with_deps_scheduled(true);

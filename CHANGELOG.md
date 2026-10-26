@@ -98,6 +98,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file, so two runtimes with the same config got different initramfs images and
   ids. The query now uses `--dbpath /var/lib/rpm`, the same as the rootfs. Every
   initramfs build id changes once.
+- **`avocado build -r <rt>` works right after a plain `avocado install` on a
+  project with more than one runtime.** (ENG-2691) Before, a plain `install`
+  populated only the per-target extension sysroot, so a `build -r <rt>` for a
+  project with two or more runtimes stopped on each package extension with
+  "its sysroot for runtime '<rt>' has no package database. Run 'avocado install
+  -r <rt>' first", even though `avocado build` (all runtimes) passed on the same
+  volume. A multi-runtime `install` now seeds each runtime's per-runtime
+  extension sysroot from the per-target install, so `build -r` finds a populated
+  tree. A single-runtime project was never affected.
 - **Builds through the avocado-vm on macOS are much faster.** On one ROS 2
   project, `avocado install` went from 23 to 5 minutes. Every syscall in the
   VM is about 7x faster, and reading files from the project about 700x.

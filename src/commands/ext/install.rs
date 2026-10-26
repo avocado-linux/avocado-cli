@@ -245,6 +245,13 @@ pub struct ExtInstallCommand {
     /// the on-disk layout once all ext command consumers (build, image,
     /// clean, runtime build) accept a runtime parameter.
     runtime: Option<String>,
+    /// Runtimes whose per-runtime extension sysroot should be seeded from the
+    /// per-target install this command performs. Set only on the multi-runtime
+    /// `avocado install` path, where `runtime` is `None` (the install lands in
+    /// the per-target tree) but each runtime that lists this extension still
+    /// needs its own populated `runtimes/<rt>/extensions/<ext>` tree so a later
+    /// `build -r <rt>` finds a package database. Empty on every other path.
+    seed_runtimes: Vec<String>,
 }
 
 impl ExtInstallCommand {
@@ -273,6 +280,7 @@ impl ExtInstallCommand {
             composed_config: None,
             tui_context: None,
             runtime: None,
+            seed_runtimes: Vec::new(),
         }
     }
 
@@ -285,6 +293,16 @@ impl ExtInstallCommand {
     /// fetch) reading the same content transparently.
     pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Seed the per-runtime extension sysroot for each listed runtime from the
+    /// per-target tree this install populates. Used by the multi-runtime
+    /// `avocado install` path (see `seed_runtimes`). A single-runtime install
+    /// uses `with_runtime` instead, which installs straight into the one
+    /// runtime's tree, so the two are mutually exclusive.
+    pub fn with_seed_runtimes(mut self, runtimes: Vec<String>) -> Self {
+        self.seed_runtimes = runtimes;
         self
     }
 
@@ -641,7 +659,7 @@ impl ExtInstallCommand {
         };
 
         // Execute the installation and ensure cleanup
-        let result = self
+        let mut result = self
             .execute_install_internal(
                 config,
                 parsed,
@@ -660,6 +678,31 @@ impl ExtInstallCommand {
             )
             .await;
 
+        // Multi-runtime install only: seed each member runtime's per-runtime
+        // extension sysroot from the per-target tree we just populated, so a
+        // later `build -r <rt>` finds a package database (ENG-2791 / B-8). This
+        // is a no-op unless `seed_runtimes` is set, which only the multi-runtime
+        // `avocado install` scheduler does.
+        if result.is_ok() {
+            if let Err(e) = self
+                .seed_runtime_sysroots(
+                    &container_helper,
+                    container_image,
+                    &target,
+                    &extensions_to_install,
+                    repo_url.as_ref(),
+                    repo_release.as_ref(),
+                    feeds.as_ref(),
+                    &merged_container_args,
+                    runs_on_context.as_ref(),
+                    &effective_tui_context,
+                )
+                .await
+            {
+                result = Err(e);
+            }
+        }
+
         // Always teardown the context if it was created
         if let Some(ref mut context) = runs_on_context {
             if let Err(e) = context.teardown().await {
@@ -677,6 +720,76 @@ impl ExtInstallCommand {
         }
 
         result
+    }
+
+    /// Seed per-runtime extension sysroots from the per-target tree.
+    ///
+    /// On a multi-runtime `avocado install` each extension is installed once
+    /// into the per-target tree (`$AVOCADO_PREFIX/extensions/<ext>`) with
+    /// `self.runtime == None`. Every runtime that lists the extension still
+    /// needs its own `$AVOCADO_PREFIX/runtimes/<rt>/extensions/<ext>` tree, or a
+    /// later `build -r <rt>` fails the package-database probe in `ext/build.rs`.
+    /// Copy the populated per-target tree into each member runtime's path.
+    ///
+    /// Copying the whole tree (not just `var/lib/rpm`) is deliberate: a package
+    /// extension builds its image from the files dnf installed into the
+    /// sysroot, and the rpm database is only the probe's proxy for "an install
+    /// reached this tree". Seeding the db alone would pass the probe and ship an
+    /// empty image.
+    ///
+    /// No-op unless `seed_runtimes` is set, which only the multi-runtime
+    /// `avocado install` scheduler does.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_runtime_sysroots(
+        &self,
+        container_helper: &SdkContainer,
+        container_image: &str,
+        target: &str,
+        extensions_to_install: &[(String, ExtensionLocation)],
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
+        merged_container_args: &Option<Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+        effective_tui_context: &Option<TuiContext>,
+    ) -> Result<()> {
+        if self.seed_runtimes.is_empty() {
+            return Ok(());
+        }
+
+        for (extension, _location) in extensions_to_install {
+            let command = seed_runtime_sysroot_command(extension, &self.seed_runtimes);
+
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: repo_url.cloned(),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.cloned(),
+                container_args: merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                tui_context: effective_tui_context.clone(),
+                // No AVOCADO_RUNTIME on purpose: the copy reads the per-target
+                // tree and writes absolute per-runtime paths. Setting it would
+                // flip the container's $AVOCADO_EXT_SYSROOTS and let the
+                // entrypoint rewrite the legacy compat symlink.
+                ..Default::default()
+            };
+
+            let success =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+            if !success {
+                return Err(anyhow::anyhow!(
+                    "Failed to seed per-runtime sysroot for extension '{extension}'."
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Internal implementation of the install logic
@@ -1846,6 +1959,37 @@ $DNF_SDK_HOST \
     }
 }
 
+/// Build the in-container shell that seeds each runtime's per-runtime extension
+/// sysroot from the per-target tree.
+///
+/// The per-target install lands in `$AVOCADO_PREFIX/extensions/<ext>`; a
+/// `build -r <rt>` reads `$AVOCADO_PREFIX/runtimes/<rt>/extensions/<ext>`. Copy
+/// the whole tree (not just `var/lib/rpm`) with `cp -a`, so symlinks,
+/// permissions and the real package files the image is built from are
+/// preserved. `rm -rf` first keeps it idempotent across re-installs. The
+/// `[ -d "$src" ]` guard skips a `type: path`/sysext extension that has no
+/// per-target package sysroot. Returns an empty-effect script when `runtimes`
+/// is empty.
+///
+/// The script must run with `AVOCADO_RUNTIME` unset so the container entrypoint
+/// leaves `$AVOCADO_EXT_SYSROOTS` and the legacy compat symlink untouched; it
+/// addresses both trees by absolute path instead.
+fn seed_runtime_sysroot_command(extension: &str, runtimes: &[String]) -> String {
+    let mut blocks = String::new();
+    for rt in runtimes {
+        blocks.push_str(&format!(
+            "  dst=\"$AVOCADO_PREFIX/runtimes/{rt}/extensions/{extension}\"\n\
+             \x20 mkdir -p \"$AVOCADO_PREFIX/runtimes/{rt}/extensions\"\n\
+             \x20 rm -rf \"$dst\"\n\
+             \x20 cp -a \"$src\" \"$dst\"\n\
+             \x20 echo \"[INFO] Seeded extension '{extension}' sysroot into runtime '{rt}'.\"\n"
+        ));
+    }
+    format!(
+        "set -e\nsrc=\"$AVOCADO_PREFIX/extensions/{extension}\"\nif [ -d \"$src\" ]; then\n{blocks}fi\n"
+    )
+}
+
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
@@ -2189,5 +2333,58 @@ mod tests {
         // Cleared pin, no sysroot: a plain first install.
         assert_eq!(change(None, Some("6.6.5"), false), None);
         assert_eq!(change(Some("6.6.5"), None, true), None);
+    }
+
+    /// ENG-2791 / B-8: on a multi-runtime plain `install`, the ext install seeds
+    /// each member runtime's per-runtime sysroot from the per-target tree. The
+    /// generated shell must copy the WHOLE tree (not just `var/lib/rpm`) from
+    /// the per-target path into each runtime's exact per-runtime path, or a
+    /// later `build -r <rt>` fails the package-database probe (or ships an empty
+    /// image). These assertions pin the paths a wrong rewrite would move.
+    #[test]
+    fn seed_command_copies_per_target_tree_into_each_runtime_path() {
+        let cmd = seed_runtime_sysroot_command(
+            "avocado-ext-dev",
+            &["alpha".to_string(), "beta".to_string()],
+        );
+
+        // Source is the per-target tree, guarded so a path/sysext extension
+        // with no package sysroot is skipped.
+        assert!(cmd.contains("src=\"$AVOCADO_PREFIX/extensions/avocado-ext-dev\""));
+        assert!(cmd.contains("if [ -d \"$src\" ]; then"));
+
+        // Each runtime gets the per-target tree copied into its exact
+        // per-runtime destination with `cp -a` (full tree, preserving attrs).
+        for rt in ["alpha", "beta"] {
+            let dst = format!("$AVOCADO_PREFIX/runtimes/{rt}/extensions/avocado-ext-dev");
+            assert!(
+                cmd.contains(&format!("dst=\"{dst}\"")),
+                "missing destination for runtime {rt}"
+            );
+            assert!(
+                cmd.contains(&format!(
+                    "mkdir -p \"$AVOCADO_PREFIX/runtimes/{rt}/extensions\""
+                )),
+                "missing mkdir for runtime {rt}"
+            );
+            assert!(cmd.contains("rm -rf \"$dst\""), "copy must be idempotent");
+            assert!(
+                cmd.contains("cp -a \"$src\" \"$dst\""),
+                "must copy full tree"
+            );
+        }
+
+        // It copies the tree itself, never only the rpm database, which would
+        // pass the build probe but ship an empty image.
+        assert!(!cmd.contains("var/lib/rpm"));
+    }
+
+    /// With no member runtimes (the single-runtime path, which dual-writes
+    /// instead) the script has no copy effect.
+    #[test]
+    fn seed_command_is_inert_without_runtimes() {
+        let cmd = seed_runtime_sysroot_command("avocado-ext-dev", &[]);
+        assert!(!cmd.contains("cp -a"));
+        assert!(!cmd.contains("$AVOCADO_PREFIX/runtimes/"));
     }
 }
