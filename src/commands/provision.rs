@@ -15,7 +15,7 @@ pub struct ProvisionConfig {
     pub config_path: String,
     /// Enable verbose output
     pub verbose: bool,
-    /// Force operation without prompts
+    /// Skip prompts, except the confirmation before a raw SD card write
     pub force: bool,
     /// Global target architecture
     pub target: Option<String>,
