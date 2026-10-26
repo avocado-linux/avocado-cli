@@ -47,6 +47,47 @@ pub fn parse_overlay_config(value: &Value) -> (String, bool) {
     }
 }
 
+/// Shell that copies an overlay directory into a sysroot. The overlay sets
+/// attributes only on the paths it creates.
+///
+/// - New files, symlinks and directories are `root:root` (the archive is
+///   written with `--owner=0 --group=0`), with the working-tree mode when
+///   `preserve` is set and the umask-filtered mode otherwise (`cp -r`
+///   semantics, opaque mode).
+/// - A directory that already exists in the sysroot keeps its mode and owner
+///   (`--no-overwrite-dir`): `var/log/journal` 2755, `tmp` 1777 and
+///   `etc/sudoers.d` 750 come from packages. `cp -a` rewrote an existing
+///   directory's mode, and a chown after it reset the group and cleared
+///   setgid.
+/// - Nothing else in the sysroot is touched. A recursive chown over the
+///   sysroot also cleared setuid/setgid on package binaries: an extension
+///   shipping an overlay lost the bit on nvidia-modprobe, so
+///   nvidia-persistenced could not create /dev/nvidia*.
+/// - An overlay directory whose path is a symlink or a file in the sysroot is
+///   refused before anything is written, as `cp -a` refused it. Without the
+///   check, tar would silently replace a merged-usr `lib -> usr/lib` symlink
+///   with a directory.
+///
+/// `src` and `dst` are shell words, interpolated inside double quotes. Needs
+/// bash (`read -d ''`, `PIPESTATUS`) and GNU tar, which every SDK image ships.
+pub fn overlay_copy_command(src: &str, dst: &str, preserve: bool) -> String {
+    let mode_flags = if preserve {
+        "-p"
+    } else {
+        "--no-same-permissions --touch"
+    };
+    format!(
+        r#"(cd "{src}" && find . -mindepth 1 -type d -print0) | (cd "{dst}" && while IFS= read -r -d '' _ovl_d; do
+    if [ -L "$_ovl_d" ] || {{ [ -e "$_ovl_d" ] && [ ! -d "$_ovl_d" ]; }}; then
+        echo "ERROR: overlay directory '${{_ovl_d#./}}' would replace a non-directory in the sysroot" >&2
+        exit 1
+    fi
+done) || exit 1
+tar -C "{src}" -cf - --owner=0 --group=0 --numeric-owner . | tar -C "{dst}" -xf - --no-overwrite-dir {mode_flags}
+[ "${{PIPESTATUS[*]}}" = "0 0" ] || {{ echo "ERROR: could not copy the overlay {src} into {dst}" >&2; exit 1; }}"#
+    )
+}
+
 /// Which overlay files to run the `{{ }}` preprocessor over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreprocessSpec {
@@ -770,5 +811,131 @@ mod tests {
         // guidance applies.
         let err = rel_str(root, &root.join(name)).unwrap_err();
         assert!(err.to_string().contains("non-UTF-8"));
+    }
+
+    /// Runs `overlay_copy_command` with bash against a sysroot that already
+    /// holds package paths. Returns (exit status, stderr).
+    #[cfg(unix)]
+    fn run_overlay_copy(src: &Path, dst: &Path, preserve: bool) -> (bool, String) {
+        let cmd = overlay_copy_command(src.to_str().unwrap(), dst.to_str().unwrap(), preserve);
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// An overlay sets attributes only on paths it creates. Package paths it
+    /// shares a directory with keep their mode (setgid journal dir, sticky
+    /// tmp), package files it does not ship are not touched (setuid binary),
+    /// and new paths take the working-tree mode. Ownership cannot be checked
+    /// without root, so the archive flags that make new paths root:root are
+    /// pinned on the command text.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_copy_sets_attributes_only_on_paths_it_creates() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        for preserve in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (src, dst) = (tmp.path().join("ov"), tmp.path().join("sysroot"));
+            for d in ["var/log/journal", "tmp", "usr/bin", "usr/lib"] {
+                std::fs::create_dir_all(dst.join(d)).unwrap();
+            }
+            set(&dst.join("var/log/journal"), 0o2755);
+            set(&dst.join("tmp"), 0o1777);
+            std::fs::write(dst.join("usr/bin/nvidia-modprobe"), "pkg").unwrap();
+            set(&dst.join("usr/bin/nvidia-modprobe"), 0o4755);
+            set(&dst, 0o755);
+
+            for d in ["var/log/journal", "tmp", "usr/bin", "etc/new.d"] {
+                std::fs::create_dir_all(src.join(d)).unwrap();
+            }
+            std::fs::write(src.join("var/log/journal/keep"), "x").unwrap();
+            std::fs::write(src.join("usr/bin/tool"), "x").unwrap();
+            set(&src.join("usr/bin/tool"), 0o750);
+            std::os::unix::fs::symlink("/dev/null", src.join("etc/masked.service")).unwrap();
+            set(&src.join("var/log/journal"), 0o700);
+            set(&src.join("tmp"), 0o700);
+            set(&src.join("usr/bin"), 0o700);
+            set(&src.join("etc/new.d"), 0o750);
+            set(&src, 0o700);
+
+            let (ok, err) = run_overlay_copy(&src, &dst, preserve);
+            assert!(ok, "preserve={preserve}: {err}");
+            assert_eq!(mode(&dst), 0o755, "the sysroot root keeps its mode");
+            assert_eq!(mode(&dst.join("var/log/journal")), 0o2755);
+            assert_eq!(mode(&dst.join("tmp")), 0o1777);
+            assert_eq!(mode(&dst.join("usr/bin")), 0o755);
+            assert_eq!(mode(&dst.join("usr/bin/nvidia-modprobe")), 0o4755);
+            assert_eq!(
+                std::fs::read_to_string(dst.join("usr/bin/nvidia-modprobe")).unwrap(),
+                "pkg"
+            );
+            assert!(dst.join("var/log/journal/keep").is_file());
+            assert_eq!(
+                std::fs::read_link(dst.join("etc/masked.service")).unwrap(),
+                Path::new("/dev/null"),
+                "a symlink is copied as a symlink"
+            );
+            if preserve {
+                assert_eq!(mode(&dst.join("usr/bin/tool")), 0o750);
+                assert_eq!(mode(&dst.join("etc/new.d")), 0o750);
+            }
+        }
+        for preserve in [true, false] {
+            let cmd = overlay_copy_command("/s", "/d", preserve);
+            assert!(cmd.contains("--owner=0 --group=0 --numeric-owner"), "{cmd}");
+            assert!(cmd.contains("--no-overwrite-dir"), "{cmd}");
+            assert!(!cmd.contains("chown"), "{cmd}");
+        }
+    }
+
+    /// An overlay directory landing on a sysroot symlink (merged-usr
+    /// `lib -> usr/lib`) or a file is refused before anything is written,
+    /// rather than replacing it with a directory.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_copy_refuses_a_directory_over_a_symlink_or_file() {
+        for blocker in ["symlink", "file"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (src, dst) = (tmp.path().join("ov"), tmp.path().join("sysroot"));
+            std::fs::create_dir_all(dst.join("usr/lib")).unwrap();
+            if blocker == "symlink" {
+                std::os::unix::fs::symlink("usr/lib", dst.join("lib")).unwrap();
+            } else {
+                std::fs::write(dst.join("lib"), "x").unwrap();
+            }
+            std::fs::create_dir_all(src.join("lib/firmware")).unwrap();
+            std::fs::write(src.join("lib/firmware/fw.bin"), "x").unwrap();
+            std::fs::write(src.join("first"), "x").unwrap();
+
+            let (ok, err) = run_overlay_copy(&src, &dst, true);
+            assert!(!ok, "{blocker}: accepted");
+            assert!(err.contains("overlay directory 'lib'"), "{blocker}: {err}");
+            assert!(
+                !dst.join("first").exists(),
+                "{blocker}: wrote before refusing"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(dst.join("lib"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                blocker == "symlink"
+            );
+        }
     }
 }
