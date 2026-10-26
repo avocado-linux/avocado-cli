@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **The initramfs build id now reads its own packages and matches across
+  runtimes that share a config.** The derivation ran `rpm -qa` with no
+  `--dbpath`, so rpm read the SDK default database (0 packages), not the
+  initramfs database at `/var/lib/rpm`. Two results followed: the id did not
+  move when a package version changed, and rpm wrote a stray database into the
+  initramfs sysroot. Only runtimes built after the first one shipped that stray
+  file, so two runtimes with the same config got different initramfs images and
+  ids. The query now uses `--dbpath /var/lib/rpm`, the same as the rootfs. Every
+  initramfs build id changes once.
 - **Builds through the avocado-vm on macOS are much faster.** On one ROS 2
   project, `avocado install` went from 23 to 5 minutes. Every syscall in the
   VM is about 7x faster, and reading files from the project about 700x.
