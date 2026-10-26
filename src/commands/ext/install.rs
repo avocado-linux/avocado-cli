@@ -1141,7 +1141,7 @@ impl ExtInstallCommand {
             // sysroot. `seed_runtimes` is non-empty only on the multi-runtime
             // `avocado install` scheduler path, which installs one extension per
             // command, so it always refers to this `ext_name`.
-            if !ext_up_to_date {
+            if should_seed_runtime_sysroots(ext_up_to_date, &self.seed_runtimes) {
                 self.seed_extension_runtime_sysroots(
                     ext_name,
                     container_helper,
@@ -1988,6 +1988,19 @@ $DNF_SDK_HOST \
 /// The script must run with `AVOCADO_RUNTIME` unset so the container entrypoint
 /// leaves `$AVOCADO_EXT_SYSROOTS` and the legacy compat symlink untouched; it
 /// addresses both trees by absolute path instead.
+/// Whether to seed the per-runtime extension sysroots after an install step.
+///
+/// Seed only when the extension was actually (re)installed this run
+/// (`!ext_up_to_date`) and there is at least one runtime to seed. A warm
+/// install that took the fast path must not reseed: that would overwrite files
+/// a prior `build -r <rt>` wrote into the runtime tree with the package-only
+/// source. On a real (re)install the stamp write just above already dropped the
+/// extension's build and image stamps, so `build -r` rebuilds from the
+/// refreshed sysroot.
+fn should_seed_runtime_sysroots(ext_up_to_date: bool, seed_runtimes: &[String]) -> bool {
+    !ext_up_to_date && !seed_runtimes.is_empty()
+}
+
 fn seed_runtime_sysroot_command(extension: &str, runtimes: &[String]) -> String {
     let mut blocks = String::new();
     for rt in runtimes {
@@ -2412,5 +2425,17 @@ mod tests {
         let cmd = seed_runtime_sysroot_command("avocado-ext-dev", &[]);
         assert!(!cmd.contains("cp -a"));
         assert!(!cmd.contains("$AVOCADO_PREFIX/runtimes/"));
+    }
+
+    #[test]
+    fn warm_skipped_install_does_not_reseed() {
+        let runtimes = vec!["alpha".to_string(), "beta".to_string()];
+        // Fresh (re)install with runtimes to seed: seed runs.
+        assert!(should_seed_runtime_sysroots(false, &runtimes));
+        // Warm install that took the fast path: do not reseed, so a prior
+        // `build -r <rt>` output in the runtime tree is left intact.
+        assert!(!should_seed_runtime_sysroots(true, &runtimes));
+        // Single-runtime project (dual-write, no seed targets): never seeds.
+        assert!(!should_seed_runtime_sysroots(false, &[]));
     }
 }

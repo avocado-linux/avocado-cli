@@ -106,7 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -r <rt>' first", even though `avocado build` (all runtimes) passed on the same
   volume. A multi-runtime `install` now seeds each runtime's per-runtime
   extension sysroot from the per-target install, so `build -r` finds a populated
-  tree. A single-runtime project was never affected.
+  tree. A single-runtime project was never affected. The seed runs when an
+  extension is actually installed, so a volume built before this change keeps
+  its empty per-runtime sysroots until the next real install reaches that
+  extension; run `avocado install -f` to seed them in one pass.
 - **Builds through the avocado-vm on macOS are much faster.** On one ROS 2
   project, `avocado install` went from 23 to 5 minutes. Every syscall in the
   VM is about 7x faster, and reading files from the project about 700x.
