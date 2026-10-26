@@ -13,6 +13,21 @@
 //!           speed: "12000000"
 //! ```
 //!
+//! An entry without `src` names a stock overlay the BSP already ships: it is
+//! delivered and selected like any other, and nothing is compiled.
+//!
+//! An extension can also list `boot_config` lines for settings an overlay
+//! source cannot express (a base `dtparam`, a firmware option). The BSP hook
+//! decides how to apply them; see [`collect_boot_config`].
+//!
+//! ```yaml
+//! ext:
+//!   my-board:
+//!     boot_config:
+//!       - dtparam=i2c_arm=on
+//!       - usb_max_current_enable=1
+//! ```
+//!
 //! `name` is authoritative: it is the stone `out` basename
 //! (`overlays/<name>.dtbo`), the RPi `config.txt` `dtoverlay=<name>` argument,
 //! and the u-boot overlay entry. It must therefore be a safe basename. This is
@@ -43,7 +58,9 @@ pub struct DeviceTreeOverlay {
     /// the u-boot entry.
     pub name: String,
     /// Source `.dtso`/`.dts`, relative to the root named by [`Self::src_root`].
-    pub src: String,
+    /// `None` names a stock overlay the BSP already ships: it is delivered and
+    /// selected like any other, but there is nothing to compile.
+    pub src: Option<String>,
     /// Where `src` is resolved from.
     ///
     /// An inline extension has its files in the project tree, bind-mounted
@@ -136,14 +153,167 @@ pub fn collect_for_runtime(
     Ok(out)
 }
 
-/// Names of the active extensions that declare at least one device-tree overlay.
+/// Collect the `boot_config` lines declared by every extension enabled on the
+/// runtime, in declaration order, with repeated lines kept once.
+///
+/// Each entry is a single `key=value` line (for example
+/// `dtparam=i2c_arm=on` or `usb_max_current_enable=1`) that the BSP's delivery
+/// hook writes into the boot configuration. The CLI only checks the shape; what
+/// a line means, and whether this BSP can apply it, is the hook's decision.
+pub fn collect_boot_config(merged_runtime: &Value, parsed: &Value) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+
+    let Some(ext_list) = merged_runtime
+        .get("extensions")
+        .and_then(|e| e.as_sequence())
+    else {
+        return Ok(out);
+    };
+
+    for ext_val in ext_list {
+        let Some(spec) =
+            crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry(ext_val)
+        else {
+            continue;
+        };
+        let ext_name = spec.name.as_str();
+
+        let Some(decls) = parsed
+            .get("extensions")
+            .and_then(|e| e.get(ext_name))
+            .and_then(|e| e.get("boot_config"))
+        else {
+            continue;
+        };
+
+        let seq = decls
+            .as_sequence()
+            .ok_or_else(|| anyhow!("extension '{ext_name}': boot_config must be a list"))?;
+
+        for (idx, entry) in seq.iter().enumerate() {
+            let line = entry.as_str().ok_or_else(|| {
+                anyhow!("extension '{ext_name}': boot_config[{idx}] must be a string")
+            })?;
+            validate_boot_config_line(line, ext_name, idx)?;
+            if !out.iter().any(|l| l == line) {
+                out.push(line.to_string());
+            }
+        }
+    }
+
+    for (key, values) in conflicting_boot_config_keys(&out) {
+        crate::utils::output::print_warning_above(&format!(
+            "boot_config sets '{key}' to conflicting values ({}); the firmware uses the last \
+             one, which follows the order of the runtime's extensions list",
+            values.join(", ")
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Keys the firmware accepts more than once, so repeating one is not a conflict.
+const REPEATABLE_BOOT_CONFIG_KEYS: &[&str] = &["dtparam", "dtoverlay", "gpio"];
+
+/// Keys that appear with more than one distinct value, with the values in
+/// first-seen order. Only the last value takes effect, so the outcome depends
+/// on the order of the runtime's extensions list.
+fn conflicting_boot_config_keys(lines: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if REPEATABLE_BOOT_CONFIG_KEYS.contains(&key) {
+            continue;
+        }
+        match seen.iter_mut().find(|(k, _)| k == key) {
+            Some((_, values)) => {
+                if !values.iter().any(|v| v == value) {
+                    values.push(value.to_string());
+                }
+            }
+            None => seen.push((key.to_string(), vec![value.to_string()])),
+        }
+    }
+    seen.retain(|(_, values)| values.len() > 1);
+    seen
+}
+
+/// A boot config line is written verbatim into a file the firmware parses
+/// line by line, so a stray newline would inject a second setting and stray
+/// whitespace would make the line not match what the BSP looks for.
+fn validate_boot_config_line(line: &str, ext_name: &str, idx: usize) -> Result<()> {
+    if line.chars().any(char::is_control) {
+        bail!(
+            "extension '{ext_name}': boot_config[{idx}] must be a single line with no \
+             control characters"
+        );
+    }
+    if line.trim().is_empty() {
+        bail!("extension '{ext_name}': boot_config[{idx}] must not be empty");
+    }
+    if line != line.trim() {
+        bail!("extension '{ext_name}': boot_config[{idx}] must not start or end with whitespace");
+    }
+    // The key is an identifier, which also rules out a `[gpio4=1]` conditional
+    // filter and a `#x=y` comment: both contain '=' yet are not settings, and a
+    // filter would silently scope every later line to one pin state.
+    let key_ok = line.split_once('=').is_some_and(|(key, _)| {
+        let mut chars = key.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    if !key_ok {
+        bail!("extension '{ext_name}': boot_config[{idx}] must be a key=value line, got '{line}'");
+    }
+    // A dtoverlay line here would bypass the uniqueness check, param rendering
+    // and per-overlay claim that a device_tree_overlays entry gets.
+    if line.starts_with("dtoverlay=") {
+        bail!(
+            "extension '{ext_name}': boot_config[{idx}] selects an overlay with '{line}'; \
+             declare it under device_tree_overlays (omit src for an overlay the BSP ships)"
+        );
+    }
+    Ok(())
+}
+
+/// Names of the active extensions that need the BSP delivery hook: those that
+/// declare at least one device-tree overlay (compiled or stock) or any
+/// `boot_config` line.
 ///
 /// Unlike [`collect_for_runtime`], which scopes to a single runtime's enabled
 /// extensions, this scans the whole active-extension set: the SDK install spans
-/// every runtime, so the overlay build wrapper and delivery hook must be
-/// provisioned whenever any active extension declares overlays. Returns the
-/// declaring extension names sorted; an empty result means the feature is inert.
+/// every runtime, so the delivery hook must be provisioned whenever any active
+/// extension declares one of them. Returns the declaring extension names
+/// sorted; an empty result means the feature is inert.
 pub fn active_extensions_declaring_overlays(
+    parsed: &Value,
+    active_extensions: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let non_empty = |ext: &str, key: &str| {
+        parsed
+            .get("extensions")
+            .and_then(|e| e.get(ext))
+            .and_then(|e| e.get(key))
+            .and_then(|d| d.as_sequence())
+            .is_some_and(|s| !s.is_empty())
+    };
+    let mut out: Vec<String> = active_extensions
+        .iter()
+        .filter(|ext| non_empty(ext, "device_tree_overlays") || non_empty(ext, "boot_config"))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// Names of the active extensions that declare at least one overlay with a
+/// `src`, which is what needs the SDK build wrapper. A stock overlay or a
+/// `boot_config` line compiles nothing, so those alone do not.
+pub fn active_extensions_compiling_overlays(
     parsed: &Value,
     active_extensions: &std::collections::HashSet<String>,
 ) -> Vec<String> {
@@ -155,7 +325,7 @@ pub fn active_extensions_declaring_overlays(
                 .and_then(|e| e.get(ext.as_str()))
                 .and_then(|e| e.get("device_tree_overlays"))
                 .and_then(|d| d.as_sequence())
-                .is_some_and(|s| !s.is_empty())
+                .is_some_and(|s| s.iter().any(|o| o.get("src").is_some_and(|v| !v.is_null())))
         })
         .cloned()
         .collect();
@@ -178,17 +348,25 @@ fn parse_entry(
         .to_string();
     validate_name(&name, ext_name)?;
 
-    let src = entry
-        .get("src")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "extension '{ext_name}': device-tree overlay '{name}' missing a non-empty 'src'"
-            )
-        })?
-        .to_string();
+    // An absent `src` names a stock overlay the BSP already ships, so there is
+    // nothing to compile. A `src` that is present but empty or not a string is
+    // a mistake, and treating it as a stock overlay would hide it.
+    let src = match entry.get("src") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "extension '{ext_name}': device-tree overlay '{name}' has an unusable \
+                         'src': it must be a non-empty string (omit it to name a stock overlay \
+                         the BSP ships)"
+                    )
+                })?
+                .to_string(),
+        ),
+    };
 
     let params = parse_params(entry.get("params"), ext_name, &name)?;
 
@@ -271,7 +449,9 @@ pub const SDK_OVERLAY_PACKAGE: &str = "nativesdk-avocado-dtc-overlay";
 pub const DELIVERY_HOOK_PACKAGE: &str = "avocado-dtc-overlay-deliver";
 
 // In-container guard: fail the build if the hook staged overlays but left any
-// unclaimed (declared and compiled, yet not delivered to the boot medium).
+// unclaimed (declared and compiled, yet not delivered to the boot medium), or
+// left boot_config lines unclaimed. The second check is what makes a hook that
+// predates boot_config fail loudly instead of succeeding while ignoring them.
 const CLAIMED_CHECK_PY: &str = r#"python3 - "$DTBO_STAGING/overlays.manifest.json" <<'AVOCADO_DTO_CHECK_EOF'
 import json, sys
 data = json.load(open(sys.argv[1]))
@@ -280,13 +460,18 @@ if data.get("version") != 1:
 unclaimed = [o.get("name") for o in data.get("overlays", []) if not o.get("claimed_by")]
 if unclaimed:
     sys.exit("[ERROR] device-tree overlays staged but not delivered by the BSP hook: " + ", ".join(unclaimed))
+if data.get("boot_config") and not data.get("boot_config_claimed_by"):
+    sys.exit("[ERROR] boot_config lines staged but not delivered by the BSP hook (this target's hook does not support boot_config): " + ", ".join(data["boot_config"]))
 AVOCADO_DTO_CHECK_EOF
 "#;
 
 /// Build the CLI-authored `overlays.manifest.json`. `claimed_by` starts null;
 /// the BSP hook sets it per overlay it delivers, and the in-container check
-/// then fails on any that stayed null.
-fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
+/// then fails on any that stayed null. `boot_config` follows the same shape
+/// with one claim for the whole list. The manifest stays `version` 1: the new
+/// fields are additive, and an older hook that ignores them leaves the claim
+/// null, which the check turns into a build failure.
+fn build_manifest_json(overlays: &[DeviceTreeOverlay], boot_config: &[String]) -> Result<String> {
     let arr: Vec<serde_json::Value> = overlays
         .iter()
         .map(|o| {
@@ -294,11 +479,17 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
                 "name": o.name,
                 "file": format!("{}.dtbo", o.name),
                 "params": o.params,
+                "stock": o.src.is_none(),
                 "claimed_by": serde_json::Value::Null,
             })
         })
         .collect();
-    let doc = serde_json::json!({ "version": 1, "overlays": arr });
+    let doc = serde_json::json!({
+        "version": 1,
+        "overlays": arr,
+        "boot_config": boot_config,
+        "boot_config_claimed_by": serde_json::Value::Null,
+    });
     Ok(serde_json::to_string_pretty(&doc)?)
 }
 
@@ -311,7 +502,10 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay]) -> Result<String> {
 /// The block assumes `$STONE_MANIFEST` and `$STONE_INCLUDE_FLAGS` are already
 /// set (they are by the time the build reaches the stone step) and leaves
 /// `$STONE_INCLUDE_FLAGS` / `$STONE_OVERLAY_FLAG` updated for the bundle call.
-pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
+pub fn render_build_section(
+    overlays: &[DeviceTreeOverlay],
+    boot_config: &[String],
+) -> Result<String> {
     let mut s = String::new();
 
     // The staging directory describes THIS build, so it is cleared before every
@@ -335,26 +529,47 @@ pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
     );
     s.push_str("rm -rf \"$DTBO_STAGING\"\n");
 
-    if overlays.is_empty() {
+    // boot_config alone still needs the hook: the settings reach the boot
+    // medium only through it, and an early return here would drop them while
+    // the build reported success.
+    if overlays.is_empty() && boot_config.is_empty() {
         return Ok(s);
     }
 
-    let manifest_json = build_manifest_json(overlays)?;
+    let manifest_json = build_manifest_json(overlays, boot_config)?;
     s.push_str("mkdir -p \"$DTBO_STAGING\"\n");
     s.push_str(&format!(
-        "echo -e \"\\033[94m[INFO]\\033[0m Building {} device-tree overlay(s).\"\n",
-        overlays.len()
+        "echo -e \"\\033[94m[INFO]\\033[0m Delivering {} device-tree overlay(s) and {} boot config line(s).\"\n",
+        overlays.len(),
+        boot_config.len()
     ));
 
     // name is a validated basename; src is user config, so double-quote it.
+    // An overlay without a src is a stock overlay the BSP already ships: the
+    // hook delivers and selects it, but there is nothing to compile.
+    // The wrapper is installed by `avocado install` only when an overlay has a
+    // source, and the SDK stamp does not track that, so a project that gained
+    // its first source since the last install would otherwise fail with a bare
+    // "command not found".
+    if overlays.iter().any(|o| o.src.is_some()) {
+        s.push_str("if ! command -v avocado-dtc-overlay >/dev/null 2>&1; then\n");
+        s.push_str(
+            "    echo \"[ERROR] avocado-dtc-overlay is not installed in the SDK; run 'avocado install' to add it.\" >&2\n",
+        );
+        s.push_str("    exit 1\n");
+        s.push_str("fi\n");
+    }
     for o in overlays {
+        let Some(src) = &o.src else {
+            continue;
+        };
         // /opt/src is the project bind-mount; includes/<ext> is where a
         // package-sourced extension unpacks. Getting this wrong fails with
         // "source ... does not exist" on a declaration that is otherwise valid.
         let src_expr = match o.src_root {
-            SrcRoot::Project => format!("/opt/src/{}", o.src),
+            SrcRoot::Project => format!("/opt/src/{src}"),
             SrcRoot::Extension => {
-                format!("$AVOCADO_PREFIX/includes/{}/{}", o.ext_name, o.src)
+                format!("$AVOCADO_PREFIX/includes/{}/{src}", o.ext_name)
             }
         };
         s.push_str(&format!(
@@ -375,7 +590,7 @@ pub fn render_build_section(overlays: &[DeviceTreeOverlay]) -> Result<String> {
     // not a silent skip - otherwise the build succeeds and ships nothing.
     s.push_str("if [ ! -x \"$DTO_HOOK\" ]; then\n");
     s.push_str(
-        "    echo \"[ERROR] device-tree overlays are declared but this target provides no delivery hook.\" >&2\n",
+        "    echo \"[ERROR] device-tree overlays or boot_config lines are declared but this target provides no delivery hook.\" >&2\n",
     );
     s.push_str(
         "    echo \"        Expected an executable at $DTO_HOOK (installed by the BSP layer).\" >&2\n",
@@ -455,7 +670,7 @@ extensions:
             got.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
             vec!["spi-fast", "uart-rts", "gpio-leds"]
         );
-        assert_eq!(got[0].src, "overlays/spi-fast.dtso");
+        assert_eq!(got[0].src.as_deref(), Some("overlays/spi-fast.dtso"));
         assert_eq!(got[0].ext_name, "board-a");
         assert_eq!(got[0].params.get("speed").unwrap(), "12000000");
         assert_eq!(got[0].params.get("cs").unwrap(), "0");
@@ -514,18 +729,50 @@ extensions:
     }
 
     #[test]
-    fn missing_name_or_src_is_error() {
+    fn missing_name_is_error() {
         let no_name = cfg("extensions:\n  a:\n    device_tree_overlays:\n      - src: a.dtso\n");
         assert!(collect_for_runtime(&runtime_with(&["a"]), &no_name)
             .unwrap_err()
             .to_string()
             .contains("missing 'name'"));
+    }
 
-        let no_src = cfg("extensions:\n  a:\n    device_tree_overlays:\n      - name: x\n");
-        assert!(collect_for_runtime(&runtime_with(&["a"]), &no_src)
-            .unwrap_err()
-            .to_string()
-            .contains("'src'"));
+    /// An absent `src` names a stock overlay the BSP ships; a `src` that is
+    /// present but unusable is still a mistake, not a stock overlay.
+    #[test]
+    fn a_present_but_unusable_src_is_error() {
+        for bad in ["\"\"", "\"   \"", "[a]", "{k: v}", "7"] {
+            let parsed = cfg(&format!(
+                "extensions:\n  a:\n    device_tree_overlays:\n      - name: x\n        src: {bad}\n"
+            ));
+            let err = collect_for_runtime(&runtime_with(&["a"]), &parsed)
+                .expect_err(&format!("src {bad} must be rejected"))
+                .to_string();
+            assert!(err.contains("'src'"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_overlay_without_src_is_a_stock_overlay_and_keeps_its_params() {
+        let parsed = cfg(r#"
+extensions:
+  a:
+    device_tree_overlays:
+      - name: disable-bt
+      - name: i2c1
+        params:
+          pins_2_3: true
+      - name: mine
+        src: overlays/mine.dtso
+"#);
+        let got = collect_for_runtime(&runtime_with(&["a"]), &parsed).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].name, "disable-bt");
+        assert_eq!(got[0].src, None);
+        assert!(got[0].params.is_empty());
+        assert_eq!(got[1].src, None);
+        assert_eq!(got[1].params.get("pins_2_3").unwrap(), "true");
+        assert_eq!(got[2].src.as_deref(), Some("overlays/mine.dtso"));
     }
 
     #[test]
@@ -554,7 +801,7 @@ extensions:
     fn overlay(name: &str, src: &str) -> DeviceTreeOverlay {
         DeviceTreeOverlay {
             name: name.to_string(),
-            src: src.to_string(),
+            src: Some(src.to_string()),
             src_root: SrcRoot::Project,
             params: BTreeMap::new(),
             ext_name: "board".to_string(),
@@ -571,7 +818,7 @@ extensions:
     /// overlays.
     #[test]
     fn render_clears_staging_even_with_no_overlays() {
-        let sh = render_build_section(&[]).unwrap();
+        let sh = render_build_section(&[], &[]).unwrap();
 
         assert!(
             sh.contains("rm -rf \"$DTBO_STAGING\""),
@@ -591,10 +838,37 @@ extensions:
     /// overlay dropped from the set does not linger alongside the current ones.
     #[test]
     fn render_clears_staging_before_staging_overlays() {
-        let sh = render_build_section(&[overlay("spi-fast", "overlays/spi-fast.dtso")]).unwrap();
+        let sh =
+            render_build_section(&[overlay("spi-fast", "overlays/spi-fast.dtso")], &[]).unwrap();
         let clear = sh.find("rm -rf \"$DTBO_STAGING\"").expect("clear present");
         let stage = sh.find("avocado-dtc-overlay").expect("stage present");
         assert!(clear < stage, "the clear must precede any staging: {sh}");
+    }
+
+    #[test]
+    fn a_compiled_overlay_guards_on_the_compile_wrapper_being_installed() {
+        let sh = render_build_section(&[overlay("a", "a.dtso")], &[]).unwrap();
+        let guard = sh
+            .find("command -v avocado-dtc-overlay")
+            .expect("a guard for the missing wrapper");
+        let call = sh.find("avocado-dtc-overlay --name").expect("compile call");
+        assert!(
+            guard < call,
+            "guard must run before the first compile: {sh}"
+        );
+        assert!(sh.contains("avocado install"), "{sh}");
+        // Stock overlays and boot_config compile nothing, so need no wrapper.
+        let sh = render_build_section(&[], &["dtparam=spi=on".to_string()]).unwrap();
+        assert!(!sh.contains("command -v avocado-dtc-overlay"), "{sh}");
+    }
+
+    #[test]
+    fn the_missing_hook_error_names_boot_config_too() {
+        let sh = render_build_section(&[], &["dtparam=spi=on".to_string()]).unwrap();
+        assert!(
+            sh.contains("device-tree overlays or boot_config lines are declared"),
+            "{sh}"
+        );
     }
 
     #[test]
@@ -603,7 +877,7 @@ extensions:
             overlay("spi-fast", "overlays/spi-fast.dtso"),
             overlay("uart-rts", "dts/uart.dtso"),
         ];
-        let sh = render_build_section(&overlays).unwrap();
+        let sh = render_build_section(&overlays, &[]).unwrap();
 
         assert!(sh.contains(
             "avocado-dtc-overlay --name \"spi-fast\" --src \"/opt/src/overlays/spi-fast.dtso\" --out \"$DTBO_STAGING/spi-fast.dtbo\""
@@ -627,12 +901,12 @@ extensions:
         params.insert("speed".to_string(), "12000000".to_string());
         let overlays = vec![DeviceTreeOverlay {
             name: "spi".to_string(),
-            src: "a.dtso".to_string(),
+            src: Some("a.dtso".to_string()),
             src_root: SrcRoot::Project,
             params,
             ext_name: "board".to_string(),
         }];
-        let json = build_manifest_json(&overlays).unwrap();
+        let json = build_manifest_json(&overlays, &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["overlays"][0]["name"], "spi");
@@ -727,7 +1001,7 @@ extensions:
         assert_eq!(local.src_root, SrcRoot::Project);
         assert_eq!(pkg.src_root, SrcRoot::Extension);
 
-        let script = render_build_section(&overlays).expect("renders");
+        let script = render_build_section(&overlays, &[]).expect("renders");
         assert!(
             script.contains("--src \"/opt/src/overlays/from-project.dtso\""),
             "a project-tree extension keeps the bind-mount path: {script}"
@@ -749,5 +1023,366 @@ extensions:
         let active: std::collections::HashSet<String> =
             ["a"].iter().map(|s| s.to_string()).collect();
         assert!(active_extensions_declaring_overlays(&parsed, &active).is_empty());
+    }
+
+    fn active(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- boot_config ----
+
+    #[test]
+    fn boot_config_is_collected_in_declaration_order_and_deduplicated() {
+        let parsed = cfg(r#"
+extensions:
+  board-a:
+    boot_config:
+      - dtparam=i2c_arm=on
+      - usb_max_current_enable=1
+  board-b:
+    boot_config:
+      - usb_max_current_enable=1
+      - dtparam=spi=on
+"#);
+        let got = collect_boot_config(&runtime_with(&["board-a", "board-b"]), &parsed).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "dtparam=i2c_arm=on".to_string(),
+                "usb_max_current_enable=1".to_string(),
+                "dtparam=spi=on".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_config_of_a_disabled_extension_does_not_contribute() {
+        let parsed = cfg(r#"
+extensions:
+  on:
+    boot_config:
+      - dtparam=i2c_arm=on
+  off:
+    boot_config:
+      - dtparam=spi=on
+"#);
+        let got = collect_boot_config(&runtime_with(&["on"]), &parsed).unwrap();
+        assert_eq!(got, vec!["dtparam=i2c_arm=on".to_string()]);
+    }
+
+    #[test]
+    fn boot_config_absent_or_empty_collects_nothing() {
+        let none = cfg("extensions:\n  a:\n    packages:\n      - vim\n");
+        assert!(collect_boot_config(&runtime_with(&["a"]), &none)
+            .unwrap()
+            .is_empty());
+        assert!(collect_boot_config(&cfg("{}"), &none).unwrap().is_empty());
+        let empty = cfg("extensions:\n  a:\n    boot_config: []\n");
+        assert!(collect_boot_config(&runtime_with(&["a"]), &empty)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_malformed_boot_config_line_is_rejected_by_name() {
+        // Each is quoted so YAML hands the exact bytes to the validator.
+        let bad = [
+            "\"\"",
+            "\"   \"",
+            "\"dtparam\"",
+            "\"[gpio4=1]\"",
+            "\"#x=y\"",
+            "\"=value\"",
+            "\"9key=1\"",
+            "\"bad key=1\"",
+            "\"dtoverlay=disable-bt\"",
+            "\" dtparam=spi=on\"",
+            "\"dtparam=spi=on \"",
+            "\"dtparam=spi=on\\ndtoverlay=x\"",
+            "\"dtparam=spi=on\\tx\"",
+            "\"dtparam=spi=on\\u0007\"",
+        ];
+        for line in bad {
+            let parsed = cfg(&format!(
+                "extensions:\n  board:\n    boot_config:\n      - {line}\n"
+            ));
+            let err = collect_boot_config(&runtime_with(&["board"]), &parsed)
+                .expect_err(&format!("{line} must be rejected"))
+                .to_string();
+            assert!(
+                err.contains("board") && err.contains("boot_config"),
+                "{line}: the error names the extension and the key: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dtoverlay_in_boot_config_points_at_the_stock_overlay_entry() {
+        let parsed = cfg("extensions:\n  board:\n    boot_config:\n      - dtoverlay=disable-bt\n");
+        let err = collect_boot_config(&runtime_with(&["board"]), &parsed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("device_tree_overlays"),
+            "the error must name the supported way to select a stock overlay: {err}"
+        );
+    }
+
+    #[test]
+    fn conflicting_values_for_one_key_are_reported_but_repeatable_keys_are_not() {
+        let lines: Vec<String> = [
+            "usb_max_current_enable=1",
+            "dtparam=i2c_arm=on",
+            "usb_max_current_enable=0",
+            "dtparam=spi=on",
+            "gpio=4=op",
+            "gpio=5=op",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = conflicting_boot_config_keys(&lines);
+        assert_eq!(
+            got,
+            vec![(
+                "usb_max_current_enable".to_string(),
+                vec!["1".to_string(), "0".to_string()]
+            )]
+        );
+        assert!(conflicting_boot_config_keys(&lines[..2]).is_empty());
+    }
+
+    #[test]
+    fn boot_config_must_be_a_list_of_strings() {
+        for body in [
+            "    boot_config: dtparam=spi=on\n",
+            "    boot_config:\n      - 7\n",
+        ] {
+            let parsed = cfg(&format!("extensions:\n  board:\n{body}"));
+            let err = collect_boot_config(&runtime_with(&["board"]), &parsed)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("boot_config"), "{err}");
+        }
+    }
+
+    // ---- stock overlays and the manifest ----
+
+    fn stock(name: &str) -> DeviceTreeOverlay {
+        DeviceTreeOverlay {
+            name: name.to_string(),
+            src: None,
+            src_root: SrcRoot::Project,
+            params: BTreeMap::new(),
+            ext_name: "board".to_string(),
+        }
+    }
+
+    #[test]
+    fn manifest_marks_stock_overlays_and_carries_boot_config_unclaimed() {
+        let overlays = vec![stock("disable-bt"), overlay("mine", "m.dtso")];
+        let boot = vec!["dtparam=i2c_arm=on".to_string()];
+        let v: serde_json::Value =
+            serde_json::from_str(&build_manifest_json(&overlays, &boot).unwrap()).unwrap();
+
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["overlays"][0]["name"], "disable-bt");
+        assert_eq!(v["overlays"][0]["file"], "disable-bt.dtbo");
+        assert_eq!(v["overlays"][0]["stock"], true);
+        assert_eq!(v["overlays"][1]["stock"], false);
+        assert_eq!(v["boot_config"], serde_json::json!(["dtparam=i2c_arm=on"]));
+        assert!(
+            v["boot_config_claimed_by"].is_null()
+                && v.as_object()
+                    .unwrap()
+                    .contains_key("boot_config_claimed_by"),
+            "the key exists and starts null so the hook has to set it: {v}"
+        );
+    }
+
+    #[test]
+    fn manifest_always_carries_the_boot_config_key_pair() {
+        let v: serde_json::Value =
+            serde_json::from_str(&build_manifest_json(&[overlay("a", "a.dtso")], &[]).unwrap())
+                .unwrap();
+        assert_eq!(v["boot_config"], serde_json::json!([]));
+        assert!(v["boot_config_claimed_by"].is_null());
+        assert!(v
+            .as_object()
+            .unwrap()
+            .contains_key("boot_config_claimed_by"));
+    }
+
+    #[test]
+    fn a_stock_overlay_is_delivered_but_never_compiled() {
+        let sh = render_build_section(&[stock("disable-bt")], &[]).unwrap();
+        assert!(
+            !sh.contains("avocado-dtc-overlay --name"),
+            "a stock overlay has no source to compile: {sh}"
+        );
+        assert!(sh.contains("\"stock\": true"), "{sh}");
+        assert!(sh.contains(DELIVERY_HOOK_RELATIVE), "{sh}");
+    }
+
+    #[test]
+    fn boot_config_alone_still_runs_the_hook_and_wires_stone() {
+        let boot = vec![
+            "dtparam=i2c_arm=on".to_string(),
+            "usb_max_current_enable=1".to_string(),
+        ];
+        let sh = render_build_section(&[], &boot).unwrap();
+
+        assert!(sh.contains("rm -rf \"$DTBO_STAGING\""), "{sh}");
+        assert!(sh.contains("mkdir -p \"$DTBO_STAGING\""), "{sh}");
+        assert!(!sh.contains("avocado-dtc-overlay --name"), "{sh}");
+        assert!(sh.contains("if [ ! -x \"$DTO_HOOK\" ]; then"), "{sh}");
+        assert!(sh.contains(DELIVERY_HOOK_RELATIVE), "{sh}");
+        assert!(sh.contains("\"dtparam=i2c_arm=on\""), "{sh}");
+        assert!(sh.contains("\"usb_max_current_enable=1\""), "{sh}");
+        assert!(sh.contains("-i $DTBO_STAGING"), "{sh}");
+        assert!(
+            sh.contains("STONE_OVERLAY_FLAG=\"--overlay $DTO_FRAGMENT\""),
+            "{sh}"
+        );
+    }
+
+    /// Runs the in-container claim check against a manifest, as the build does.
+    /// Returns None when no python3 is available on the host.
+    fn run_claim_check(manifest: &serde_json::Value) -> Option<(bool, String)> {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("overlays.manifest.json"),
+            serde_json::to_string(manifest).unwrap(),
+        )
+        .unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(CLAIMED_CHECK_PY)
+            .env("DTBO_STAGING", dir.path())
+            .output()
+            .unwrap();
+        Some((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    #[test]
+    fn an_unclaimed_boot_config_fails_the_claim_check() {
+        let Some((ok, stderr)) = run_claim_check(&serde_json::json!({
+            "version": 1,
+            "overlays": [],
+            "boot_config": ["dtparam=i2c_arm=on"],
+            "boot_config_claimed_by": null,
+        })) else {
+            eprintln!("python3 not available, skipping");
+            return;
+        };
+        assert!(
+            !ok,
+            "an older hook that ignores boot_config must fail the build"
+        );
+        assert!(stderr.contains("boot_config"), "{stderr}");
+    }
+
+    #[test]
+    fn a_claimed_boot_config_and_empty_boot_config_pass_the_claim_check() {
+        let claimed = serde_json::json!({
+            "version": 1,
+            "overlays": [],
+            "boot_config": ["dtparam=i2c_arm=on"],
+            "boot_config_claimed_by": "raspberrypi",
+        });
+        let none = serde_json::json!({
+            "version": 1,
+            "overlays": [],
+            "boot_config": [],
+            "boot_config_claimed_by": null,
+        });
+        let legacy = serde_json::json!({ "version": 1, "overlays": [] });
+        for m in [claimed, none, legacy] {
+            let Some((ok, stderr)) = run_claim_check(&m) else {
+                eprintln!("python3 not available, skipping");
+                return;
+            };
+            assert!(ok, "{m}: {stderr}");
+        }
+    }
+
+    #[test]
+    fn an_unclaimed_overlay_still_fails_the_claim_check() {
+        let Some((ok, stderr)) = run_claim_check(&serde_json::json!({
+            "version": 1,
+            "overlays": [{"name": "x", "claimed_by": null}],
+            "boot_config": [],
+            "boot_config_claimed_by": null,
+        })) else {
+            eprintln!("python3 not available, skipping");
+            return;
+        };
+        assert!(!ok);
+        assert!(stderr.contains("x"), "{stderr}");
+    }
+
+    // ---- what the SDK install provisions ----
+
+    #[test]
+    fn the_hook_is_needed_for_boot_config_and_stock_overlays_too() {
+        let parsed = cfg(r#"
+extensions:
+  only-boot:
+    boot_config:
+      - dtparam=i2c_arm=on
+  only-stock:
+    device_tree_overlays:
+      - name: disable-bt
+  nothing:
+    packages:
+      - vim
+"#);
+        assert_eq!(
+            active_extensions_declaring_overlays(
+                &parsed,
+                &active(&["only-boot", "only-stock", "nothing"])
+            ),
+            vec!["only-boot".to_string(), "only-stock".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_compile_wrapper_is_needed_only_for_overlays_with_a_source() {
+        let parsed = cfg(r#"
+extensions:
+  only-boot:
+    boot_config:
+      - dtparam=i2c_arm=on
+  only-stock:
+    device_tree_overlays:
+      - name: disable-bt
+  compiles:
+    device_tree_overlays:
+      - name: mine
+        src: m.dtso
+  mixed:
+    device_tree_overlays:
+      - name: disable-bt2
+      - name: mine2
+        src: m2.dtso
+"#);
+        assert_eq!(
+            active_extensions_compiling_overlays(
+                &parsed,
+                &active(&["only-boot", "only-stock", "compiles", "mixed"])
+            ),
+            vec!["compiles".to_string(), "mixed".to_string()]
+        );
+        assert!(active_extensions_compiling_overlays(&parsed, &active(&[])).is_empty());
     }
 }
