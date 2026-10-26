@@ -1732,6 +1732,9 @@ fi
 "##;
 
 #[cfg(test)]
+// Resolution reads AVOCADO_RELEASEVER through the config, and config.rs's
+// #[serial] tests set it process-wide; unserialized, these raced them.
+#[serial_test::serial]
 mod tests {
     use super::*;
 

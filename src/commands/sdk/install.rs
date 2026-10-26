@@ -146,28 +146,59 @@ parse_install_section() {
     done < "$unit_file"
 }
 
+# The unit file behind a name: an instance (getty@tty1.service) is backed by
+# its template (getty@.service).
+unit_file_name() {
+    case "$1" in
+        *@?*.*) echo "${1%%@*}@.${1##*.}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# The names to enable for a unit. A bare template is never linked itself
+# (systemd would run getty@.service as getty@getty): it becomes the instances
+# a preset rule lists, else its DefaultInstance, else nothing - as systemctl
+# does.
+enable_names() {
+    local unit="$1" unit_file="$2"
+    shift 2
+    case "$unit" in
+        *@.*)
+            local inst instances="$*"
+            [ -n "$instances" ] || instances="$(parse_install_section "$unit_file" "DefaultInstance")"
+            for inst in $instances; do echo "${unit%%@*}@${inst}.${unit##*.}"; done ;;
+        *) echo "$unit" ;;
+    esac
+}
+
 do_enable() {
     local unit="$1"
-    local unit_file="$UNIT_DIR/$unit"
+    shift
+    local file_name
+    file_name="$(unit_file_name "$unit")"
+    local unit_file="$UNIT_DIR/$file_name"
     [ -f "$unit_file" ] || return 0
 
-    # Process WantedBy
-    for target in $(parse_install_section "$unit_file" "WantedBy"); do
-        local wants_dir="$ETC_DIR/${target}.wants"
-        mkdir -p "$wants_dir"
-        ln -sf "/usr/lib/systemd/system/$unit" "$wants_dir/$unit"
-    done
+    local name
+    for name in $(enable_names "$unit" "$unit_file" "$@"); do
+        # Process WantedBy
+        for target in $(parse_install_section "$unit_file" "WantedBy"); do
+            local wants_dir="$ETC_DIR/${target}.wants"
+            mkdir -p "$wants_dir"
+            ln -sf "/usr/lib/systemd/system/$file_name" "$wants_dir/$name"
+        done
 
-    # Process RequiredBy
-    for target in $(parse_install_section "$unit_file" "RequiredBy"); do
-        local requires_dir="$ETC_DIR/${target}.requires"
-        mkdir -p "$requires_dir"
-        ln -sf "/usr/lib/systemd/system/$unit" "$requires_dir/$unit"
+        # Process RequiredBy
+        for target in $(parse_install_section "$unit_file" "RequiredBy"); do
+            local requires_dir="$ETC_DIR/${target}.requires"
+            mkdir -p "$requires_dir"
+            ln -sf "/usr/lib/systemd/system/$file_name" "$requires_dir/$name"
+        done
     done
 
     # Process Alias
     for alias in $(parse_install_section "$unit_file" "Alias"); do
-        ln -sf "/usr/lib/systemd/system/$unit" "$ETC_DIR/$alias"
+        ln -sf "/usr/lib/systemd/system/$file_name" "$ETC_DIR/$alias"
     done
 
     # Process Also (recursive enable)
@@ -178,14 +209,19 @@ do_enable() {
 
 do_disable() {
     local unit="$1"
-    local unit_file="$UNIT_DIR/$unit"
+    local unit_file
+    unit_file="$UNIT_DIR/$(unit_file_name "$unit")"
     [ -f "$unit_file" ] || return 0
 
+    # Disabling a bare template disables every instance of it.
+    local names="$unit"
+    case "$unit" in *@.*) names="$unit ${unit%%@*}@*.${unit##*.}" ;; esac
+    local name
     for target in $(parse_install_section "$unit_file" "WantedBy"); do
-        rm -f "$ETC_DIR/${target}.wants/$unit"
+        for name in $names; do rm -f "$ETC_DIR/${target}.wants/"$name; done
     done
     for target in $(parse_install_section "$unit_file" "RequiredBy"); do
-        rm -f "$ETC_DIR/${target}.requires/$unit"
+        for name in $names; do rm -f "$ETC_DIR/${target}.requires/"$name; done
     done
     for alias in $(parse_install_section "$unit_file" "Alias"); do
         rm -f "$ETC_DIR/$alias"
@@ -225,23 +261,39 @@ load_presets() {
     done
 }
 
+# Prints the matching rule's action, then any instances it lists
+# ("enable getty@.service tty1" -> "enable tty1").
 check_preset() {
     local unit="$1"
     local rules
     rules=$(load_presets)
     while IFS= read -r rule; do
-        local action pattern
+        local action pattern instances
         action="${rule%% *}"
         pattern="${rule#* }"
         pattern="${pattern#"${pattern%%[![:space:]]*}"}"
         [ -z "$pattern" ] && continue
+        instances=""
+        case "$pattern" in *[[:space:]]*) instances="${pattern#*[[:space:]]}"; pattern="${pattern%%[[:space:]]*}" ;; esac
         # fnmatch-style: check if unit matches pattern
         case "$unit" in
-            $pattern) echo "$action"; return ;;
+            $pattern) echo "$action $instances"; return ;;
         esac
     done <<< "$rules"
     # Default: enable
     echo "enable"
+}
+
+apply_preset() {
+    local unit="$1" result action
+    result=$(check_preset "$unit")
+    action="${result%% *}"
+    # shellcheck disable=SC2086
+    if [ "$action" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
+        do_enable "$unit" ${result#"$action"}
+    elif [ "$action" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
+        do_disable "$unit"
+    fi
 }
 
 case "$ACTION" in
@@ -254,25 +306,12 @@ case "$ACTION" in
     unmask)
         for unit in "${UNITS[@]}"; do do_unmask "$unit"; done ;;
     preset)
-        for unit in "${UNITS[@]}"; do
-            result=$(check_preset "$unit")
-            if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
-                do_enable "$unit"
-            elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
-                do_disable "$unit"
-            fi
-        done ;;
+        for unit in "${UNITS[@]}"; do apply_preset "$unit"; done ;;
     preset-all)
         if [ -d "$UNIT_DIR" ]; then
             for unit_file in "$UNIT_DIR"/*.service "$UNIT_DIR"/*.socket "$UNIT_DIR"/*.timer "$UNIT_DIR"/*.path "$UNIT_DIR"/*.target; do
                 [ -f "$unit_file" ] || continue
-                unit="$(basename "$unit_file")"
-                result=$(check_preset "$unit")
-                if [ "$result" = "enable" ] && [ "$PRESET_MODE" != "disable-only" ]; then
-                    do_enable "$unit"
-                elif [ "$result" = "disable" ] && [ "$PRESET_MODE" != "enable-only" ]; then
-                    do_disable "$unit"
-                fi
+                apply_preset "$(basename "$unit_file")"
             done
         fi ;;
 esac
@@ -2428,6 +2467,145 @@ mod tests {
         };
         assert!(enable(true), "rootfs install must enable the unit");
         assert!(!enable(false), "extension install must not enable the unit");
+    }
+
+    /// Run the offline systemctl, once per entry of `runs`, against one sysroot
+    /// holding `units` (name, body) and `presets` (file name, body); returns
+    /// the sysroot's etc/systemd/system tree as sorted "dir/link -> target".
+    #[cfg(unix)]
+    fn offline_systemctl(
+        units: &[(&str, &str)],
+        presets: &[(&str, &str)],
+        runs: &[&[&str]],
+    ) -> Vec<String> {
+        let bin = tempfile::tempdir().unwrap();
+        let systemctl = write_script(bin.path(), "systemctl", SYSTEMCTL_WRAPPER);
+        let root = tempfile::tempdir().unwrap();
+        let unit_dir = root.path().join("usr/lib/systemd/system");
+        let preset_dir = root.path().join("usr/lib/systemd/system-preset");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(&preset_dir).unwrap();
+        for (name, body) in units {
+            std::fs::write(unit_dir.join(name), body).unwrap();
+        }
+        for (name, body) in presets {
+            std::fs::write(preset_dir.join(name), body).unwrap();
+        }
+        for args in runs {
+            let mut cmd = std::process::Command::new(&systemctl);
+            cmd.arg(format!("--root={}", root.path().display()))
+                .args(*args)
+                .env("AVOCADO_SYSROOT_SCRIPTS", "1")
+                .env_remove("AVOCADO_EXT_INSTALLROOT");
+            assert!(run_status(&mut cmd).success());
+        }
+        let etc = root.path().join("etc/systemd/system");
+        let mut links = Vec::new();
+        for dir in std::fs::read_dir(&etc).into_iter().flatten().flatten() {
+            for link in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let target = std::fs::read_link(link.path()).unwrap();
+                links.push(format!(
+                    "{}/{} -> {}",
+                    dir.file_name().to_string_lossy(),
+                    link.file_name().to_string_lossy(),
+                    target.display()
+                ));
+            }
+        }
+        links.sort();
+        links
+    }
+
+    const GETTY: &str = "[Service]\nExecStart=/sbin/agetty %I\n[Install]\nWantedBy=getty.target\nDefaultInstance=tty1\n";
+
+    /// A bare template is never linked itself: systemd runs a wants link named
+    /// getty@.service as getty@getty, which has no tty, so every image with
+    /// OE's "enable getty@.service" preset booted degraded with no console
+    /// login. It enables the preset's instances, else DefaultInstance.
+    #[cfg(unix)]
+    #[test]
+    fn offline_systemctl_enables_template_instances_never_the_template() {
+        let via_default = offline_systemctl(
+            &[("getty@.service", GETTY)],
+            &[("90-systemd.preset", "enable getty@.service\n")],
+            &[&["--preset-mode=enable-only", "preset-all"]],
+        );
+        assert_eq!(
+            via_default,
+            ["getty.target.wants/getty@tty1.service -> /usr/lib/systemd/system/getty@.service"]
+        );
+
+        // An earlier rule's instance list wins over the bare rule after it.
+        let via_preset = offline_systemctl(
+            &[("getty@.service", GETTY)],
+            &[
+                ("89-console.preset", "enable getty@.service tty2 tty3\n"),
+                ("90-systemd.preset", "enable getty@.service\n"),
+            ],
+            &[&["preset-all"]],
+        );
+        assert_eq!(
+            via_preset,
+            [
+                "getty.target.wants/getty@tty2.service -> /usr/lib/systemd/system/getty@.service",
+                "getty.target.wants/getty@tty3.service -> /usr/lib/systemd/system/getty@.service",
+            ]
+        );
+
+        // No instance anywhere: nothing to enable, as systemctl does.
+        let none = offline_systemctl(
+            &[(
+                "x@.service",
+                "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+            )],
+            &[("90-x.preset", "enable x@.service\n")],
+            &[&["preset-all"]],
+        );
+        assert!(none.is_empty(), "{none:?}");
+
+        // An explicit instance is backed by its template's unit file.
+        let instance = offline_systemctl(
+            &[(
+                "serial-getty@.service",
+                "[Service]\nExecStart=/sbin/agetty %I\n[Install]\nWantedBy=getty.target\n",
+            )],
+            &[],
+            &[&["enable", "serial-getty@ttyS0.service"]],
+        );
+        assert_eq!(
+            instance,
+            ["getty.target.wants/serial-getty@ttyS0.service -> /usr/lib/systemd/system/serial-getty@.service"]
+        );
+    }
+
+    /// Disabling a template takes its instances with it; the serial-console
+    /// preset relies on this to keep VT gettys off boards without a VT.
+    #[cfg(unix)]
+    #[test]
+    fn offline_systemctl_disabling_a_template_removes_its_instances() {
+        let presets = [
+            ("89-serial.preset", "disable getty@.service\n"),
+            ("90-systemd.preset", "enable getty@.service\n"),
+        ];
+        let enabled = offline_systemctl(
+            &[("getty@.service", GETTY)],
+            &presets,
+            &[&["enable", "getty@tty1.service", "getty@tty2.service"]],
+        );
+        assert_eq!(enabled.len(), 2, "instances must enable first: {enabled:?}");
+        let links = offline_systemctl(
+            &[("getty@.service", GETTY)],
+            &presets,
+            &[
+                &["enable", "getty@tty1.service", "getty@tty2.service"],
+                &["preset-all"],
+            ],
+        );
+        assert!(links.is_empty(), "{links:?}");
     }
 
     /// A feed rebuilt in place advances avocado-sdk-target, which arrives
