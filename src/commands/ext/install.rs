@@ -774,6 +774,68 @@ impl ExtInstallCommand {
         Ok(())
     }
 
+    /// Drop this extension's per-runtime sysroot copies after a targeted
+    /// reinstall into the shared per-target tree (`ext install <ext>` /
+    /// `install -e <ext>`), so a later `build -r <rt>` fails loudly instead of
+    /// building from a stale copy and shipping the old package (ENG-2691 / B-8).
+    ///
+    /// The multi-runtime `avocado install` scheduler reseeds the per-runtime
+    /// trees itself and so never calls this. The targeted paths do not, so the
+    /// per-runtime copies made by an earlier full install drift from the shared
+    /// tree this reinstall just refreshed. Removing them restores the pre-fix
+    /// loud error ("run 'avocado install -r <rt>' first") for those paths.
+    ///
+    /// The shell guards keep it safe for a single-runtime project, whose one
+    /// runtime sysroot is the install target reached through the legacy compat
+    /// symlink: `[ -d "$src" ]` skips everything when the install did not land
+    /// in the shared tree, and `[ "$src" -ef "$dst" ]` skips a copy that is the
+    /// same directory as that target.
+    #[allow(clippy::too_many_arguments)]
+    async fn invalidate_stale_runtime_sysroots(
+        &self,
+        extension: &str,
+        container_helper: &SdkContainer,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
+        merged_container_args: &Option<Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+        effective_tui_context: &Option<TuiContext>,
+    ) -> Result<()> {
+        let command = invalidate_runtime_sysroot_command(extension);
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            tui_context: effective_tui_context.clone(),
+            // No AVOCADO_RUNTIME, same as the seed: the script addresses both
+            // trees by absolute path and must not flip $AVOCADO_EXT_SYSROOTS or
+            // let the entrypoint rewrite the legacy compat symlink.
+            ..Default::default()
+        };
+
+        let success = run_container_command(container_helper, run_config, runs_on_context).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to drop stale per-runtime sysroots for extension '{extension}'."
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Internal implementation of the install logic
     #[allow(clippy::too_many_arguments)]
     async fn execute_install_internal(
@@ -1131,18 +1193,42 @@ impl ExtInstallCommand {
                 }
             }
 
-            // Multi-runtime install: this extension was just (re)installed into
-            // the per-target tree, so refresh each member runtime's per-runtime
-            // sysroot from it (ENG-2791 / B-8). Gated on `!ext_up_to_date` so a
-            // warm install that skipped the extension does not clobber files a
-            // prior `build -r <rt>` wrote into the runtime tree. On this
-            // (re)install path the stamp write above dropped this extension's
-            // build and image stamps, so `build -r` rebuilds from the refreshed
-            // sysroot. `seed_runtimes` is non-empty only on the multi-runtime
-            // `avocado install` scheduler path, which installs one extension per
-            // command, so it always refers to this `ext_name`.
+            // This extension was just (re)installed into the per-target tree.
+            // Keep each member runtime's per-runtime sysroot consistent with it
+            // (ENG-2791 / B-8), gated on `!ext_up_to_date` so a warm install
+            // that skipped the extension touches nothing. `seed_runtimes` is
+            // non-empty only on the multi-runtime `avocado install` scheduler
+            // path, which installs one extension per command, so it always
+            // refers to this `ext_name`:
+            //
+            //   - Full multi-runtime install (`seed_runtimes` set): seed each
+            //     runtime's sysroot from the refreshed per-target tree. The
+            //     stamp write above dropped this extension's build and image
+            //     stamps, so `build -r` rebuilds from it.
+            //   - Targeted install, `ext install` / `install -e` (no seed
+            //     targets): the per-runtime copies from an earlier full install
+            //     now drift from this refreshed tree, so drop them and let
+            //     `build -r` fail loudly rather than ship the stale copy.
             if should_seed_runtime_sysroots(ext_up_to_date, &self.seed_runtimes) {
                 self.seed_extension_runtime_sysroots(
+                    ext_name,
+                    container_helper,
+                    container_image,
+                    target,
+                    repo_url,
+                    repo_release,
+                    feeds,
+                    merged_container_args,
+                    runs_on_context,
+                    effective_tui_context,
+                )
+                .await?;
+            } else if should_invalidate_stale_runtime_sysroots(ext_up_to_date, &self.seed_runtimes)
+            {
+                // Targeted reinstall (`ext install` / `install -e`): this
+                // refreshed only the shared per-target tree, so drop the stale
+                // per-runtime copies instead of letting `build -r` ship them.
+                self.invalidate_stale_runtime_sysroots(
                     ext_name,
                     container_helper,
                     container_image,
@@ -2001,6 +2087,21 @@ fn should_seed_runtime_sysroots(ext_up_to_date: bool, seed_runtimes: &[String]) 
     !ext_up_to_date && !seed_runtimes.is_empty()
 }
 
+/// Whether to drop stale per-runtime sysroot copies after an install step.
+///
+/// This is the targeted-install counterpart of [`should_seed_runtime_sysroots`]:
+/// it fires when an extension was actually (re)installed (`!ext_up_to_date`) but
+/// there are no seed targets, which is the `ext install <ext>` / `install -e
+/// <ext>` path. A warm fast-path install leaves the trees alone. The two are
+/// mutually exclusive on `seed_runtimes`, so an install either seeds the copies
+/// or invalidates them, never both.
+fn should_invalidate_stale_runtime_sysroots(
+    ext_up_to_date: bool,
+    seed_runtimes: &[String],
+) -> bool {
+    !ext_up_to_date && seed_runtimes.is_empty()
+}
+
 fn seed_runtime_sysroot_command(extension: &str, runtimes: &[String]) -> String {
     let mut blocks = String::new();
     for rt in runtimes {
@@ -2018,6 +2119,37 @@ fn seed_runtime_sysroot_command(extension: &str, runtimes: &[String]) -> String 
     }
     format!(
         "set -e\nsrc=\"$AVOCADO_PREFIX/extensions/{extension}\"\nif [ -d \"$src\" ]; then\n{blocks}fi\n"
+    )
+}
+
+/// Build the in-container shell that drops this extension's stale per-runtime
+/// sysroot copies after a targeted reinstall into the shared per-target tree.
+///
+/// `$src` is the shared per-target tree the targeted install just refreshed.
+/// The loop globs every `runtimes/<rt>/extensions/<ext>` copy and removes the
+/// ones that are a distinct directory, so a later `build -r <rt>` fails the
+/// package-database probe and tells the user to run `install -r <rt>` first,
+/// instead of building from the stale copy.
+///
+/// `[ -d "$src" ]` skips everything when the install did not land in the shared
+/// tree (a single-runtime dual-write installs straight into its one runtime
+/// sysroot), and `[ "$src" -ef "$d" ]` skips a copy that is the same directory
+/// as `$src` through the legacy compat symlink. A glob that matches nothing
+/// leaves `$d` as the literal pattern, which `[ -e "$d" ]` then skips.
+fn invalidate_runtime_sysroot_command(extension: &str) -> String {
+    format!(
+        "set -e\n\
+         src=\"$AVOCADO_PREFIX/extensions/{extension}\"\n\
+         if [ -d \"$src\" ]; then\n\
+         \x20 for d in \"$AVOCADO_PREFIX\"/runtimes/*/extensions/{extension}; do\n\
+         \x20   [ -e \"$d\" ] || continue\n\
+         \x20   if [ \"$src\" -ef \"$d\" ]; then\n\
+         \x20     continue\n\
+         \x20   fi\n\
+         \x20   rm -rf \"$d\"\n\
+         \x20   echo \"[INFO] Dropped stale per-runtime sysroot for extension '{extension}' at $d; run 'avocado install -r <rt>' before 'build -r <rt>'.\"\n\
+         \x20 done\n\
+         fi\n"
     )
 }
 
@@ -2437,5 +2569,44 @@ mod tests {
         assert!(!should_seed_runtime_sysroots(true, &runtimes));
         // Single-runtime project (dual-write, no seed targets): never seeds.
         assert!(!should_seed_runtime_sysroots(false, &[]));
+    }
+
+    #[test]
+    fn invalidate_command_drops_distinct_stale_copies_and_guards_the_target() {
+        let cmd = invalidate_runtime_sysroot_command("avocado-ext-dev");
+        // Reads the shared per-target tree the targeted install just refreshed.
+        assert!(cmd.contains("src=\"$AVOCADO_PREFIX/extensions/avocado-ext-dev\""));
+        // Only acts when that shared tree exists (a single-runtime dual-write
+        // installs elsewhere, so this is a no-op there).
+        assert!(cmd.contains("if [ -d \"$src\" ]; then"));
+        // Globs every per-runtime copy of this extension.
+        assert!(cmd.contains("\"$AVOCADO_PREFIX\"/runtimes/*/extensions/avocado-ext-dev"));
+        // Skips a copy that is the same directory as the target (compat symlink).
+        assert!(cmd.contains("if [ \"$src\" -ef \"$d\" ]; then"));
+        // Removes the distinct stale copies so `build -r` fails loud.
+        assert!(cmd.contains("rm -rf \"$d\""));
+        assert!(cmd.contains("avocado install -r <rt>"));
+        // It drops copies, never writes one.
+        assert!(!cmd.contains("cp -a"));
+    }
+
+    #[test]
+    fn targeted_reinstall_invalidates_but_full_and_warm_do_not() {
+        let runtimes = vec!["alpha".to_string(), "beta".to_string()];
+        // Targeted reinstall (no seed targets, extension reinstalled): invalidate.
+        assert!(should_invalidate_stale_runtime_sysroots(false, &[]));
+        // Full multi-runtime install (seed targets present): seed, do not invalidate.
+        assert!(!should_invalidate_stale_runtime_sysroots(false, &runtimes));
+        // Warm fast-path install: leave the trees alone.
+        assert!(!should_invalidate_stale_runtime_sysroots(true, &[]));
+        // Seed and invalidate are mutually exclusive: never both in one step.
+        for utd in [true, false] {
+            for rts in [&runtimes[..], &[]] {
+                assert!(
+                    !(should_seed_runtime_sysroots(utd, rts)
+                        && should_invalidate_stale_runtime_sysroots(utd, rts))
+                );
+            }
+        }
     }
 }
