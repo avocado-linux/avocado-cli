@@ -805,6 +805,13 @@ impl ExtInstallCommand {
                 let resolved_kernel = lock_file
                     .get_kernel_version_any_scope(target, ext_name)
                     .cloned();
+                // The pin gate judges the scope the installer re-locks, so it
+                // uses that scope's kernel pin (not the any-scope one the stamp
+                // hash above uses): the normal path resolves overrides against
+                // the kernel it pins into `extension_sysroot`. Reading the wrong
+                // scope's kernel could pick the wrong `kernel-<spec>` override.
+                let gate_sysroot = self.extension_sysroot(ext_name);
+                let gate_kernel = lock_file.get_kernel_version(target, &gate_sysroot).cloned();
                 // Fold target/kernel override pins into `packages` exactly as
                 // the normal install path does (`resolve_overrides_in_value` at
                 // the dnf step), so the pin gate below compares the same
@@ -819,7 +826,7 @@ impl ExtInstallCommand {
                             config.resolve_overrides_in_value(
                                 raw.clone(),
                                 target,
-                                resolved_kernel.as_deref(),
+                                gate_kernel.as_deref(),
                                 &format!("extensions.{ext_name}"),
                             )
                         });
@@ -854,9 +861,8 @@ impl ExtInstallCommand {
                             && has_pins
                             && lock_file.extension_exact_pins_match_lock(
                                 target,
-                                &self.extension_sysroot(ext_name),
+                                &gate_sysroot,
                                 resolved_ext.as_ref(),
-                                resolved_kernel.as_deref(),
                             )
                             && stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs)))
                     }

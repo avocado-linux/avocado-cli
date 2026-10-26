@@ -4,7 +4,6 @@
 //! across different sysroots to ensure reproducible builds.
 
 use crate::commands::rootfs::install::is_explicit_version;
-use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::output::{print_info, OutputLevel};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -2029,12 +2028,24 @@ impl LockFile {
     /// uses: a `*`, a glob (`*`/`?`/`[`) or an empty version follows the feed
     /// and never forces a reinstall. An exact pin with no matching lock entry in
     /// this scope also fails the gate, so the normal path records one.
+    ///
+    /// The gate reads the lock by the name exactly as `avocado.yaml` declares
+    /// it, matching what the installer records. Two cases are deliberately left
+    /// out, because gating on them would force a reinstall on every run:
+    /// - A mapping that is a compile dependency (`compile:`) or an extension
+    ///   dependency (string `extensions:`), checked in the same order the
+    ///   installer checks them. Those are never repo pins, so no lock entry is
+    ///   ever written for them, even if override merging left a stray `version:`
+    ///   key alongside.
+    /// - A templated name (`{{ avocado.kernel.version }}`). The installer
+    ///   records the lock under the unresolved name it queries, so a resolved
+    ///   lookup never matches; such a pin can only be judged by an actual
+    ///   install, not this gate.
     pub fn extension_exact_pins_match_lock(
         &self,
         target: &str,
         sysroot: &SysrootType,
         resolved_ext: Option<&serde_yaml::Value>,
-        resolved_kernel: Option<&str>,
     ) -> bool {
         let Some(packages) = resolved_ext
             .and_then(|ext| ext.get("packages"))
@@ -2049,27 +2060,37 @@ impl LockFile {
                 continue;
             };
             // A repo pin is a bare version string, or a `{ version: "..." }`
-            // map. Any other mapping (`compile:`, `extensions:`, ...) is not a
-            // package repo dependency, so it is never pinned against the lock.
+            // map. Mirror the installer's dependency-type checks (ext/install
+            // `install_single_extension`): a `compile:` mapping is SDK-built and
+            // a string `extensions:` mapping is an extension dependency -- both
+            // are skipped before any `version:` is read, so neither is pinned
+            // against the lock.
             let version = match spec {
                 serde_yaml::Value::String(v) => v.as_str(),
-                serde_yaml::Value::Mapping(m) => match m.get("version").and_then(|v| v.as_str()) {
-                    Some(v) => v,
-                    None => continue,
-                },
+                serde_yaml::Value::Mapping(m) => {
+                    if m.contains_key("compile")
+                        || m.get("extensions").and_then(|v| v.as_str()).is_some()
+                    {
+                        continue;
+                    }
+                    match m.get("version").and_then(|v| v.as_str()) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
                 _ => continue,
             };
             // Only exact pins gate -- identical test to the re-lock arm.
             if !is_explicit_version(Some(version)) || version.contains(['*', '?', '[']) {
                 continue;
             }
-            // The lock keys by the kernel-substituted name, as the installer
-            // records it, so resolve the name the same way before the lookup.
-            let resolved_name = match resolved_kernel {
-                Some(kver) => substitute_kernel_version(name, kver),
-                None => name.to_string(),
-            };
-            match self.get_locked_version(target, sysroot, &resolved_name) {
+            // A templated name is recorded in the lock under the unresolved form
+            // the installer queries, so a kernel-substituted lookup would never
+            // match and would reinstall every run. Leave it to the normal path.
+            if name.contains("{{") {
+                continue;
+            }
+            match self.get_locked_version(target, sysroot, name) {
                 Some(locked) if config_pin_matches_locked(version, locked) => {}
                 // Mismatch or no lock entry for an exact pin: refuse the skip.
                 _ => return false,
@@ -3556,7 +3577,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let resolved_ext: serde_yaml::Value =
             serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
 
-        assert!(!lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
+        assert!(!lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext)));
     }
 
     /// An exact pin that still matches the lock lets the fast path skip.
@@ -3571,7 +3592,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let resolved_ext: serde_yaml::Value =
             serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.0\"\n").unwrap();
 
-        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext)));
     }
 
     /// A `*` (follow the feed) pin never gates the skip, even when the lock
@@ -3586,7 +3607,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let resolved_ext: serde_yaml::Value =
             serde_yaml::from_str("packages:\n  alsa-conf: \"*\"\n").unwrap();
 
-        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext)));
     }
 
     /// An exact pin recorded under the runtime scope gates against that scope.
@@ -3603,7 +3624,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let resolved_ext: serde_yaml::Value =
             serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
 
-        assert!(!lock.extension_exact_pins_match_lock(target, &rt_ext, Some(&resolved_ext), None));
+        assert!(!lock.extension_exact_pins_match_lock(target, &rt_ext, Some(&resolved_ext)));
     }
 
     /// The gate judges only the scope the install re-locks, never a sibling
@@ -3628,9 +3649,9 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
 
         // Runtime-scoped install: its own entry matches, so the skip is allowed.
-        assert!(lock.extension_exact_pins_match_lock(target, &runtime, Some(&resolved_ext), None));
+        assert!(lock.extension_exact_pins_match_lock(target, &runtime, Some(&resolved_ext)));
         // Legacy-scoped install: its own entry is stale, so the skip is refused.
-        assert!(!lock.extension_exact_pins_match_lock(target, &legacy, Some(&resolved_ext), None));
+        assert!(!lock.extension_exact_pins_match_lock(target, &legacy, Some(&resolved_ext)));
     }
 
     /// The caller resolves `target-<name>`/`kernel-<spec>` overrides before the
@@ -3656,7 +3677,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             config.resolve_overrides_in_value(raw_overridden, target, None, "extensions.ext-b");
         let mut lock = LockFile::new();
         lock.set_locked_version(target, &ext, "demo-pkg", "2.0-r0.x86_64");
-        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved), None));
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved)));
 
         // A pin that exists only in the override: the base has none, so an
         // unresolved read would never check it. Resolved, its drift is caught.
@@ -3668,7 +3689,51 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             config.resolve_overrides_in_value(raw_override_only, target, None, "extensions.ext-b");
         let mut drifted = LockFile::new();
         drifted.set_locked_version(target, &ext, "demo-pkg", "1.9-r0.x86_64");
-        assert!(!drifted.extension_exact_pins_match_lock(target, &ext, Some(&resolved_only), None));
+        assert!(!drifted.extension_exact_pins_match_lock(target, &ext, Some(&resolved_only)));
+    }
+
+    /// A compile dependency and a string `extensions:` dependency are not repo
+    /// pins -- the installer skips them before reading any `version`, and never
+    /// writes a lock entry for them. The gate must skip them too, even when
+    /// override merging left a stray `version:` alongside, or it would demand a
+    /// lock entry that never exists and reinstall on every run.
+    #[test]
+    fn compile_and_extension_dependencies_never_gate_the_skip() {
+        let target = "qemux86-64";
+        let ext = SysrootType::Extension("ext-b".to_string());
+        // No lock entries exist for either dependency.
+        let lock = LockFile::new();
+
+        // A compile dependency carrying a stray exact `version`.
+        let compile_dep: serde_yaml::Value = serde_yaml::from_str(
+            "packages:\n  tool:\n    compile: build\n    install: run.sh\n    version: \"1.0\"\n",
+        )
+        .unwrap();
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&compile_dep)));
+
+        // An extension dependency carrying a stray exact `version`.
+        let ext_dep: serde_yaml::Value = serde_yaml::from_str(
+            "packages:\n  dep:\n    extensions: other-ext\n    version: \"1.0\"\n",
+        )
+        .unwrap();
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&ext_dep)));
+    }
+
+    /// A templated package name is recorded in the lock under the unresolved
+    /// form the installer queries, so a resolved lookup would never match. The
+    /// gate skips such names rather than forcing a reinstall on every run when a
+    /// sibling package makes `has_pins` true.
+    #[test]
+    fn a_templated_name_never_gates_the_skip() {
+        let target = "qemux86-64";
+        let ext = SysrootType::Extension("ext-b".to_string());
+        // No lock entry under any form of the templated name.
+        let lock = LockFile::new();
+        let templated: serde_yaml::Value = serde_yaml::from_str(
+            "packages:\n  kernel-module-host1x-{{ avocado.kernel.version }}: \"1.0-r0\"\n",
+        )
+        .unwrap();
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&templated)));
     }
 
     /// With no lock entry the yaml decides, as before.
