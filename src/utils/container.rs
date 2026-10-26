@@ -1490,8 +1490,16 @@ fn build_exec_command(
     name: &str,
     env_pairs: &[String],
     command: &str,
+    forward_stdin: bool,
 ) -> Vec<String> {
     let mut cmd = vec![container_tool.to_string(), "exec".to_string()];
+    // The standalone `docker run` this replaces is built with `-i` for a
+    // non-detached run, so a caller piping into `avocado sdk run -- cat` gets
+    // its stdin. `docker exec` drops stdin without `-i`, so restore it here for
+    // the main path. Capture steps read no stdin and pass false.
+    if forward_stdin {
+        cmd.push("-i".to_string());
+    }
     for pair in env_pairs {
         cmd.push("-e".to_string());
         cmd.push(pair.clone());
@@ -1598,15 +1606,17 @@ fn session_containers_enabled() -> bool {
 ///
 /// A detached run (its lifetime is the caller's, not one step's), an interactive
 /// run, a run with no entrypoint (no mount block for the exec to skip), a run
-/// the caller already named, or the `AVOCADO_NO_SESSION_CONTAINER` hatch each
-/// keep their own container.
+/// the caller already named, a run that asks to keep its container (`rm` is
+/// false, so reuse would reap a container the caller wanted to retain), or the
+/// `AVOCADO_NO_SESSION_CONTAINER` hatch each keep their own container.
 fn session_reuse_eligible(
     detach: bool,
     interactive: bool,
     use_entrypoint: bool,
     caller_named: bool,
+    rm: bool,
 ) -> bool {
-    !detach && !interactive && use_entrypoint && !caller_named && session_containers_enabled()
+    rm && !detach && !interactive && use_entrypoint && !caller_named && session_containers_enabled()
 }
 
 /// Split a generated `docker run` argv into the container's shape and the
@@ -2081,6 +2091,7 @@ impl SdkContainer {
             config.interactive,
             config.use_entrypoint,
             config.container_name.is_some(),
+            config.rm,
         );
 
         // For non-detached runs, ensure we have a container name for Ctrl-C handling
@@ -2138,6 +2149,7 @@ impl SdkContainer {
                             &name,
                             &env_pairs,
                             &exec_command,
+                            true,
                         );
                         routed_to_session = true;
                     }
@@ -2872,6 +2884,7 @@ impl SdkContainer {
             effective_config.interactive,
             effective_config.use_entrypoint,
             effective_config.container_name.is_some(),
+            effective_config.rm,
         );
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
@@ -2895,6 +2908,7 @@ impl SdkContainer {
                             &name,
                             &env_pairs,
                             &exec_command,
+                            false,
                         );
                     }
                     Err(e) => {
@@ -5649,6 +5663,7 @@ extensions:
     }
 
     #[test]
+    #[serial_test::serial]
     fn session_key_shares_by_shape_and_the_hatch_stops_sharing() {
         let a = vec![
             "-v".to_string(),
@@ -5677,28 +5692,41 @@ extensions:
     }
 
     #[test]
+    #[serial_test::serial]
     fn session_reuse_eligible_reads_the_callers_request() {
         // The normal non-detached, unnamed build step is eligible. This is the
         // case run_in_container generates an `avocado-run-<uuid>` name for, and
         // reading that generated name back (instead of the caller's) is what
         // made the main-step session path dead code (B-10 / ENG-2793).
-        assert!(session_reuse_eligible(false, false, true, false));
+        assert!(session_reuse_eligible(false, false, true, false, true));
 
         // A detached run, an interactive run, a run with no entrypoint (no
-        // mount block to skip), or a run the caller already named each keep
-        // their own container.
-        assert!(!session_reuse_eligible(true, false, true, false));
-        assert!(!session_reuse_eligible(false, true, true, false));
-        assert!(!session_reuse_eligible(false, false, false, false));
-        assert!(!session_reuse_eligible(false, false, true, true));
+        // mount block to skip), a run the caller already named, or a run that
+        // asks to keep its container (rm == false, which reuse would reap) each
+        // keep their own container.
+        assert!(!session_reuse_eligible(true, false, true, false, true));
+        assert!(!session_reuse_eligible(false, true, true, false, true));
+        assert!(!session_reuse_eligible(false, false, false, false, true));
+        assert!(!session_reuse_eligible(false, false, true, true, true));
+        assert!(!session_reuse_eligible(false, false, true, false, false));
 
         // The escape hatch forces the otherwise-eligible case back to its own
         // `docker run`. Set around the assertion only, as the hatch is read per
         // call.
         std::env::set_var("AVOCADO_NO_SESSION_CONTAINER", "1");
-        let disabled = session_reuse_eligible(false, false, true, false);
+        let disabled = session_reuse_eligible(false, false, true, false, true);
         std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
         assert!(!disabled, "the hatch must force a standalone run");
+    }
+
+    #[test]
+    fn build_exec_command_forwards_stdin_only_when_asked() {
+        // The main path replaces a `docker run -i`, so its exec must keep `-i`
+        // for piped stdin; capture steps read no stdin and must not add it.
+        let with = build_exec_command("docker", "sess", &[], "true", true);
+        assert!(with.iter().any(|a| a == "-i"), "{with:?}");
+        let without = build_exec_command("docker", "sess", &[], "true", false);
+        assert!(!without.iter().any(|a| a == "-i"), "{without:?}");
     }
 
     #[test]
@@ -6095,7 +6123,7 @@ extensions:
         // guard and nothing from the first step.
         let (shape2, pairs2) = step(&HashMap::new());
         assert_eq!(shape1, shape2);
-        let exec = build_exec_command("docker", "sess", &pairs2, "true");
+        let exec = build_exec_command("docker", "sess", &pairs2, "true", false);
         assert!(exec.iter().any(|a| a == guard), "{exec:?}");
     }
 
