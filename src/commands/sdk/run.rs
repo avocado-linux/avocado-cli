@@ -30,17 +30,28 @@ fn join_argv(argv: &[String]) -> String {
 /// Validate an explicit `-r/--runtime` against the composed config.
 ///
 /// A typo'd runtime name otherwise falls through to an unsigned run that still
-/// exits 0. The check is skipped when no runtimes are defined, because a
-/// zero-runtime project resolves a synthesized `default` that the composed
-/// loader does not inject into `config.runtimes` (ENG-2352).
+/// exits 0 (ENG-2352). When no runtimes are defined, the only runtime that can
+/// exist is the implicit `default` that the composed loader synthesizes but does
+/// not inject into `config.runtimes`, so accept that name and reject any other.
 fn validate_runtime_arg(
     runtime: Option<&str>,
     runtimes: Option<&std::collections::HashMap<String, crate::utils::config::RuntimeConfig>>,
 ) -> Result<()> {
-    let Some((runtime_name, map)) = runtime.zip(runtimes) else {
+    let Some(runtime_name) = runtime else {
         return Ok(());
     };
-    if map.is_empty() || map.contains_key(runtime_name) {
+
+    let Some(map) = runtimes.filter(|m| !m.is_empty()) else {
+        // No runtimes defined: only the implicit `default` is valid.
+        if runtime_name == "default" {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!(
+            "Runtime '{runtime_name}' not found in configuration. No runtimes are defined; only the implicit 'default' runtime is available."
+        ));
+    };
+
+    if map.contains_key(runtime_name) {
         return Ok(());
     }
     let mut available: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
@@ -509,10 +520,13 @@ mod tests {
         assert!(validate_runtime_arg(Some("prod"), Some(&runtimes)).is_ok());
         // No -r passes.
         assert!(validate_runtime_arg(None, Some(&runtimes)).is_ok());
-        // No runtimes defined: skip the check so a synthesized `default` is fine.
+        // No runtimes defined: the synthesized `default` is accepted, but any
+        // other name is still rejected, with both an absent and an empty map.
         assert!(validate_runtime_arg(Some("default"), None).is_ok());
+        assert!(validate_runtime_arg(Some("bogus"), None).is_err());
         let empty = std::collections::HashMap::new();
         assert!(validate_runtime_arg(Some("default"), Some(&empty)).is_ok());
+        assert!(validate_runtime_arg(Some("bogus"), Some(&empty)).is_err());
     }
 
     /// `sdk run` used to read the legacy `sdk.repo_release` only, so the
