@@ -836,6 +836,53 @@ impl ExtInstallCommand {
         Ok(())
     }
 
+    /// Remove this extension's install stamp so the next plain install redoes
+    /// the install. Used on the failure path of the per-runtime sync, where the
+    /// stamp has already been written but the sync that follows it did not
+    /// finish (ENG-2791 / B-8 review).
+    #[allow(clippy::too_many_arguments)]
+    async fn drop_install_stamp(
+        &self,
+        extension: &str,
+        container_helper: &SdkContainer,
+        container_image: &str,
+        target: &str,
+        repo_url: Option<&String>,
+        repo_release: Option<&String>,
+        feeds: Option<&crate::utils::feeds::FeedMaterialization>,
+        merged_container_args: &Option<Vec<String>>,
+        runs_on_context: Option<&RunsOnContext>,
+        effective_tui_context: &Option<TuiContext>,
+    ) -> Result<()> {
+        let command = drop_install_stamp_script(extension);
+
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command,
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: repo_url.cloned(),
+            feeds: feeds.cloned(),
+            repo_release: repo_release.cloned(),
+            container_args: merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            tui_context: effective_tui_context.clone(),
+            ..Default::default()
+        };
+
+        let success = run_container_command(container_helper, run_config, runs_on_context).await?;
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Failed to drop the install stamp for extension '{extension}'."
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Internal implementation of the install logic
     #[allow(clippy::too_many_arguments)]
     async fn execute_install_internal(
@@ -1209,7 +1256,7 @@ impl ExtInstallCommand {
             //     targets): the per-runtime copies from an earlier full install
             //     now drift from this refreshed tree, so drop them and let
             //     `build -r` fail loudly rather than ship the stale copy.
-            if should_seed_runtime_sysroots(ext_up_to_date, &self.seed_runtimes) {
+            let sync_result = if should_seed_runtime_sysroots(ext_up_to_date, &self.seed_runtimes) {
                 self.seed_extension_runtime_sysroots(
                     ext_name,
                     container_helper,
@@ -1222,7 +1269,7 @@ impl ExtInstallCommand {
                     runs_on_context,
                     effective_tui_context,
                 )
-                .await?;
+                .await
             } else if should_invalidate_stale_runtime_sysroots(ext_up_to_date, &self.seed_runtimes)
             {
                 // Targeted reinstall (`ext install` / `install -e`): this
@@ -1240,7 +1287,46 @@ impl ExtInstallCommand {
                     runs_on_context,
                     effective_tui_context,
                 )
-                .await?;
+                .await
+            } else {
+                Ok(())
+            };
+
+            if let Err(err) = sync_result {
+                // The install stamp was written just above, before this runtime
+                // sync ran. If the sync failed, a current stamp now sits next to
+                // half-synced runtime trees, so the next plain install would
+                // fast-path over them and never repair them. Drop the stamp so
+                // the next install redoes the install and this sync. The install
+                // is failing regardless, so losing the stamp only forces the
+                // rerun the user must do anyway.
+                if !self.no_stamps && !ext_up_to_date {
+                    if let Err(drop_err) = self
+                        .drop_install_stamp(
+                            ext_name,
+                            container_helper,
+                            container_image,
+                            target,
+                            repo_url,
+                            repo_release,
+                            feeds,
+                            merged_container_args,
+                            runs_on_context,
+                            effective_tui_context,
+                        )
+                        .await
+                    {
+                        print_warning(
+                            &format!(
+                                "Could not drop the install stamp for extension '{ext_name}' after \
+                                 a failed runtime sync ({drop_err}); the next install may skip it. \
+                                 Run 'avocado install -f' before retrying."
+                            ),
+                            OutputLevel::Normal,
+                        );
+                    }
+                }
+                return Err(err);
             }
         }
 
@@ -2153,6 +2239,15 @@ fn invalidate_runtime_sysroot_command(extension: &str) -> String {
     )
 }
 
+/// One `rm -f` for this extension's install stamp. Dropping it makes the next
+/// plain install treat the extension as not up to date, so it reinstalls and
+/// reruns the per-runtime sync that failed last time.
+fn drop_install_stamp_script(extension: &str) -> String {
+    crate::utils::stamps::remove_own_stamp_line(
+        &crate::utils::stamps::StampRequirement::ext_install(extension),
+    )
+}
+
 /// Helper function to run a container command, using shared context if available
 async fn run_container_command(
     container_helper: &SdkContainer,
@@ -2588,6 +2683,16 @@ mod tests {
         assert!(cmd.contains("avocado install -r <rt>"));
         // It drops copies, never writes one.
         assert!(!cmd.contains("cp -a"));
+    }
+
+    #[test]
+    fn drop_install_stamp_script_removes_this_extensions_install_stamp() {
+        let script = drop_install_stamp_script("avocado-ext-dev");
+        assert!(script.contains("rm -f"), "must remove a stamp");
+        assert!(
+            script.contains("ext/avocado-ext-dev/install.stamp"),
+            "must target this extension's install stamp, got: {script}"
+        );
     }
 
     #[test]
