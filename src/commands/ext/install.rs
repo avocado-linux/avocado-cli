@@ -805,6 +805,24 @@ impl ExtInstallCommand {
                 let resolved_kernel = lock_file
                     .get_kernel_version_any_scope(target, ext_name)
                     .cloned();
+                // Fold target/kernel override pins into `packages` exactly as
+                // the normal install path does (`resolve_overrides_in_value` at
+                // the dnf step), so the pin gate below compares the same
+                // effective pins the installer would lock -- not the unresolved
+                // base pins, which would reject a correctly locked override or
+                // skip an override-only pin.
+                let resolved_ext =
+                    parsed
+                        .get("extensions")
+                        .and_then(|e| e.get(ext_name))
+                        .map(|raw| {
+                            config.resolve_overrides_in_value(
+                                raw.clone(),
+                                target,
+                                resolved_kernel.as_deref(),
+                                &format!("extensions.{ext_name}"),
+                            )
+                        });
                 match compute_ext_install_input_hash_with_deps(
                     parsed,
                     ext_name,
@@ -829,14 +847,15 @@ impl ExtInstallCommand {
                         // which re-locks it. The skip leaves the lock untouched,
                         // so the re-lock arm in `build_package_spec_with_lock`
                         // would otherwise never run and the stale entry would
-                        // persist on every later install. Read across scopes,
-                        // matching `has_pins` and the kernel read above.
+                        // persist on every later install. Judged against the
+                        // same scope (`extension_sysroot`) and override-resolved
+                        // pins the normal path re-locks.
                         sysroot_present
                             && has_pins
                             && lock_file.extension_exact_pins_match_lock(
                                 target,
-                                ext_name,
-                                parsed,
+                                &self.extension_sysroot(ext_name),
+                                resolved_ext.as_ref(),
                                 resolved_kernel.as_deref(),
                             )
                             && stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs)))

@@ -2000,8 +2000,9 @@ impl LockFile {
         tl.extensions.get(ext_name).map(|e| &e.packages)
     }
 
-    /// Whether every EXACT package pin declared for `ext_name` in `avocado.yaml`
-    /// matches the version the lock holds for it.
+    /// Whether every EXACT package pin declared for an extension in
+    /// `avocado.yaml` matches the version the lock holds for it, in the scope
+    /// the installer records.
     ///
     /// The ext-install fast path calls this to decide whether its "up to date"
     /// skip is safe. The skip leaves the lock untouched, so it must not run
@@ -2010,31 +2011,38 @@ impl LockFile {
     /// never get the chance to correct it. When this returns false the fast
     /// path reinstalls, which re-locks to the yaml pin.
     ///
+    /// The caller passes the exact same inputs the normal install path uses, so
+    /// the gate judges the entry that path would re-lock:
+    /// - `sysroot` is `extension_sysroot(ext)` -- runtime-scoped when a runtime
+    ///   is set, legacy otherwise. The lock read is scope-specific
+    ///   ([`Self::get_locked_version`]), not any-scope: a sibling legacy or
+    ///   other-runtime entry must not stand in for the scope being installed, or
+    ///   a stale sibling would force a reinstall every time while a matching
+    ///   sibling would hide real drift in the install scope.
+    /// - `resolved_ext` is the extension node after
+    ///   [`Config::resolve_overrides_in_value`](crate::utils::config::Config::resolve_overrides_in_value),
+    ///   so target/kernel override pins are already folded into `packages`. The
+    ///   gate reads that node's `packages`, matching the effective pins the
+    ///   installer locks instead of the unresolved base pins.
+    ///
     /// Only exact pins gate, mirroring the `exact_pin` test the re-lock arm
     /// uses: a `*`, a glob (`*`/`?`/`[`) or an empty version follows the feed
-    /// and never forces a reinstall. The locked version is read across scopes
-    /// the same way [`Self::get_extension_packages_any_scope`] and the fast
-    /// path's `has_pins`/kernel reads are, so the skip decision and those
-    /// readers agree. An exact pin with no matching lock entry also fails the
-    /// gate, so the normal path records one.
+    /// and never forces a reinstall. An exact pin with no matching lock entry in
+    /// this scope also fails the gate, so the normal path records one.
     pub fn extension_exact_pins_match_lock(
         &self,
         target: &str,
-        ext_name: &str,
-        config: &serde_yaml::Value,
+        sysroot: &SysrootType,
+        resolved_ext: Option<&serde_yaml::Value>,
         resolved_kernel: Option<&str>,
     ) -> bool {
-        let Some(packages) = config
-            .get("extensions")
-            .and_then(|e| e.get(ext_name))
+        let Some(packages) = resolved_ext
             .and_then(|ext| ext.get("packages"))
             .and_then(|p| p.as_mapping())
         else {
             // No declared packages: nothing to gate on.
             return true;
         };
-
-        let locked = self.get_extension_packages_any_scope(target, ext_name);
 
         for (name_val, spec) in packages {
             let Some(name) = name_val.as_str() else {
@@ -2061,8 +2069,8 @@ impl LockFile {
                 Some(kver) => substitute_kernel_version(name, kver),
                 None => name.to_string(),
             };
-            match locked.and_then(|pkgs| pkgs.get(&resolved_name)) {
-                Some(locked_pkg) if config_pin_matches_locked(version, &locked_pkg.version) => {}
+            match self.get_locked_version(target, sysroot, &resolved_name) {
+                Some(locked) if config_pin_matches_locked(version, locked) => {}
                 // Mismatch or no lock entry for an exact pin: refuse the skip.
                 _ => return false,
             }
@@ -3545,12 +3553,10 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let ext = SysrootType::Extension("ext-b".to_string());
         lock.set_locked_version(target, &ext, "alsa-conf", "1.2.15.3-r0.0.x86_64");
 
-        let config: serde_yaml::Value = serde_yaml::from_str(
-            "extensions:\n  ext-b:\n    packages:\n      alsa-conf: \"1.2.15.3-r0.1\"\n",
-        )
-        .unwrap();
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
 
-        assert!(!lock.extension_exact_pins_match_lock(target, "ext-b", &config, None));
+        assert!(!lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
     }
 
     /// An exact pin that still matches the lock lets the fast path skip.
@@ -3562,12 +3568,10 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         lock.set_locked_version(target, &ext, "alsa-conf", "1.2.15.3-r0.0.x86_64");
 
         // The lock stores VERSION-RELEASE.ARCH; the bare VERSION-RELEASE pin matches.
-        let config: serde_yaml::Value = serde_yaml::from_str(
-            "extensions:\n  ext-b:\n    packages:\n      alsa-conf: \"1.2.15.3-r0.0\"\n",
-        )
-        .unwrap();
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.0\"\n").unwrap();
 
-        assert!(lock.extension_exact_pins_match_lock(target, "ext-b", &config, None));
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
     }
 
     /// A `*` (follow the feed) pin never gates the skip, even when the lock
@@ -3579,15 +3583,13 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         let ext = SysrootType::Extension("ext-b".to_string());
         lock.set_locked_version(target, &ext, "alsa-conf", "1.2.15.3-r0.0.x86_64");
 
-        let config: serde_yaml::Value =
-            serde_yaml::from_str("extensions:\n  ext-b:\n    packages:\n      alsa-conf: \"*\"\n")
-                .unwrap();
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"*\"\n").unwrap();
 
-        assert!(lock.extension_exact_pins_match_lock(target, "ext-b", &config, None));
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved_ext), None));
     }
 
-    /// A runtime-scoped lock entry is read the same way `has_pins` reads it, so
-    /// an exact pin recorded only under a runtime still gates correctly.
+    /// An exact pin recorded under the runtime scope gates against that scope.
     #[test]
     fn a_runtime_scoped_mismatch_fails_the_fast_path_gate() {
         let mut lock = LockFile::new();
@@ -3598,12 +3600,75 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         };
         lock.set_locked_version(target, &rt_ext, "alsa-conf", "1.2.15.3-r0.0.x86_64");
 
-        let config: serde_yaml::Value = serde_yaml::from_str(
-            "extensions:\n  ext-b:\n    packages:\n      alsa-conf: \"1.2.15.3-r0.1\"\n",
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
+
+        assert!(!lock.extension_exact_pins_match_lock(target, &rt_ext, Some(&resolved_ext), None));
+    }
+
+    /// The gate judges only the scope the install re-locks, never a sibling
+    /// scope. With a stale legacy entry and a correct runtime entry for the
+    /// same extension, a runtime-scoped install must see its own (matching)
+    /// entry and skip, and a legacy-scoped install must not be fooled by the
+    /// runtime entry. An any-scope read (legacy-first) would get both wrong.
+    #[test]
+    fn the_gate_reads_only_the_install_scope_not_a_sibling_scope() {
+        let mut lock = LockFile::new();
+        let target = "qemux86-64";
+        let legacy = SysrootType::Extension("ext-b".to_string());
+        let runtime = SysrootType::RuntimeExtension {
+            runtime: "dev".to_string(),
+            extension: "ext-b".to_string(),
+        };
+        // Stale legacy entry, correct runtime entry.
+        lock.set_locked_version(target, &legacy, "alsa-conf", "1.2.15.3-r0.0.x86_64");
+        lock.set_locked_version(target, &runtime, "alsa-conf", "1.2.15.3-r0.1.x86_64");
+
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
+
+        // Runtime-scoped install: its own entry matches, so the skip is allowed.
+        assert!(lock.extension_exact_pins_match_lock(target, &runtime, Some(&resolved_ext), None));
+        // Legacy-scoped install: its own entry is stale, so the skip is refused.
+        assert!(!lock.extension_exact_pins_match_lock(target, &legacy, Some(&resolved_ext), None));
+    }
+
+    /// The caller resolves `target-<name>`/`kernel-<spec>` overrides before the
+    /// gate compares, so a base pin overridden for the target is judged by the
+    /// override value the installer actually locks -- a correctly locked
+    /// override passes, and an override-only pin that drifted is still caught.
+    #[test]
+    fn override_resolved_pins_are_what_the_gate_compares() {
+        use crate::utils::config::Config;
+        let target = "qemux86-64";
+        let ext = SysrootType::Extension("ext-b".to_string());
+        let config =
+            Config::load_from_yaml_str("supported_targets:\n  - qemux86-64\nextensions: {}\n")
+                .unwrap();
+
+        // Base pins 1.0; the target override bumps it to 2.0, which is what the
+        // installer locks. The unresolved base pin would have mismatched 2.0.
+        let raw_overridden: serde_yaml::Value = serde_yaml::from_str(
+            "packages:\n  demo-pkg: \"1.0\"\ntarget-qemux86-64:\n  packages:\n    demo-pkg: \"2.0\"\n",
         )
         .unwrap();
+        let resolved =
+            config.resolve_overrides_in_value(raw_overridden, target, None, "extensions.ext-b");
+        let mut lock = LockFile::new();
+        lock.set_locked_version(target, &ext, "demo-pkg", "2.0-r0.x86_64");
+        assert!(lock.extension_exact_pins_match_lock(target, &ext, Some(&resolved), None));
 
-        assert!(!lock.extension_exact_pins_match_lock(target, "ext-b", &config, None));
+        // A pin that exists only in the override: the base has none, so an
+        // unresolved read would never check it. Resolved, its drift is caught.
+        let raw_override_only: serde_yaml::Value = serde_yaml::from_str(
+            "packages: {}\ntarget-qemux86-64:\n  packages:\n    demo-pkg: \"2.0\"\n",
+        )
+        .unwrap();
+        let resolved_only =
+            config.resolve_overrides_in_value(raw_override_only, target, None, "extensions.ext-b");
+        let mut drifted = LockFile::new();
+        drifted.set_locked_version(target, &ext, "demo-pkg", "1.9-r0.x86_64");
+        assert!(!drifted.extension_exact_pins_match_lock(target, &ext, Some(&resolved_only), None));
     }
 
     /// With no lock entry the yaml decides, as before.
