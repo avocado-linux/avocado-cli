@@ -48,6 +48,37 @@ fn ext_install_edges(
         .collect()
 }
 
+/// Map each extension to the runtimes that should seed their per-runtime
+/// extension sysroot from it on a multi-runtime install (ENG-2691 / B-8).
+///
+/// On a multi-runtime project each ext installs into the per-target tree only,
+/// so a later `build -r <rt>` would find an empty per-runtime sysroot and fail
+/// the package-database probe. The returned map tells the ext install which
+/// runtime trees to seed. Membership follows the same `depends_on` closure that
+/// `build -r <rt>` resolves, so a dependency pulled in by a runtime is seeded
+/// into that runtime too.
+///
+/// Returns an empty map for a single-runtime project, which dual-writes into
+/// its one runtime sysroot directly and needs no seeding.
+fn ext_seed_runtime_map(
+    composed: &ComposedConfig,
+    target_runtimes: &[String],
+    target: &str,
+    config_path: &str,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    if target_runtimes.len() <= 1 {
+        return Ok(map);
+    }
+    for rt in target_runtimes {
+        let members = crate::utils::ext_deps::runtime_members(composed, rt, target, config_path)?;
+        for ext in members {
+            map.entry(ext).or_default().push(rt.clone());
+        }
+    }
+    Ok(map)
+}
+
 /// Represents an extension dependency
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExtensionDependency {
@@ -413,14 +444,28 @@ impl InstallCommand {
             let composed2 = Arc::clone(&composed);
             let renderer2 = renderer.clone();
             // Phase 2d.3 dual-write: when the project has exactly one target-relevant
-            // runtime, ext installs can mirror their lockfile state under
-            // `runtimes.<r>.extensions.<ext>`. Multi-runtime projects skip the mirror
-            // for now (per-extension membership lookup lands in a follow-up commit).
+            // runtime, ext installs mirror their lockfile state under
+            // `runtimes.<r>.extensions.<ext>` and install straight into that
+            // runtime's per-runtime sysroot. Multi-runtime projects install into
+            // the per-target tree and seed each runtime's per-runtime sysroot from
+            // it afterward (see `ext_seed_runtimes` below), so a later
+            // `build -r <rt>` finds a populated tree.
             let dual_write_runtime = if target_runtimes.len() == 1 {
                 target_runtimes.first().cloned()
             } else {
                 None
             };
+
+            // Multi-runtime install: `dual_write_runtime` is `None`, so each ext
+            // installs into the per-target tree only. Map each extension to the
+            // runtimes that list it (the `depends_on` closure, matching what
+            // `build -r` resolves) so the ext install can seed each runtime's
+            // per-runtime sysroot from that per-target tree. Without it, a later
+            // `build -r <rt>` fails the package-database probe (ENG-2691 / B-8).
+            // Empty for a single-runtime project, which dual-writes instead.
+            let ext_seed_runtimes: Arc<HashMap<String, Vec<String>>> = Arc::new(
+                ext_seed_runtime_map(&composed, &target_runtimes, &_target, &self.config_path)?,
+            );
 
             let sched_renderer = renderer
                 .clone()
@@ -438,6 +483,7 @@ impl InstallCommand {
                     let composed = Arc::clone(&composed2);
                     let renderer = renderer2.clone();
                     let dual_write_runtime = dual_write_runtime.clone();
+                    let ext_seed_runtimes = Arc::clone(&ext_seed_runtimes);
 
                     Box::pin(async move {
                         let tui_ctx = renderer.as_ref().map(|r| TuiContext {
@@ -461,6 +507,9 @@ impl InstallCommand {
                                 .with_sdk_arch(sdk_arch)
                                 .with_composed_config(composed)
                                 .with_runtime(dual_write_runtime)
+                                .with_seed_runtimes(
+                                    ext_seed_runtimes.get(name).cloned().unwrap_or_default(),
+                                )
                                 // The DAG above scheduled every dependency as
                                 // its own task, ordered ahead of this one.
                                 .with_deps_scheduled(true);
@@ -850,6 +899,103 @@ fn scope_label(scope: &PackageScope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The multi-runtime install must hand each extension the runtimes whose
+    /// per-runtime sysroot it has to seed, including extensions reached only
+    /// through `depends_on`. Without this map the `.with_seed_runtimes(..)`
+    /// wiring seeds nothing and a later `build -r <rt>` fails the
+    /// package-database probe (ENG-2691 / B-8). A test that only checked the
+    /// seed shell script would still pass with the map wired to an empty vec.
+    #[test]
+    fn multi_runtime_install_maps_each_extension_to_its_runtimes() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  alpha:
+    target-qemux86-64:
+      extensions:
+        - common
+        - app-a
+  beta:
+    target-qemux86-64:
+      extensions:
+        - common
+        - app-b
+extensions:
+  common:
+    version: "1.0.0"
+    packages: { a: '*' }
+  app-a:
+    version: "1.0.0"
+    packages: { b: '*' }
+  app-b:
+    version: "1.0.0"
+    depends_on:
+      - lib
+    packages: { c: '*' }
+  lib:
+    version: "1.0.0"
+    packages: { d: '*' }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let runtimes = vec!["alpha".to_string(), "beta".to_string()];
+        let map =
+            ext_seed_runtime_map(&composed, &runtimes, "qemux86-64", config_path).expect("maps");
+
+        let sorted = |ext: &str| {
+            let mut v = map.get(ext).cloned().unwrap_or_default();
+            v.sort();
+            v
+        };
+        // A shared extension is seeded into every runtime that lists it.
+        assert_eq!(sorted("common"), vec!["alpha", "beta"]);
+        // An extension unique to one runtime is seeded into that one only.
+        assert_eq!(sorted("app-a"), vec!["alpha"]);
+        assert_eq!(sorted("app-b"), vec!["beta"]);
+        // A `depends_on`-only extension is a member of the runtime that pulls
+        // it in, so it must be seeded there too.
+        assert_eq!(sorted("lib"), vec!["beta"]);
+    }
+
+    /// A single-runtime project dual-writes into its one runtime sysroot and
+    /// needs no seeding, so the map is empty and seeding stays off.
+    #[test]
+    fn single_runtime_install_seeds_nothing() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - common
+extensions:
+  common:
+    version: "1.0.0"
+    packages: { a: '*' }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let runtimes = vec!["only".to_string()];
+        let map =
+            ext_seed_runtime_map(&composed, &runtimes, "qemux86-64", config_path).expect("maps");
+        assert!(
+            map.is_empty(),
+            "single-runtime project must not seed per-runtime copies: {map:?}"
+        );
+    }
 
     #[test]
     fn ext_install_waits_on_the_base_it_seeds_from() {
