@@ -41,10 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery hook may also ship `usr/libexec/avocado/boot-settings.json`
   (`{"version": 1, "kinds": [...]}`, kinds `dt_overlay`, `dt_overlay_stock`,
   `boot_config`, `kernel_args`). When it is there, a runtime build that
-  declares a hook kind the board does not list fails before anything is
-  compiled, naming every such kind and the kinds the board supports; a file it
-  cannot read fails the build too. With `kernel.cmdline` or
-  `kernel.cmdline_extra` set and `kernel_args` not listed, the build warns that
+  declares a hook kind the board does not list fails at the start of the
+  build script, before the extension images, rootfs, initramfs and FIT are
+  built, naming every such kind and the kinds the board supports; a file it
+  cannot read fails the build too. A kind id this CLI does not know draws a
+  warning that points at the board's file and is otherwise ignored. The file
+  stays `version` 1 for additive changes; only a breaking change increments
+  it. With `kernel.cmdline` or `kernel.cmdline_extra` set and `kernel_args` not
+  listed, the build warns that
   the setting may be ignored and carries on. A board with no file behaves as
   before. The error for a board with no hook now names the declared kinds
   instead of saying only "device-tree overlays". The file ships in the hook

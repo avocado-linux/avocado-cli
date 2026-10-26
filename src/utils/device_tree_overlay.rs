@@ -460,8 +460,16 @@ pub const DELIVERY_HOOK_PACKAGE: &str = "avocado-dtc-overlay-deliver";
 ///
 /// A board without the file keeps the behaviour it had before the file
 /// existed: the hook runs and the claim check decides. With the file, a project
-/// that declares a kind the board does not list fails before anything is
-/// compiled, naming the kind.
+/// that declares a kind the board does not list fails before any image is
+/// built, naming the kind (see [`render_capability_check`]).
+///
+/// Version rule: `version` stays 1 for every additive change (a new kind id, a
+/// new optional field), because a CLI already in the field ignores what it does
+/// not know and a BSP and the CLI release on different schedules. Only a
+/// breaking change to the meaning of existing fields increments it, and a CLI
+/// that reads version 1 then fails on the file rather than guess. A kind id
+/// this CLI does not recognise draws a warning pointing at the file and is
+/// otherwise ignored.
 ///
 /// [`KERNEL_ARGS_KIND`] is the one id this hook does not deliver: kernel
 /// arguments are applied by each board's own build or provisioning step (a
@@ -490,6 +498,9 @@ pub enum BootSettingKind {
 }
 
 impl BootSettingKind {
+    /// Every kind, for the ids the capability check recognises.
+    pub const ALL: [BootSettingKind; 3] = [Self::DtOverlay, Self::DtOverlayStock, Self::BootConfig];
+
     pub fn id(self) -> &'static str {
         match self {
             Self::DtOverlay => "dt_overlay",
@@ -518,10 +529,11 @@ pub fn declared_kinds(
     out
 }
 
-// In-container capability check. Arguments: a mode, the capability file, then
-// the kinds the project uses.
+// In-container capability check. Arguments: a mode, the capability file, the
+// kind ids this CLI knows (comma-separated, empty to skip the unknown-id
+// warning), then the kinds the project uses.
 //
-//   check  runs before anything is compiled and FAILS the build on a kind the
+//   check  runs before any image is built and FAILS the build on a kind the
 //          board does not list, and on a file it cannot trust: a capability
 //          file that cannot be read or understood is not a pass.
 //   warn   covers kernel arguments, which a board has always been free to ignore
@@ -532,7 +544,7 @@ pub fn declared_kinds(
 // `version` has to be an integer 1: Python would otherwise accept `true` and
 // `1.0`, which compare equal to it.
 const CAPABILITY_CHECK_PY: &str = r#"import json, sys
-mode, path, wanted = sys.argv[1], sys.argv[2], sys.argv[3:]
+mode, path, known, wanted = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 def bad(msg):
     if mode == "check":
         sys.exit("[ERROR] " + msg)
@@ -549,6 +561,12 @@ if type(caps.get("version")) is not int or caps["version"] != 1:
 kinds = caps.get("kinds")
 if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
     bad(path + ": 'kinds' must be a list of strings")
+if known:
+    unknown = [k for k in kinds if k not in known.split(",")]
+    if unknown:
+        sys.stderr.write("[WARNING] " + path + " lists " + ", ".join(unknown)
+                         + ", which this CLI does not recognise and ignores. If one is a misspelling of "
+                         + known.replace(",", ", ") + ", the mistake is in that file, not in this project.\n")
 missing = [k for k in wanted if k not in kinds]
 if not missing:
     sys.exit(0)
@@ -605,6 +623,80 @@ fn build_manifest_json(overlays: &[DeviceTreeOverlay], boot_config: &[String]) -
     Ok(serde_json::to_string_pretty(&doc)?)
 }
 
+/// Render the in-container shell block that checks the board's capability
+/// file against what the runtime declares.
+///
+/// The runtime build script places it at the top, before the extension images,
+/// the rootfs, the initramfs and the FIT are built, so a kind the board cannot
+/// deliver costs the build seconds instead of a full image build. It is kept
+/// apart from [`render_build_section`], which sits in the OTA tail after all of
+/// that work.
+///
+/// What this board says it can deliver: absent means the BSP has not published
+/// a file, and nothing changes for it. A path that exists but is not a regular
+/// file (a directory, a dangling link) counts as present, so the script reports
+/// it instead of the build quietly taking the legacy path. Python runs isolated
+/// (-I): the working directory is the project tree, and a `json.py` there must
+/// not stand in for the standard library.
+///
+/// The block assumes `$OECORE_TARGET_SYSROOT` is set. It fails the build with
+/// `exit 1` on a kind the board does not list.
+pub fn render_capability_check(overlays: &[DeviceTreeOverlay], boot_config: &[String]) -> String {
+    let mut s = String::new();
+    s.push_str("# --- boot-setting capabilities ---\n");
+    s.push_str(&format!(
+        "DTO_CAPS=\"$OECORE_TARGET_SYSROOT/{CAPABILITIES_RELATIVE}\"\n"
+    ));
+    s.push_str("DTO_CAPS_PRESENT=0\n");
+    s.push_str("if [ -e \"$DTO_CAPS\" ] || [ -L \"$DTO_CAPS\" ]; then DTO_CAPS_PRESENT=1; fi\n");
+
+    let kinds = declared_kinds(overlays, boot_config);
+    let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
+
+    // The ids this CLI knows, so the script can say when the board's file
+    // lists one it does not. The check below reports them too, so the warn
+    // pass stays quiet about them when the check will run.
+    let known: Vec<&str> = BootSettingKind::ALL
+        .iter()
+        .map(|k| k.id())
+        .chain(std::iter::once(KERNEL_ARGS_KIND))
+        .collect();
+    let known = known.join(",");
+
+    // Kernel arguments are applied by each board's own build or provisioning
+    // step, not by the delivery hook, so this does not depend on an overlay
+    // being declared. It does depend on the capability file being in the
+    // sysroot. It only ever warns.
+    s.push_str(
+        "if [ -n \"${AVOCADO_KERNEL_CMDLINE:-}${AVOCADO_KERNEL_CMDLINE_EXTRA:-}\" ] && [ \"$DTO_CAPS_PRESENT\" = 1 ]; then\n",
+    );
+    let warn_known = if ids.is_empty() { known.as_str() } else { "" };
+    s.push_str(&format!(
+        "python3 -I - warn \"$DTO_CAPS\" '{warn_known}' {KERNEL_ARGS_KIND} <<'AVOCADO_DTO_CAPS_EOF' || true\n"
+    ));
+    s.push_str(CAPABILITY_CHECK_PY);
+    s.push_str("AVOCADO_DTO_CAPS_EOF\n");
+    s.push_str("fi\n");
+
+    // boot_config alone still needs the hook, so any declared kind is checked.
+    if ids.is_empty() {
+        return s;
+    }
+
+    // A board can still refuse one particular declaration later (the Qualcomm
+    // hook refuses overlay params), since the file lists kinds, not every
+    // restriction.
+    s.push_str("if [ \"$DTO_CAPS_PRESENT\" = 1 ]; then\n");
+    s.push_str(&format!(
+        "python3 -I - check \"$DTO_CAPS\" '{known}' {} <<'AVOCADO_DTO_CAPS_EOF' || exit 1\n",
+        ids.join(" ")
+    ));
+    s.push_str(CAPABILITY_CHECK_PY);
+    s.push_str("AVOCADO_DTO_CAPS_EOF\n");
+    s.push_str("fi\n");
+    s
+}
+
 /// Render the in-container shell block that builds, stages, delivers, and
 /// validates the device-tree overlays, for injection into the runtime build
 /// script immediately before `stone bundle`. With no overlays the block only
@@ -641,32 +733,6 @@ pub fn render_build_section(
     );
     s.push_str("rm -rf \"$DTBO_STAGING\"\n");
 
-    // What this board says it can deliver. Absent means the BSP has not
-    // published one, and nothing below changes for it. A path that exists but
-    // is not a regular file (a directory, a dangling link) counts as present,
-    // so the script reports it instead of the build quietly taking the legacy
-    // path. Python runs isolated (-I): the working directory is the project
-    // tree, and a `json.py` there must not stand in for the standard library.
-    s.push_str(&format!(
-        "DTO_CAPS=\"$OECORE_TARGET_SYSROOT/{CAPABILITIES_RELATIVE}\"\n"
-    ));
-    s.push_str("DTO_CAPS_PRESENT=0\n");
-    s.push_str("if [ -e \"$DTO_CAPS\" ] || [ -L \"$DTO_CAPS\" ]; then DTO_CAPS_PRESENT=1; fi\n");
-
-    // Kernel arguments are applied by each board's own build or provisioning
-    // step, not by the delivery hook, so this does not depend on an overlay
-    // being declared. It does depend on the capability file being in the
-    // sysroot. It only ever warns.
-    s.push_str(
-        "if [ -n \"${AVOCADO_KERNEL_CMDLINE:-}${AVOCADO_KERNEL_CMDLINE_EXTRA:-}\" ] && [ \"$DTO_CAPS_PRESENT\" = 1 ]; then\n",
-    );
-    s.push_str(&format!(
-        "python3 -I - warn \"$DTO_CAPS\" {KERNEL_ARGS_KIND} <<'AVOCADO_DTO_CAPS_EOF' || true\n"
-    ));
-    s.push_str(CAPABILITY_CHECK_PY);
-    s.push_str("AVOCADO_DTO_CAPS_EOF\n");
-    s.push_str("fi\n");
-
     // boot_config alone still needs the hook: the settings reach the boot
     // medium only through it, and an early return here would drop them while
     // the build reported success.
@@ -674,21 +740,8 @@ pub fn render_build_section(
         return Ok(s);
     }
 
-    // Fail on a kind the board does not list before compiling anything: a
-    // kind the hook cannot deliver should cost the build seconds, not a compile
-    // and a claim failure after it. A board can still refuse one particular
-    // declaration later (the Qualcomm hook refuses overlay params), since the
-    // file lists kinds, not every restriction.
     let kinds = declared_kinds(overlays, boot_config);
     let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
-    s.push_str("if [ \"$DTO_CAPS_PRESENT\" = 1 ]; then\n");
-    s.push_str(&format!(
-        "python3 -I - check \"$DTO_CAPS\" {} <<'AVOCADO_DTO_CAPS_EOF' || exit 1\n",
-        ids.join(" ")
-    ));
-    s.push_str(CAPABILITY_CHECK_PY);
-    s.push_str("AVOCADO_DTO_CAPS_EOF\n");
-    s.push_str("fi\n");
 
     let manifest_json = build_manifest_json(overlays, boot_config)?;
     s.push_str("mkdir -p \"$DTBO_STAGING\"\n");
@@ -1762,12 +1815,110 @@ done
             lines.iter().map(|l| l.to_string()).collect()
         }
 
+        /// The capability check followed by the build section, in the order the
+        /// runtime build script emits them: the check at the top, the section
+        /// just before `stone bundle`.
+        fn full(overlays: &[DeviceTreeOverlay], boot_config: &[String]) -> Result<String> {
+            Ok(format!(
+                "{}{}",
+                render_capability_check(overlays, boot_config),
+                render_build_section(overlays, boot_config)?
+            ))
+        }
+
+        #[test]
+        fn the_build_section_no_longer_carries_the_capability_check() {
+            let sh = render_build_section(&[stock("disable-bt")], &boot(&["a=b"])).unwrap();
+            assert!(!sh.contains("DTO_CAPS"), "{sh}");
+            assert!(!sh.contains(CAPABILITIES_RELATIVE), "{sh}");
+        }
+
+        #[test]
+        fn the_capability_check_fails_without_the_build_section_or_the_hook() {
+            let sb = Sandbox::new()
+                .with_hook()
+                .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
+            let sh = render_capability_check(&[], &boot(&["a=b"]));
+            let Some(out) = sb.run(&sh, &[]) else { return };
+
+            assert!(!out.ok);
+            assert!(out.stderr.contains("boot_config"), "{}", out.stderr);
+            assert!(sb.log().is_empty(), "nothing else may have run");
+        }
+
+        #[test]
+        fn a_kind_id_the_cli_does_not_know_is_reported_as_a_board_file_problem() {
+            let sb = Sandbox::new()
+                .with_hook()
+                .with_caps(r#"{"version":1,"kinds":["boot-config","dt_overlay_stock"]}"#);
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
+            let Some(out) = sb.run(&sh, &[]) else { return };
+
+            assert!(
+                out.ok,
+                "an id from a newer BSP must not break this CLI: {}",
+                out.stderr
+            );
+            assert!(
+                out.stderr.contains("[WARNING]")
+                    && out.stderr.contains("boot-config")
+                    && out.stderr.contains("boot-settings.json"),
+                "the warning must name the id and the file: {}",
+                out.stderr
+            );
+        }
+
+        #[test]
+        fn a_known_kind_list_draws_no_unknown_id_warning() {
+            let sb = Sandbox::new()
+                .with_hook()
+                .with_caps(r#"{"version":1,"kinds":["dt_overlay_stock","kernel_args"]}"#);
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
+            let Some(out) = sb.run(&sh, CMDLINE) else {
+                return;
+            };
+
+            assert!(out.ok, "{}", out.stderr);
+            assert!(!out.stderr.contains("[WARNING]"), "{}", out.stderr);
+        }
+
+        #[test]
+        fn an_unknown_kind_is_reported_once_when_both_checks_run() {
+            let sb = Sandbox::new().with_hook().with_caps(
+                r#"{"version":1,"kinds":["dtoverlay","dt_overlay_stock","kernel_args"]}"#,
+            );
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
+            let Some(out) = sb.run(&sh, CMDLINE) else {
+                return;
+            };
+
+            assert!(out.ok, "{}", out.stderr);
+            assert_eq!(out.stderr.matches("dtoverlay").count(), 1, "{}", out.stderr);
+        }
+
+        #[test]
+        fn an_unknown_kind_is_reported_when_only_kernel_args_are_set() {
+            let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["kernel-args"]}"#);
+            let sh = full(&[], &[]).unwrap();
+            let Some(out) = sb.run(&sh, CMDLINE) else {
+                return;
+            };
+
+            assert!(out.ok, "{}", out.stderr);
+            assert_eq!(
+                out.stderr.matches("kernel-args").count(),
+                1,
+                "{}",
+                out.stderr
+            );
+        }
+
         #[test]
         fn an_unsupported_boot_config_fails_by_name_and_the_hook_never_runs() {
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[], &boot(&["dtparam=i2c_arm=on"])).unwrap();
+            let sh = full(&[], &boot(&["dtparam=i2c_arm=on"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(
@@ -1792,7 +1943,7 @@ done
                 .with_hook()
                 .with_compiler()
                 .with_caps(r#"{"version":1,"kinds":["boot_config"]}"#);
-            let sh = render_build_section(&[overlay("spi", "overlays/spi.dtso")], &[]).unwrap();
+            let sh = full(&[overlay("spi", "overlays/spi.dtso")], &[]).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok, "{}", out.stderr);
@@ -1810,7 +1961,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[stock("disable-bt")], &[]).unwrap();
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok, "{}", out.stderr);
@@ -1822,8 +1973,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[stock("disable-bt")], &boot(&["dtparam=i2c_arm=on"]))
-                .unwrap();
+            let sh = full(&[stock("disable-bt")], &boot(&["dtparam=i2c_arm=on"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok, "{}", out.stderr);
@@ -1836,7 +1986,7 @@ done
             let sb = Sandbox::new().with_hook().with_compiler().with_caps(
                 r#"{"version":1,"kinds":["dt_overlay","dt_overlay_stock","boot_config"]}"#,
             );
-            let sh = render_build_section(
+            let sh = full(
                 &[overlay("spi", "overlays/spi.dtso"), stock("disable-bt")],
                 &boot(&["dtparam=i2c_arm=on"]),
             )
@@ -1852,7 +2002,7 @@ done
         #[test]
         fn a_target_with_no_capability_file_keeps_the_legacy_path() {
             let sb = Sandbox::new().with_hook();
-            let sh = render_build_section(&[stock("disable-bt")], &boot(&["a=b"])).unwrap();
+            let sh = full(&[stock("disable-bt")], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(
@@ -1866,7 +2016,7 @@ done
         #[test]
         fn a_malformed_capability_file_fails_and_names_the_file() {
             let sb = Sandbox::new().with_hook().with_caps("{ not json");
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok, "an unreadable capability file is not a pass");
@@ -1895,7 +2045,7 @@ done
             ];
             for (json, expected) in cases {
                 let sb = Sandbox::new().with_hook().with_caps(json);
-                let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+                let sh = full(&[], &boot(&["a=b"])).unwrap();
                 let Some(out) = sb.run(&sh, &[]) else { return };
                 assert!(!out.ok, "{json} must be refused: {}", out.stderr);
                 assert!(
@@ -1915,7 +2065,7 @@ done
                 Sandbox::new().with_hook().with_caps_directory(),
                 Sandbox::new().with_hook().with_dangling_caps(),
             ] {
-                let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+                let sh = full(&[], &boot(&["a=b"])).unwrap();
                 let Some(out) = sb.run(&sh, &[]) else { return };
                 assert!(!out.ok, "{}", out.stderr);
                 assert!(out.stderr.contains("boot-settings.json"), "{}", out.stderr);
@@ -1931,7 +2081,7 @@ done
             let caps = r#"{"version":1,"kinds":["dt_overlay"]}"#;
 
             let sb = Sandbox::new().with_shadowing_json().with_caps(caps);
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -1947,7 +2097,7 @@ done
                 .with_hook()
                 .with_shadowing_json()
                 .with_caps(caps);
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
             assert!(!out.ok);
             assert!(
@@ -1963,7 +2113,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[stock("disable-bt")], &[]).unwrap();
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             let missing = out
@@ -1982,7 +2132,7 @@ done
         #[test]
         fn a_listed_kind_still_needs_the_hook_to_be_installed() {
             let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["boot_config"]}"#);
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(
@@ -1998,7 +2148,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2012,7 +2162,7 @@ done
         #[test]
         fn a_full_replacement_command_line_also_triggers_the_kernel_args_warning() {
             let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, &[("AVOCADO_KERNEL_CMDLINE", "root=/dev/sda2")]) else {
                 return;
             };
@@ -2024,7 +2174,7 @@ done
         #[test]
         fn an_unreadable_capability_file_only_warns_when_just_kernel_args_are_set() {
             let sb = Sandbox::new().with_caps("{ not json");
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2051,7 +2201,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":2,"kinds":["boot_config"]}"#);
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok);
@@ -2063,7 +2213,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":"boot_config"}"#);
-            let sh = render_build_section(&[], &boot(&["a=b"])).unwrap();
+            let sh = full(&[], &boot(&["a=b"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(
@@ -2076,7 +2226,7 @@ done
         #[test]
         fn the_no_hook_error_names_what_was_declared() {
             let sb = Sandbox::new();
-            let sh = render_build_section(&[], &boot(&["dtparam=i2c_arm=on"])).unwrap();
+            let sh = full(&[], &boot(&["dtparam=i2c_arm=on"])).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(!out.ok);
@@ -2095,7 +2245,7 @@ done
             let sb = Sandbox::new()
                 .with_hook()
                 .with_caps(r#"{"version":1,"kinds":["dt_overlay_stock"]}"#);
-            let sh = render_build_section(&[stock("disable-bt")], &[]).unwrap();
+            let sh = full(&[stock("disable-bt")], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2111,7 +2261,7 @@ done
         #[test]
         fn the_kernel_args_warning_needs_no_overlays_to_be_declared() {
             let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2123,7 +2273,7 @@ done
         #[test]
         fn a_target_that_lists_kernel_args_is_not_warned() {
             let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["kernel_args"]}"#);
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2138,7 +2288,7 @@ done
         #[test]
         fn no_capability_file_means_no_kernel_args_warning() {
             let sb = Sandbox::new();
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, CMDLINE) else {
                 return;
             };
@@ -2153,7 +2303,7 @@ done
         #[test]
         fn no_kernel_args_set_means_no_warning_even_when_unlisted() {
             let sb = Sandbox::new().with_caps(r#"{"version":1,"kinds":["dt_overlay"]}"#);
-            let sh = render_build_section(&[], &[]).unwrap();
+            let sh = full(&[], &[]).unwrap();
             let Some(out) = sb.run(&sh, &[]) else { return };
 
             assert!(

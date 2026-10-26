@@ -1550,8 +1550,16 @@ echo -n '}}'
                 )
             })?;
 
-        // Device-tree overlays declared by this runtime's extensions.
-        // Empty section - and no build-time work - unless at least one is declared.
+        // What this board can deliver, checked against the boot settings this
+        // runtime declares. It leads the script so a mismatch fails the build
+        // before any image work, not after the rootfs, initramfs and FIT.
+        let capability_check_section = {
+            let overlays =
+                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, parsed)?;
+            let boot_config =
+                crate::utils::device_tree_overlay::collect_boot_config(&merged_runtime, parsed)?;
+            crate::utils::device_tree_overlay::render_capability_check(&overlays, &boot_config)
+        };
 
         // Extract extension names from the `extensions` array
         let mut required_extensions = HashSet::new();
@@ -2551,6 +2559,8 @@ export RUNTIME_NAME="{runtime_name}"
 export TARGET_ARCH="{target_arch}"
 export RUNTIME_VERSION="{runtime_version}"
 
+{capability_check_section}
+
 VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging
 mkdir -p "$VAR_DIR/lib/avocado/images"
 mkdir -p "$VAR_DIR/lib/avocado/runtimes"
@@ -2635,6 +2645,7 @@ export AVOCADO_OS_VERSION_ID
             runtime_name = self.runtime_name,
             target_arch = target_arch,
             runtime_version = runtime_version,
+            capability_check_section = capability_check_section,
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
             fit_section = fit_section,
@@ -5106,6 +5117,70 @@ runtimes:
             )
             .expect("the in-scope target has no opt-in and must build");
         assert!(!script.contains("/etc/avocado/var-encrypt"));
+    }
+
+    /// A board that cannot deliver a declared kind must fail the build before
+    /// the rootfs, the initramfs and the FIT are built, not after them.
+    #[test]
+    fn the_boot_setting_capability_check_runs_before_any_image_is_built() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+sdk:
+  image: "test-image"
+
+connect:
+  org: test
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - test-ext
+
+extensions:
+  test-ext:
+    version: "1.0.0"
+    types:
+      - sysext
+    boot_config:
+      - "dtparam=i2c_arm=on"
+"#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "test-runtime".to_string(),
+            config_path,
+            false,
+            Some("x86_64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        let script = cmd
+            .create_build_script(
+                &config,
+                &parsed,
+                "x86_64",
+                &["test-ext-1.0.0".to_string()],
+                SysrootImageReuse::default(),
+            )
+            .unwrap();
+
+        let check = script
+            .find("python3 -I - check")
+            .expect("the capability check is in the script");
+        let copy = script
+            .find("Copying required extension images")
+            .expect("the copy step is in the script");
+        assert!(
+            check < copy,
+            "the capability check must come before the first image work"
+        );
+        assert_eq!(
+            script.matches("python3 -I - check").count(),
+            1,
+            "the check is emitted once, not again in the OTA tail"
+        );
     }
 
     #[test]
