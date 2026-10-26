@@ -1195,8 +1195,18 @@ impl SessionContainers {
         let mut held = slot
             .lock()
             .map_err(|_| anyhow::anyhow!("session container slot is poisoned"))?;
+        // Reuse the cached container only while it is still up. The keepalive
+        // backstop, a crash, or an outside `docker rm` can leave the name
+        // pointing at a container that is gone; handing it back would make every
+        // later `docker exec` fail with "No such container" and no fallback.
+        // Drop a dead entry and create a fresh one. One probe per reused step is
+        // cheap next to the exec it guards.
         if let Some(name) = held.as_ref() {
-            return Ok(name.clone());
+            let name = name.clone();
+            if block_in_place_if_async(|| container_is_running(container_tool, &name)) {
+                return Ok(name);
+            }
+            *held = None;
         }
 
         let name =
@@ -1235,15 +1245,19 @@ impl SessionContainers {
         // below. Running them as the container's own command would race: `run
         // -d` returns as soon as the container starts, not when its command has
         // finished, so the first caller could exec into a container whose
-        // /opt/src was not mounted yet. The timeout is a backstop for the case
-        // where teardown never runs — a leaked container dies within the hour
-        // instead of living until the next sweep.
+        // /opt/src was not mounted yet. The sleep is a leak backstop for the
+        // case where teardown never runs AND no later invocation sweeps it; the
+        // common leak is reaped by `sweep_abandoned` on the next run. It is set
+        // well past any realistic `avocado build`/`install` so the container
+        // never exits under an active step — main steps run inside it now, not
+        // just the quick capture reads, and a step losing its container
+        // mid-build was the regression a one-hour cap caused.
         //
         // `sh -c`, not `bash`: this has to work in the fallback images too,
         // which are reached when no project config names an SDK image.
         cmd.push("sh".to_string());
         cmd.push("-c".to_string());
-        cmd.push("sleep 3600".to_string());
+        cmd.push(format!("sleep {SESSION_KEEPALIVE_SECS}"));
 
         let out = std::process::Command::new(container_tool)
             .args(&cmd)
@@ -1485,6 +1499,29 @@ pub fn default_container_tool() -> String {
 /// The environment moves here from container creation, which is what lets steps
 /// with different `AVOCADO_RUNTIME`, `--dnf-arg` or signing variables share one
 /// container.
+/// Backstop lifetime for a parked session container, in seconds. Only reached
+/// when teardown never runs (a hard kill with no atexit) and no later
+/// invocation sweeps it; `sweep_abandoned` handles the common leak on the next
+/// run. Set well past any realistic single `avocado` invocation so an active
+/// build/install never loses its container mid-step. 24h.
+const SESSION_KEEPALIVE_SECS: u64 = 24 * 60 * 60;
+
+/// True while `name` is an existing, running container under `container_tool`.
+///
+/// Blocking: shells out to `<tool> inspect`. Used to drop a cached session
+/// container that has gone away (keepalive expired, crash, outside `rm`) before
+/// it is handed back for another `exec`.
+fn container_is_running(container_tool: &str, name: &str) -> bool {
+    let out = std::process::Command::new(container_tool)
+        .args(["inspect", "-f", "{{.State.Running}}", name])
+        .output();
+    matches!(
+        out,
+        Ok(o) if o.status.success()
+            && String::from_utf8_lossy(&o.stdout).trim() == "true"
+    )
+}
+
 fn build_exec_command(
     container_tool: &str,
     name: &str,
@@ -6811,6 +6848,93 @@ extensions:
                 container_tool: tool,
                 ..SdkContainer::new()
             }
+        }
+
+        fn script(dir: &Path, name: &str, body: &str) -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p.display().to_string()
+        }
+
+        #[test]
+        fn container_is_running_reads_the_inspect_state() {
+            let dir = tempfile::tempdir().unwrap();
+            // A running container: inspect prints "true".
+            let up = script(dir.path(), "up", "echo true");
+            assert!(container_is_running(&up, "sess"));
+            // Stopped: inspect prints "false".
+            let down = script(dir.path(), "down", "echo false");
+            assert!(!container_is_running(&down, "sess"));
+            // Gone: inspect fails. A dead cached name must read as not running so
+            // get_or_create recreates instead of handing it back.
+            let gone = script(dir.path(), "gone", "exit 1");
+            assert!(!container_is_running(&gone, "sess"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn an_unnamed_main_step_routes_through_exec_not_run() {
+            // The B-10 regression (reading eligibility from
+            // effective_config.container_name, which is always Some once the
+            // generated avocado-run name is set) leaves session_reuse_eligible
+            // passing while the step still runs as a one-off `docker run`.
+            // Drive a real run_in_container through the stub tool and assert the
+            // step reaches the session container by `exec`, never a standalone
+            // `avocado-run-` run. Reintroducing the `&& container_name.is_none()`
+            // guard in front of the route flips this to a run and fails here.
+            std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+
+            // Pre-seed volume state so get_or_create_volume returns early: the
+            // stub exits 0 for `volume inspect`, so volume_exists() is true and
+            // no volume is minted.
+            crate::utils::volume::VolumeState::new(dir.path().to_path_buf(), tool.clone())
+                .save_to_dir(dir.path())
+                .unwrap();
+
+            let container = SdkContainer {
+                container_tool: tool.clone(),
+                cwd: dir.path().to_path_buf(),
+                src_dir: None,
+                config_path: None,
+                verbose: false,
+                cli_target_board: None,
+            };
+            let config = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo B10_ROUTE".to_string(),
+                // No avocado.yaml in the temp cwd; skip the derived mounts.
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+
+            let ok = container.run_in_container(config).await.unwrap();
+            assert!(ok, "the stubbed step should report success");
+
+            // Clear the global registry this run populated.
+            SessionContainers::shutdown(&tool);
+
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            // The step actually ran, through the session container...
+            assert!(log.contains("echo B10_ROUTE"), "step never ran:\n{log}");
+            assert!(
+                log.contains("avocado-sess-"),
+                "no session container was used:\n{log}"
+            );
+            // ...and never as a one-off `docker run --name avocado-run-<uuid>`,
+            // which is the only path that carries the step under a run. Session
+            // creation is the sole `run` (`run -d ... avocado-sess-`).
+            assert!(
+                !log.contains("avocado-run-"),
+                "step took the standalone run path:\n{log}"
+            );
         }
 
         #[tokio::test]
