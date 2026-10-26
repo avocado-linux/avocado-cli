@@ -114,7 +114,9 @@ impl fmt::Display for StampComponent {
 /// install stamps, and written next to the SDK's scriptlet wrappers, so a
 /// sysroot or SDK set up under an older contract is reinstalled or refused
 /// instead of trusted.
-pub const SCRIPTLET_CONTRACT: &str = "offline-root-1";
+// offline-root-2: the offline systemctl enables template instances, not the
+// bare template (sysroots preset under -1 carry getty.target.wants/getty@.service).
+pub const SCRIPTLET_CONTRACT: &str = "offline-root-2";
 
 /// Version of the steps a rootfs or initramfs install runs after its dnf
 /// transaction. Bump it whenever those steps change what lands in the
