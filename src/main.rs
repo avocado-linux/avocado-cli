@@ -3677,8 +3677,12 @@ async fn main() -> Result<()> {
                 dnf_args,
                 no_bootstrap,
             } => {
-                // Validate runtime exists if provided
-                validate_runtime_if_provided(&config, runtime.as_ref())?;
+                // Runtime validation runs inside SdkRunCommand::execute against the
+                // composed config, which covers the `runtime:` alias, composed and
+                // remote runtimes, and a synthesized default. The on-disk
+                // validate_runtime_if_provided check used elsewhere reads only the
+                // literal `runtimes:` key, so it rejected those valid names here. It
+                // is intentionally not used for `sdk run` (ENG-2352).
 
                 let cmd = if command.is_empty() {
                     None
