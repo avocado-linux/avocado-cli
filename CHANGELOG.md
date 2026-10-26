@@ -33,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `boot_config_claimed_by` and per-overlay `stock` fields). A hook that does not
   claim `boot_config` fails the runtime build instead of ignoring the lines. The
   SDK compile wrapper is installed only when an overlay has a `src`; the
-  delivery hook is installed for any of the three.
+  delivery hook is installed for any of the three. A `boot_config` key must be an
+  identifier (so `[gpio4=1]` and `#x=y` are refused), `dtoverlay=` is refused in
+  favor of a `device_tree_overlays` entry, and conflicting values for one key
+  produce a warning.
 - **SBOM extension scopes carry a stable image id.** (ENG-2199)
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry

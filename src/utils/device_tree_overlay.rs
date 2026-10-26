@@ -201,7 +201,43 @@ pub fn collect_boot_config(merged_runtime: &Value, parsed: &Value) -> Result<Vec
         }
     }
 
+    for (key, values) in conflicting_boot_config_keys(&out) {
+        crate::utils::output::print_warning_above(&format!(
+            "boot_config sets '{key}' to conflicting values ({}); the firmware uses the last \
+             one, which follows the order of the runtime's extensions list",
+            values.join(", ")
+        ));
+    }
+
     Ok(out)
+}
+
+/// Keys the firmware accepts more than once, so repeating one is not a conflict.
+const REPEATABLE_BOOT_CONFIG_KEYS: &[&str] = &["dtparam", "dtoverlay", "gpio"];
+
+/// Keys that appear with more than one distinct value, with the values in
+/// first-seen order. Only the last value takes effect, so the outcome depends
+/// on the order of the runtime's extensions list.
+fn conflicting_boot_config_keys(lines: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if REPEATABLE_BOOT_CONFIG_KEYS.contains(&key) {
+            continue;
+        }
+        match seen.iter_mut().find(|(k, _)| k == key) {
+            Some((_, values)) => {
+                if !values.iter().any(|v| v == value) {
+                    values.push(value.to_string());
+                }
+            }
+            None => seen.push((key.to_string(), vec![value.to_string()])),
+        }
+    }
+    seen.retain(|(_, values)| values.len() > 1);
+    seen
 }
 
 /// A boot config line is written verbatim into a file the firmware parses
@@ -220,8 +256,26 @@ fn validate_boot_config_line(line: &str, ext_name: &str, idx: usize) -> Result<(
     if line != line.trim() {
         bail!("extension '{ext_name}': boot_config[{idx}] must not start or end with whitespace");
     }
-    if !line.contains('=') {
+    // The key is an identifier, which also rules out a `[gpio4=1]` conditional
+    // filter and a `#x=y` comment: both contain '=' yet are not settings, and a
+    // filter would silently scope every later line to one pin state.
+    let key_ok = line.split_once('=').is_some_and(|(key, _)| {
+        let mut chars = key.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    if !key_ok {
         bail!("extension '{ext_name}': boot_config[{idx}] must be a key=value line, got '{line}'");
+    }
+    // A dtoverlay line here would bypass the uniqueness check, param rendering
+    // and per-overlay claim that a device_tree_overlays entry gets.
+    if line.starts_with("dtoverlay=") {
+        bail!(
+            "extension '{ext_name}': boot_config[{idx}] selects an overlay with '{line}'; \
+             declare it under device_tree_overlays (omit src for an overlay the BSP ships)"
+        );
     }
     Ok(())
 }
@@ -493,6 +547,18 @@ pub fn render_build_section(
     // name is a validated basename; src is user config, so double-quote it.
     // An overlay without a src is a stock overlay the BSP already ships: the
     // hook delivers and selects it, but there is nothing to compile.
+    // The wrapper is installed by `avocado install` only when an overlay has a
+    // source, and the SDK stamp does not track that, so a project that gained
+    // its first source since the last install would otherwise fail with a bare
+    // "command not found".
+    if overlays.iter().any(|o| o.src.is_some()) {
+        s.push_str("if ! command -v avocado-dtc-overlay >/dev/null 2>&1; then\n");
+        s.push_str(
+            "    echo \"[ERROR] avocado-dtc-overlay is not installed in the SDK; run 'avocado install' to add it.\" >&2\n",
+        );
+        s.push_str("    exit 1\n");
+        s.push_str("fi\n");
+    }
     for o in overlays {
         let Some(src) = &o.src else {
             continue;
@@ -524,7 +590,7 @@ pub fn render_build_section(
     // not a silent skip - otherwise the build succeeds and ships nothing.
     s.push_str("if [ ! -x \"$DTO_HOOK\" ]; then\n");
     s.push_str(
-        "    echo \"[ERROR] device-tree overlays are declared but this target provides no delivery hook.\" >&2\n",
+        "    echo \"[ERROR] device-tree overlays or boot_config lines are declared but this target provides no delivery hook.\" >&2\n",
     );
     s.push_str(
         "    echo \"        Expected an executable at $DTO_HOOK (installed by the BSP layer).\" >&2\n",
@@ -780,6 +846,32 @@ extensions:
     }
 
     #[test]
+    fn a_compiled_overlay_guards_on_the_compile_wrapper_being_installed() {
+        let sh = render_build_section(&[overlay("a", "a.dtso")], &[]).unwrap();
+        let guard = sh
+            .find("command -v avocado-dtc-overlay")
+            .expect("a guard for the missing wrapper");
+        let call = sh.find("avocado-dtc-overlay --name").expect("compile call");
+        assert!(
+            guard < call,
+            "guard must run before the first compile: {sh}"
+        );
+        assert!(sh.contains("avocado install"), "{sh}");
+        // Stock overlays and boot_config compile nothing, so need no wrapper.
+        let sh = render_build_section(&[], &["dtparam=spi=on".to_string()]).unwrap();
+        assert!(!sh.contains("command -v avocado-dtc-overlay"), "{sh}");
+    }
+
+    #[test]
+    fn the_missing_hook_error_names_boot_config_too() {
+        let sh = render_build_section(&[], &["dtparam=spi=on".to_string()]).unwrap();
+        assert!(
+            sh.contains("device-tree overlays or boot_config lines are declared"),
+            "{sh}"
+        );
+    }
+
+    #[test]
     fn render_emits_wrapper_hook_and_wiring() {
         let overlays = vec![
             overlay("spi-fast", "overlays/spi-fast.dtso"),
@@ -950,7 +1042,7 @@ extensions:
   board-b:
     boot_config:
       - usb_max_current_enable=1
-      - dtoverlay=disable-bt
+      - dtparam=spi=on
 "#);
         let got = collect_boot_config(&runtime_with(&["board-a", "board-b"]), &parsed).unwrap();
         assert_eq!(
@@ -958,7 +1050,7 @@ extensions:
             vec![
                 "dtparam=i2c_arm=on".to_string(),
                 "usb_max_current_enable=1".to_string(),
-                "dtoverlay=disable-bt".to_string(),
+                "dtparam=spi=on".to_string(),
             ]
         );
     }
@@ -998,6 +1090,12 @@ extensions:
             "\"\"",
             "\"   \"",
             "\"dtparam\"",
+            "\"[gpio4=1]\"",
+            "\"#x=y\"",
+            "\"=value\"",
+            "\"9key=1\"",
+            "\"bad key=1\"",
+            "\"dtoverlay=disable-bt\"",
             "\" dtparam=spi=on\"",
             "\"dtparam=spi=on \"",
             "\"dtparam=spi=on\\ndtoverlay=x\"",
@@ -1016,6 +1114,42 @@ extensions:
                 "{line}: the error names the extension and the key: {err}"
             );
         }
+    }
+
+    #[test]
+    fn dtoverlay_in_boot_config_points_at_the_stock_overlay_entry() {
+        let parsed = cfg("extensions:\n  board:\n    boot_config:\n      - dtoverlay=disable-bt\n");
+        let err = collect_boot_config(&runtime_with(&["board"]), &parsed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("device_tree_overlays"),
+            "the error must name the supported way to select a stock overlay: {err}"
+        );
+    }
+
+    #[test]
+    fn conflicting_values_for_one_key_are_reported_but_repeatable_keys_are_not() {
+        let lines: Vec<String> = [
+            "usb_max_current_enable=1",
+            "dtparam=i2c_arm=on",
+            "usb_max_current_enable=0",
+            "dtparam=spi=on",
+            "gpio=4=op",
+            "gpio=5=op",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = conflicting_boot_config_keys(&lines);
+        assert_eq!(
+            got,
+            vec![(
+                "usb_max_current_enable".to_string(),
+                vec!["1".to_string(), "0".to_string()]
+            )]
+        );
+        assert!(conflicting_boot_config_keys(&lines[..2]).is_empty());
     }
 
     #[test]
