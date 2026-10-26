@@ -146,11 +146,21 @@ parse_install_section() {
     done < "$unit_file"
 }
 
-# The unit file behind a name: an instance (getty@tty1.service) is backed by
-# its template (getty@.service).
+# A bare template (getty@.service), not an instance (getty@tty1.service,
+# worker@.blue.service).
+is_template() {
+    [ "${1#*@}" = ".${1##*.}" ]
+}
+
+# The unit file behind a name: its own file when one exists, else an instance
+# (getty@tty1.service) is backed by its template (getty@.service).
 unit_file_name() {
+    if [ -f "$UNIT_DIR/$1" ]; then
+        echo "$1"
+        return
+    fi
     case "$1" in
-        *@?*.*) echo "${1%%@*}@.${1##*.}" ;;
+        *@*.*) echo "${1%%@*}@.${1##*.}" ;;
         *) echo "$1" ;;
     esac
 }
@@ -162,13 +172,13 @@ unit_file_name() {
 enable_names() {
     local unit="$1" unit_file="$2"
     shift 2
-    case "$unit" in
-        *@.*)
-            local inst instances="$*"
-            [ -n "$instances" ] || instances="$(parse_install_section "$unit_file" "DefaultInstance")"
-            for inst in $instances; do echo "${unit%%@*}@${inst}.${unit##*.}"; done ;;
-        *) echo "$unit" ;;
-    esac
+    if is_template "$unit"; then
+        local inst instances="$*"
+        [ -n "$instances" ] || instances="$(parse_install_section "$unit_file" "DefaultInstance")"
+        for inst in $instances; do echo "${unit%%@*}@${inst}.${unit##*.}"; done
+    else
+        echo "$unit"
+    fi
 }
 
 do_enable() {
@@ -215,7 +225,7 @@ do_disable() {
 
     # Disabling a bare template disables every instance of it.
     local names="$unit"
-    case "$unit" in *@.*) names="$unit ${unit%%@*}@*.${unit##*.}" ;; esac
+    is_template "$unit" && names="$unit ${unit%%@*}@*.${unit##*.}"
     local name
     for target in $(parse_install_section "$unit_file" "WantedBy"); do
         for name in $names; do rm -f "$ETC_DIR/${target}.wants/"$name; done
@@ -262,9 +272,16 @@ load_presets() {
 }
 
 # Prints the matching rule's action, then any instances it lists
-# ("enable getty@.service tty1" -> "enable tty1").
+# ("enable getty@.service tty1" -> "enable tty1"). An instance matches a rule
+# that lists instances when its template matches and it is listed.
 check_preset() {
     local unit="$1"
+    local template="" instance=""
+    if [[ "$unit" == *@*.* ]] && ! is_template "$unit"; then
+        template="${unit%%@*}@.${unit##*.}"
+        instance="${unit#*@}"
+        instance="${instance%.*}"
+    fi
     local rules
     rules=$(load_presets)
     while IFS= read -r rule; do
@@ -275,6 +292,13 @@ check_preset() {
         [ -z "$pattern" ] && continue
         instances=""
         case "$pattern" in *[[:space:]]*) instances="${pattern#*[[:space:]]}"; pattern="${pattern%%[[:space:]]*}" ;; esac
+        if [ -n "$instances" ] && [ -n "$template" ]; then
+            # shellcheck disable=SC2254
+            case "$template" in
+                $pattern) case " $instances " in *" $instance "*) echo "$action"; return ;; esac ;;
+            esac
+            continue
+        fi
         # fnmatch-style: check if unit matches pattern
         case "$unit" in
             $pattern) echo "$action $instances"; return ;;
@@ -2606,6 +2630,53 @@ mod tests {
             ],
         );
         assert!(links.is_empty(), "{links:?}");
+    }
+
+    /// Instance names follow systemctl: an instance's own unit file wins over
+    /// its template, a dotted instance is not the bare template, and an
+    /// explicit instance matches a preset rule that lists it.
+    #[cfg(unix)]
+    #[test]
+    fn offline_systemctl_instance_names_follow_systemctl() {
+        let own_file = offline_systemctl(
+            &[(
+                "demo@tty1.service",
+                "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+            )],
+            &[],
+            &[&["enable", "demo@tty1.service"]],
+        );
+        assert_eq!(
+            own_file,
+            ["multi-user.target.wants/demo@tty1.service -> /usr/lib/systemd/system/demo@tty1.service"]
+        );
+
+        let worker = "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n";
+        let dotted = offline_systemctl(
+            &[("worker@.service", worker)],
+            &[],
+            &[
+                &["enable", "worker@.blue.service", "worker@red.service"],
+                &["disable", "worker@.blue.service"],
+            ],
+        );
+        assert_eq!(
+            dotted,
+            ["multi-user.target.wants/worker@red.service -> /usr/lib/systemd/system/worker@.service"]
+        );
+
+        let listed = offline_systemctl(
+            &[("getty@.service", GETTY)],
+            &[(
+                "90-x.preset",
+                "enable getty@.service tty2 tty3\ndisable *\n",
+            )],
+            &[&["preset", "getty@tty2.service", "getty@tty4.service"]],
+        );
+        assert_eq!(
+            listed,
+            ["getty.target.wants/getty@tty2.service -> /usr/lib/systemd/system/getty@.service"]
+        );
     }
 
     /// A feed rebuilt in place advances avocado-sdk-target, which arrives
