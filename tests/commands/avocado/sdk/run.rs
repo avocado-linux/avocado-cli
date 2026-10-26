@@ -24,8 +24,11 @@ fn test_sdk_run_echo() {
     // in CI. Before ENG-2352, `sdk run` swallowed a failed container command and
     // exited 0, so asserting success passed falsely. `sdk run` now exits non-zero
     // on a failed command, so assert only that the CLI runs to completion.
-    let result =
-        common::cli_with_config(&["sdk", "run", "--", "echo", "test"], None, Some(&config_path));
+    let result = common::cli_with_config(
+        &["sdk", "run", "--", "echo", "test"],
+        None,
+        Some(&config_path),
+    );
     common::assert_command_completes(&result);
 }
 
