@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry
   `os_build_id`/`initramfs_build_id` once `runtime var-image` has run.
+- `avocado config schema` prints the avocado.yaml JSON Schema this CLI uses.
+  (ENG-2775)
+- `avocado config validate` checks an avocado.yaml without building: YAML
+  parse errors, every schema violation, and the loader's own checks are
+  errors, and keys the CLI ignores are warnings. `-c -` reads stdin, and
+  `--output json` prints `{ok, errors, warnings}`. It exits 1 when there are
+  errors. avocado-mcp's `validate-yaml` calls it. (ENG-2775)
 - `avocado connect upload --no-sbom` skips SBOM generation.
 - `avocado connect runtimes list` gains an `SBOM` column: `indexed`,
   `pending`, `failed` or `none`, and `?` against a server that does not report
@@ -61,6 +68,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **Builds through the avocado-vm on macOS are much faster.** On one ROS 2
+  project, `avocado install` went from 23 to 5 minutes. Every syscall in the
+  VM is about 7x faster, and reading files from the project about 700x.
+  Three causes, all fixed in the CLI:
+  - The CPU idle state the CLI adds to the VM's device tree was a power-down
+    state, which QEMU's HVF cannot enter. The guest counted every idle entry
+    as a failed suspend, which slowed every syscall and file share request
+    about 10x and kept 1 to 4 host cores busy at idle. The state is now a
+    standby state that is never entered. Idle host CPU is about 2%.
+  - The project share is mounted with `cache=mmap` and `msize=512000`. Before,
+    file reads and writes went as one 4 KiB request per page: reading 256 MiB
+    took 63 s, now 0.09 s. Edits made on the Mac still show up in the VM at
+    once.
+  - Containers no longer run bindfs on top of the share under the VM, which
+    made file operations 2 to 18x slower. The share already stores new files
+    as the Mac user. Project files now show the Mac UID inside the container,
+    so the CLI passes git `safe.directory=*` in those containers (as bindfs
+    did, every project repo is trusted), and runtime `var_files` copied from the project
+    are made root's before the var partition is built. Set `AVOCADO_HOST_UID`
+    to get bindfs back.
+
+  Run `avocado vm stop && avocado vm start` once after the upgrade: a running
+  VM keeps the old settings until it restarts. Linux hosts are not affected.
 - **`repos:` feeds work on macOS with the avocado-vm.** The per-run feeds
   directory was made in `$TMPDIR`, which the VM does not share, so a `path:`
   feed failed with a read-only mount error and a `url:` feed was not seen by

@@ -398,6 +398,33 @@ STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $STONE_INPUT_DIR"
 # it targets stays until the BSP recipe stages those artifacts here.
 STONE_INCLUDE_FLAGS="$STONE_INCLUDE_FLAGS -i $AVOCADO_SDK_PREFIX/stone"
 
+# stone copies AVOCADO_OS_BUILD_ID from --os-release into bundle.json
+# verify.expected, and the device rolls the update back after the reboot if the
+# booted rootfs has a different id. So the file must be the os-release of the
+# image this bundle ships: the copy the rootfs section keeps beside the image
+# (AVOCADO_ROOTFS_OS_RELEASE, replayed from .exports when the image is reused).
+# The shared sysroot is never read for the id: every runtime images it, so it
+# cannot tell which runtime's image this is.
+#
+# stone gets no initramfs os-release, so the bundle has no verify_initramfs
+# block. Turning that boot-time check on is a separate change that needs
+# device testing.
+STONE_OS_RELEASE="${{AVOCADO_ROOTFS_OS_RELEASE:-}}"
+
+# Guard, before stone: the os-release given to stone must hold the id the
+# rootfs image was built with. It runs before the platform build hook, so a
+# mismatch stops the build before the hook writes anything.
+if [ -n "${{AVOCADO_OS_BUILD_ID:-}}" ]; then
+    STONE_OS_RELEASE_ID=$(grep '^AVOCADO_OS_BUILD_ID=' "$STONE_OS_RELEASE" 2>/dev/null | head -n 1 | cut -d= -f2-) \
+        || STONE_OS_RELEASE_ID=""
+    if [ "$STONE_OS_RELEASE_ID" != "$AVOCADO_OS_BUILD_ID" ]; then
+        # The bundle from an earlier build is for an image this build replaced.
+        rm -f "$STONE_AOS_OUTPUT"
+        echo "ERROR: the os-release for the OS bundle ('$STONE_OS_RELEASE') has AVOCADO_OS_BUILD_ID='$STONE_OS_RELEASE_ID', but the rootfs image of runtime '$RUNTIME_NAME' has '$AVOCADO_OS_BUILD_ID'. A device would roll this update back after the reboot. Rebuild the images with 'avocado --no-stamps build'." >&2
+        exit 1
+    fi
+fi
+
 STONE_OVERLAY_FLAG=""
 {device_tree_overlay_section}
 # Platform build hook. A BSP uses this to stage artifacts the manifest
@@ -450,21 +477,26 @@ echo -e "  Manifest:  $STONE_MANIFEST"
 echo -e "  Output:    $STONE_AOS_OUTPUT"
 echo -e "  Build dir: $STONE_BUILD_DIR"
 
-STONE_INITRD_FLAG=""
-INITRD_OS_RELEASE="$AVOCADO_PREFIX/initramfs/usr/lib/os-release-initrd"
-if [ -f "$INITRD_OS_RELEASE" ]; then
-    STONE_INITRD_FLAG="--os-release-initrd $INITRD_OS_RELEASE"
-fi
-
 stone bundle \
-    --os-release "$AVOCADO_PREFIX/rootfs/usr/lib/os-release" \
-    $STONE_INITRD_FLAG \
+    --os-release "$STONE_OS_RELEASE" \
     -m "$STONE_MANIFEST" \
     $STONE_INCLUDE_FLAGS \
     $STONE_OVERLAY_FLAG \
     --partition-size "var=$STONE_VAR_SIZE" \
     -o "$STONE_AOS_OUTPUT" \
     --build-dir "$STONE_BUILD_DIR"
+
+# Guard, after stone: the bundle must expect the id of the rootfs it ships. The
+# bad bundle is removed, so nothing can deploy or upload it.
+if [ -n "${{AVOCADO_OS_BUILD_ID:-}}" ] && [ -f "$STONE_AOS_OUTPUT" ]; then
+    STONE_VERIFY_ID=$(python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("verify") or {{}}).get("expected", ""))' "$STONE_BUILD_DIR/bundle.json" 2>/dev/null) \
+        || STONE_VERIFY_ID=""
+    if [ "$STONE_VERIFY_ID" != "$AVOCADO_OS_BUILD_ID" ]; then
+        rm -f "$STONE_AOS_OUTPUT"
+        echo "ERROR: the OS bundle for runtime '$RUNTIME_NAME' expects AVOCADO_OS_BUILD_ID='$STONE_VERIFY_ID' (verify.expected in $STONE_BUILD_DIR/bundle.json), but its rootfs image has '$AVOCADO_OS_BUILD_ID'. A device would roll this update back after the reboot. The bundle was removed." >&2
+        exit 1
+    fi
+fi
 
 # Patch manifest in var-staging to add os_bundle reference (for connect upload)
 # The btrfs image for provisioning doesn't need os_bundle — initial flash doesn't OTA.
@@ -497,15 +529,9 @@ print("  OS bundle: os-bundle.aos -> " + aos_image_id + ".raw")
 
 with open(manifest_path, "r") as f:
     manifest = json.load(f)
-os_build_id = None
-os_release_path = os.path.join(os.environ.get("AVOCADO_PREFIX", ""), "rootfs/usr/lib/os-release")
-if os.path.isfile(os_release_path):
-    with open(os_release_path) as f:
-        for line in f:
-            if line.startswith("AVOCADO_OS_BUILD_ID="):
-                os_build_id = line.strip().split("=", 1)[1]
-                break
-
+# Both ids come from the image sections that built (or reused) the images this
+# bundle ships, never from the shared sysroots.
+os_build_id = os.environ.get("AVOCADO_OS_BUILD_ID")
 initramfs_build_id = os.environ.get("AVOCADO_INITRAMFS_BUILD_ID")
 
 os_bundle = dict(image_id=aos_image_id, sha256=aos_sha256)
@@ -929,6 +955,144 @@ extensions:
         // Guarded on absence: a provision in the same project leaves a REAL
         // var image here, and truncating it back would unmount /var on boot.
         assert!(ota.contains(r#"if [ ! -f "$STONE_VAR_PLACEHOLDER" ]; then"#));
+    }
+
+    /// The bundle and the manifest take the build id from the image they
+    /// ship, never from a shared sysroot: every runtime images the sysroot, so
+    /// it only knows the runtime that built last.
+    #[test]
+    fn the_ota_tail_takes_the_build_id_from_the_image_not_the_sysroot() {
+        let ota = ota_half(BASE);
+        for needle in [
+            "rootfs/usr/lib/os-release",
+            "$AVOCADO_PREFIX/initramfs",
+            "--os-release-initrd",
+            "STONE_INITRD_FLAG",
+        ] {
+            assert!(!ota.contains(needle), "OTA tail must not use {needle}");
+        }
+        assert!(ota.contains(r#"STONE_OS_RELEASE="${AVOCADO_ROOTFS_OS_RELEASE:-}""#));
+        assert!(ota.contains(r#"--os-release "$STONE_OS_RELEASE""#));
+        assert!(ota.contains(r#"os_build_id = os.environ.get("AVOCADO_OS_BUILD_ID")"#));
+        assert!(
+            ota.contains(r#"initramfs_build_id = os.environ.get("AVOCADO_INITRAMFS_BUILD_ID")"#)
+        );
+
+        // Guard before the platform hook and stone, then stone, guard after,
+        // then the manifest patch.
+        let pre = ota.find("STONE_OS_RELEASE_ID=").expect("pre-bundle guard");
+        let hook = ota.find("AVOCADO_BUILD_HOOK=").expect("platform hook");
+        let stone = ota.find("\nstone bundle ").expect("stone bundle");
+        let post = ota.find("STONE_VERIFY_ID=").expect("post-bundle guard");
+        let patch = ota.find("python3 << 'PYEOF'").expect("manifest patch");
+        assert!(pre < hook && hook < stone && stone < post && post < patch);
+    }
+
+    /// Run the tail from the os-release choice through both guards under
+    /// bash, with `stone` replaced by a function that writes bundle.json the
+    /// way stone does (verify.expected from the first AVOCADO_OS_BUILD_ID in
+    /// --os-release), or with `$FAKE_STONE_ID` when set.
+    #[cfg(unix)]
+    #[test]
+    fn the_bundle_guards_stop_a_build_id_mismatch() {
+        let ota = ota_half(BASE);
+        // The guard before stone and the stone part, without the platform
+        // hook and var placeholder that sit between them.
+        let guard_start = ota.find("STONE_OS_RELEASE=").unwrap();
+        let guard_end = ota.find("STONE_OVERLAY_FLAG=\"\"").unwrap();
+        let stone_start = ota.find("\nstone bundle ").unwrap();
+        let end = ota.find("# Patch manifest in var-staging").unwrap();
+        let section = format!(
+            "{}\n{}",
+            &ota[guard_start..guard_end],
+            &ota[stone_start..end]
+        );
+        let fake_stone = r#"
+stone() {
+    local osr="" out="" bdir=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --os-release) osr="$2"; shift 2 ;;
+            -o) out="$2"; shift 2 ;;
+            --build-dir) bdir="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -f "$osr" ] || { echo "stone: no os-release" >&2; return 1; }
+    local id
+    id=$(grep '^AVOCADO_OS_BUILD_ID=' "$osr" | head -n 1 | cut -d= -f2-)
+    id="${FAKE_STONE_ID:-$id}"
+    mkdir -p "$bdir"
+    if [ -n "$id" ]; then
+        printf '{"verify": {"expected": "%s"}}' "$id" > "$bdir/bundle.json"
+    else
+        printf '{}' > "$bdir/bundle.json"
+    fi
+    echo bundle > "$out"
+    echo STONE-RAN
+}
+"#;
+        let run = |os_release: Option<&str>, build_id: Option<&str>, fake: Option<&str>| {
+            let dir = TempDir::new().unwrap();
+            let osr = dir.path().join("img.erofs-lz4.os-release");
+            if let Some(content) = os_release {
+                std::fs::write(&osr, content).unwrap();
+            }
+            // A bundle from an earlier build: a failed guard must not leave it.
+            let aos = dir.path().join("os-bundle.aos");
+            std::fs::write(&aos, "old bundle").unwrap();
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(format!("{fake_stone}\n{section}\necho TAIL-DONE"))
+                .env("RUNTIME_NAME", "dev")
+                .env("STONE_BUILD_DIR", dir.path().join("stone"))
+                .env("STONE_AOS_OUTPUT", &aos)
+                .env("AVOCADO_ROOTFS_OS_RELEASE", &osr)
+                .env_remove("AVOCADO_OS_BUILD_ID")
+                .env_remove("FAKE_STONE_ID");
+            if let Some(id) = build_id {
+                cmd.env("AVOCADO_OS_BUILD_ID", id);
+            }
+            if let Some(id) = fake {
+                cmd.env("FAKE_STONE_ID", id);
+            }
+            let o = cmd.output().unwrap();
+            (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).to_string(),
+                String::from_utf8_lossy(&o.stderr).to_string(),
+                aos.exists(),
+            )
+        };
+
+        let image = "ID=avocado\nAVOCADO_OS_BUILD_ID=aaa\nAVOCADO_RUNTIME_NAME=dev\n";
+
+        let (code, out, err, aos) = run(Some(image), Some("aaa"), None);
+        assert_eq!(code, Some(0), "{err}");
+        assert!(out.contains("STONE-RAN") && out.contains("TAIL-DONE") && aos);
+
+        // The os-release is from another build: stopped before stone runs.
+        let other = "ID=avocado\nAVOCADO_OS_BUILD_ID=bbb\n";
+        let (code, out, err, aos) = run(Some(other), Some("aaa"), None);
+        assert_eq!(code, Some(1));
+        assert!(!out.contains("STONE-RAN") && !aos);
+        assert!(err.contains("ERROR:") && err.contains("'bbb'") && err.contains("'aaa'"));
+
+        // No os-release beside the image: stopped, never a silent fallback.
+        let (code, out, err, aos) = run(None, Some("aaa"), None);
+        assert_eq!(code, Some(1));
+        assert!(!out.contains("STONE-RAN") && !aos && err.contains("ERROR:"));
+
+        // stone wrote a different verify.expected: the bundle is removed.
+        let (code, out, err, aos) = run(Some(image), Some("aaa"), Some("ccc"));
+        assert_eq!(code, Some(1));
+        assert!(out.contains("STONE-RAN") && !aos);
+        assert!(err.contains("ERROR:") && err.contains("'ccc'"));
+
+        // No rootfs id at all (no rootfs sysroot): nothing to compare.
+        let (code, out, err, _) = run(Some("ID=avocado\n"), None, None);
+        assert_eq!(code, Some(0), "{err}");
+        assert!(out.contains("TAIL-DONE"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use utils::config::Config;
 use commands::build::BuildCommand;
 use commands::clean::CleanCommand;
 use commands::config_show::ConfigShowCommand;
+use commands::config_validate::ConfigValidateCommand;
 use commands::connect::auth::{
     ConnectAuthLoginCommand, ConnectAuthLogoutCommand, ConnectAuthStatusCommand, OutputFormat,
 };
@@ -434,7 +435,8 @@ enum Commands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Skip warnings and confirmation prompts. A raw SD card write from the
+        /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
         /// Runtime name to provision (deprecated, use positional argument)
@@ -1423,6 +1425,18 @@ enum ConfigCommands {
         #[arg(long)]
         detail: bool,
     },
+    /// Print the JSON Schema for avocado.yaml that this CLI uses.
+    Schema,
+    /// Check an avocado.yaml against the schema and the CLI's own rules,
+    /// without building. Exits 1 when there are errors.
+    Validate {
+        /// Path to avocado.yaml, or `-` to read it from stdin
+        #[arg(short = 'c', long, default_value = "./avocado.yaml")]
+        config: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
 }
 
 /// Arguments shared by `avocado login` and `avocado connect auth login`.
@@ -1810,7 +1824,8 @@ enum RuntimeCommands {
         /// Enable verbose output
         #[arg(short, long)]
         verbose: bool,
-        /// Force the operation to proceed, bypassing warnings or confirmation prompts
+        /// Skip warnings and confirmation prompts. A raw SD card write from the
+        /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
         /// Runtime name (deprecated, use positional argument)
@@ -3386,6 +3401,18 @@ async fn main() -> Result<()> {
                 };
                 cmd.execute().await?;
                 Ok(())
+            }
+            ConfigCommands::Schema => {
+                print!("{}", utils::config_lint::SCHEMA_SOURCE);
+                Ok(())
+            }
+            ConfigCommands::Validate { config, output } => {
+                ConfigValidateCommand {
+                    config_path: config,
+                    output,
+                }
+                .execute()
+                .await
             }
         },
         Commands::Container { command } => match command {

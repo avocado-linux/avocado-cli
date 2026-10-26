@@ -230,6 +230,7 @@ mod tests {
             initramfs: None,
             kernel: None,
             permissions: None,
+            locked_releasever: None,
         }
     }
 

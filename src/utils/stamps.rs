@@ -116,6 +116,16 @@ impl fmt::Display for StampComponent {
 /// instead of trusted.
 pub const SCRIPTLET_CONTRACT: &str = "offline-root-1";
 
+/// Version of the steps a rootfs or initramfs install runs after its dnf
+/// transaction. Bump it whenever those steps change what lands in the
+/// sysroot: it is part of the sysroot install input hash, so a sysroot
+/// installed without the change is installed again. Unlike
+/// [`SCRIPTLET_CONTRACT`] it does not touch the SDK or extensions.
+///
+/// `kernel-module-deps-1`: depmod runs once after all packages are in place.
+/// Sysroots from CLIs before it can have an empty `modules.dep`.
+pub const SYSROOT_POST_INSTALL: &str = "kernel-module-deps-1";
+
 /// Input hashes that determine if a stamp is stale
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StampInputs {
@@ -398,26 +408,40 @@ impl Stamp {
         )
     }
 
-    /// Create rootfs image stamp
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn rootfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+    /// Create rootfs image stamp for one runtime.
+    ///
+    /// The sysroot is shared by the target, but each runtime builds its own
+    /// image at `runtimes/<runtime>/avocado-image-rootfs-*`. The stamp is per
+    /// runtime for the same reason: one runtime's rebuild must not make another
+    /// runtime's older image look current.
+    pub fn rootfs_image(
+        runtime: &str,
+        target: &str,
+        inputs: StampInputs,
+        outputs: StampOutputs,
+    ) -> Self {
         Self::new(
             StampCommand::Image,
             StampComponent::Rootfs,
-            None,
+            Some(runtime.to_string()),
             target.to_string(),
             inputs,
             outputs,
         )
     }
 
-    /// Create initramfs image stamp
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn initramfs_image(target: &str, inputs: StampInputs, outputs: StampOutputs) -> Self {
+    /// Create initramfs image stamp for one runtime. Per runtime for the
+    /// reason given on [`Stamp::rootfs_image`].
+    pub fn initramfs_image(
+        runtime: &str,
+        target: &str,
+        inputs: StampInputs,
+        outputs: StampOutputs,
+    ) -> Self {
         Self::new(
             StampCommand::Image,
             StampComponent::Initramfs,
-            None,
+            Some(runtime.to_string()),
             target.to_string(),
             inputs,
             outputs,
@@ -437,8 +461,16 @@ impl Stamp {
             (StampComponent::Runtime, Some(name)) => {
                 format!("runtime/{}/{}.stamp", name, self.command)
             }
-            (StampComponent::Rootfs, _) => format!("rootfs/{}.stamp", self.command),
-            (StampComponent::Initramfs, _) => format!("initramfs/{}.stamp", self.command),
+            // Image stamps are per runtime (rootfs/<runtime>/image.stamp);
+            // the install stamp is per target, like the sysroot it describes.
+            (StampComponent::Rootfs, Some(runtime)) => {
+                format!("rootfs/{}/{}.stamp", runtime, self.command)
+            }
+            (StampComponent::Initramfs, Some(runtime)) => {
+                format!("initramfs/{}/{}.stamp", runtime, self.command)
+            }
+            (StampComponent::Rootfs, None) => format!("rootfs/{}.stamp", self.command),
+            (StampComponent::Initramfs, None) => format!("initramfs/{}.stamp", self.command),
             _ => panic!("Component name required for Extension and Runtime"),
         }
     }
@@ -581,16 +613,18 @@ impl StampRequirement {
         Self::new(StampCommand::Install, StampComponent::Initramfs, None)
     }
 
-    /// Rootfs image requirement
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn rootfs_image() -> Self {
-        Self::new(StampCommand::Image, StampComponent::Rootfs, None)
+    /// Rootfs image requirement for one runtime (see [`Stamp::rootfs_image`])
+    pub fn rootfs_image(runtime: &str) -> Self {
+        Self::new(StampCommand::Image, StampComponent::Rootfs, Some(runtime))
     }
 
-    /// Initramfs image requirement
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn initramfs_image() -> Self {
-        Self::new(StampCommand::Image, StampComponent::Initramfs, None)
+    /// Initramfs image requirement for one runtime (see [`Stamp::initramfs_image`])
+    pub fn initramfs_image(runtime: &str) -> Self {
+        Self::new(
+            StampCommand::Image,
+            StampComponent::Initramfs,
+            Some(runtime),
+        )
     }
 
     /// Get the stamp file path relative to $AVOCADO_PREFIX/.stamps/
@@ -612,8 +646,16 @@ impl StampRequirement {
             (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime/{}/{}.stamp", name, self.command)
             }
-            (StampComponent::Rootfs, _, _) => format!("rootfs/{}.stamp", self.command),
-            (StampComponent::Initramfs, _, _) => format!("initramfs/{}.stamp", self.command),
+            (StampComponent::Rootfs, Some(runtime), _) => {
+                format!("rootfs/{}/{}.stamp", runtime, self.command)
+            }
+            (StampComponent::Initramfs, Some(runtime), _) => {
+                format!("initramfs/{}/{}.stamp", runtime, self.command)
+            }
+            (StampComponent::Rootfs, None, _) => format!("rootfs/{}.stamp", self.command),
+            (StampComponent::Initramfs, None, _) => {
+                format!("initramfs/{}.stamp", self.command)
+            }
             _ => panic!("Component name required for Extension and Runtime"),
         }
     }
@@ -631,8 +673,14 @@ impl StampRequirement {
             (StampComponent::Runtime, Some(name), _) => {
                 format!("runtime '{}' {}", name, self.command)
             }
-            (StampComponent::Rootfs, _, _) => format!("rootfs {}", self.command),
-            (StampComponent::Initramfs, _, _) => format!("initramfs {}", self.command),
+            (StampComponent::Rootfs, Some(runtime), _) => {
+                format!("rootfs {} for runtime '{}'", self.command, runtime)
+            }
+            (StampComponent::Initramfs, Some(runtime), _) => {
+                format!("initramfs {} for runtime '{}'", self.command, runtime)
+            }
+            (StampComponent::Rootfs, None, _) => format!("rootfs {}", self.command),
+            (StampComponent::Initramfs, None, _) => format!("initramfs {}", self.command),
             _ => format!("{} {}", self.component, self.command),
         }
     }
@@ -680,6 +728,11 @@ impl StampRequirement {
             }
             (StampComponent::Initramfs, _, StampCommand::Install) => {
                 "avocado initramfs install".to_string()
+            }
+            // Only `runtime build` writes the per-runtime image stamps.
+            (StampComponent::Rootfs, Some(runtime), StampCommand::Image)
+            | (StampComponent::Initramfs, Some(runtime), StampCommand::Image) => {
+                format!("avocado runtime build {runtime}")
             }
             _ => format!("avocado {} {}", self.component, self.command),
         }
@@ -1941,6 +1994,10 @@ pub fn compute_ext_image_input_hash(
 /// - `permissions` — the bodies behind `<section>.permissions: <name>` refs.
 /// - `source_date_epoch` — `mkfs.erofs -T` and the cpio mtime normalization.
 /// - `sdk.image` — the container whose mkfs/cpio/zstd produce the bytes.
+/// - `runtime`: which runtime the image is for. Each runtime has its own
+///   image, and its os-release records AVOCADO_RUNTIME_NAME. The stamp path
+///   is per runtime as well, so this is a second guard against one runtime's
+///   stamp passing for another's image.
 /// - `runtimes.<rt>.{var,version,rootfs,initramfs}`, and the same four under
 ///   each `runtimes.<rt>.target-*:` block since the build resolves those
 ///   overrides for its target: `var` drives the initramfs encrypt marker,
@@ -1954,7 +2011,6 @@ pub fn compute_ext_image_input_hash(
 ///   invalidate and the path alone cannot show it. Set but unreadable is an
 ///   error, like a declared script that is missing. Nothing is folded for a
 ///   non-kab image, so a stray env var cannot churn it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_sysroot_image_input_hash(
     section: &str,
     resolved_section: &serde_yaml::Value,
@@ -1991,6 +2047,15 @@ pub fn compute_sysroot_image_input_hash(
         if let Some(v) = value {
             hash_data.insert(serde_yaml::Value::String(key.to_string()), v.clone());
         }
+    }
+    // The image belongs to one runtime: its os-release holds
+    // AVOCADO_RUNTIME_NAME. The stamp path is per runtime too; the identity in
+    // the hash means two runtimes with the same config still differ here.
+    if let Some(rt) = runtime_name {
+        hash_data.insert(
+            serde_yaml::Value::String("runtime".to_string()),
+            serde_yaml::Value::String(rt.to_string()),
+        );
     }
     let runtime = runtime_name.and_then(|rt| Some((rt, config.get("runtimes")?.get(rt)?)));
     if let Some((rt, runtime)) = runtime {
@@ -2404,6 +2469,10 @@ fn compute_sysroot_install_input_hash(
     hash_data.insert(
         serde_yaml::Value::String("scriptlet_contract".to_string()),
         serde_yaml::Value::String(SCRIPTLET_CONTRACT.to_string()),
+    );
+    hash_data.insert(
+        serde_yaml::Value::String("sysroot_post_install".to_string()),
+        serde_yaml::Value::String(SYSROOT_POST_INSTALL.to_string()),
     );
 
     // The effective set, not the raw `<section>.packages` node — an absent
@@ -8152,23 +8221,83 @@ rootfs:
         );
     }
 
+    /// Image stamps live under the runtime that owns the image; the install
+    /// stamps stay per target, because the sysroot is shared.
     #[test]
     fn sysroot_image_stamp_paths_and_requirements() {
         let inputs = StampInputs::new("sha256:abc".to_string());
-        let stamp = Stamp::rootfs_image("qemux86-64", inputs.clone(), StampOutputs::default());
+        let stamp =
+            Stamp::rootfs_image("dev", "qemux86-64", inputs.clone(), StampOutputs::default());
         assert_eq!(stamp.command, StampCommand::Image);
         assert_eq!(stamp.component, StampComponent::Rootfs);
-        assert_eq!(stamp.relative_path(), "rootfs/image.stamp");
-        let stamp = Stamp::initramfs_image("qemux86-64", inputs, StampOutputs::default());
-        assert_eq!(stamp.relative_path(), "initramfs/image.stamp");
+        assert_eq!(stamp.relative_path(), "rootfs/dev/image.stamp");
+        let stamp = Stamp::initramfs_image("dev", "qemux86-64", inputs, StampOutputs::default());
+        assert_eq!(stamp.relative_path(), "initramfs/dev/image.stamp");
 
-        let req = StampRequirement::rootfs_image();
-        assert_eq!(req.relative_path(), "rootfs/image.stamp");
-        assert_eq!(req.description(), "rootfs image");
-        assert_eq!(req.fix_command(), "avocado rootfs image");
-        let req = StampRequirement::initramfs_image();
-        assert_eq!(req.relative_path(), "initramfs/image.stamp");
-        assert_eq!(req.description(), "initramfs image");
-        assert_eq!(req.fix_command(), "avocado initramfs image");
+        let req = StampRequirement::rootfs_image("dev");
+        assert_eq!(req.relative_path(), "rootfs/dev/image.stamp");
+        assert_eq!(req.description(), "rootfs image for runtime 'dev'");
+        assert_eq!(req.fix_command(), "avocado runtime build dev");
+        let req = StampRequirement::initramfs_image("dev");
+        assert_eq!(req.relative_path(), "initramfs/dev/image.stamp");
+        assert_eq!(req.description(), "initramfs image for runtime 'dev'");
+        assert_eq!(req.fix_command(), "avocado runtime build dev");
+
+        assert_eq!(
+            StampRequirement::rootfs_install().relative_path(),
+            "rootfs/install.stamp"
+        );
+        assert_eq!(
+            StampRequirement::initramfs_install().relative_path(),
+            "initramfs/install.stamp"
+        );
+    }
+
+    /// Two runtimes on one target each build their own image. A shared stamp
+    /// let the second runtime reuse its old image after the first one rebuilt
+    /// and wrote the stamp, so the two stamps must never be one file.
+    #[test]
+    fn two_runtimes_get_distinct_image_stamps() {
+        let inputs = StampInputs::new("sha256:abc".to_string());
+        for (a, b) in [
+            (
+                Stamp::rootfs_image("main", "t", inputs.clone(), StampOutputs::default()),
+                Stamp::rootfs_image("release", "t", inputs.clone(), StampOutputs::default()),
+            ),
+            (
+                Stamp::initramfs_image("main", "t", inputs.clone(), StampOutputs::default()),
+                Stamp::initramfs_image("release", "t", inputs.clone(), StampOutputs::default()),
+            ),
+        ] {
+            assert_ne!(a.relative_path(), b.relative_path());
+        }
+        assert_ne!(
+            StampRequirement::rootfs_image("main").relative_path(),
+            StampRequirement::rootfs_image("release").relative_path()
+        );
+        assert_ne!(
+            StampRequirement::initramfs_image("main").relative_path(),
+            StampRequirement::initramfs_image("release").relative_path()
+        );
+
+        // A batch read of one runtime's stamp must not answer for the other.
+        let main_req = StampRequirement::rootfs_image("main");
+        let release_req = StampRequirement::rootfs_image("release");
+        let main_stamp = Stamp::rootfs_image("main", "t", inputs.clone(), StampOutputs::default());
+        let batch = batch_line(&main_req, Some(&main_stamp));
+        assert!(own_stamp_is_current(&batch, &main_req, &inputs));
+        assert!(!own_stamp_is_current(&batch, &release_req, &inputs));
+    }
+
+    /// Two runtimes with the same config still get different image inputs.
+    #[test]
+    fn sysroot_image_hash_differs_per_runtime() {
+        let root = Path::new(".");
+        // No var/version/rootfs/initramfs keys: the runtime itself is the only
+        // difference, as in a project whose runtimes share every image setting.
+        let cfg = "runtimes:\n  main:\n    packages: {}\n  release:\n    packages: {}\n";
+        let hash =
+            |rt: &str| image_hash_in("rootfs", "filesystem: erofs\n", cfg, Some(rt), root).unwrap();
+        assert_ne!(hash("main"), hash("release"));
     }
 }

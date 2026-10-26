@@ -21,8 +21,9 @@ use std::sync::Mutex;
 /// wins, A's changes are gone.
 ///
 /// `save()` acquires this mutex, reloads the on-disk state inside the
-/// critical section, **merges** with self (self wins for any key it
-/// touched; disk-only keys are preserved), and writes the merged result.
+/// critical section, **merges** with self (self wins for any entry it
+/// changed since it was loaded; every other entry keeps the disk value),
+/// and writes the merged result.
 /// All modifications by parallel callers thus accumulate without explicit
 /// coordination from the call sites.
 static LOCKFILE_SAVE_GATE: Mutex<()> = Mutex::new(());
@@ -513,7 +514,7 @@ pub struct ExtensionSourceLock {
 }
 
 /// Lock data for a single extension — unifies sysroot packages and source metadata
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionLock {
     /// Source metadata (only present for remote/fetched extensions)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,7 +552,7 @@ fn runtime_extensions_are_empty(extensions: &HashMap<String, ExtensionLock>) -> 
 /// out of the global `targets.<t>.extensions` namespace into per-runtime
 /// scope. v5 lockfiles stored runtime state as a flat `name → packages`
 /// map; the v5→v6 migration wraps that as `{ packages: <old>, extensions: {} }`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeLock {
     /// Packages installed in the runtime's sysroot.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -578,7 +579,7 @@ fn runtimes_are_empty(runtimes: &HashMap<String, RuntimeLock>) -> bool {
 /// Authoritative record of what's flashed on the device for a given target.
 /// Written by `provision`/`deploy`; read by `deploy` to decide between a
 /// userspace push (kernel unchanged) and a full OS update (kernel changed).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BootRecord {
     /// KERNEL_VERSION of the kernel currently flashed on the device.
     #[serde(
@@ -683,18 +684,20 @@ pub struct TargetLocks {
     ///
     /// `None` means "no writer has recorded a feed set for this target"; an empty
     /// vec means "a writer recorded that this target resolves no named feeds".
-    /// The distinction is load-bearing: [`LockFile::merge_with`] adopts the
-    /// on-disk value only for `None`, so removing the last named feed from a
-    /// config actually clears the record instead of having `save()` resurrect it
-    /// from disk on every subsequent write.
+    /// [`LockFile::merge_with`] needs the two apart: a writer that changes the
+    /// record to an empty vec keeps it empty, so removing the last named feed
+    /// from a config clears the record instead of having `save()` bring the old
+    /// list back from disk. A writer that did not change the record takes the
+    /// disk value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feeds: Option<Vec<LockedFeed>>,
 
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
-    /// Not persisted. `merge_with` skips re-inserting disk packages for any
-    /// section named here, so a `save()` after a clean doesn't pull old
-    /// packages back from the on-disk lockfile.
+    /// Not persisted. `merge_with` checks only "rootfs" and "initramfs": for
+    /// those it keeps the in-memory section as it is and ignores the disk
+    /// copy, so a `save()` after a clean doesn't pull old packages back from
+    /// the on-disk lockfile. Other keys are recorded but not read.
     #[serde(skip)]
     pub cleared_sections: HashSet<String>,
 }
@@ -709,6 +712,14 @@ pub struct LockFile {
     pub distro_release: Option<String>,
     /// Package versions organized by target
     pub targets: HashMap<String, TargetLocks>,
+    /// In-memory only: the state [`LockFile::load`] read from disk. `save()`
+    /// compares `self` with it to find what this instance changed. Only those
+    /// changes are written; every other entry keeps the disk value, which a
+    /// parallel task may have updated since this instance was loaded.
+    /// `None` for a lock that was not loaded: then every entry `self` holds
+    /// counts as changed.
+    #[serde(skip)]
+    as_loaded: Option<Box<LockFile>>,
 }
 
 impl Default for LockFile {
@@ -724,6 +735,7 @@ impl LockFile {
             version: LOCKFILE_VERSION,
             distro_release: None,
             targets: HashMap::new(),
+            as_loaded: None,
         }
     }
 
@@ -774,7 +786,8 @@ impl LockFile {
             return Ok(Self::new());
         };
 
-        let lock_file = Self::parse_and_migrate(&content, &read_path)?;
+        let mut lock_file = Self::parse_and_migrate(&content, &read_path)?;
+        lock_file.as_loaded = Some(Box::new(lock_file.clone()));
 
         Ok(lock_file)
     }
@@ -1075,11 +1088,17 @@ impl LockFile {
     /// `serde_json::Map` (a `BTreeMap` without the `preserve_order` feature),
     /// so key order is stable regardless of the `HashMap` insertion order in
     /// the in-memory struct.
-    pub fn save(&self, src_dir: &Path) -> Result<()> {
+    ///
+    /// After a successful write, the state that this instance compares with
+    /// on its next save becomes this instance's own content, not the merged
+    /// result written to disk. A second save from the same instance then
+    /// writes only what changed after the first one.
+    pub fn save(&mut self, src_dir: &Path) -> Result<()> {
         // Serialize all read-modify-write sequences across concurrent
         // tasks. The mutex is briefly held — long enough to reload the
-        // on-disk state, merge in self's changes (self wins for any key
-        // it touched; disk-only keys preserved), and write the result.
+        // on-disk state, merge in self's changes (self wins for any entry
+        // it changed since load; disk wins for the rest), and write the
+        // result.
         let _guard = LOCKFILE_SAVE_GATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1102,7 +1121,9 @@ impl LockFile {
             self.clone()
         };
 
-        Self::write_to_disk(&to_write, src_dir)
+        Self::write_to_disk(&to_write, src_dir)?;
+        self.refresh_as_loaded();
+        Ok(())
     }
 
     /// Save without merging — write `self` verbatim, replacing any disk
@@ -1113,11 +1134,31 @@ impl LockFile {
     ///
     /// Still serializes against the global save gate so it doesn't race
     /// with concurrent merging writers.
-    pub fn save_replacing(&self, src_dir: &Path) -> Result<()> {
+    ///
+    /// Refreshes the compare state the same way as `save()`, so a later
+    /// `save()` from this instance does not count the replaced content as
+    /// changes.
+    pub fn save_replacing(&mut self, src_dir: &Path) -> Result<()> {
         let _guard = LOCKFILE_SAVE_GATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::write_to_disk(self, src_dir)
+        Self::write_to_disk(self, src_dir)?;
+        self.refresh_as_loaded();
+        Ok(())
+    }
+
+    /// Make the current content the state that the next `save()` compares
+    /// with. The copy holds no copy of its own, so the copies do not nest.
+    ///
+    /// The cleared flags are reset first: the clear is on disk now, so a
+    /// later save of rootfs or initramfs follows the three-way rule again
+    /// instead of ignoring the disk copy.
+    fn refresh_as_loaded(&mut self) {
+        for target in self.targets.values_mut() {
+            target.cleared_sections.clear();
+        }
+        self.as_loaded = None;
+        self.as_loaded = Some(Box::new(self.clone()));
     }
 
     /// Internal: serialize and write `lock` to the lockfile path under
@@ -1161,116 +1202,125 @@ impl LockFile {
         Ok(())
     }
 
-    /// Combine `self` with another `LockFile` so concurrent writers'
-    /// updates accumulate. **Self wins for any key it touched**; keys
-    /// only present in `other` are preserved. Used inside the
-    /// `LOCKFILE_SAVE_GATE` critical section to merge the saver's
-    /// in-memory state with the current disk state.
+    /// Combine `self` with the disk state so concurrent writers' updates
+    /// accumulate. Used inside the `LOCKFILE_SAVE_GATE` critical section.
+    ///
+    /// A three-way merge against the state `self` was loaded from: an entry
+    /// `self` changed since load (set, updated or removed) takes self's
+    /// value, and every other entry takes the disk value. A parallel install
+    /// loads the whole lock but changes only its own sysroot, so its save
+    /// must not put a sibling's entry back to the version it read at load.
+    /// A lock that was not loaded has no base, so every entry it holds wins
+    /// and disk-only entries are kept.
     fn merge_with(mut self, other: Self) -> Self {
+        let base = self.as_loaded.take().map(|b| *b).unwrap_or_default();
+        let empty_target = TargetLocks::default();
+
         // Bump version to whichever is newer.
         self.version = self.version.max(other.version);
-        if self.distro_release.is_none() {
-            self.distro_release = other.distro_release;
-        }
+        // Not every writer sets the release, so a writer with none keeps the
+        // recorded one. A set release follows the three-way rule.
+        self.distro_release = match self.distro_release {
+            None => other.distro_release,
+            mine => merge_value(mine, &base.distro_release, other.distro_release),
+        };
 
+        // A target that only self holds is not in `other.targets`, so it is
+        // written whole.
         for (target_name, other_target) in other.targets {
+            let base_target = base.targets.get(&target_name).unwrap_or(&empty_target);
             let self_target = self.targets.entry(target_name).or_default();
             // SDK packages — keyed by host arch, then package name.
-            for (arch, packages) in other_target.sdk {
-                let self_arch = self_target.sdk.entry(arch).or_default();
-                for (pkg, ver) in packages {
-                    self_arch.entry(pkg).or_insert(ver);
-                }
-            }
-            // Top-level package maps. or_insert preserves disk values for
-            // keys self didn't write, lets self's values win for keys it
-            // did. Skip the merge entirely for sections that were explicitly
+            self_target.sdk = merge_nested(
+                std::mem::take(&mut self_target.sdk),
+                &base_target.sdk,
+                other_target.sdk,
+                merge_packages,
+            );
+            // Skip the merge entirely for sections that were explicitly
             // cleared in self (kernel-pin-change clean): the cleared flag
             // means "my version of this section is authoritative" — pulling
             // in disk-only package keys (old kernel packages) would corrupt
             // the sysroot's recorded state.
             if !self_target.cleared_sections.contains("rootfs") {
-                for (k, v) in other_target.rootfs {
-                    self_target.rootfs.entry(k).or_insert(v);
-                }
+                self_target.rootfs = merge_packages(
+                    std::mem::take(&mut self_target.rootfs),
+                    &base_target.rootfs,
+                    other_target.rootfs,
+                );
             }
             if !self_target.cleared_sections.contains("initramfs") {
-                for (k, v) in other_target.initramfs {
-                    self_target.initramfs.entry(k).or_insert(v);
-                }
+                self_target.initramfs = merge_packages(
+                    std::mem::take(&mut self_target.initramfs),
+                    &base_target.initramfs,
+                    other_target.initramfs,
+                );
             }
-            for (k, v) in other_target.target_sysroot {
-                self_target.target_sysroot.entry(k).or_insert(v);
-            }
+            self_target.target_sysroot = merge_packages(
+                std::mem::take(&mut self_target.target_sysroot),
+                &base_target.target_sysroot,
+                other_target.target_sysroot,
+            );
             // Legacy/global extensions namespace — still authoritative
-            // for fetched-extension source metadata. Recurse into the
-            // per-extension package map for the same reason as the
-            // per-runtime case below: stale empty markers must not
-            // shadow concurrent writers' packages.
-            for (ext_name, other_ext) in other_target.extensions {
-                let self_ext = self_target.extensions.entry(ext_name).or_default();
-                for (pkg, ver) in other_ext.packages {
-                    self_ext.packages.entry(pkg).or_insert(ver);
-                }
-                if self_ext.source.is_none() {
-                    self_ext.source = other_ext.source;
-                }
-            }
-            // Per-runtime state — recurse into RuntimeLock. Crucially,
-            // recurse all the way down into per-extension package maps:
-            // a task's in-memory lockfile can hold a stale empty
-            // membership marker (`{}`) for a sibling extension it loaded
-            // before that sibling's task wrote packages. A whole-
-            // ExtensionLock-level or_insert would let that stale `{}`
-            // discard the sibling's freshly-saved packages on merge.
-            for (rt_name, other_rt) in other_target.runtimes {
-                let self_rt = self_target.runtimes.entry(rt_name).or_default();
-                for (k, v) in other_rt.packages {
-                    self_rt.packages.entry(k).or_insert(v);
-                }
-                for (ext_name, other_ext) in other_rt.extensions {
-                    let self_ext = self_rt.extensions.entry(ext_name).or_default();
-                    for (pkg, ver) in other_ext.packages {
-                        self_ext.packages.entry(pkg).or_insert(ver);
-                    }
-                    if self_ext.source.is_none() {
-                        self_ext.source = other_ext.source;
-                    }
-                }
-            }
+            // for fetched-extension source metadata.
+            self_target.extensions = merge_nested(
+                std::mem::take(&mut self_target.extensions),
+                &base_target.extensions,
+                other_target.extensions,
+                merge_extension,
+            );
+            // Per-runtime state: recurse into RuntimeLock and down into the
+            // per-extension package maps, so a runtime install's save and an
+            // ext install's save each keep only their own changes.
+            self_target.runtimes = merge_nested(
+                std::mem::take(&mut self_target.runtimes),
+                &base_target.runtimes,
+                other_target.runtimes,
+                |mine, base, disk| RuntimeLock {
+                    packages: merge_packages(mine.packages, &base.packages, disk.packages),
+                    extensions: merge_nested(
+                        mine.extensions,
+                        &base.extensions,
+                        disk.extensions,
+                        merge_extension,
+                    ),
+                },
+            );
             // Pinned kernel-versions per sysroot.
-            for (k, v) in other_target.kernel_versions {
-                self_target.kernel_versions.entry(k).or_insert(v);
-            }
+            self_target.kernel_versions = merge_entries(
+                std::mem::take(&mut self_target.kernel_versions),
+                &base_target.kernel_versions,
+                other_target.kernel_versions,
+                keep_mine,
+            );
             // Per-kernel-sysroot package state.
-            for (kver, packages) in other_target.kernels {
-                let self_kernel = self_target.kernels.entry(kver).or_default();
-                for (pkg, ver) in packages {
-                    self_kernel.entry(pkg).or_insert(ver);
-                }
-            }
-            // Boot record — adopt disk's value only when self has nothing.
-            if self_target.boot.kernel_version.is_none()
-                && other_target.boot.kernel_version.is_some()
-            {
-                self_target.boot = other_target.boot;
-            }
-            // Repo snapshot — adopt disk's pin only when self has none, so a
-            // concurrent writer's freshly-resolved pin isn't dropped. An
-            // explicit clear (unlock) goes through `save_replacing`, which
-            // never merges, so a cleared pin stays cleared.
-            // Same rule as the snapshot: adopt the other side's record only when
-            // this side has none. `None` is "did not touch feeds"; `Some(vec![])`
-            // is "recorded that there are none", which is why the field is an
-            // Option — treating an empty vec as "untouched" made clearing the
-            // record impossible, since `save()` reloads disk and would resurrect
-            // the old list on every write after the last named feed was removed.
-            if self_target.feeds.is_none() {
-                self_target.feeds = other_target.feeds;
-            }
-            if self_target.repo_snapshot.is_none() {
-                self_target.repo_snapshot = other_target.repo_snapshot;
-            }
+            self_target.kernels = merge_nested(
+                std::mem::take(&mut self_target.kernels),
+                &base_target.kernels,
+                other_target.kernels,
+                merge_packages,
+            );
+            self_target.boot = merge_value(
+                std::mem::take(&mut self_target.boot),
+                &base_target.boot,
+                other_target.boot,
+            );
+            // `None` is "did not touch feeds"; `Some(vec![])` is "recorded
+            // that there are none". That is why the field is an Option: a
+            // writer that cleared the record keeps it cleared, where an
+            // empty vec read as "untouched" would bring the old list back
+            // from disk on every save. An explicit clear of the snapshot pin
+            // (unlock) goes through `save_replacing`, which never merges.
+            self_target.feeds = merge_value(
+                self_target.feeds.take(),
+                &base_target.feeds,
+                other_target.feeds,
+            );
+            self_target.repo_snapshot = merge_value(
+                self_target.repo_snapshot.take(),
+                &base_target.repo_snapshot,
+                other_target.repo_snapshot,
+            );
         }
 
         self
@@ -1898,11 +1948,13 @@ impl LockFile {
             }
         }
 
-        // Mark the section authoritative, exactly as `clear_rootfs` does. Without
-        // this, `save()`'s merge re-inserts the dropped keys straight back off
-        // disk, so a removal never converges: the next run sees the resurrected
-        // package, detects the removal again, and wipes and reinstalls — forever,
-        // with the lockfile permanently listing a package that isn't installed.
+        // Mark the section authoritative, exactly as `clear_rootfs` does. The
+        // three-way merge in `save()` already keeps a removal made on a loaded
+        // lock. For rootfs and initramfs this flag also makes `save()` ignore
+        // the disk copy of the section entirely, so a removal converges even
+        // for a lock that was not loaded: otherwise the next run sees the
+        // resurrected package, detects the removal again, and wipes and
+        // reinstalls forever.
         //
         // "Cleared" is the right flag even though only some keys were dropped:
         // the caller goes on to reinstall and record the full installed set, so
@@ -2041,6 +2093,101 @@ impl LockFile {
     #[allow(dead_code)]
     pub fn get_targets(&self) -> Vec<String> {
         self.targets.keys().cloned().collect()
+    }
+}
+
+/// Three-way merge of one value for [`LockFile::merge_with`]: self's value
+/// when it differs from the value at load, else the disk value.
+fn merge_value<T: PartialEq>(mine: T, base: &T, disk: T) -> T {
+    if mine == *base {
+        disk
+    } else {
+        mine
+    }
+}
+
+/// Three-way merge of one keyed map for [`LockFile::merge_with`].
+///
+/// - A key that `self` removed since load stays removed.
+/// - A key whose value `self` did not change takes the disk value, or is
+///   dropped when the disk no longer has it.
+/// - A key that `self` added or changed goes through `merge_changed` with
+///   the value at load and the disk value, when they exist. So a key that
+///   `self` changed is written back even when a sibling removed it from disk.
+///   For a nested entry, only the sub-entries that `self` changed are written
+///   back then; the sub-entries it did not change are dropped with the
+///   parent that the sibling removed.
+fn merge_entries<V, F>(
+    mine: HashMap<String, V>,
+    base: &HashMap<String, V>,
+    disk: HashMap<String, V>,
+    merge_changed: F,
+) -> HashMap<String, V>
+where
+    V: PartialEq,
+    F: Fn(V, Option<&V>, Option<V>) -> V,
+{
+    let mut out = disk;
+    for key in base.keys() {
+        if !mine.contains_key(key) {
+            out.remove(key);
+        }
+    }
+    for (key, value) in mine {
+        let base_value = base.get(&key);
+        if base_value == Some(&value) {
+            continue;
+        }
+        let disk_value = out.remove(&key);
+        let merged = merge_changed(value, base_value, disk_value);
+        out.insert(key, merged);
+    }
+    out
+}
+
+/// [`merge_entries`] for a map of maps or structs: an entry that `self`
+/// changed merges one level down, with an empty value in place of a missing
+/// one.
+fn merge_nested<V, F>(
+    mine: HashMap<String, V>,
+    base: &HashMap<String, V>,
+    disk: HashMap<String, V>,
+    merge_changed: F,
+) -> HashMap<String, V>
+where
+    V: PartialEq + Default,
+    F: Fn(V, &V, V) -> V,
+{
+    let empty = V::default();
+    merge_entries(mine, base, disk, |mine, base, disk| {
+        merge_changed(mine, base.unwrap_or(&empty), disk.unwrap_or_default())
+    })
+}
+
+/// One sysroot's package map: per package, a change made by `self` wins.
+fn merge_packages(
+    mine: PackageVersions,
+    base: &PackageVersions,
+    disk: PackageVersions,
+) -> PackageVersions {
+    merge_entries(mine, base, disk, keep_mine)
+}
+
+/// `merge_changed` for leaf values: the value that `self` changed wins.
+fn keep_mine<V>(mine: V, _base: Option<&V>, _disk: Option<V>) -> V {
+    mine
+}
+
+/// One extension entry that `self` changed: its packages merge per package,
+/// and its source follows the same rule as any other value.
+fn merge_extension(
+    mine: ExtensionLock,
+    base: &ExtensionLock,
+    disk: ExtensionLock,
+) -> ExtensionLock {
+    ExtensionLock {
+        source: merge_value(mine.source, &base.source, disk.source),
+        packages: merge_packages(mine.packages, &base.packages, disk.packages),
     }
 }
 
@@ -2844,7 +2991,7 @@ wget 1.21-r0.core2_64
         fs::write(&legacy, serde_json::to_string_pretty(&seed).unwrap()).unwrap();
 
         // `load()` reads the legacy pins but does NOT write/relocate on its own.
-        let loaded = LockFile::load(src_dir).unwrap();
+        let mut loaded = LockFile::load(src_dir).unwrap();
         assert_eq!(
             loaded
                 .get_locked_version("qemux86-64", &sdk_x86, "curl")
@@ -3395,7 +3542,7 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
 
         // Task A loads, modifies its own ext-a entry (no-op for this test;
         // imagine it added another package).
-        let task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
 
         // Task B loads the same state independently.
         let mut task_b = LockFile::load(temp_dir.path()).unwrap();
@@ -4413,6 +4560,599 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert_eq!(
             loaded.get_locked_version("qemux86-64", &SysrootType::Rootfs, "curl"),
             Some(&"8.0.0-r0".to_string())
+        );
+    }
+
+    /// Versions as a `HashMap<String, String>`, the shape installs record.
+    fn versions(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn runtime_ext(runtime: &str, extension: &str) -> SysrootType {
+        SysrootType::RuntimeExtension {
+            runtime: runtime.to_string(),
+            extension: extension.to_string(),
+        }
+    }
+
+    /// Two parallel ext installs load the same lock, each updates its own
+    /// extension, both save. The second save must not put the first one's
+    /// extension back to the version it held at load time (ENG-2769).
+    #[test]
+    fn stale_snapshot_save_keeps_sibling_extension_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = SysrootType::Extension("ext-a".to_string());
+        let ext_b = SysrootType::Extension("ext-b".to_string());
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+        task_b.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "2.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string()),
+            "task B's save reverted ext-a to its stale snapshot"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"2.0".to_string())
+        );
+    }
+
+    /// Same race on the runtime-scoped path, which is where a runtime install
+    /// records its extensions.
+    #[test]
+    fn stale_snapshot_save_keeps_sibling_runtime_extension_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+        task_b.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "2.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string()),
+            "task B's save reverted dev/ext-a to its stale snapshot"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"2.0".to_string())
+        );
+    }
+
+    /// The membership save at the start of an ext install writes the whole
+    /// snapshot too. It must not revert a sibling that finished meanwhile.
+    #[test]
+    fn membership_save_keeps_sibling_extension_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+        task_b.record_runtime_extension_membership(target, "dev", "ext-b");
+        task_b.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string()),
+            "the membership save reverted dev/ext-a to its stale snapshot"
+        );
+        let dev = &on_disk.targets[target].runtimes["dev"];
+        assert!(dev.extensions.contains_key("ext-b"));
+    }
+
+    /// The real ext install flow saves twice from one instance: membership
+    /// first, then the installed versions. A sibling that saved between the
+    /// two must survive the second save as well.
+    #[test]
+    fn second_save_of_one_instance_keeps_sibling_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.record_runtime_extension_membership(target, "dev", "ext-a");
+        task_a.save(temp_dir.path()).unwrap();
+        task_b.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "2.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string())
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"2.0".to_string()),
+            "task A's second save reverted dev/ext-b to its stale snapshot"
+        );
+    }
+
+    /// A save refreshes the state that the next save compares with. Without
+    /// that, the second save of task A sees its own earlier write as a
+    /// change and puts task B's newer value back to it.
+    #[test]
+    fn resave_does_not_revert_a_newer_value_from_another_task() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+        task_b.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "3.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        task_a.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"3.0".to_string()),
+            "task A's second save reverted task B's newer value"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    /// An instance that saves a value, sets it back to the value at load and
+    /// saves again must write the value it holds now.
+    #[test]
+    fn resave_writes_a_value_set_back_to_the_value_at_load() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task = LockFile::load(temp_dir.path()).unwrap();
+        task.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task.save(temp_dir.path()).unwrap();
+        task.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        task.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    /// `save_replacing` refreshes the compare state too: a later `save()`
+    /// from the same instance keeps a sibling value written in between.
+    #[test]
+    fn save_after_save_replacing_keeps_sibling_update() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut task_a = LockFile::new();
+        task_a.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        task_a.save_replacing(temp_dir.path()).unwrap();
+
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+        task_b.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        task_b.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        task_a.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string())
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    /// A lock that was never loaded has nothing to compare with: every entry
+    /// it holds wins, and entries only on disk stay.
+    #[test]
+    fn unloaded_lock_wins_for_its_entries_and_keeps_disk_only_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = SysrootType::Extension("ext-a".to_string());
+        let ext_b = SysrootType::Extension("ext-b".to_string());
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "1.0")]));
+        initial.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut writer = LockFile::new();
+        writer.update_sysroot_versions(target, &ext_a, versions(&[("pkg-a", "2.0")]));
+        writer.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"2.0".to_string())
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    /// Runtime package maps follow the same rule: two runtime installs from
+    /// the same snapshot both keep their update.
+    #[test]
+    fn stale_snapshot_save_keeps_sibling_runtime_packages() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let dev = SysrootType::Runtime("dev".to_string());
+        let prod = SysrootType::Runtime("prod".to_string());
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &dev, versions(&[("base", "1.0")]));
+        initial.update_sysroot_versions(target, &prod, versions(&[("base", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_dev = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_prod = LockFile::load(temp_dir.path()).unwrap();
+
+        task_dev.update_sysroot_versions(target, &dev, versions(&[("base", "2.0")]));
+        task_dev.save(temp_dir.path()).unwrap();
+        task_prod.update_sysroot_versions(target, &prod, versions(&[("base", "2.0")]));
+        task_prod.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &dev, "base"),
+            Some(&"2.0".to_string())
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &prod, "base"),
+            Some(&"2.0".to_string())
+        );
+    }
+
+    fn feed(name: &str) -> LockedFeed {
+        LockedFeed {
+            name: name.to_string(),
+            position: 0,
+            url: format!("https://example.com/{name}"),
+            digest: None,
+            stages: None,
+        }
+    }
+
+    fn snapshot(id: &str) -> RepoSnapshot {
+        RepoSnapshot {
+            release: "2026".to_string(),
+            channel: "edge".to_string(),
+            snapshot: id.to_string(),
+            repo_url: None,
+            created: None,
+        }
+    }
+
+    /// `feeds` and `repo-snapshot` on a loaded lock: a stale save keeps the
+    /// newer disk value, and a change of this instance (an empty feed set)
+    /// wins.
+    #[test]
+    fn feeds_and_repo_snapshot_follow_the_three_way_rule() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+
+        let mut initial = LockFile::new();
+        initial.set_feeds(target, vec![feed("old")]);
+        initial.set_repo_snapshot(target, snapshot("OLD"));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut stale = LockFile::load(temp_dir.path()).unwrap();
+        let mut newer = LockFile::load(temp_dir.path()).unwrap();
+        newer.set_feeds(target, vec![feed("new")]);
+        newer.set_repo_snapshot(target, snapshot("NEW"));
+        newer.save(temp_dir.path()).unwrap();
+
+        stale.set_locked_version(target, &SysrootType::Rootfs, "curl", "8.0.0-r0");
+        stale.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(on_disk.get_feeds(target), &[feed("new")]);
+        assert_eq!(
+            on_disk
+                .get_repo_snapshot(target)
+                .map(|s| s.snapshot.as_str()),
+            Some("NEW")
+        );
+
+        let mut clearing = LockFile::load(temp_dir.path()).unwrap();
+        clearing.set_feeds(target, Vec::new());
+        clearing.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert!(on_disk.has_feed_record(target));
+        assert!(on_disk.get_feeds(target).is_empty());
+    }
+
+    /// `ext fetch` prunes a stale source with `clear_extension_source`; the
+    /// save must not read the source back from disk.
+    #[test]
+    fn cleared_extension_source_stays_cleared() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let source = ExtensionSourceLock {
+            source_type: "package".to_string(),
+            package: Some("ext-a".to_string()),
+            version: Some("1.0".to_string()),
+            implied: false,
+        };
+
+        let mut initial = LockFile::new();
+        initial.set_extension_source(target, "ext-a", source);
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut fetch = LockFile::load(temp_dir.path()).unwrap();
+        fetch.clear_extension_source(target, "ext-a");
+        fetch.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert!(on_disk.get_extension_source(target, "ext-a").is_none());
+    }
+
+    /// A writer with no release keeps the recorded one. A writer with a
+    /// release it did not change keeps a newer release from disk.
+    #[test]
+    fn distro_release_keeps_disk_value_unless_changed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+
+        let mut initial = LockFile::new();
+        initial.distro_release = Some("2024".to_string());
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut no_release = LockFile::load(temp_dir.path()).unwrap();
+        no_release.distro_release = None;
+        no_release.set_locked_version(target, &SysrootType::Rootfs, "curl", "8.0.0-r0");
+        no_release.save(temp_dir.path()).unwrap();
+        assert_eq!(
+            LockFile::load(temp_dir.path())
+                .unwrap()
+                .distro_release
+                .as_deref(),
+            Some("2024")
+        );
+
+        let mut stale = LockFile::load(temp_dir.path()).unwrap();
+        let mut newer = LockFile::load(temp_dir.path()).unwrap();
+        newer.distro_release = Some("2026".to_string());
+        newer.save(temp_dir.path()).unwrap();
+        stale.set_locked_version(target, &SysrootType::Rootfs, "jq", "1.7-r0");
+        stale.save(temp_dir.path()).unwrap();
+        assert_eq!(
+            LockFile::load(temp_dir.path())
+                .unwrap()
+                .distro_release
+                .as_deref(),
+            Some("2026")
+        );
+    }
+
+    /// The base after a save is this instance's own content, not the merged
+    /// result. A merged base would hold task B's newer value, so task A's
+    /// older in-memory value would count as a change and win the next save.
+    #[test]
+    fn base_after_save_is_own_content_not_merged_result() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_x = runtime_ext("dev", "ext-x");
+        let ext_y = runtime_ext("dev", "ext-y");
+        let ext_z = runtime_ext("dev", "ext-z");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(target, &ext_x, versions(&[("pkg-x", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_b.update_sysroot_versions(target, &ext_x, versions(&[("pkg-x", "2.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        task_a.update_sysroot_versions(target, &ext_y, versions(&[("pkg-y", "1.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+        task_a.update_sysroot_versions(target, &ext_z, versions(&[("pkg-z", "1.0")]));
+        task_a.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_x, "pkg-x"),
+            Some(&"2.0".to_string()),
+            "task A's second save reverted task B's value"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_z, "pkg-z"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    /// A save resets the cleared flags. After the clear is on disk, a second
+    /// save of the same instance follows the three-way rule for rootfs and
+    /// keeps a sibling's rootfs change.
+    #[test]
+    fn second_save_after_clear_rootfs_keeps_sibling_rootfs_change() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+
+        let mut initial = LockFile::new();
+        initial.set_locked_version(target, &SysrootType::Rootfs, "old-kmod", "1.0");
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        task_a.clear_rootfs(target);
+        task_a.save(temp_dir.path()).unwrap();
+        assert_eq!(
+            LockFile::load(temp_dir.path()).unwrap().get_locked_version(
+                target,
+                &SysrootType::Rootfs,
+                "old-kmod"
+            ),
+            None
+        );
+
+        let mut sibling = LockFile::load(temp_dir.path()).unwrap();
+        sibling.set_locked_version(target, &SysrootType::Rootfs, "curl", "8.0.0-r0");
+        sibling.save(temp_dir.path()).unwrap();
+
+        task_a.set_locked_version(target, &SysrootType::TargetSysroot, "gcc", "13.0");
+        task_a.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &SysrootType::Rootfs, "curl"),
+            Some(&"8.0.0-r0".to_string()),
+            "the second save ignored the disk copy of rootfs again"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &SysrootType::Rootfs, "old-kmod"),
+            None
+        );
+    }
+
+    /// A package removed from one extension stays removed: the removing
+    /// task's own save must not read it back from disk, and a sibling's later
+    /// save must not restore it from a snapshot taken before the removal.
+    #[test]
+    fn removed_package_stays_removed_after_sibling_save() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(
+            target,
+            &ext_a,
+            versions(&[("pkg-a", "1.0"), ("pkg-old", "1.0")]),
+        );
+        initial.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "1.0")]));
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.remove_packages_from_sysroot(target, &ext_a, &["pkg-old".to_string()]);
+        task_a.save(temp_dir.path()).unwrap();
+        let after_a = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            after_a.get_locked_version(target, &ext_a, "pkg-old"),
+            None,
+            "the removing task's own save read the package back from disk"
+        );
+
+        task_b.update_sysroot_versions(target, &ext_b, versions(&[("pkg-b", "2.0")]));
+        task_b.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-old"),
+            None,
+            "task B's save restored a package task A removed"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_a, "pkg-a"),
+            Some(&"1.0".to_string())
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ext_b, "pkg-b"),
+            Some(&"2.0".to_string())
+        );
+    }
+
+    /// The kernel pin of a sibling sysroot follows the same rule as its
+    /// packages.
+    #[test]
+    fn stale_snapshot_save_keeps_sibling_kernel_pin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "qemux86-64";
+        let ext_a = runtime_ext("dev", "ext-a");
+        let ext_b = runtime_ext("dev", "ext-b");
+
+        let mut initial = LockFile::new();
+        initial.set_kernel_version(target, &ext_a, "6.6.1");
+        initial.set_kernel_version(target, &ext_b, "6.6.1");
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task_a = LockFile::load(temp_dir.path()).unwrap();
+        let mut task_b = LockFile::load(temp_dir.path()).unwrap();
+
+        task_a.set_kernel_version(target, &ext_a, "6.6.2");
+        task_a.save(temp_dir.path()).unwrap();
+        task_b.set_kernel_version(target, &ext_b, "6.6.2");
+        task_b.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_kernel_version(target, &ext_a),
+            Some(&"6.6.2".to_string())
+        );
+        assert_eq!(
+            on_disk.get_kernel_version(target, &ext_b),
+            Some(&"6.6.2".to_string())
         );
     }
 }

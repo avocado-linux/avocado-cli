@@ -214,7 +214,7 @@ fn build_save_archive(
     // `avocado.lock` and (via `write_to_disk`) drops the legacy file.
     let config_dir = crate::utils::config::config_file_dir(config_path);
     if LockFile::legacy_path(config_dir).exists() {
-        if let Ok(lock) = LockFile::load(config_dir) {
+        if let Ok(mut lock) = LockFile::load(config_dir) {
             let _ = lock.save_replacing(config_dir);
         }
     }

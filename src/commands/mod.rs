@@ -1,6 +1,7 @@
 pub mod build;
 pub mod clean;
 pub mod config_show;
+pub mod config_validate;
 pub mod connect;
 pub mod container;
 pub mod ext;

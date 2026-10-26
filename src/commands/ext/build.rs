@@ -1350,14 +1350,16 @@ fi
     ) -> String {
         let overlay_section = self.overlay_section(overlay_config, ext_src_path, None);
 
-        // Create modprobe commands section for AVOCADO_ON_MERGE
+        // Create modprobe commands section for AVOCADO_ON_MERGE. It is written
+        // outside the kernel module check: a module can come from the rootfs
+        // kernel or another extension, not only from this one.
         let modprobe_section = if !modprobe_modules.is_empty() {
             modprobe_modules
                 .iter()
                 .map(|module| {
                     format!(
-                        r#"    echo "AVOCADO_ON_MERGE=\"modprobe {module}\"" >> "$release_file"
-    echo "[INFO] Added AVOCADO_ON_MERGE=\"modprobe {module}\" to release file""#
+                        r#"echo "AVOCADO_ON_MERGE=\"modprobe {module}\"" >> "$release_file"
+echo "[INFO] Added AVOCADO_ON_MERGE=\"modprobe {module}\" to release file""#
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1417,8 +1419,8 @@ echo "SYSEXT_SCOPE={}" >> "$release_file"
 if [ -d "$modules_dir" ] && [ -n "$(find "$modules_dir" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.gz" 2>/dev/null | head -n 1)" ]; then
     echo "AVOCADO_ON_MERGE=\"depmod\"" >> "$release_file"
     echo "[INFO] Found kernel modules in extension '{}', added AVOCADO_ON_MERGE=\"depmod\" to release file"
-    {}
 fi
+{}
 
 # Check if extension includes sysusers.d config files and add systemd-sysusers to AVOCADO_ON_MERGE if needed
 sysusers_dir1="$AVOCADO_EXT_SYSROOTS/{}/usr/local/lib/sysusers.d"
@@ -3253,6 +3255,119 @@ extensions:
         assert!(
             script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe ext4\\\" to release file")
         );
+    }
+
+    /// Run the real sysext build script for extension `kmod-ext` under `sh`.
+    /// `modules` lists files (made empty) under its `usr/lib/modules`; `None`
+    /// leaves that directory out. Returns the release file the script writes.
+    #[cfg(unix)]
+    fn run_sysext_script_with_modules(modprobe: &[&str], modules: Option<&[&str]>) -> String {
+        let cmd = ExtBuildCommand {
+            extension: "kmod-ext".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let modprobe: Vec<String> = modprobe.iter().map(|m| m.to_string()).collect();
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &modprobe,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            "/opt/src",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sysroot = tmp.path().join("sysroots/kmod-ext");
+        std::fs::create_dir_all(&sysroot).unwrap();
+        if modules.is_some() {
+            std::fs::create_dir_all(sysroot.join("usr/lib/modules")).unwrap();
+        }
+        for rel in modules.unwrap_or_default() {
+            let p = sysroot.join("usr/lib/modules").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+        }
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_EXT_SYSROOTS", tmp.path().join("sysroots"))
+            .env("AVOCADO_PREFIX", tmp.path().join("prefix"))
+            .output()
+            .expect("run script");
+        assert!(
+            out.status.success(),
+            "script failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(
+            sysroot.join("usr/lib/extension-release.d/extension-release.kmod-ext-1.0"),
+        )
+        .unwrap()
+    }
+
+    /// The on_merge lines of a release file, in order.
+    #[cfg(unix)]
+    fn on_merge_lines(release: &str) -> Vec<&str> {
+        release
+            .lines()
+            .filter(|l| l.starts_with("AVOCADO_ON_MERGE="))
+            .collect()
+    }
+
+    // A module from the rootfs kernel or another extension must still load
+    // when this extension ships no .ko file.
+    #[cfg(unix)]
+    #[test]
+    fn modprobe_entries_written_when_extension_has_no_kernel_modules() {
+        for modules in [None, Some(&[][..])] {
+            let release = run_sysext_script_with_modules(&["uvcvideo", "br_netfilter"], modules);
+            assert_eq!(
+                on_merge_lines(&release),
+                vec![
+                    r#"AVOCADO_ON_MERGE="modprobe uvcvideo""#,
+                    r#"AVOCADO_ON_MERGE="modprobe br_netfilter""#,
+                ],
+                "modules dir {modules:?}, release file:\n{release}"
+            );
+        }
+    }
+
+    // With a .ko in the extension, depmod comes first, then each modprobe.
+    #[cfg(unix)]
+    #[test]
+    fn modprobe_entries_follow_depmod_when_extension_has_kernel_modules() {
+        let release =
+            run_sysext_script_with_modules(&["uvcvideo"], Some(&["6.6.0/extra/uvcvideo.ko"]));
+        assert_eq!(
+            on_merge_lines(&release),
+            vec![
+                r#"AVOCADO_ON_MERGE="depmod""#,
+                r#"AVOCADO_ON_MERGE="modprobe uvcvideo""#,
+            ],
+            "release file:\n{release}"
+        );
+    }
+
+    // A compressed module with no modprobe list still gets depmod, and
+    // nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn depmod_only_when_extension_has_kernel_modules_and_no_modprobe() {
+        for module in ["6.6.0/extra/foo.ko.xz", "6.6.0/extra/foo.ko.gz"] {
+            let release = run_sysext_script_with_modules(&[], Some(&[module]));
+            assert_eq!(
+                on_merge_lines(&release),
+                vec![r#"AVOCADO_ON_MERGE="depmod""#],
+                "module {module}, release file:\n{release}"
+            );
+        }
     }
 
     #[test]

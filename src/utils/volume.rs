@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
@@ -27,6 +28,22 @@ pub struct VolumeState {
 fn volume_already_gone(stderr: &str) -> bool {
     stderr.to_ascii_lowercase().contains("no such volume")
 }
+
+/// What `volume rm` says when a container still holds the volume. Docker
+/// prints `remove <name>: volume is in use - [<id>]`, podman prints
+/// `volume is being used`.
+fn volume_in_use(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("volume is in use") || stderr.contains("volume is being used")
+}
+
+/// How long `clean` waits for removed containers to release the volume.
+/// A `--rm` container that was killed stays `Dead` and holds the volume
+/// until the daemon finishes its removal, which takes about a second.
+const VOLUME_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time between `volume rm` tries while the volume is still in use.
+const VOLUME_RELEASE_POLL: Duration = Duration::from_millis(250);
 
 impl VolumeState {
     /// Create a new volume state with a generated UUID-based name
@@ -330,25 +347,83 @@ impl VolumeManager {
     /// removed: `.avocado-state` can outlive its volume (a VM reset, a
     /// manual `volume rm`), and the state `clean` wants is "no volume".
     pub async fn remove_volume(&self, volume_name: &str) -> Result<()> {
+        match self.try_remove_volume(volume_name).await? {
+            None => Ok(()),
+            Some(stderr) => anyhow::bail!("Failed to remove volume {volume_name}: {stderr}"),
+        }
+    }
+
+    /// Run `volume rm` one time. Returns `None` when the volume is gone
+    /// (removed now, or not there), and the daemon's stderr when it is not.
+    async fn try_remove_volume(&self, volume_name: &str) -> Result<Option<String>> {
         let output = AsyncCommand::new(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()
             .await
             .with_context(|| "Failed to remove docker volume")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if volume_already_gone(&stderr) {
-                return Ok(());
-            }
-            anyhow::bail!("Failed to remove volume {volume_name}: {stderr}");
+        if output.status.success() {
+            return Ok(None);
         }
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if volume_already_gone(&stderr) {
+            return Ok(None);
+        }
+        Ok(Some(stderr))
+    }
 
-        Ok(())
+    /// Remove a volume right after its containers were removed. `kill` on a
+    /// `--rm` container starts its removal in the daemon, so the `rm -f` that
+    /// follows can return before the container is gone. Until then the
+    /// container is `Dead` and still holds the volume. Try `volume rm` again
+    /// while it says "in use", until `timeout`, then fail with its error.
+    ///
+    /// `removed` holds the IDs of the containers that were removed. If a
+    /// container that is not in `removed` holds the volume, it will not go
+    /// away by itself, so fail at once.
+    async fn remove_volume_once_released(
+        &self,
+        volume_name: &str,
+        removed: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut told = false;
+        loop {
+            let stderr = match self.try_remove_volume(volume_name).await? {
+                None => return Ok(()),
+                Some(stderr) => stderr,
+            };
+            if !volume_in_use(&stderr)
+                || Instant::now() >= deadline
+                || self.held_by_others(volume_name, removed).await?
+            {
+                anyhow::bail!("Failed to remove volume {volume_name}: {stderr}");
+            }
+            if self.verbose && !told {
+                print_info(
+                    "Waiting for the removed containers to release the volume...",
+                    OutputLevel::Normal,
+                );
+                told = true;
+            }
+            tokio::time::sleep(VOLUME_RELEASE_POLL).await;
+        }
+    }
+
+    /// True when a container that is not in `removed` uses the volume.
+    async fn held_by_others(&self, volume_name: &str, removed: &[String]) -> Result<bool> {
+        let holders = self.get_containers_using_volume(volume_name).await?;
+        Ok(holders.iter().any(|id| !removed.contains(id)))
     }
 
     /// Force remove a docker volume by first stopping and removing all containers using it
     pub async fn force_remove_volume(&self, volume_name: &str) -> Result<()> {
+        self.force_remove_volume_within(volume_name, VOLUME_RELEASE_TIMEOUT)
+            .await
+    }
+
+    async fn force_remove_volume_within(&self, volume_name: &str, timeout: Duration) -> Result<()> {
         // Get containers using this volume
         let containers = self.get_containers_using_volume(volume_name).await?;
 
@@ -389,8 +464,14 @@ impl VolumeManager {
             }
         }
 
-        // Now remove the volume
-        self.remove_volume(volume_name).await
+        // Now remove the volume. With no containers listed, nothing was
+        // removed, so there is nothing to wait for.
+        if containers.is_empty() {
+            self.remove_volume(volume_name).await
+        } else {
+            self.remove_volume_once_released(volume_name, &containers, timeout)
+                .await
+        }
     }
 
     /// Get list of container IDs using a specific volume
@@ -479,14 +560,14 @@ impl VolumeManager {
     }
 
     /// Stop and remove VS Code extension explorer containers using a specific volume.
-    /// Returns the number of containers that were stopped.
-    pub async fn stop_explorer_containers(&self, volume_name: &str) -> Result<usize> {
+    /// Returns the IDs of the containers that were stopped.
+    pub async fn stop_explorer_containers(&self, volume_name: &str) -> Result<Vec<String>> {
         let containers = self
             .get_explorer_containers_using_volume(volume_name)
             .await?;
 
         if containers.is_empty() {
-            return Ok(0);
+            return Ok(containers);
         }
 
         if self.verbose {
@@ -525,25 +606,41 @@ impl VolumeManager {
             }
         }
 
-        Ok(containers.len())
+        Ok(containers)
     }
 
     /// Remove a docker volume, automatically stopping any VS Code explorer containers first.
     /// Unlike force_remove_volume, this only stops known safe containers (explorer containers)
     /// and will still fail if other containers are using the volume.
     pub async fn remove_volume_with_explorer_cleanup(&self, volume_name: &str) -> Result<()> {
+        self.remove_volume_with_explorer_cleanup_within(volume_name, VOLUME_RELEASE_TIMEOUT)
+            .await
+    }
+
+    async fn remove_volume_with_explorer_cleanup_within(
+        &self,
+        volume_name: &str,
+        timeout: Duration,
+    ) -> Result<()> {
         // First, stop any VS Code explorer containers that might be using this volume
         let stopped = self.stop_explorer_containers(volume_name).await?;
 
-        if stopped > 0 && self.verbose {
+        if stopped.is_empty() {
+            return self.remove_volume(volume_name).await;
+        }
+
+        if self.verbose {
             print_info(
-                &format!("Stopped {stopped} VS Code explorer container(s) before volume removal"),
+                &format!(
+                    "Stopped {} VS Code explorer container(s) before volume removal",
+                    stopped.len()
+                ),
                 OutputLevel::Normal,
             );
         }
 
-        // Now try to remove the volume
-        self.remove_volume(volume_name).await
+        self.remove_volume_once_released(volume_name, &stopped, timeout)
+            .await
     }
 }
 
@@ -672,6 +769,256 @@ mod tests {
         assert!(!volume_already_gone(
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"
         ));
+    }
+
+    #[test]
+    fn a_held_volume_is_in_use() {
+        assert!(volume_in_use(
+            "Error response from daemon: remove avo-f49a9283: volume is in use - [e122764a8f95]\n"
+        ));
+        assert!(volume_in_use(
+            "Error: volume avo-f49a9283 is being used by the following container(s): e122764a8f95: volume is being used\n"
+        ));
+        assert!(!volume_in_use(
+            "Error response from daemon: get avo-f49a9283: no such volume\n"
+        ));
+        assert!(!volume_in_use(
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"
+        ));
+    }
+
+    /// A stand-in for the container tool. `ps` prints `holders` (or
+    /// `explorers` when the call filters on the explorer prefix). After the
+    /// first `volume rm`, `ps` also prints `newcomers`: containers that
+    /// start while `clean` runs. `volume rm` fails with "volume is in use"
+    /// while `busy` is above zero, and with "no such volume" when `gone`
+    /// exists. Every call is appended to `calls`.
+    #[cfg(unix)]
+    struct FakeTool {
+        dir: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeTool {
+        fn new(holders: &[&str], explorers: &[&str], busy: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().unwrap();
+            let d = dir.path().display();
+            let script = format!(
+                r#"#!/bin/sh
+echo "$*" >> "{d}/calls"
+case "$*" in
+  *"name=avocado-explorer-"*) cat "{d}/explorers"; exit 0 ;;
+  ps*)
+    cat "{d}/holders"
+    if grep -q "^volume rm" "{d}/calls"; then cat "{d}/newcomers"; fi
+    exit 0 ;;
+  "volume rm"*)
+    if [ -e "{d}/gone" ]; then echo "Error response from daemon: get $3: no such volume" >&2; exit 1; fi
+    n=$(cat "{d}/busy")
+    if [ "$n" -gt 0 ]; then
+      echo $((n - 1)) > "{d}/busy"
+      echo "Error response from daemon: remove $3: volume is in use - [0123456789ab]" >&2
+      exit 1
+    fi
+    exit 0 ;;
+esac
+exit 0
+"#
+            );
+            let tool = dir.path().join("docker");
+            fs::write(&tool, script).unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(dir.path().join("holders"), lines(holders)).unwrap();
+            fs::write(dir.path().join("explorers"), lines(explorers)).unwrap();
+            fs::write(dir.path().join("newcomers"), "").unwrap();
+            fs::write(dir.path().join("busy"), busy.to_string()).unwrap();
+            exec_once(&tool);
+            Self { dir }
+        }
+
+        fn newcomer(&self, id: &str) {
+            fs::write(self.dir.path().join("newcomers"), format!("{id}\n")).unwrap();
+        }
+
+        fn manager(&self) -> VolumeManager {
+            VolumeManager::new(self.dir.path().join("docker").display().to_string(), false)
+        }
+
+        fn volume_is_gone(&self) {
+            fs::write(self.dir.path().join("gone"), "").unwrap();
+        }
+
+        fn volume_rm_calls(&self) -> usize {
+            fs::read_to_string(self.dir.path().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("volume rm"))
+                .count()
+        }
+    }
+
+    /// Run the stub one time before a test uses it. Another test thread can
+    /// fork while the stub is still open for writing here; until that child
+    /// execs and its close-on-exec copy goes away, exec of the stub fails
+    /// with ETXTBSY. Retry on exactly that, as `sdk::install` tests do.
+    #[cfg(unix)]
+    fn exec_once(tool: &Path) {
+        const ETXTBSY: i32 = 26;
+        let mut cmd = std::process::Command::new(tool);
+        cmd.arg("--version");
+        for _ in 0..100 {
+            match cmd.status() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                status => {
+                    status.unwrap();
+                    return;
+                }
+            }
+        }
+        cmd.status().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn lines(items: &[&str]) -> String {
+        items.iter().map(|i| format!("{i}\n")).collect()
+    }
+
+    /// `clean -f` kills the containers that hold the volume. A killed `--rm`
+    /// container stays `Dead` for a moment and still holds the volume, so the
+    /// first `volume rm` tries fail with "in use". The removal tries again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_waits_for_removed_containers_to_release_the_volume() {
+        let tool = FakeTool::new(&["aaa111", "bbb222"], &[], 2);
+        tool.manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(tool.volume_rm_calls(), 3);
+    }
+
+    /// If the volume is still in use when the wait ends, `clean -f` fails
+    /// with the daemon's "in use" error, as it did before the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_fails_when_the_volume_stays_in_use() {
+        let tool = FakeTool::new(&["aaa111"], &[], u32::MAX);
+        let err = tool
+            .manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("volume is in use"), "{err}");
+        assert!(tool.volume_rm_calls() > 1);
+    }
+
+    /// A removed container that `ps` still lists (`Dead`) is waited for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_waits_for_a_removed_container_that_is_still_listed() {
+        let tool = FakeTool::new(&["aaa111"], &[], 2);
+        tool.manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(tool.volume_rm_calls(), 3);
+        let calls = fs::read_to_string(tool.dir.path().join("calls")).unwrap();
+        assert!(calls.lines().filter(|l| l.starts_with("ps")).count() >= 3);
+    }
+
+    /// A container that `clean -f` did not remove (a new `sdk run`, for
+    /// example) will not go away by itself: fail at once, with no wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_does_not_wait_for_a_container_it_did_not_remove() {
+        let tool = FakeTool::new(&["aaa111"], &[], u32::MAX);
+        tool.newcomer("ddd444");
+        let err = tool
+            .manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("volume is in use"), "{err}");
+        assert_eq!(tool.volume_rm_calls(), 1);
+    }
+
+    /// With no containers on the volume there is nothing to wait for: one
+    /// `volume rm`, and its error comes back at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_without_containers_does_not_wait() {
+        let tool = FakeTool::new(&[], &[], 1);
+        let err = tool
+            .manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("volume is in use"), "{err}");
+        assert_eq!(tool.volume_rm_calls(), 1);
+    }
+
+    /// A volume that is already gone still counts as removed (ENG-2761).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_remove_of_a_missing_volume_succeeds() {
+        let tool = FakeTool::new(&["aaa111"], &[], 0);
+        tool.volume_is_gone();
+        tool.manager()
+            .force_remove_volume_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(tool.volume_rm_calls(), 1);
+    }
+
+    /// `clean` without `-f` stops the VS Code explorer containers, then waits
+    /// for them to release the volume in the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explorer_cleanup_waits_for_stopped_explorers_to_release_the_volume() {
+        let tool = FakeTool::new(&["ccc333"], &["ccc333\tavocado-explorer-1"], 2);
+        tool.manager()
+            .remove_volume_with_explorer_cleanup_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(tool.volume_rm_calls(), 3);
+    }
+
+    /// Explorer containers were stopped, but another container also holds
+    /// the volume. `clean` fails at once, so the `--force` hint shows with
+    /// no wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explorer_cleanup_does_not_wait_for_other_containers() {
+        let tool = FakeTool::new(
+            &["aaa111", "ccc333"],
+            &["ccc333\tavocado-explorer-1"],
+            u32::MAX,
+        );
+        let err = tool
+            .manager()
+            .remove_volume_with_explorer_cleanup_within("avo-x", Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("volume is in use"), "{err}");
+        assert_eq!(tool.volume_rm_calls(), 1);
+    }
+
+    /// Without explorer containers, a volume held by another container
+    /// fails at once, so `clean` can show its `--force` hint.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explorer_cleanup_without_explorers_does_not_wait() {
+        let tool = FakeTool::new(&["aaa111"], &[], 1);
+        let err = tool
+            .manager()
+            .remove_volume_with_explorer_cleanup_within("avo-x", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("volume is in use"), "{err}");
+        assert_eq!(tool.volume_rm_calls(), 1);
     }
 
     /// The state file lives in the working directory, which is where

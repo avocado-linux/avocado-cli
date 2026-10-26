@@ -89,19 +89,119 @@ pub fn is_vm_routing_active() -> bool {
     host == format!("unix://{}", paths.docker_socket().display())
 }
 
+/// Host UID/GID passed to the container entrypoint, which bindfs-maps them to
+/// root on `/opt/src`. Under VM routing this returns 0:0, so the entrypoint
+/// uses a plain bind mount, and bindfs on top of 9p made file operations 2 to
+/// 18x slower. An explicit `AVOCADO_HOST_UID` still wins (with
+/// `AVOCADO_HOST_GID`, or the host GID); `AVOCADO_HOST_GID` alone does not.
+///
+/// bindfs exists so that root in the container does not write root-owned
+/// files into the host's project dir. Under the VM that cannot happen without
+/// it: QEMU writes the host files, as the user who started the VM, and
+/// `security_model=mapped-xattr` (`vm::share::qemu_args_for`) keeps the
+/// guest's owner in an xattr. If either changes (another security model, or
+/// QEMU run as root), container writes reach the host with the guest owner
+/// and this needs bindfs again.
+fn src_mount_uid_gid() -> (u32, u32) {
+    if vm_plain_src_mount() {
+        return (0, 0);
+    }
+    crate::utils::config::resolve_host_uid_gid(None)
+}
+
+fn vm_plain_src_mount() -> bool {
+    is_vm_routing_active() && std::env::var_os("AVOCADO_HOST_UID").is_none()
+}
+
+/// `-e` values for the `/opt/src` mount: the UID/GID the entrypoint maps
+/// (see `src_mount_uid_gid`), and under the plain VM mount
+/// `safe.directory=*` for git. Without bindfs, host files show the host UID
+/// inside the container, and git refuses such a repository as root
+/// ("detected dubious ownership"). With bindfs every project repo looked
+/// root-owned, so git trusted all of them, nested repos and path-extension
+/// mounts included; `*` keeps that. Narrower `<dir>/*` entries need git 2.46,
+/// and the 2024 SDK ships 2.44. `GIT_CONFIG_PARAMETERS` is how `git -c`
+/// reaches child processes (command scope, which git honors for
+/// `safe.directory`), and it does not touch a project's own `GIT_CONFIG_COUNT`.
+///
+/// `git_common` is set when the project is a linked worktree and its git
+/// common dir is mounted too (see `SdkContainer::git_common_mount`). The
+/// container cannot see the other worktrees of that repository, so `git gc`
+/// in the container would think they were deleted and prune their metadata
+/// on the host. `gc.worktreePruneExpire=never` stops that.
+///
+/// `caller_git` is a `GIT_CONFIG_PARAMETERS` the caller set. It comes first
+/// in the one merged value, so the generated settings come last and win, and
+/// the caller must not emit its own copy (docker keeps the last `-e`).
+fn src_mount_env(git_common: bool, caller_git: Option<&str>) -> Vec<String> {
+    let (uid, gid) = src_mount_uid_gid();
+    let mut env = vec![
+        format!("AVOCADO_HOST_UID={uid}"),
+        format!("AVOCADO_HOST_GID={gid}"),
+    ];
+    let mut git_config: Vec<&str> = caller_git
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .into_iter()
+        .collect();
+    git_config.extend(generated_git_config(git_common));
+    if !git_config.is_empty() {
+        env.push(format!("GIT_CONFIG_PARAMETERS={}", git_config.join(" ")));
+    }
+    env
+}
+
+/// The git settings the CLI adds itself (see `src_mount_env`), without any
+/// caller setting.
+fn generated_git_config(git_common: bool) -> Vec<&'static str> {
+    let mut git_config = Vec::new();
+    if vm_plain_src_mount() {
+        git_config.push("'safe.directory'='*'");
+    }
+    if git_common {
+        git_config.push("'gc.worktreePruneExpire'='never'");
+    }
+    git_config
+}
+
+/// Container paths that `build_container_command` and the mount block use. A
+/// git common dir mount must not cover any of them or land inside one.
+const CONTAINER_MOUNT_PATHS: &[&str] = &[
+    "/opt/src",
+    "/opt/_avocado",
+    "/opt/signing-keys",
+    "/mnt",
+    "/run/avocado",
+    "/run/avocado-agent.sock",
+    "/usr/local/bin/avocado-sign-request",
+];
+
+/// Where the container stages a linked worktree's git common dir before the
+/// mount block binds it at `$AVOCADO_GIT_COMMON_DIR`.
+const GIT_COMMON_STAGING: &str = "/mnt/git-common";
+
 /// When docker is going to execute inside the avocado-vm, ensure the
 /// 9p workspace share is actually mounted in the guest before we issue
 /// any bind mounts. Lazy on purpose: we only pay the SSH probe right
-/// before container start, and only when VM routing is active. The
-/// SSH-driven mount (`share::ensure_mounted_in_guest`) is idempotent,
-/// so cycles of "already mounted → no-op" are cheap.
+/// before container start, and only when VM routing is active.
+///
+/// Every container start site calls this, so a command can call it many
+/// times. Each probe is one SSH connection (about 100 to 200 ms), so the
+/// first success is kept for the rest of the process. A failure is not kept,
+/// and the next container start tries again.
 ///
 /// Failure is non-fatal: we warn and let the container start proceed.
 /// Without the mount, `/opt/src` will be empty inside the container —
 /// the surface error (compile script not found, bind mount source
 /// missing, etc.) is loud enough that the user can tell what's wrong.
 async fn ensure_workspace_mounted_if_routed() {
+    static MOUNTED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    #[cfg(test)]
+    tests::workspace_mount_check::record_call();
     if !is_vm_routing_active() {
+        return;
+    }
+    if MOUNTED.initialized() {
         return;
     }
     let paths = match crate::utils::vm::state::VmPaths::resolve() {
@@ -115,7 +215,11 @@ async fn ensure_workspace_mounted_if_routed() {
         return;
     };
     let target = crate::utils::vm::ssh::SshTarget::local(&paths, port);
-    if let Err(e) = crate::utils::vm::share::ensure_mounted_in_guest(&target).await {
+    // One probe at a time: two concurrent mounts of the same 9p tag fail.
+    let mounted = MOUNTED
+        .get_or_try_init(|| crate::utils::vm::share::ensure_mounted_in_guest(&target))
+        .await;
+    if let Err(e) = mounted {
         crate::utils::output::print_warning(
             &format!(
                 "could not mount workspace 9p share inside the avocado-vm: {e:#}. \
@@ -150,6 +254,106 @@ fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
     vm_workspace()
         .and_then(|ws| crate::utils::vm::share::translate_to_vm(src_path, &ws).ok())
         .unwrap_or_else(|| src_path.to_path_buf())
+}
+
+/// Container paths where a git common dir may be mounted, besides the
+/// avocado-vm share. git needs the common dir at exactly the path it
+/// resolves, so the mount cannot be moved somewhere safe. A list of paths to
+/// avoid always misses one (`/usr/bin`, `/var/lib/...`), so this is a list of
+/// paths to allow:
+///
+/// - `/opt/<name>`: a relative gitdir resolves under `/opt`, next to
+///   `/opt/src`, for a worktree next to its main checkout.
+/// - `/Users/<name>` and `/home/<name>`: an absolute gitdir keeps its host
+///   path, and projects live in a user's home on macOS and Linux. The SDK
+///   image has nothing there.
+///
+/// A common dir anywhere else (`/srv`, `/data`, `/var/lib/jenkins`) gets a
+/// warning and no mount, and git in the container fails as it does without
+/// this feature.
+const GIT_COMMON_ALLOWED_ROOTS: &[&str] = &["/opt", "/Users", "/home"];
+
+/// Whether a git common dir mount at `dest` is safe in the container. It must
+/// be strictly under an allowed root (see [`GIT_COMMON_ALLOWED_ROOTS`]) or
+/// under the avocado-vm share (`workspace`), and it must not cover or sit
+/// inside one of the container's own mounts.
+fn check_container_dest(dest: &Path, workspace: Option<&Path>) -> Result<(), String> {
+    let feeds = Path::new(crate::utils::feeds::CONTAINER_FEEDS_DIR);
+    if let Some(hidden) = CONTAINER_MOUNT_PATHS
+        .iter()
+        .map(Path::new)
+        .chain(std::iter::once(feeds))
+        .find(|p| p.starts_with(dest) || dest.starts_with(p))
+    {
+        return Err(format!("it would hide {}", hidden.display()));
+    }
+    let under = |root: &Path| dest.starts_with(root) && dest != root;
+    let allowed = GIT_COMMON_ALLOWED_ROOTS
+        .iter()
+        .map(Path::new)
+        .chain(workspace)
+        .any(under);
+    if !allowed {
+        return Err(
+            "the CLI mounts a git common dir only under /opt, /Users, /home or the \
+             avocado-vm share"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The git common dir mount for `src` (see `utils::git_worktree`), checked
+/// against the avocado-vm share when docker runs in the VM (`workspace`).
+/// Under the VM a bind source must be inside the share, so a common dir
+/// outside it is an error, the same as a `.git` file a mount cannot serve.
+fn git_common_mount_for(
+    src: &Path,
+    workspace: Option<&Path>,
+) -> Result<Option<crate::utils::git_worktree::GitCommonMount>, String> {
+    let Some(mount) = crate::utils::git_worktree::git_common_dir_mount(src, Path::new("/opt/src"))?
+    else {
+        return Ok(None);
+    };
+    if let Err(why) = check_container_dest(&mount.container, workspace) {
+        return Err(format!(
+            "git looks for the common dir {} at {} in the container, and {why}",
+            mount.host.display(),
+            mount.container.display()
+        ));
+    }
+    if let Some(ws) = workspace {
+        if crate::utils::vm::share::translate_to_vm(&mount.host, ws).is_err() {
+            return Err(format!(
+                "the git common dir {} is outside the avocado-vm share {}. Set \
+                 AVOCADO_VM_WORKSPACE to a directory that holds both, then run \
+                 `avocado vm stop && avocado vm start`",
+                mount.host.display(),
+                ws.display()
+            ));
+        }
+    }
+    Ok(Some(mount))
+}
+
+/// Why git will not work on `/opt/src` in a `--runs-on` container, when `src`
+/// is a linked worktree. A worktree the local path would refuse gets that
+/// reason, so the user learns about it on a remote run too.
+fn remote_git_warning(src: &Path) -> Option<String> {
+    match crate::utils::git_worktree::git_common_dir_mount(src, Path::new("/opt/src")) {
+        Ok(None) => None,
+        Ok(Some(m)) => Some(format!(
+            "{} is a git worktree. --runs-on shares only the project dir, not the git \
+             common dir {}, so git commands on /opt/src will not work on the remote.",
+            src.display(),
+            m.host.display()
+        )),
+        Err(reason) => Some(format!(
+            "Could not use the git dir of {} on the remote: {reason}. git commands on \
+             /opt/src will not work on the remote.",
+            src.display()
+        )),
+    }
 }
 
 /// Ensure QEMU binfmt_misc is registered for cross-architecture container emulation.
@@ -492,7 +696,7 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
             if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
                 if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
                     mount --bind "$mnt_path" "$target_path"
-                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (host is root)" >&2; fi
+                    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted extension '$ext_name': $mnt_path -> $target_path (plain bind mount)" >&2; fi
                 else
                     _map="--map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0"
                     # Keep both attempts' stderr and print neither unless the
@@ -512,6 +716,21 @@ if [ -n "$AVOCADO_EXT_PATH_MOUNTS" ]; then
             echo "[WARNING] Extension mount path not found: $mnt_path" >&2
         fi
     done
+fi
+"##;
+
+/// Bash that binds a linked worktree's git common dir, staged at
+/// `/mnt/git-common`, at the path git in the container looks for
+/// (`$AVOCADO_GIT_COMMON_DIR`). It maps UID/GID the same way as `/opt/src`.
+pub const GIT_COMMON_MOUNT_SNIPPET: &str = r##"
+if [ -n "$AVOCADO_GIT_COMMON_DIR" ] && [ -d /mnt/git-common ]; then
+    mkdir -p "$AVOCADO_GIT_COMMON_DIR"
+    if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ] && [ "$AVOCADO_HOST_UID:$AVOCADO_HOST_GID" != "0:0" ]; then
+        bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt/git-common "$AVOCADO_GIT_COMMON_DIR"
+    else
+        mount --bind /mnt/git-common "$AVOCADO_GIT_COMMON_DIR"
+    fi
+    if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted git common dir /mnt/git-common -> $AVOCADO_GIT_COMMON_DIR" >&2; fi
 fi
 "##;
 
@@ -787,6 +1006,34 @@ static TOOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ATEXIT: std::sync::Once = std::sync::Once::new();
 static SIGINT_REAPER: std::sync::Once = std::sync::Once::new();
 
+/// The foreground `docker run` containers this process is waiting on. The
+/// SIGINT reaper exits the process, which skips the caller's own `docker
+/// stop`, so [`SessionContainers::shutdown`] handles these as well. Each
+/// entry records if the run was started with `--rm`: shutdown removes those
+/// and only stops the others, so a kept container stays kept.
+static FOREGROUND_RUNS: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a container in [`FOREGROUND_RUNS`] while its run is in progress.
+struct ForegroundRun(Option<String>);
+
+impl ForegroundRun {
+    fn register(name: Option<&str>, rm: bool) -> Self {
+        let name = name.map(str::to_string);
+        if let (Some(n), Ok(mut runs)) = (&name, FOREGROUND_RUNS.lock()) {
+            runs.push((n.clone(), rm));
+        }
+        Self(name)
+    }
+}
+
+impl Drop for ForegroundRun {
+    fn drop(&mut self) {
+        if let (Some(n), Ok(mut runs)) = (&self.0, FOREGROUND_RUNS.lock()) {
+            runs.retain(|(r, _)| r != n);
+        }
+    }
+}
+
 /// Teardown registered with libc `atexit`.
 ///
 /// Nine call sites reach `std::process::exit` directly — a stamp failure, a
@@ -866,7 +1113,26 @@ impl SessionContainers {
     /// container. Best-effort: a container that is already gone is not an
     /// error, and a failure here must not mask the command's own result.
     pub fn shutdown(container_tool: &str) {
-        for name in Self::active_names() {
+        let foreground: Vec<(String, bool)> = FOREGROUND_RUNS
+            .lock()
+            .map(|runs| runs.clone())
+            .unwrap_or_default();
+        let mut names = Vec::new();
+        for (name, rm) in foreground {
+            if rm {
+                names.push(name);
+            } else {
+                // Started without --rm: the user wants the stopped container kept.
+                let _ = std::process::Command::new(container_tool)
+                    // stdio-flags-ok: docker stop timeout in seconds, not a tty
+                    .args(["stop", "-t", "2", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+        names.extend(Self::active_names());
+        for name in names {
             let _ = std::process::Command::new(container_tool)
                 .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
@@ -959,19 +1225,7 @@ impl SessionContainers {
             name.clone(),
         ];
         if with_mounts {
-            for k in [
-                "AVOCADO_TARGET",
-                "AVOCADO_HOST_UID",
-                "AVOCADO_HOST_GID",
-                "AVOCADO_SRC_DIR",
-                "AVOCADO_EXT_PATH_MOUNTS",
-                "AVOCADO_VERBOSE",
-            ] {
-                if let Some(v) = env.get(k) {
-                    cmd.push("-e".to_string());
-                    cmd.push(format!("{k}={v}"));
-                }
-            }
+            cmd.extend(session_create_env(env));
         }
         // shape ends with the image; everything before it is create flags.
         let (flags, image) = shape.split_at(shape.len() - 1);
@@ -1091,6 +1345,109 @@ impl SdkContainer {
     ) -> Result<String> {
         SessionContainers::get_or_create(&self.container_tool, shape, env_vars, true)
     }
+}
+
+/// `-e` args for creating a session container: the variables its mount
+/// block reads, and the generated git settings, so that a plain
+/// `docker exec` into the container still gets `safe.directory` and the
+/// worktree prune guard (see `src_mount_env`).
+///
+/// A caller's own git settings are not stored. The session key does not
+/// include the env, so a later step of the same shape would inherit them.
+/// Each SDK exec passes its own merged `GIT_CONFIG_PARAMETERS` instead, and
+/// a step with no caller setting has only the generated settings, which is
+/// what the container holds. Steps of one shape share the generated part,
+/// because the git common dir mount is part of the shape.
+fn session_create_env(env: &HashMap<String, String>) -> Vec<String> {
+    let mut args = Vec::new();
+    for k in [
+        "AVOCADO_TARGET",
+        "AVOCADO_HOST_UID",
+        "AVOCADO_HOST_GID",
+        "AVOCADO_SRC_DIR",
+        "AVOCADO_EXT_PATH_MOUNTS",
+        "AVOCADO_GIT_COMMON_DIR",
+        "AVOCADO_VERBOSE",
+    ] {
+        if let Some(v) = env.get(k) {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+    }
+    let git_config = generated_git_config(env.contains_key("AVOCADO_GIT_COMMON_DIR"));
+    if !git_config.is_empty() {
+        args.push("-e".to_string());
+        args.push(format!("GIT_CONFIG_PARAMETERS={}", git_config.join(" ")));
+    }
+    args
+}
+
+/// Remove every `GIT_CONFIG_PARAMETERS` setting from docker args and return
+/// their values in order. Reads env flags with [`docker_env_flag`]. A flag
+/// with no value takes the value from the CLI's own environment, as docker
+/// would.
+fn take_git_config_args(args: &mut Vec<String>) -> Option<String> {
+    take_git_config_args_with(args, |k| std::env::var(k).ok())
+}
+
+/// [`take_git_config_args`] with the host environment as `host_env`.
+fn take_git_config_args_with(
+    args: &mut Vec<String>,
+    host_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    const KEY: &str = "GIT_CONFIG_PARAMETERS";
+    let mut values = Vec::new();
+    let mut kept = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if let Some((used, operand)) = docker_env_flag(args, i) {
+            let (key, value) = match operand.split_once('=') {
+                Some((k, v)) => (k, Some(v.to_string())),
+                None => (operand, None),
+            };
+            if key == KEY {
+                values.extend(value.or_else(|| host_env(KEY)));
+                i += used;
+                continue;
+            }
+        }
+        kept.push(args[i].clone());
+        i += 1;
+    }
+    *args = kept;
+    (!values.is_empty()).then(|| values.join(" "))
+}
+
+/// The env flag at `args[i]`, in any form docker accepts: `-e X`, `--env X`,
+/// `-eX`, `-e=X`, `--env=X`. Returns how many args it takes and its operand,
+/// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
+///
+/// Not handled: `--env-file`, which docker reads itself (an explicit `-e`
+/// wins over it, so the generated git settings still apply), and short
+/// flags packed together with `-e` (`-ie K=V`).
+fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
+    let a = args.get(i)?.as_str();
+    if a == "-e" || a == "--env" {
+        return args.get(i + 1).map(|v| (2, v.as_str()));
+    }
+    let operand = a
+        .strip_prefix("--env=")
+        .or_else(|| a.strip_prefix("-e="))
+        .or_else(|| a.strip_prefix("-e"))?;
+    (!operand.is_empty()).then_some((1, operand))
+}
+
+/// `k=v` pairs, as `split_run_argv` returns them, as a map. The session
+/// container's mount block reads the mount variables that
+/// `build_container_command` adds (`AVOCADO_HOST_UID`,
+/// `AVOCADO_EXT_PATH_MOUNTS`, `AVOCADO_GIT_COMMON_DIR`), and those are only
+/// in the argv, not in the caller's env map.
+fn env_map(pairs: &[String]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 /// The container tool to address session containers with when no config is at
@@ -1261,14 +1618,16 @@ fn split_run_argv(argv: &[String], command_len: usize) -> Option<(Vec<String>, V
             // AVOCADO_TARGET, the host uid/gid, the signing and extension-mount
             // variables. Reading them back here is what guarantees an exec sees
             // exactly what the equivalent run would have.
-            "-e" | "--env" if i + 1 < image_idx => {
-                env.push(argv[i + 1].clone());
-                i += 2;
-            }
-            other => {
-                shape.push(other.to_string());
-                i += 1;
-            }
+            other => match docker_env_flag(&argv[..image_idx], i) {
+                Some((used, operand)) => {
+                    env.push(operand.to_string());
+                    i += used;
+                }
+                None => {
+                    shape.push(other.to_string());
+                    i += 1;
+                }
+            },
         }
     }
     shape.push(image);
@@ -1351,6 +1710,58 @@ impl SdkContainer {
     /// set, else the working directory.
     pub fn mounted_src_dir(&self) -> &Path {
         self.src_dir.as_deref().unwrap_or(&self.cwd)
+    }
+
+    /// The git common dir to mount when the source dir is a linked git
+    /// worktree, so that git works on `/opt/src` in the container. Warns,
+    /// once per process, when no mount can be made (see
+    /// [`git_common_mount_for`]).
+    fn git_common_mount(&self) -> Option<crate::utils::git_worktree::GitCommonMount> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let src = self.mounted_src_dir();
+        match git_common_mount_for(src, vm_workspace().as_deref()) {
+            Ok(Some(m)) if m.relative_worktrees => {
+                static RELATIVE: std::sync::Once = std::sync::Once::new();
+                RELATIVE.call_once(|| {
+                    crate::utils::output::print_warning(
+                        &format!(
+                            "The git repository of {} uses relative worktree paths \
+                             (extensions.relativeWorktrees). git in the SDK container \
+                             needs version 2.48 or newer to read it. The 2024 SDK has \
+                             git 2.44 and fails with \"unknown repository extension\"; \
+                             the 2026 SDK has git 2.53.",
+                            src.display()
+                        ),
+                        OutputLevel::Normal,
+                    )
+                });
+                Some(m)
+            }
+            Ok(m) => m,
+            Err(reason) => {
+                WARNED.call_once(|| {
+                    crate::utils::output::print_warning(
+                        &format!(
+                            "Could not mount the git dir of {}: {reason}. git commands \
+                             in the SDK container will not work on /opt/src.",
+                            src.display()
+                        ),
+                        OutputLevel::Normal,
+                    )
+                });
+                None
+            }
+        }
+    }
+
+    /// `--runs-on` shares only the project dir over NFS, so a linked
+    /// worktree's git common dir cannot reach the remote container. Warns once
+    /// (see [`remote_git_warning`]).
+    fn warn_git_worktree_remote(&self) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        if let Some(msg) = remote_git_warning(self.mounted_src_dir()) {
+            WARNED.call_once(|| crate::utils::output::print_warning(&msg, OutputLevel::Normal));
+        }
     }
 
     /// Create a new SdkContainer with configuration from config file
@@ -1558,11 +1969,11 @@ impl SdkContainer {
 
         // If docker is routed through the avocado-vm, the 9p workspace
         // share has to be mounted inside the guest before we issue a
-        // bind mount under the workspace root — otherwise the container
+        // bind mount under the workspace root. If not, the container
         // sees empty tmpfs. `avocado vm start` (CLI) mounts during boot,
         // but when Avocado.app launches QEMU directly the mount step
-        // is skipped. Call it just-in-time here; the SSH probe + mount
-        // is idempotent (no-op when already mounted).
+        // is skipped. Call it just-in-time here. After the first success
+        // the result is cached for the rest of the process.
         ensure_workspace_mounted_if_routed().await;
 
         // Get or create docker volume for persistent state
@@ -1677,7 +2088,7 @@ impl SdkContainer {
             && session_containers_enabled();
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
-                match self.session_container(&shape, &env_vars) {
+                match self.session_container(&shape, &env_map(&env_pairs)) {
                     Ok(name) => {
                         // The same command, minus the mount block the container
                         // already ran, with the environment moved to the exec.
@@ -1720,6 +2131,7 @@ impl SdkContainer {
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
                 effective_container_name.as_deref(),
+                effective_config.rm,
                 tui_ctx,
             )
             .await
@@ -1729,6 +2141,7 @@ impl SdkContainer {
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
                 effective_container_name.as_deref(),
+                effective_config.rm,
             )
             .await
         }
@@ -1818,6 +2231,7 @@ impl SdkContainer {
         context: &crate::utils::runs_on::RunsOnContext,
         config: &RunConfig,
     ) -> Result<bool> {
+        self.warn_git_worktree_remote();
         // Build environment variables
         let mut env_vars = config.env_vars.clone().unwrap_or_default();
 
@@ -2042,6 +2456,28 @@ impl SdkContainer {
         container_cmd.push("-v".to_string());
         container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
 
+        // A linked git worktree's `.git` file points into the main checkout.
+        // Stage that common dir read-write (`git submodule update` writes to
+        // it); the mount block binds it at the path git looks for.
+        let git_common = self.git_common_mount();
+        if let Some(m) = &git_common {
+            container_cmd.push("-v".to_string());
+            container_cmd.push(format!(
+                "{}:{GIT_COMMON_STAGING}:rw",
+                translate_bind_for_vm(&m.host).display()
+            ));
+            if self.verbose {
+                print_info(
+                    &format!(
+                        "Mounting git common dir: {} -> {}",
+                        m.host.display(),
+                        m.container.display()
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+
         // Mount avocado-vm-agent's Unix socket so the provisioning script
         // can request real USB disconnect/reconnect cycles
         // (`request_twiddle`) instead of toggling
@@ -2169,11 +2605,31 @@ impl SdkContainer {
         container_cmd.push("AVOCADO_SRC_DIR=/opt/src".to_string());
 
         // Pass host UID/GID for bindfs permission translation
-        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        // `sdk.container_args` come after the env in the argv, so a
+        // GIT_CONFIG_PARAMETERS there would replace the merged value. Take it
+        // out and merge it like the env one.
+        let mut extra_args: Vec<String> = config
+            .container_args
+            .iter()
+            .flatten()
+            .flat_map(|arg| Self::parse_container_arg(arg))
+            .collect();
+        let caller_git = [
+            env_vars.get("GIT_CONFIG_PARAMETERS").cloned(),
+            take_git_config_args(&mut extra_args),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        for kv in src_mount_env(git_common.is_some(), Some(&caller_git)) {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
+        if let Some(m) = &git_common {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(format!("AVOCADO_GIT_COMMON_DIR={}", m.container.display()));
+        }
 
         // Add signing-related environment variables
         if config.signing_socket_path.is_some() {
@@ -2210,16 +2666,18 @@ impl SdkContainer {
         }
 
         for (key, value) in env_vars {
+            // Merged into the one value `src_mount_env` emits, or set only
+            // from the detected mount: a caller's AVOCADO_GIT_COMMON_DIR comes
+            // later in the argv and would move the mount anywhere.
+            if key == "GIT_CONFIG_PARAMETERS" || key == "AVOCADO_GIT_COMMON_DIR" {
+                continue;
+            }
             container_cmd.push("-e".to_string());
             container_cmd.push(format!("{key}={value}"));
         }
 
         // Add additional container arguments if provided
-        if let Some(args) = &config.container_args {
-            for arg in args {
-                container_cmd.extend(Self::parse_container_arg(arg));
-            }
-        }
+        container_cmd.extend(extra_args);
 
         // Add the container image
         container_cmd.push(config.container_image.to_string());
@@ -2262,6 +2720,10 @@ impl SdkContainer {
         if let Some(ref arch) = config.sdk_arch {
             ensure_cross_arch_emulation(&self.container_tool, arch).await?;
         }
+
+        // The same check as `run_in_container`: a command whose first
+        // container step is a capture step must not see an empty /opt/src.
+        ensure_workspace_mounted_if_routed().await;
 
         // Get or create docker volume for persistent state
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
@@ -2366,7 +2828,7 @@ impl SdkContainer {
             && session_containers_enabled();
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
-                match self.session_container(&shape, &env_vars) {
+                match self.session_container(&shape, &env_map(&env_pairs)) {
                     Ok(name) => {
                         // The same command, minus the mount block the container
                         // already ran, with the environment moved to the exec.
@@ -2675,6 +3137,7 @@ impl SdkContainer {
         std::collections::HashMap<String, String>,
         Vec<String>,
     )> {
+        self.warn_git_worktree_remote();
         // The generated .repo files live in a host tempdir that only the local
         // docker can mount; on the remote daemon dnf would silently see none of
         // them while the install stamp recorded the full set. Fail closed.
@@ -2778,6 +3241,7 @@ impl SdkContainer {
         detach: bool,
         verbose: bool,
         container_name: Option<&str>,
+        rm: bool,
     ) -> Result<bool> {
         if verbose {
             print_info(
@@ -2847,14 +3311,14 @@ impl SdkContainer {
                 }
             } else {
                 // Inherit all three so the user can interact with prompts
-                // (e.g. dnf "Is this ok [y/N]:").  Ctrl-C propagates
-                // naturally through the process group — Docker forwards
-                // SIGINT to the container which exits, then Docker exits.
+                // (e.g. dnf "Is this ok [y/N]:").  The docker client stays in
+                // the terminal's process group; Ctrl-C handling is below.
                 cmd.stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
             }
 
+            let _foreground = ForegroundRun::register(container_name, rm);
             let mut child = cmd
                 .spawn()
                 .with_context(|| "Failed to spawn container command")?;
@@ -2922,45 +3386,69 @@ impl SdkContainer {
                         Ok(status.success())
                     }
                     _ = tokio::signal::ctrl_c() => {
-                        // Stop the container gracefully
-                        if let Some(name) = container_name {
-                            let stop_result = AsyncCommand::new(&self.container_tool)
-                                // stdio-flags-ok: docker stop timeout in seconds, not a tty
-                                .args(["stop", "-t", "2", name])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status()
-                                .await;
-                            if stop_result.is_err()
-                                || !stop_result.as_ref().unwrap().success()
-                            {
-                                let _ = AsyncCommand::new(&self.container_tool)
-                                    .args(["kill", name])
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .status()
-                                    .await;
-                            }
-                        } else {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
+                        self.stop_interrupted_container(&mut child, container_name).await;
                         Err(anyhow::anyhow!("Interrupted by user"))
                     }
                 }
             } else {
-                // Interactive/inherited stdio: let Ctrl-C propagate
-                // naturally through the process group.  SIGINT goes to
-                // Docker and the container — no need to intercept.
-                // Avoiding tokio::signal::ctrl_c() here keeps the default
-                // SIGINT handler in place.
-                let status = child
-                    .wait()
+                // Inherited stdio: SIGINT also reaches the docker client,
+                // which forwards it to the container's shell. That shell runs
+                // its trap only once the foreground command returns, which
+                // may be never (an ssh to a peer that is gone). So stop the
+                // container here as well.
+                self.wait_or_stop_on_interrupt(&mut child, container_name, tokio::signal::ctrl_c())
                     .await
-                    .with_context(|| "Failed to wait for container command")?;
-                Ok(status.success())
             }
         }
+    }
+
+    /// Wait for a foreground container command. If `interrupt` completes
+    /// first, stop the container and return an "Interrupted by user" error.
+    async fn wait_or_stop_on_interrupt(
+        &self,
+        child: &mut tokio::process::Child,
+        container_name: Option<&str>,
+        interrupt: impl std::future::Future,
+    ) -> Result<bool> {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| "Failed to wait for container command")?;
+                Ok(status.success())
+            }
+            _ = interrupt => {
+                self.stop_interrupted_container(child, container_name).await;
+                Err(anyhow::anyhow!("Interrupted by user"))
+            }
+        }
+    }
+
+    /// Stop the container (`docker kill` if the stop fails), or kill the
+    /// client process when the container is not known, then reap the client.
+    async fn stop_interrupted_container(
+        &self,
+        child: &mut tokio::process::Child,
+        container_name: Option<&str>,
+    ) {
+        if let Some(name) = container_name {
+            let stop_result = AsyncCommand::new(&self.container_tool)
+                // stdio-flags-ok: docker stop timeout in seconds, not a tty
+                .args(["stop", "-t", "2", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            if !matches!(&stop_result, Ok(s) if s.success()) {
+                let _ = AsyncCommand::new(&self.container_tool)
+                    .args(["kill", name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+        } else {
+            let _ = child.kill().await;
+        }
+        let _ = child.wait().await;
     }
 
     /// Execute a container command with TUI output capture.
@@ -2974,6 +3462,7 @@ impl SdkContainer {
         detach: bool,
         verbose: bool,
         container_name: Option<&str>,
+        rm: bool,
         tui_ctx: &TuiContext,
     ) -> Result<bool> {
         // tokio::io imports are used by read_output_stream below
@@ -2988,7 +3477,7 @@ impl SdkContainer {
         // For detached mode, fall back to the normal path
         if detach {
             return self
-                .execute_container_command(container_cmd, detach, verbose, container_name)
+                .execute_container_command(container_cmd, detach, verbose, container_name, rm)
                 .await;
         }
 
@@ -3014,6 +3503,7 @@ impl SdkContainer {
             });
         }
 
+        let _foreground = ForegroundRun::register(container_name, rm);
         let mut child = cmd
             .spawn()
             .with_context(|| "Failed to spawn container command")?;
@@ -3075,28 +3565,14 @@ impl SdkContainer {
         result
     }
 
-    /// Run a simple command in the container without the full SDK entrypoint.
-    ///
-    /// This is useful for quick one-off operations like chown, cp, etc.
-    /// that don't need the SDK environment setup.
-    ///
-    /// # Arguments
-    /// * `container_image` - The container image to use
-    /// * `command` - The bash command to run
-    /// * `rm` - Whether to remove the container after exit
-    ///
-    /// # Returns
-    /// `true` if the command succeeded, `false` otherwise
-    pub async fn run_simple_command(
+    /// The `docker run` argv for `run_simple_command`, without running it.
+    fn simple_command_argv(
         &self,
         container_image: &str,
         command: &str,
         rm: bool,
-    ) -> Result<bool> {
-        // Get or create docker volume for persistent state
-        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
-        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
-
+        volume_name: &str,
+    ) -> Vec<String> {
         let mut container_cmd = vec![self.container_tool.clone(), "run".to_string()];
 
         if rm {
@@ -3120,14 +3596,14 @@ impl SdkContainer {
             translate_bind_for_vm(src_path).display()
         ));
         container_cmd.push("-v".to_string());
-        container_cmd.push(format!("{}:/opt/_avocado:rw", volume_state.volume_name));
+        container_cmd.push(format!("{volume_name}:/opt/_avocado:rw"));
 
         // Pass host UID/GID for bindfs permission translation
-        let (host_uid, host_gid) = crate::utils::config::resolve_host_uid_gid(None);
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_UID={host_uid}"));
-        container_cmd.push("-e".to_string());
-        container_cmd.push(format!("AVOCADO_HOST_GID={host_gid}"));
+        let (host_uid, host_gid) = src_mount_uid_gid();
+        for kv in src_mount_env(false, None) {
+            container_cmd.push("-e".to_string());
+            container_cmd.push(kv);
+        }
         // Pass SDK image for error messages
         container_cmd.push("-e".to_string());
         container_cmd.push(format!("AVOCADO_SDK_IMAGE={container_image}"));
@@ -3159,6 +3635,37 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             )
         };
         container_cmd.push(full_command);
+        container_cmd
+    }
+
+    /// Run a simple command in the container without the full SDK entrypoint.
+    ///
+    /// This is useful for quick one-off operations like chown, cp, etc.
+    /// that don't need the SDK environment setup.
+    ///
+    /// # Arguments
+    /// * `container_image` - The container image to use
+    /// * `command` - The bash command to run
+    /// * `rm` - Whether to remove the container after exit
+    ///
+    /// # Returns
+    /// `true` if the command succeeded, `false` otherwise
+    pub async fn run_simple_command(
+        &self,
+        container_image: &str,
+        command: &str,
+        rm: bool,
+    ) -> Result<bool> {
+        // The same check as `run_in_container`: this binds the project dir too.
+        ensure_workspace_mounted_if_routed().await;
+
+        // Get or create docker volume for persistent state
+        let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
+        let volume_state = volume_manager.get_or_create_volume(&self.cwd).await?;
+
+        let container_cmd =
+            self.simple_command_argv(container_image, command, rm, &volume_state.volume_name);
+        let src_path = self.mounted_src_dir();
 
         if self.verbose {
             print_info(
@@ -3243,10 +3750,10 @@ if ! command -v bindfs >/dev/null 2>&1; then
 fi
 
 if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-    # If host user is already root (UID 0), no mapping needed - just bind mount
+    # Host UID/GID 0:0 (host is root, or the avocado-vm): plain bind mount, no mapping
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (plain bind mount, no UID mapping)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
@@ -3462,7 +3969,8 @@ fi
 
     /// Create the entrypoint script for SDK initialization
     /// The mount half of the prologue: the bindfs remount of `/mnt/src` onto
-    /// `/opt/src`, and the per-extension bindfs mounts.
+    /// `/opt/src`, the per-extension bindfs mounts, and a linked worktree's
+    /// git common dir.
     ///
     /// Split out because it is the one part that is **not** safe to re-run.
     /// Mounts live in the container's mount namespace, and nothing here guards
@@ -3472,7 +3980,7 @@ fi
     /// must run it exactly once, at creation.
     pub fn render_mount_block() -> String {
         format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             r#"# Remount source directory with permission translation via bindfs
 # This maps host UID/GID to root inside the container for seamless file access
 mkdir -p /opt/src
@@ -3490,10 +3998,10 @@ if ! command -v bindfs >/dev/null 2>&1; then
 fi
 
 if [ -n "$AVOCADO_HOST_UID" ] && [ -n "$AVOCADO_HOST_GID" ]; then
-    # If host user is already root (UID 0), no mapping needed - just bind mount
+    # Host UID/GID 0:0 (host is root, or the avocado-vm): plain bind mount, no mapping
     if [ "$AVOCADO_HOST_UID" = "0" ] && [ "$AVOCADO_HOST_GID" = "0" ]; then
         mount --bind /mnt/src /opt/src
-        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (host is root, no mapping needed)" >&2; fi
+        if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (plain bind mount, no UID mapping)" >&2; fi
     else
         # Use --map with colon-separated user and group mappings
         # Maps host UID -> 0 (root) and host GID -> 0 (root group)
@@ -3507,7 +4015,8 @@ else
     if [ -n "$AVOCADO_VERBOSE" ]; then echo "[INFO] Mounted /mnt/src -> /opt/src (no UID/GID mapping)" >&2; fi
 fi
 "#,
-            EXT_PATH_MOUNT_SNIPPET
+            EXT_PATH_MOUNT_SNIPPET,
+            GIT_COMMON_MOUNT_SNIPPET
         )
     }
 
@@ -4003,6 +4512,104 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every container start site must check the avocado-vm workspace mount
+    /// first. If Avocado.app starts QEMU, or the share is unmounted, the
+    /// mount made at `avocado vm start` is missing, and a step that skips the
+    /// check runs on an empty `/opt/src`.
+    pub(super) mod workspace_mount_check {
+        use super::*;
+        use std::cell::Cell;
+
+        thread_local! {
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// Called by `ensure_workspace_mounted_if_routed`. Thread-local, so
+        /// tests that run in parallel do not see each other's calls.
+        pub(in crate::utils::container) fn record_call() {
+            CALLS.with(|c| c.set(c.get() + 1));
+        }
+
+        fn calls() -> usize {
+            CALLS.with(Cell::get)
+        }
+
+        /// A container tool that does not exist, so each start site stops at
+        /// the volume lookup, after the point where the mount check belongs.
+        /// No docker command runs. The volume state file goes to `dir`.
+        fn container_without_tool(dir: &Path) -> SdkContainer {
+            SdkContainer {
+                container_tool: dir.join("no-such-container-tool").display().to_string(),
+                cwd: dir.to_path_buf(),
+                ..SdkContainer::new()
+            }
+        }
+
+        fn run_config() -> RunConfig {
+            RunConfig {
+                container_image: "test-image".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "true".to_string(),
+                ..Default::default()
+            }
+        }
+
+        // `#[tokio::test]` runs on the current thread, so the count is this
+        // test's own. Serial, with `DOCKER_HOST` cleared: VM routing stays
+        // off, so the check returns at once and never reaches a real VM.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_capture_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container_capture(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_in_container_with_output_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_in_container_with_output(run_config())
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn run_simple_command_checks_the_mount() {
+            let (_restore, _) = vm_routing_env();
+            let dir = tempfile::tempdir().unwrap();
+            let before = calls();
+            let result = container_without_tool(dir.path())
+                .run_simple_command("test-image", "true", true)
+                .await;
+            assert!(result.is_err(), "the volume lookup must fail");
+            assert_eq!(calls() - before, 1);
+        }
+    }
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.
     /// The rootfs script reads `${SOURCE_DATE_EPOCH:-0}` for `mkfs.erofs -T` but
@@ -4531,6 +5138,153 @@ extensions:
         assert!(container.verbose);
     }
 
+    /// Restores the env on drop, so a failed assert does not leak
+    /// DOCKER_HOST into later tests.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Saves and clears the env that decides the `/opt/src` mount, and
+    /// returns the `DOCKER_HOST` value that turns VM routing on. Tests that
+    /// use it must be `#[serial]`.
+    fn vm_routing_env() -> (RestoreEnv, String) {
+        let restore = RestoreEnv(
+            ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect(),
+        );
+        for k in ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"] {
+            std::env::remove_var(k);
+        }
+        let vm_sock = format!(
+            "unix://{}",
+            crate::utils::vm::state::VmPaths::resolve()
+                .unwrap()
+                .docker_socket()
+                .display()
+        );
+        (restore, vm_sock)
+    }
+
+    /// Both container start sites must take the plain mount and the git
+    /// trust under VM routing, and neither without it. Guards the call sites,
+    /// not only `src_mount_env`.
+    #[test]
+    #[serial_test::serial]
+    fn container_start_sites_use_the_plain_mount_only_under_vm_routing() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, vm_sock) = vm_routing_env();
+        // Not the working directory: a checkout of this repo can be a linked
+        // git worktree, which adds a git common dir mount and its git config.
+        let src = tempfile::tempdir().unwrap();
+        let container = SdkContainer::new().with_src_dir(Some(src.path().to_path_buf()));
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let build = |c: &SdkContainer| {
+            c.build_container_command(
+                &config,
+                &["true".to_string()],
+                &HashMap::new(),
+                &volume_state,
+            )
+            .unwrap()
+        };
+        let simple = |c: &SdkContainer| c.simple_command_argv("test-image", "true", true, "vol");
+        let git = "GIT_CONFIG_PARAMETERS='safe.directory'='*'".to_string();
+        let (uid, gid) = crate::utils::config::resolve_host_uid_gid(None);
+        let host_uid = format!("AVOCADO_HOST_UID={uid}");
+        let host_gid = format!("AVOCADO_HOST_GID={gid}");
+
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&host_uid) && cmd.contains(&host_gid),
+                "{name}: {cmd:?}"
+            );
+            assert!(!cmd.contains(&git), "{name}: git trust without VM routing");
+        }
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_UID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(
+                cmd.contains(&"AVOCADO_HOST_GID=0".to_string()),
+                "{name}: {cmd:?}"
+            );
+            assert!(cmd.contains(&git), "{name}: no git trust under VM routing");
+        }
+        // run_simple_command builds its own mount script from the same UID.
+        let script = simple(&container).pop().unwrap();
+        assert!(
+            script.contains("mount --bind /mnt/src /opt/src"),
+            "{script}"
+        );
+        assert!(!script.contains("bindfs --map"), "{script}");
+    }
+
+    // Serial: mutates DOCKER_HOST and AVOCADO_HOST_UID/GID.
+    #[test]
+    #[serial_test::serial]
+    fn src_mount_env_skips_bindfs_and_trusts_git_only_under_vm_routing() {
+        let (_restore, vm_sock) = vm_routing_env();
+
+        std::env::remove_var("DOCKER_HOST");
+        assert_eq!(
+            src_mount_uid_gid(),
+            crate::utils::config::resolve_host_uid_gid(None)
+        );
+
+        assert!(!src_mount_env(false, None)
+            .iter()
+            .any(|e| e.starts_with("GIT_CONFIG")));
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        assert_eq!(src_mount_uid_gid(), (0, 0));
+        assert_eq!(
+            src_mount_env(false, None),
+            [
+                "AVOCADO_HOST_UID=0",
+                "AVOCADO_HOST_GID=0",
+                "GIT_CONFIG_PARAMETERS='safe.directory'='*'",
+            ]
+        );
+
+        // An explicit UID brings bindfs back, so no safe.directory either.
+        std::env::set_var("AVOCADO_HOST_UID", "1234");
+        std::env::set_var("AVOCADO_HOST_GID", "5678");
+        assert_eq!(src_mount_uid_gid(), (1234, 5678));
+        assert!(!src_mount_env(false, None)
+            .iter()
+            .any(|e| e.starts_with("GIT_CONFIG")));
+        assert_eq!(
+            src_mount_env(true, None).last().unwrap(),
+            "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'"
+        );
+
+        // Both entries share the one variable git reads.
+        std::env::remove_var("AVOCADO_HOST_UID");
+        std::env::remove_var("AVOCADO_HOST_GID");
+        assert_eq!(
+            src_mount_env(true, None).last().unwrap(),
+            "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'"
+        );
+    }
+
     // Serial because `build_container_command` reads AVOCADO_SIGNING_KEYS_DIR,
     // which config.rs's SigningKeysRegistryFixture tests mutate.
     #[test]
@@ -4609,6 +5363,100 @@ extensions:
         // Verify source mount uses /mnt/src (bindfs will remount to /opt/src)
         let has_mnt_src_mount = cmd.iter().any(|s| s.contains(":/mnt/src:"));
         assert!(has_mnt_src_mount, "Source should be mounted to /mnt/src");
+    }
+
+    /// A project in a linked git worktree has a `.git` file that points into
+    /// the main checkout. The container must get that common dir, staged
+    /// read-write and bound at the path git looks for, or every git command
+    /// on `/opt/src` fails with "not a git repository".
+    #[test]
+    #[serial_test::serial]
+    fn a_linked_worktree_mounts_its_git_common_dir() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+            vec!["worktree", "add", "-q", wt.to_str().unwrap()],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(["-c", "worktree.useRelativePaths=false"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(&args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+        let in_container = PathBuf::from("/opt/main/.git");
+        let host = main.join(".git").canonicalize().unwrap();
+
+        let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
+        let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let cmd = container
+            .build_container_command(
+                &config,
+                &["true".to_string()],
+                &HashMap::new(),
+                &volume_state,
+            )
+            .unwrap();
+
+        assert!(
+            cmd.contains(&format!("{}:/mnt/git-common:rw", host.display())),
+            "{cmd:?}"
+        );
+        assert!(
+            cmd.contains(&format!(
+                "AVOCADO_GIT_COMMON_DIR={}",
+                in_container.display()
+            )),
+            "{cmd:?}"
+        );
+        assert!(
+            cmd.iter().any(|e| e.starts_with("GIT_CONFIG_PARAMETERS=")
+                && e.contains("'gc.worktreePruneExpire'='never'")),
+            "{cmd:?}"
+        );
+        let block = SdkContainer::render_mount_block();
+        assert!(
+            block.contains(r#"mount --bind /mnt/git-common "$AVOCADO_GIT_COMMON_DIR""#),
+            "{block}"
+        );
+
+        // The main checkout has a `.git` dir and needs nothing extra.
+        let container = SdkContainer::new().with_src_dir(Some(main.clone()));
+        let cmd = container
+            .build_container_command(
+                &config,
+                &["true".to_string()],
+                &HashMap::new(),
+                &volume_state,
+            )
+            .unwrap();
+        assert!(
+            !cmd.iter()
+                .any(|s| s.contains("git-common") || s.contains("GIT_")),
+            "{cmd:?}"
+        );
     }
 
     /// `includes/<ext>` still holds the tree from an earlier package/git fetch
@@ -4831,6 +5679,533 @@ extensions:
             env,
             vec!["AVOCADO_TARGET=qemux86-64", "AVOCADO_HOST_UID=1000"]
         );
+    }
+
+    /// Under the avocado-vm a bind source must be inside the share. A common
+    /// dir outside it gets no mount (and a warning), not a failed `docker run`.
+    #[test]
+    fn a_git_common_dir_outside_the_vm_share_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("main");
+        let wt = root.join("wt");
+        std::fs::create_dir(&main).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+            vec!["worktree", "add", "-q", wt.to_str().unwrap()],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(["-c", "worktree.useRelativePaths=false"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(&args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+
+        let inside = git_common_mount_for(&wt, Some(&root)).unwrap().unwrap();
+        assert_eq!(inside.host, main.join(".git"));
+        assert!(git_common_mount_for(&wt, None).unwrap().is_some());
+
+        let err = git_common_mount_for(&wt, Some(&wt)).unwrap_err();
+        assert!(err.contains("outside the avocado-vm share"), "{err}");
+        // A plain repo or a non-git dir never needs the share check.
+        assert_eq!(git_common_mount_for(&main, Some(&wt)), Ok(None));
+        assert_eq!(git_common_mount_for(tmp.path(), Some(&wt)), Ok(None));
+    }
+
+    /// git run for a test fixture, with none of the user's or system's config.
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(["-c", "worktree.useRelativePaths=false"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// `-e GIT_CONFIG_PARAMETERS` with no `=` makes docker pass the host's
+    /// value. It must be taken out too, or it lands after the merged value.
+    #[test]
+    fn git_config_pass_through_args_are_taken_out_of_container_args() {
+        let host_has_it = std::env::var_os("GIT_CONFIG_PARAMETERS").is_some();
+        let mut args: Vec<String> = [
+            "-e",
+            "GIT_CONFIG_PARAMETERS",
+            "--env",
+            "GIT_CONFIG_PARAMETERS",
+            "--env=GIT_CONFIG_PARAMETERS",
+            "-eGIT_CONFIG_PARAMETERS",
+            "--privileged",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let taken = take_git_config_args(&mut args);
+        assert_eq!(args, ["--privileged"]);
+        if !host_has_it {
+            assert_eq!(taken, None);
+        }
+    }
+
+    #[test]
+    fn git_config_pass_through_args_take_the_host_value() {
+        let mut args: Vec<String> = [
+            "-e",
+            "GIT_CONFIG_PARAMETERS",
+            "--env=GIT_CONFIG_PARAMETERS='a.b'='1'",
+            "-e",
+            "GIT_CONFIG_PARAMETERS_OTHER=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        assert_eq!(
+            take_git_config_args_with(&mut args, host).as_deref(),
+            Some("'h.x'='9' 'a.b'='1'")
+        );
+        assert_eq!(args, ["-e", "GIT_CONFIG_PARAMETERS_OTHER=1"]);
+    }
+
+    /// Every form docker accepts for an env flag, with a value and without
+    /// one (docker then passes the CLI's own value). Each must be taken out
+    /// and merged, and a near-miss name must be kept.
+    #[test]
+    fn every_docker_env_flag_form_is_taken_out_of_container_args() {
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        let forms: &[&[&str]] = &[
+            &["-e", "GIT_CONFIG_PARAMETERS=V"],
+            &["-e", "GIT_CONFIG_PARAMETERS"],
+            &["-eGIT_CONFIG_PARAMETERS=V"],
+            &["-eGIT_CONFIG_PARAMETERS"],
+            &["-e=GIT_CONFIG_PARAMETERS=V"],
+            &["-e=GIT_CONFIG_PARAMETERS"],
+            &["--env", "GIT_CONFIG_PARAMETERS=V"],
+            &["--env", "GIT_CONFIG_PARAMETERS"],
+            &["--env=GIT_CONFIG_PARAMETERS=V"],
+            &["--env=GIT_CONFIG_PARAMETERS"],
+        ];
+        for form in forms {
+            let mut args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            args.push("--privileged".to_string());
+            let want = if form.concat().ends_with("=V") {
+                "V"
+            } else {
+                "'h.x'='9'"
+            };
+            assert_eq!(
+                take_git_config_args_with(&mut args, host).as_deref(),
+                Some(want),
+                "{form:?}"
+            );
+            assert_eq!(args, ["--privileged"], "{form:?}");
+
+            // The same form with a near-miss name is not ours.
+            let near: Vec<String> = form
+                .iter()
+                .map(|s| s.replace("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_PARAMETERS_X"))
+                .collect();
+            let mut args = near.clone();
+            assert_eq!(take_git_config_args_with(&mut args, host), None, "{near:?}");
+            assert_eq!(args, near);
+        }
+        // `--env-file` is left for docker, which lets `-e` win over it.
+        let mut args: Vec<String> = ["--env-file", "x.env", "--entrypoint", "sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(take_git_config_args_with(&mut args, host), None);
+        assert_eq!(args.len(), 4);
+    }
+
+    /// The session split takes env flags in every docker form, so a compact
+    /// `-eK=V` from container args goes to the exec, not into the shape.
+    #[test]
+    fn split_run_argv_takes_every_env_flag_form() {
+        let argv: Vec<String> = [
+            "docker",
+            "run",
+            "-eA=1",
+            "-e=B=2",
+            "--env=C=3",
+            "--env",
+            "D=4",
+            "-e",
+            "E",
+            "--env-file",
+            "f.env",
+            "img",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (shape, env) = split_run_argv(&argv, 1).unwrap();
+        assert_eq!(env, ["A=1", "B=2", "C=3", "D=4", "E"]);
+        assert_eq!(shape, ["--env-file", "f.env", "img"]);
+    }
+
+    #[test]
+    fn git_config_args_are_taken_out_of_container_args() {
+        let mut args: Vec<String> = [
+            "--privileged",
+            "-e",
+            "GIT_CONFIG_PARAMETERS='a.b'='1'",
+            "--env=GIT_CONFIG_PARAMETERS='c.d'='2'",
+            "-eGIT_CONFIG_PARAMETERS='e.f'='3'",
+            "-e",
+            "OTHER=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            take_git_config_args(&mut args).as_deref(),
+            Some("'a.b'='1' 'c.d'='2' 'e.f'='3'")
+        );
+        assert_eq!(args, ["--privileged", "-e", "OTHER=1"]);
+        assert_eq!(take_git_config_args(&mut args), None);
+    }
+
+    /// A caller's own `GIT_CONFIG_PARAMETERS` must not replace the prune
+    /// guard. The run gets one value, the caller's settings first and the
+    /// generated ones last, and the session container gets the same value.
+    #[test]
+    #[serial_test::serial]
+    fn a_caller_git_config_keeps_the_prune_guard() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        fixture_git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        // A relative pointer, as `worktree.useRelativePaths` writes it, so the
+        // common dir lands on `/opt/main/.git` in the container wherever this
+        // checkout (and so the temp dir) lives.
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+
+        let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
+        let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            container_args: Some(vec![
+                "-e GIT_CONFIG_PARAMETERS='color.ui'='never'".to_string()
+            ]),
+            ..Default::default()
+        };
+        let caller: HashMap<String, String> = [(
+            "GIT_CONFIG_PARAMETERS".to_string(),
+            "'core.abbrev'='12'".to_string(),
+        )]
+        .into();
+        let cmd = container
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        let want = "GIT_CONFIG_PARAMETERS='core.abbrev'='12' 'color.ui'='never' \
+                    'gc.worktreePruneExpire'='never'";
+        let values: Vec<&String> = cmd
+            .iter()
+            .filter(|a| a.starts_with("GIT_CONFIG_PARAMETERS="))
+            .collect();
+        assert_eq!(values, [want], "{cmd:?}");
+
+        let (_, pairs) = split_run_argv(&cmd, 1).unwrap();
+        // The step's exec gets the merged value; the session container holds
+        // only the generated part (see `session_create_env`).
+        assert!(pairs.iter().any(|p| p == want), "{pairs:?}");
+        let create = session_create_env(&env_map(&pairs));
+        assert!(
+            create
+                .iter()
+                .any(|a| a == "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'"),
+            "{create:?}"
+        );
+
+        // A caller cannot move the mount: only the detected path is passed.
+        let caller: HashMap<String, String> =
+            [("AVOCADO_GIT_COMMON_DIR".to_string(), "/usr".to_string())].into();
+        let cmd = container
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        let dirs: Vec<&String> = cmd
+            .iter()
+            .filter(|a| a.starts_with("AVOCADO_GIT_COMMON_DIR="))
+            .collect();
+        assert_eq!(dirs.len(), 1, "{cmd:?}");
+        assert_ne!(dirs[0], "AVOCADO_GIT_COMMON_DIR=/usr");
+        // And with no worktree, the caller's value never reaches the run.
+        let plain = SdkContainer::new().with_src_dir(Some(main.clone()));
+        let cmd = plain
+            .build_container_command(&config, &["true".to_string()], &caller, &volume_state)
+            .unwrap();
+        assert!(
+            !cmd.iter().any(|a| a.starts_with("AVOCADO_GIT_COMMON_DIR=")),
+            "{cmd:?}"
+        );
+    }
+
+    /// Steps of the same shape share one session container, and its env is
+    /// set once, at creation. A caller's git setting from the first step must
+    /// not stay there for later steps: the container holds only the generated
+    /// settings, and each exec passes its own merged value.
+    #[test]
+    #[serial_test::serial]
+    fn a_session_container_does_not_keep_a_callers_git_config() {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir(&main).unwrap();
+        fixture_git(&main, &["init", "-q"]);
+        fixture_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        fixture_git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
+
+        let container = SdkContainer::new().with_src_dir(Some(wt.clone()));
+        let volume_state = VolumeState::new(wt.clone(), "docker".to_string());
+        let config = RunConfig {
+            container_image: "test-image".to_string(),
+            target: "qemuarm64".to_string(),
+            ..Default::default()
+        };
+        let step = |env: &HashMap<String, String>| {
+            let cmd = container
+                .build_container_command(&config, &["true".to_string()], env, &volume_state)
+                .unwrap();
+            split_run_argv(&cmd, 1).unwrap()
+        };
+        let guard = "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'";
+
+        let first: HashMap<String, String> = [(
+            "GIT_CONFIG_PARAMETERS".to_string(),
+            "'core.bare'='true'".to_string(),
+        )]
+        .into();
+        let (shape1, pairs1) = step(&first);
+        let create = session_create_env(&env_map(&pairs1));
+        assert!(create.iter().any(|a| a == guard), "{create:?}");
+        assert!(
+            !create.iter().any(|a| a.contains("core.bare")),
+            "{create:?}"
+        );
+        // The first step's own exec still gets its setting.
+        assert!(
+            pairs1.iter().any(|p| p
+                == "GIT_CONFIG_PARAMETERS='core.bare'='true' 'gc.worktreePruneExpire'='never'"),
+            "{pairs1:?}"
+        );
+
+        // A second step of the same shape, with no caller setting, gets the
+        // guard and nothing from the first step.
+        let (shape2, pairs2) = step(&HashMap::new());
+        assert_eq!(shape1, shape2);
+        let exec = build_exec_command("docker", "sess", &pairs2, "true");
+        assert!(exec.iter().any(|a| a == guard), "{exec:?}");
+    }
+
+    #[test]
+    fn the_common_dir_lands_only_on_allowed_container_paths() {
+        for dest in [
+            "/usr/bin",
+            "/usr/lib/x",
+            "/etc/x",
+            "/var/lib/x",
+            "/root/x",
+            "/tmp/x",
+            "/srv/x/.git",
+            "/home",
+            "/Users",
+            "/opt",
+            "/opt/src/x",
+            "/opt/_avocado/x/.git",
+            "/mnt/git-common",
+            "/",
+        ] {
+            assert!(
+                check_container_dest(Path::new(dest), None).is_err(),
+                "{dest}"
+            );
+        }
+        for dest in ["/Users/u/repo/.git", "/home/u/repo/.git", "/opt/main/.git"] {
+            assert_eq!(
+                check_container_dest(Path::new(dest), None),
+                Ok(()),
+                "{dest}"
+            );
+        }
+        // Under the avocado-vm, the share is allowed too.
+        let ws = Path::new("/Volumes/work");
+        assert_eq!(
+            check_container_dest(Path::new("/Volumes/work/r/.git"), Some(ws)),
+            Ok(())
+        );
+        assert!(check_container_dest(Path::new("/Volumes/work/r/.git"), None).is_err());
+    }
+
+    /// A bare repo at `<root>/usr/bin` and a relative worktree at
+    /// `<root>/projects/wt` put the common dir at `/usr/bin` in the
+    /// container. A mount there would hide the SDK's programs.
+    #[test]
+    fn a_common_dir_at_a_system_path_is_not_mounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        fixture_git(&src, &["init", "-q"]);
+        fixture_git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        std::fs::create_dir(root.join("usr")).unwrap();
+        fixture_git(&root, &["clone", "-q", "--bare", "src", "usr/bin"]);
+        let wt = root.join("projects/wt");
+        fixture_git(
+            &root.join("usr/bin"),
+            &["worktree", "add", "-q", wt.to_str().unwrap()],
+        );
+        std::fs::write(wt.join(".git"), "gitdir: ../../usr/bin/worktrees/wt\n").unwrap();
+
+        let err = git_common_mount_for(&wt, None).unwrap_err();
+        assert!(err.contains("/usr/bin"), "{err}");
+    }
+
+    /// `--runs-on` cannot mount the common dir. A worktree, and a worktree
+    /// the local path would also refuse, both get a reason, not silence.
+    #[test]
+    fn remote_runs_explain_why_git_will_not_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        let wt = tmp.path().join("wt");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(["-c", "worktree.useRelativePaths=false"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+
+        // A plain worktree: the common dir is not shared with the remote.
+        let msg = remote_git_warning(&wt).unwrap();
+        assert!(
+            msg.contains("--runs-on shares only the project dir"),
+            "{msg}"
+        );
+
+        // A refused worktree: the reason reaches the user.
+        std::fs::write(wt.join(".gitmodules"), "").unwrap();
+        let msg = remote_git_warning(&wt).unwrap();
+        assert!(msg.contains("submodules"), "{msg}");
+
+        // The main checkout and a non-git dir need no warning.
+        assert_eq!(remote_git_warning(&main), None);
+        assert_eq!(remote_git_warning(tmp.path()), None);
+    }
+
+    /// The session container's own environment must hold the generated git
+    /// settings, so that any exec into it (not only the SDK's step execs)
+    /// gets `safe.directory` and the worktree prune guard. A caller's
+    /// setting is not kept there.
+    #[test]
+    #[serial_test::serial]
+    fn session_create_env_carries_the_git_settings() {
+        let (_restore, vm_sock) = vm_routing_env();
+        let env: HashMap<String, String> = [
+            ("AVOCADO_HOST_UID", "0"),
+            ("AVOCADO_GIT_COMMON_DIR", "/h/.git"),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'core.bare'='true' 'gc.worktreePruneExpire'='never'",
+            ),
+            ("AVOCADO_RUNTIME", "dev"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let has = |args: &[String], want: &str| {
+            let i = args.iter().position(|a| a == want).expect(want);
+            assert_eq!(args[i - 1], "-e");
+        };
+        let args = session_create_env(&env);
+        has(&args, "AVOCADO_HOST_UID=0");
+        has(&args, "AVOCADO_GIT_COMMON_DIR=/h/.git");
+        has(
+            &args,
+            "GIT_CONFIG_PARAMETERS='gc.worktreePruneExpire'='never'",
+        );
+        // Per-step variables stay on the exec.
+        assert!(!args.iter().any(|a| a.starts_with("AVOCADO_RUNTIME")));
+
+        std::env::set_var("DOCKER_HOST", &vm_sock);
+        let args = session_create_env(&env);
+        has(
+            &args,
+            "GIT_CONFIG_PARAMETERS='safe.directory'='*' 'gc.worktreePruneExpire'='never'",
+        );
+    }
+
+    /// The session container runs the mount block once, at creation, so the
+    /// mount variables `build_container_command` puts in the argv must reach
+    /// it. They are not in the caller's env map.
+    #[test]
+    fn session_create_env_comes_from_the_argv() {
+        let argv: Vec<String> = [
+            "docker",
+            "run",
+            "-v",
+            "/h/.git:/mnt/git-common:rw",
+            "-e",
+            "AVOCADO_HOST_UID=1000",
+            "-e",
+            "AVOCADO_GIT_COMMON_DIR=/h/.git",
+            "-e",
+            "AVOCADO_EXT_PATH_MOUNTS=a b",
+            "-e",
+            "X=a=b",
+            "img",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (_, pairs) = split_run_argv(&argv, 1).unwrap();
+        let env = env_map(&pairs);
+        assert_eq!(env["AVOCADO_HOST_UID"], "1000");
+        assert_eq!(env["AVOCADO_GIT_COMMON_DIR"], "/h/.git");
+        assert_eq!(env["AVOCADO_EXT_PATH_MOUNTS"], "a b");
+        assert_eq!(env["X"], "a=b");
     }
 
     #[test]
@@ -5251,7 +6626,9 @@ extensions:
         // the same strings, and counting them made the guard compare its own
         // source against itself.
         let whole = include_str!("container.rs");
-        let src = &whole[..whole.find("#[cfg(test)]").expect("test module marker")];
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module marker")];
         let reads = src
             .matches(r#"grep "^VERSION_CODENAME=" /etc/os-release"#)
             .count();
@@ -5288,5 +6665,128 @@ extensions:
             container.mounted_src_dir(),
             env::current_dir().unwrap().as_path()
         );
+    }
+
+    mod foreground_interrupt {
+        use super::*;
+
+        /// A container tool that logs each call. `stop` also ends the
+        /// process whose pid is in `pid`, as a real stop ends the client.
+        fn stub_tool(dir: &Path) -> String {
+            let tool = dir.join("tool");
+            std::fs::write(
+                &tool,
+                format!(
+                    "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
+                    log = dir.join("log").display(),
+                    pid = dir.join("pid").display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            tool.display().to_string()
+        }
+
+        fn container_with_tool(tool: String) -> SdkContainer {
+            SdkContainer {
+                container_tool: tool,
+                ..SdkContainer::new()
+            }
+        }
+
+        #[tokio::test]
+        async fn interrupt_stops_the_container() {
+            let dir = tempfile::tempdir().unwrap();
+            let container = container_with_tool(stub_tool(dir.path()));
+            let pid_file = dir.path().join("pid");
+            let mut child = AsyncCommand::new("sh")
+                .arg("-c")
+                .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
+                .spawn()
+                .unwrap();
+            let interrupt = async {
+                while std::fs::read_to_string(&pid_file)
+                    .map(|p| !p.ends_with('\n'))
+                    .unwrap_or(true)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                container.wait_or_stop_on_interrupt(&mut child, Some("avocado-run-t"), interrupt),
+            )
+            .await
+            .expect("the wait must end once the container is stopped");
+            let err = result.expect_err("an interrupt is an error");
+            assert!(err.to_string().contains("Interrupted by user"), "{err}");
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(log.contains("stop -t 2 avocado-run-t"), "tool calls: {log}");
+        }
+
+        #[tokio::test]
+        async fn a_finished_container_returns_its_status() {
+            let dir = tempfile::tempdir().unwrap();
+            let container = container_with_tool(stub_tool(dir.path()));
+            let mut child = AsyncCommand::new("sh")
+                .arg("-c")
+                .arg("exit 3")
+                .spawn()
+                .unwrap();
+            let ok = container
+                .wait_or_stop_on_interrupt(
+                    &mut child,
+                    Some("avocado-run-t"),
+                    std::future::pending::<()>(),
+                )
+                .await
+                .unwrap();
+            assert!(!ok);
+            assert!(
+                !dir.path().join("log").exists(),
+                "no stop for a finished run"
+            );
+        }
+
+        #[test]
+        fn shutdown_removes_a_foreground_run_in_progress() {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+            let run = ForegroundRun::register(Some("avocado-run-shutdown-t"), true);
+            SessionContainers::shutdown(&tool);
+            drop(run);
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(
+                log.contains("rm -f avocado-run-shutdown-t"),
+                "tool calls: {log}"
+            );
+            assert!(!FOREGROUND_RUNS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "avocado-run-shutdown-t"));
+        }
+
+        #[test]
+        fn shutdown_stops_a_foreground_run_started_without_rm() {
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+            let run = ForegroundRun::register(Some("avocado-run-keep-t"), false);
+            SessionContainers::shutdown(&tool);
+            drop(run);
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            assert!(
+                log.contains("stop -t 2 avocado-run-keep-t"),
+                "tool calls: {log}"
+            );
+            assert!(
+                !log.contains("rm -f avocado-run-keep-t"),
+                "a run without --rm must keep its container: {log}"
+            );
+        }
     }
 }

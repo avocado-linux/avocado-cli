@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::utils::feeds::FeedStage;
 use crate::utils::{
-    config::{ComposedConfig, Config},
+    config::{ComposedConfig, Config, SdkConfig},
     container::{RunConfig, SdkContainer},
-    output::{print_info, print_success, OutputLevel},
+    output::{print_info, print_success, print_warning, OutputLevel},
     shell::shell_escape,
     target::validate_and_log_target,
 };
@@ -24,6 +25,38 @@ fn join_argv(argv: &[String]) -> String {
         .map(|a| shell_escape(a))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The feed URL and releasever for the SDK container. These are the values
+/// `sdk install` and `sdk dnf` use, so a pinned snapshot in avocado.lock
+/// applies here too.
+fn sdk_repo(config: &Config) -> (Option<String>, Option<String>) {
+    (config.get_sdk_repo_url(), config.get_sdk_repo_release())
+}
+
+/// The config that `sdk run` resolves its feed from. `sdk run` also reads
+/// `repo_url` and `repo_release` from the legacy `sdk.<target>` block (see
+/// the schema). A value set there replaces the base `sdk` value. An explicit
+/// `repo_release` there also turns the lock pin off, as `sdk.repo_release`
+/// does.
+fn run_feed_config(config: &Config, merged: &SdkConfig) -> Config {
+    let mut feed_config = config.clone();
+    let sdk = feed_config.sdk.get_or_insert_with(SdkConfig::default);
+    if merged.repo_release.is_some() && merged.repo_release != sdk.repo_release {
+        sdk.repo_release = merged.repo_release.clone();
+        feed_config.locked_releasever = None;
+    }
+    if merged.repo_url.is_some() {
+        sdk.repo_url = merged.repo_url.clone();
+    }
+    feed_config
+}
+
+/// Named feeds are bind-mounted from a host tempdir that is removed when the
+/// CLI exits. A detached container outlives the CLI, and the remote
+/// `--runs-on` path refuses named feeds, so both run without them.
+fn named_feeds_supported(detach: bool, runs_on: bool) -> bool {
+    !detach && !runs_on
 }
 
 /// Implementation of the 'sdk run' command.
@@ -220,8 +253,6 @@ impl SdkRunCommand {
         config: &Config,
         runtime_name: &str,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf, String, String)>> {
-        use crate::utils::output::print_warning;
-
         match config.resolve_runtime_signing_key(runtime_name) {
             Ok(Some((declared, _))) => print_warning(
                 &format!(
@@ -293,9 +324,26 @@ impl SdkRunCommand {
         // Get merged SDK configuration for the target
         let merged_sdk_config = config.get_merged_sdk_config(&target, &self.config_path)?;
 
-        // Get repo_url and repo_release from merged config
-        let repo_url = merged_sdk_config.repo_url.as_ref();
-        let repo_release = merged_sdk_config.repo_release.as_ref();
+        let feed_config = run_feed_config(config, &merged_sdk_config);
+        let (repo_url, repo_release) = sdk_repo(&feed_config);
+        let feeds = if named_feeds_supported(self.detach, self.runs_on.is_some()) {
+            feed_config
+                .materialize_feeds(&target, FeedStage::Sdk, &self.config_path)
+                .await?
+        } else {
+            if feed_config.repos.is_some()
+                || feed_config
+                    .distro
+                    .as_ref()
+                    .is_some_and(|d| d.feeds.is_some())
+            {
+                print_warning(
+                    "Named feeds (repos: / distro.feeds) are not available in a detached or --runs-on 'sdk run'. dnf in this container sees only the distro feed.",
+                    OutputLevel::Normal,
+                );
+            }
+            None
+        };
 
         // Merge container args from merged config with CLI args
         let config_container_args = merged_sdk_config.container_args.as_ref();
@@ -365,8 +413,9 @@ impl SdkRunCommand {
             verbose: self.verbose,
             source_environment: self.env,
             interactive: self.interactive,
-            repo_url: repo_url.cloned(),
-            repo_release: repo_release.cloned(),
+            repo_url,
+            repo_release,
+            feeds,
             container_args: merged_container_args.clone(),
             dnf_args: self.dnf_args.clone(),
             extension_sysroot: self.extension.clone(),
@@ -403,6 +452,122 @@ impl SdkRunCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sdk run` used to read the legacy `sdk.repo_release` only, so the
+    /// container fell back to the image codename. It must use the configured
+    /// feed and the snapshot that avocado.lock pins, like `sdk dnf`.
+    #[test]
+    #[serial_test::serial]
+    fn sdk_run_uses_the_locked_snapshot() {
+        use crate::utils::lockfile::{LockFile, RepoSnapshot};
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_TARGET",
+        ] {
+            std::env::remove_var(var);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &config_path,
+            "default_target: qemux86-64\ndistro:\n  release: 2026\n  channel: next\nsdk:\n  image: docker.io/avocadolinux/sdk:2026\n",
+        )
+        .unwrap();
+        let config_path = config_path.to_string_lossy().to_string();
+
+        let unpinned = Config::load_composed(&config_path, None).unwrap();
+        assert_eq!(sdk_repo(&unpinned.config).1.as_deref(), Some("2026/next"));
+
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "next".to_string(),
+                snapshot: "320".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        lock.save(dir.path()).unwrap();
+        let pinned = Config::load_composed(&config_path, None).unwrap();
+        assert_eq!(
+            sdk_repo(&pinned.config).1.as_deref(),
+            Some("2026/next/snapshots/320")
+        );
+        let merged = pinned
+            .config
+            .get_merged_sdk_config("qemux86-64", &config_path)
+            .unwrap();
+        assert_eq!(
+            sdk_repo(&run_feed_config(&pinned.config, &merged))
+                .1
+                .as_deref(),
+            Some("2026/next/snapshots/320"),
+            "with no sdk.<target> block the lock pin still applies"
+        );
+    }
+
+    /// The schema says `sdk run` reads `repo_url` and `repo_release` from the
+    /// legacy `sdk.<target>` block. An explicit `repo_release` there wins
+    /// over the lock pin, as the base `sdk.repo_release` does.
+    #[test]
+    #[serial_test::serial]
+    fn sdk_run_uses_the_target_sdk_repo_values() {
+        use crate::utils::lockfile::{LockFile, RepoSnapshot};
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_REPO_URL",
+            "AVOCADO_SDK_REPO_URL",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_TARGET",
+        ] {
+            std::env::remove_var(var);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &config_path,
+            "default_target: qemux86-64\ndistro:\n  release: 2026\n  channel: next\nsdk:\n  image: docker.io/avocadolinux/sdk:2026\n  qemux86-64:\n    repo_url: https://target.example\n    repo_release: custom/rv\n",
+        )
+        .unwrap();
+        let config_path = config_path.to_string_lossy().to_string();
+        let mut lock = LockFile::new();
+        lock.set_repo_snapshot(
+            "qemux86-64",
+            RepoSnapshot {
+                release: "2026".to_string(),
+                channel: "next".to_string(),
+                snapshot: "320".to_string(),
+                repo_url: None,
+                created: None,
+            },
+        );
+        lock.save(dir.path()).unwrap();
+
+        let composed = Config::load_composed(&config_path, None).unwrap();
+        let merged = composed
+            .config
+            .get_merged_sdk_config("qemux86-64", &config_path)
+            .unwrap();
+        let (url, release) = sdk_repo(&run_feed_config(&composed.config, &merged));
+        assert_eq!(url.as_deref(), Some("https://target.example"));
+        assert_eq!(release.as_deref(), Some("custom/rv"));
+    }
+
+    /// The feed tempdir is removed when the CLI exits, so a detached
+    /// container must not bind-mount it.
+    #[test]
+    fn detached_and_remote_runs_get_no_named_feeds() {
+        assert!(named_feeds_supported(false, false));
+        assert!(!named_feeds_supported(true, false));
+        assert!(!named_feeds_supported(false, true));
+    }
 
     #[test]
     fn test_new() {
