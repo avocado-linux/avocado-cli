@@ -150,8 +150,10 @@ pub struct BuildIdSpec<'a> {
     pub work_var: &'a str,
     /// Shell variable naming the sysroot holding the rpmdb (e.g. `ROOTFS_SYSROOT`).
     pub sysroot_var: &'a str,
-    /// Extra `rpm` args to locate the db — rootfs passes `--dbpath /var/lib/rpm`,
-    /// initramfs the empty string (default path).
+    /// Extra `rpm` args to locate the db. Both specs pass
+    /// `--dbpath /var/lib/rpm`: the rpmdb is at `/var/lib/rpm` under each
+    /// sysroot, and the SDK default `%_dbpath` would miss it (query 0 packages)
+    /// and leave a stray rpmdb in the sysroot.
     pub rpm_args: &'a str,
     /// Shell variable to assign the derived id (e.g. `OS_BUILD_ID`).
     pub id_var: &'a str,

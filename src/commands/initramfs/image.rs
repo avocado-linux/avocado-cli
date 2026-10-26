@@ -301,7 +301,11 @@ fi"#,
             namespace_uuid,
             work_var: "INITRAMFS_WORK",
             sysroot_var: "INITRAMFS_SYSROOT",
-            rpm_args: "",
+            // The initramfs rpmdb is at /var/lib/rpm under the sysroot, same as
+            // the rootfs. Without --dbpath, rpm uses the SDK default %_dbpath
+            // (under --root), queries an empty db, and drops a stray rpmdb into
+            // the sysroot that later initramfs builds would ship.
+            rpm_args: "--dbpath /var/lib/rpm",
             id_var: "INITRAMFS_BUILD_ID",
             identity_files: INITRAMFS_IDENTITY_FILES,
             // Unlike erofs, cpio has no --all-root: every newc header carries
@@ -760,6 +764,13 @@ mod tests {
         let s = generate_initramfs_build_script("ns", "cpio.zst", None, "", false, "auto");
         assert!(s.contains("TREE_HASH="), "work-tree content hash present");
         assert!(s.contains("-path ./var/lib/rpm"), "rpmdb pruned");
+        // The NEVRA query must point rpm at the initramfs rpmdb (/var/lib/rpm
+        // under --root), not the SDK default dbpath. Without this the query
+        // returns 0 packages and rpm drops a stray rpmdb into the sysroot.
+        assert!(
+            s.contains(r#"rpm --dbpath /var/lib/rpm -qa"#),
+            "the initramfs NEVRA query must use --dbpath /var/lib/rpm"
+        );
         assert!(
             s.contains("INITRAMFS_BUILD_ID=$(python3"),
             "id assigned to the initramfs var"
