@@ -2766,6 +2766,18 @@ pub fn compute_runtime_build_input_hash(
                         docker_images.clone(),
                     );
                 }
+                // boot_config lines are written into the boot medium at
+                // runtime-build time, so editing one must rebuild the runtime.
+                if let Some(boot_config) = parsed
+                    .get("extensions")
+                    .and_then(|e| e.get(ext_name))
+                    .and_then(|ext| ext.get("boot_config"))
+                {
+                    hash_data.insert(
+                        serde_yaml::Value::String(format!("ext.{ext_name}.boot_config")),
+                        boot_config.clone(),
+                    );
+                }
                 // Device-tree overlays are compiled and delivered at runtime-build
                 // time, so a declaration change (or an edit to a .dtso the
                 // declaration points at) must invalidate this stamp. Fold both the
@@ -5356,6 +5368,41 @@ extensions:
         assert_ne!(
             hash_with.config_hash, hash_edited.config_hash,
             "editing the .dtso source must change the runtime input hash"
+        );
+    }
+
+    #[test]
+    fn test_runtime_input_hash_includes_boot_config() {
+        let runtime: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  avocado-runtime: "*"
+extensions:
+  - board
+"#,
+        )
+        .unwrap();
+        let parsed = |boot_config: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&format!(
+                "extensions:\n  board:\n    version: \"1.0.0\"\n{boot_config}"
+            ))
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let hash = |p: &serde_yaml::Value| {
+            compute_runtime_build_input_hash(&runtime, "dev", p, dir.path(), &Default::default())
+                .unwrap()
+                .config_hash
+        };
+
+        let without = hash(&parsed(""));
+        let with = hash(&parsed("    boot_config:\n      - dtparam=i2c_arm=on\n"));
+        let edited = hash(&parsed("    boot_config:\n      - dtparam=i2c_arm=off\n"));
+
+        assert_ne!(without, with, "declaring boot_config must change the hash");
+        assert_ne!(
+            with, edited,
+            "editing a boot_config line must change the hash"
         );
     }
 
