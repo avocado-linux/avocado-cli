@@ -1843,6 +1843,10 @@ $DNF_SDK_HOST \
             ..Default::default()
         };
 
+        // check-update ends with `|| true` (exit 100 "updates available" is not a
+        // failure), so the in-container result is always success. Only a host or
+        // launch error, propagated by `?`, matters here. The bool is not acted on
+        // by design.
         run_container_command(
             container_helper,
             run_config,

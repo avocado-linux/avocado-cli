@@ -27,6 +27,30 @@ fn join_argv(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Validate an explicit `-r/--runtime` against the composed config.
+///
+/// A typo'd runtime name otherwise falls through to an unsigned run that still
+/// exits 0. The check is skipped when no runtimes are defined, because a
+/// zero-runtime project resolves a synthesized `default` that the composed
+/// loader does not inject into `config.runtimes` (ENG-2352).
+fn validate_runtime_arg(
+    runtime: Option<&str>,
+    runtimes: Option<&std::collections::HashMap<String, crate::utils::config::RuntimeConfig>>,
+) -> Result<()> {
+    let (Some(runtime_name), Some(map)) = (runtime, runtimes) else {
+        return Ok(());
+    };
+    if map.is_empty() || map.contains_key(runtime_name) {
+        return Ok(());
+    }
+    let mut available: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+    available.sort_unstable();
+    Err(anyhow::anyhow!(
+        "Runtime '{runtime_name}' not found in configuration. Available runtimes: {}",
+        available.join(", ")
+    ))
+}
+
 /// The feed URL and releasever for the SDK container. These are the values
 /// `sdk install` and `sdk dnf` use, so a pinned snapshot in avocado.lock
 /// applies here too.
@@ -318,6 +342,10 @@ impl SdkRunCommand {
         };
         let config = &composed.config;
 
+        // A typo'd -r/--runtime otherwise falls through to an unsigned run that
+        // still exits 0 (ENG-2352).
+        validate_runtime_arg(self.runtime.as_deref(), config.runtimes.as_ref())?;
+
         // Early target validation and logging - fail fast if target is unsupported
         let target = validate_and_log_target(self.target.as_deref(), config)?;
 
@@ -443,15 +471,46 @@ impl SdkRunCommand {
 
         if success {
             print_success("SDK command completed successfully.", OutputLevel::Normal);
+            Ok(())
+        } else {
+            // The in-container command exited non-zero. Return an error so the
+            // CLI also exits non-zero. Without this, a failed command (or a
+            // failed in-container build) still exits 0, and scripts and CI
+            // cannot see the failure. See ENG-2352 and bug report B-7.
+            anyhow::bail!("SDK command failed")
         }
-
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo'd `-r` must error and list the defined runtimes, not fall through
+    /// to an unsigned run that exits 0 (ENG-2352).
+    #[test]
+    fn sdk_run_rejects_unknown_runtime() {
+        use crate::utils::config::RuntimeConfig;
+        let rt = || serde_yaml::from_str::<RuntimeConfig>("{}").unwrap();
+        let mut runtimes = std::collections::HashMap::new();
+        runtimes.insert("prod".to_string(), rt());
+        runtimes.insert("dev".to_string(), rt());
+
+        let err = validate_runtime_arg(Some("prodd"), Some(&runtimes))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Runtime 'prodd' not found"), "got: {err}");
+        assert!(err.contains("dev, prod"), "lists sorted runtimes, got: {err}");
+
+        // A defined runtime passes.
+        assert!(validate_runtime_arg(Some("prod"), Some(&runtimes)).is_ok());
+        // No -r passes.
+        assert!(validate_runtime_arg(None, Some(&runtimes)).is_ok());
+        // No runtimes defined: skip the check so a synthesized `default` is fine.
+        assert!(validate_runtime_arg(Some("default"), None).is_ok());
+        let empty = std::collections::HashMap::new();
+        assert!(validate_runtime_arg(Some("default"), Some(&empty)).is_ok());
+    }
 
     /// `sdk run` used to read the legacy `sdk.repo_release` only, so the
     /// container fell back to the image codename. It must use the configured
