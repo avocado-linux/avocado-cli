@@ -1270,8 +1270,11 @@ impl ExtInstallCommand {
                     effective_tui_context,
                 )
                 .await
-            } else if should_invalidate_stale_runtime_sysroots(ext_up_to_date, &self.seed_runtimes)
-            {
+            } else if should_invalidate_stale_runtime_sysroots(
+                ext_up_to_date,
+                &self.seed_runtimes,
+                self.runtime.as_deref(),
+            ) {
                 // Targeted reinstall (`ext install` / `install -e`): this
                 // refreshed only the shared per-target tree, so drop the stale
                 // per-runtime copies instead of letting `build -r` ship them.
@@ -2176,16 +2179,27 @@ fn should_seed_runtime_sysroots(ext_up_to_date: bool, seed_runtimes: &[String]) 
 /// Whether to drop stale per-runtime sysroot copies after an install step.
 ///
 /// This is the targeted-install counterpart of [`should_seed_runtime_sysroots`]:
-/// it fires when an extension was actually (re)installed (`!ext_up_to_date`) but
-/// there are no seed targets, which is the `ext install <ext>` / `install -e
-/// <ext>` path. A warm fast-path install leaves the trees alone. The two are
-/// mutually exclusive on `seed_runtimes`, so an install either seeds the copies
-/// or invalidates them, never both.
+/// it fires only on the `ext install <ext>` / `install -e <ext>` path, where an
+/// extension was actually (re)installed (`!ext_up_to_date`) into the shared tree
+/// with no seed targets and no runtime in scope. A warm fast-path install leaves
+/// the trees alone, and so does a seeding install. The seed and invalidate are
+/// mutually exclusive on `seed_runtimes`, so an install does at most one.
+///
+/// `runtime.is_none()` is the guard that keeps this safe. A single-runtime
+/// `avocado install` dual-writes with a runtime set (`with_runtime(Some(rt))`)
+/// and no seeds, which otherwise matches. On the legacy layout where
+/// `$AVOCADO_PREFIX/extensions` is
+/// a real directory the entrypoint keeps (not a compat symlink), `$src` exists
+/// and is not `-ef` the freshly dual-written `runtimes/<rt>/extensions/<ext>`,
+/// so the script would delete what the install just wrote. The targeted paths
+/// build their `ExtInstallCommand` without `with_runtime`, so a `None` runtime
+/// is what tells them apart.
 fn should_invalidate_stale_runtime_sysroots(
     ext_up_to_date: bool,
     seed_runtimes: &[String],
+    runtime: Option<&str>,
 ) -> bool {
-    !ext_up_to_date && seed_runtimes.is_empty()
+    !ext_up_to_date && seed_runtimes.is_empty() && runtime.is_none()
 }
 
 fn seed_runtime_sysroot_command(extension: &str, runtimes: &[String]) -> String {
@@ -2685,6 +2699,86 @@ mod tests {
         assert!(!cmd.contains("cp -a"));
     }
 
+    /// Run the invalidate script against the two single-runtime on-disk layouts.
+    ///
+    /// On the legacy real-directory layout `$src` is a real directory distinct
+    /// from the per-runtime copy, so the script removes that copy. This is why a
+    /// single-runtime `avocado install` (runtime set) must be gated out of
+    /// invalidation by `should_invalidate_stale_runtime_sysroots`: on this
+    /// layout the copy is the tree the dual-write just produced. On the
+    /// compat-symlink layout `$src` and the copy are the same directory, so the
+    /// `-ef` guard keeps it. Together these show the script alone cannot tell a
+    /// fresh dual-write from a stale copy, which the caller-side guard does.
+    #[test]
+    #[cfg(unix)]
+    fn invalidate_script_on_single_runtime_layouts() {
+        use std::process::Command;
+        let ext = "avocado-ext-dev";
+        let script = invalidate_runtime_sysroot_command(ext);
+
+        // Legacy real-directory layout: extensions/<ext> is a real dir, and the
+        // per-runtime copy is a separate real dir.
+        let legacy = tempfile::tempdir().unwrap();
+        let legacy_shared = legacy.path().join("extensions").join(ext);
+        std::fs::create_dir_all(&legacy_shared).unwrap();
+        std::fs::write(legacy_shared.join("marker"), "shared").unwrap();
+        let legacy_copy = legacy
+            .path()
+            .join("runtimes")
+            .join("alpha")
+            .join("extensions")
+            .join(ext);
+        std::fs::create_dir_all(&legacy_copy).unwrap();
+        std::fs::write(legacy_copy.join("marker"), "runtime").unwrap();
+
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", legacy.path())
+            .output()
+            .expect("sh runs");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !legacy_copy.exists(),
+            "on the legacy layout the distinct per-runtime copy is removed"
+        );
+
+        // Compat-symlink layout: extensions/<ext> is a symlink into the runtime
+        // tree, so `$src -ef $copy` and the copy is preserved.
+        let compat = tempfile::tempdir().unwrap();
+        let compat_copy = compat
+            .path()
+            .join("runtimes")
+            .join("alpha")
+            .join("extensions")
+            .join(ext);
+        std::fs::create_dir_all(&compat_copy).unwrap();
+        std::fs::write(compat_copy.join("marker"), "runtime").unwrap();
+        std::fs::create_dir_all(compat.path().join("extensions")).unwrap();
+        std::os::unix::fs::symlink(&compat_copy, compat.path().join("extensions").join(ext))
+            .unwrap();
+
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", compat.path())
+            .output()
+            .expect("sh runs");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            compat_copy.join("marker").exists(),
+            "the compat-symlink layout keeps the install target"
+        );
+    }
+
     #[test]
     fn drop_install_stamp_script_removes_this_extensions_install_stamp() {
         let script = drop_install_stamp_script("avocado-ext-dev");
@@ -2698,19 +2792,32 @@ mod tests {
     #[test]
     fn targeted_reinstall_invalidates_but_full_and_warm_do_not() {
         let runtimes = vec!["alpha".to_string(), "beta".to_string()];
-        // Targeted reinstall (no seed targets, extension reinstalled): invalidate.
-        assert!(should_invalidate_stale_runtime_sysroots(false, &[]));
+        // Targeted reinstall (no seed targets, no runtime, reinstalled): invalidate.
+        assert!(should_invalidate_stale_runtime_sysroots(false, &[], None));
         // Full multi-runtime install (seed targets present): seed, do not invalidate.
-        assert!(!should_invalidate_stale_runtime_sysroots(false, &runtimes));
+        assert!(!should_invalidate_stale_runtime_sysroots(
+            false, &runtimes, None
+        ));
         // Warm fast-path install: leave the trees alone.
-        assert!(!should_invalidate_stale_runtime_sysroots(true, &[]));
+        assert!(!should_invalidate_stale_runtime_sysroots(true, &[], None));
+        // Single-runtime `avocado install` dual-writes with a runtime set and no
+        // seeds. It must NOT invalidate: on the legacy real-directory layout the
+        // script would delete the freshly dual-written runtime tree. This is the
+        // case the `runtime.is_none()` guard protects.
+        assert!(!should_invalidate_stale_runtime_sysroots(
+            false,
+            &[],
+            Some("alpha")
+        ));
         // Seed and invalidate are mutually exclusive: never both in one step.
         for utd in [true, false] {
             for rts in [&runtimes[..], &[]] {
-                assert!(
-                    !(should_seed_runtime_sysroots(utd, rts)
-                        && should_invalidate_stale_runtime_sysroots(utd, rts))
-                );
+                for rt in [None, Some("alpha")] {
+                    assert!(
+                        !(should_seed_runtime_sysroots(utd, rts)
+                            && should_invalidate_stale_runtime_sysroots(utd, rts, rt))
+                    );
+                }
             }
         }
     }
