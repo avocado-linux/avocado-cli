@@ -1490,15 +1490,16 @@ fn build_exec_command(
     name: &str,
     env_pairs: &[String],
     command: &str,
-    forward_stdin: bool,
+    stdio_flags: &[&str],
 ) -> Vec<String> {
     let mut cmd = vec![container_tool.to_string(), "exec".to_string()];
-    // The standalone `docker run` this replaces is built with `-i` for a
-    // non-detached run, so a caller piping into `avocado sdk run -- cat` gets
-    // its stdin. `docker exec` drops stdin without `-i`, so restore it here for
-    // the main path. Capture steps read no stdin and pass false.
-    if forward_stdin {
-        cmd.push("-i".to_string());
+    // The standalone `docker run` this replaces decides its stdin/tty flags
+    // with `ContainerStdio`; the exec needs the same ones or a piped
+    // `avocado sdk run -- cat` loses its stdin. Flags come from that module, so
+    // the source guard's single spelling of them still holds. Capture steps
+    // read no stdin and pass none.
+    for flag in stdio_flags {
+        cmd.push((*flag).to_string());
     }
     for pair in env_pairs {
         cmd.push("-e".to_string());
@@ -2144,12 +2145,19 @@ impl SdkContainer {
                         );
                         exec_command.push('\n');
                         exec_command.push_str(&effective_config.command);
+                        let mut caps =
+                            crate::utils::interactivity::StdioCapabilities::detect();
+                        caps.tui_active |= effective_config.tui_context.is_some();
+                        let stdio = crate::utils::interactivity::ContainerStdio::decide(
+                            effective_config.interactive,
+                            &caps,
+                        );
                         container_cmd = build_exec_command(
                             &self.container_tool,
                             &name,
                             &env_pairs,
                             &exec_command,
-                            true,
+                            stdio.flags(),
                         );
                         routed_to_session = true;
                     }
@@ -2908,7 +2916,7 @@ impl SdkContainer {
                             &name,
                             &env_pairs,
                             &exec_command,
-                            false,
+                            &[],
                         );
                     }
                     Err(e) => {
@@ -5720,13 +5728,21 @@ extensions:
     }
 
     #[test]
-    fn build_exec_command_forwards_stdin_only_when_asked() {
-        // The main path replaces a `docker run -i`, so its exec must keep `-i`
-        // for piped stdin; capture steps read no stdin and must not add it.
-        let with = build_exec_command("docker", "sess", &[], "true", true);
-        assert!(with.iter().any(|a| a == "-i"), "{with:?}");
-        let without = build_exec_command("docker", "sess", &[], "true", false);
-        assert!(!without.iter().any(|a| a == "-i"), "{without:?}");
+    fn build_exec_command_passes_through_stdio_flags() {
+        use crate::utils::interactivity::ContainerStdio;
+        // The main path hands the exec the same stdin/tty flags the standalone
+        // run would get, so a piped `sdk run -- cat` keeps its stdin. The flags
+        // come from ContainerStdio (never spelled here); capture passes none.
+        let keep = ContainerStdio::StdinOnly.flags();
+        let with = build_exec_command("docker", "sess", &[], "true", keep);
+        for f in keep {
+            assert!(with.iter().any(|a| a == f), "{with:?}");
+        }
+        let without = build_exec_command("docker", "sess", &[], "true", &[]);
+        assert!(
+            !without.iter().any(|a| keep.contains(&a.as_str())),
+            "{without:?}"
+        );
     }
 
     #[test]
@@ -6123,7 +6139,7 @@ extensions:
         // guard and nothing from the first step.
         let (shape2, pairs2) = step(&HashMap::new());
         assert_eq!(shape1, shape2);
-        let exec = build_exec_command("docker", "sess", &pairs2, "true", false);
+        let exec = build_exec_command("docker", "sess", &pairs2, "true", &[]);
         assert!(exec.iter().any(|a| a == guard), "{exec:?}");
     }
 
