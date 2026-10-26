@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that carry it. When `targets.json` cannot be read it warns and lets dnf
   report what is missing. A name close to one `repos:` defines is refused as a
   typo, and `<name>-sdk`, `ext` and `<name>-ext` are not add-on names.
+- **`boot_config` and stock overlays for device-tree delivery.** An extension
+  can list `boot_config` lines (one `key=value` each, such as
+  `dtparam=i2c_arm=on` or `usb_max_current_enable=1`) for the settings an
+  overlay source cannot express, and a `device_tree_overlays` entry may omit
+  `src` to name an overlay the BSP already ships. The BSP delivery hook receives
+  both in `overlays.manifest.json` (still `version` 1; new `boot_config`,
+  `boot_config_claimed_by` and per-overlay `stock` fields). A hook that does not
+  claim `boot_config` fails the runtime build instead of ignoring the lines. The
+  SDK compile wrapper is installed only when an overlay has a `src`; the
+  delivery hook is installed for any of the three. A `boot_config` key must be an
+  identifier (so `[gpio4=1]` and `#x=y` are refused), `dtoverlay=` is refused in
+  favor of a `device_tree_overlays` entry, and conflicting values for one key
+  produce a warning.
 - **SBOM extension scopes carry a stable image id.** (ENG-2199)
   `ext:<runtime>/<name>` scope elements carry the image id and sha256 from the
   runtime's build manifest, and `rootfs`/`initramfs` carry
