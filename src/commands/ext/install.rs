@@ -823,8 +823,22 @@ impl ExtInstallCommand {
                         // standard transaction, so skipping on one would leave
                         // a sysroot this invocation would have resolved
                         // differently. Reinstall instead.
+                        // An exact yaml pin that no longer matches the locked
+                        // version (a changed pin, a hand edit, or a merge
+                        // conflict in avocado.lock) must take the normal path,
+                        // which re-locks it. The skip leaves the lock untouched,
+                        // so the re-lock arm in `build_package_spec_with_lock`
+                        // would otherwise never run and the stale entry would
+                        // persist on every later install. Read across scopes,
+                        // matching `has_pins` and the kernel read above.
                         sysroot_present
                             && has_pins
+                            && lock_file.extension_exact_pins_match_lock(
+                                target,
+                                ext_name,
+                                parsed,
+                                resolved_kernel.as_deref(),
+                            )
                             && stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs)))
                     }
                     Err(_) => false,
