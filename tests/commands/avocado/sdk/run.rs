@@ -44,8 +44,11 @@ fn test_sdk_run_rejects_unknown_runtime() {
         .join("fixtures")
         .join("configs")
         .join("minimal.yaml");
-    let result =
-        common::cli_with_config(&["sdk", "run", "-r", "bogus", "--", "true"], None, Some(&config_path));
+    let result = common::cli_with_config(
+        &["sdk", "run", "-r", "bogus", "--", "true"],
+        None,
+        Some(&config_path),
+    );
     assert!(!result.success, "unknown runtime must fail");
     assert!(
         result.stderr.contains("not found in configuration"),
