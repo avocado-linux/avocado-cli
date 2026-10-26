@@ -2145,8 +2145,7 @@ impl SdkContainer {
                         );
                         exec_command.push('\n');
                         exec_command.push_str(&effective_config.command);
-                        let mut caps =
-                            crate::utils::interactivity::StdioCapabilities::detect();
+                        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
                         caps.tui_active |= effective_config.tui_context.is_some();
                         let stdio = crate::utils::interactivity::ContainerStdio::decide(
                             effective_config.interactive,
