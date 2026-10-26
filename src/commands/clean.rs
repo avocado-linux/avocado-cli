@@ -234,6 +234,9 @@ fi
             ..Default::default()
         };
 
+        // Stamp removal is best-effort bookkeeping. The guarded `rm -rf` exits 0
+        // and a launch error is already propagated by `?`, so the in-container
+        // bool is intentionally not acted on.
         container_helper.run_in_container(run_config).await?;
 
         if self.verbose {

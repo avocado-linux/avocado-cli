@@ -490,7 +490,21 @@ impl RuntimeInstallCommand {
                 tui_context: self.tui_context.clone(),
                 ..Default::default()
             };
-            let _ = run_container_command(container_helper, run_config, runs_on_context).await;
+            // A failed clean must abort the reinstall. If the rm step fails and
+            // we continue, the installroot check below sees the stale tree, skips
+            // the reseed, and dnf installs against a dirty installroot, which is
+            // the exact state needs_clean_reinstall exists to prevent (ENG-2352).
+            let cleaned =
+                run_container_command(container_helper, run_config, runs_on_context).await?;
+            if !cleaned {
+                print_error(
+                    &format!(
+                        "Failed to clean installroot for runtime '{runtime}' before reinstall."
+                    ),
+                    OutputLevel::Normal,
+                );
+                return Ok(false);
+            }
         }
 
         // Seed the runtime's rpm database from the rootfs unless it is already
