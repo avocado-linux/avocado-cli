@@ -137,6 +137,34 @@ fn stamp_allows_skip(status: &StampStatus) -> bool {
                 == Some(crate::utils::stamps::SCRIPTLET_CONTRACT))
 }
 
+/// Whether the fast path may skip installing an extension.
+///
+/// The skip is safe only when all four hold: the sysroot rpm database is seeded
+/// (`sysroot_present`), the lock still holds resolved pins (`has_pins`, the
+/// guard against `avocado update` clearing them), every exact yaml pin still
+/// matches the locked version in the install scope, and the install stamp is
+/// current (`stamp_ok`). The pin check reads the lock in `sysroot` and judges
+/// `resolved_ext` (override-resolved) -- the exact inputs the normal install
+/// path re-locks, so the fast path and the installer cannot disagree.
+///
+/// Pulled out of `ext_up_to_date` so a test covers the pin gate's place in the
+/// decision: dropping the gate term would let a mismatched pin skip, and
+/// [`tests::a_mismatched_pin_blocks_the_skip_decision`] fails if it is removed.
+fn ext_skip_is_safe(
+    lock_file: &LockFile,
+    target: &str,
+    sysroot: &SysrootType,
+    resolved_ext: Option<&serde_yaml::Value>,
+    sysroot_present: bool,
+    has_pins: bool,
+    stamp_ok: bool,
+) -> bool {
+    sysroot_present
+        && has_pins
+        && lock_file.extension_exact_pins_match_lock(target, sysroot, resolved_ext)
+        && stamp_ok
+}
+
 /// Shell that clears an extension's sysroot and drops the stamps that vouch for
 /// what was in it.
 ///
@@ -854,17 +882,19 @@ impl ExtInstallCommand {
                         // which re-locks it. The skip leaves the lock untouched,
                         // so the re-lock arm in `build_package_spec_with_lock`
                         // would otherwise never run and the stale entry would
-                        // persist on every later install. Judged against the
-                        // same scope (`extension_sysroot`) and override-resolved
-                        // pins the normal path re-locks.
-                        sysroot_present
-                            && has_pins
-                            && lock_file.extension_exact_pins_match_lock(
-                                target,
-                                &gate_sysroot,
-                                resolved_ext.as_ref(),
-                            )
-                            && stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs)))
+                        // persist on every later install. The pin gate (inside
+                        // `ext_skip_is_safe`) is judged against the same scope
+                        // (`extension_sysroot`) and override-resolved pins the
+                        // normal path re-locks.
+                        ext_skip_is_safe(
+                            &lock_file,
+                            target,
+                            &gate_sysroot,
+                            resolved_ext.as_ref(),
+                            sysroot_present,
+                            has_pins,
+                            stamp_allows_skip(&validate_stamp(&req, json, Some(&inputs))),
+                        )
                     }
                     Err(_) => false,
                 }
@@ -1834,6 +1864,47 @@ async fn run_container_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pin gate must sit inside the fast-path skip decision, not beside it:
+    /// with the sysroot seeded, pins present and the stamp current, a lock entry
+    /// that no longer matches the exact yaml pin still has to block the skip.
+    /// This fails if the `extension_exact_pins_match_lock` term is dropped from
+    /// `ext_skip_is_safe` (the gap the reviewer flagged), and it also checks the
+    /// other three terms each still gate on their own.
+    #[test]
+    fn a_mismatched_pin_blocks_the_skip_decision() {
+        let target = "qemux86-64";
+        let sysroot = SysrootType::Extension("ext-b".to_string());
+        let resolved_ext: serde_yaml::Value =
+            serde_yaml::from_str("packages:\n  alsa-conf: \"1.2.15.3-r0.1\"\n").unwrap();
+        let ext = Some(&resolved_ext);
+
+        // Everything else says "skip": sysroot seeded, pins present, stamp current.
+        let mut mismatched = LockFile::new();
+        mismatched.set_locked_version(target, &sysroot, "alsa-conf", "1.2.15.3-r0.0.x86_64");
+        assert!(
+            !ext_skip_is_safe(&mismatched, target, &sysroot, ext, true, true, true),
+            "a stale exact pin must block the skip even when sysroot, pins and stamp all allow it"
+        );
+
+        // The same decision with a matching lock entry skips.
+        let mut matched = LockFile::new();
+        matched.set_locked_version(target, &sysroot, "alsa-conf", "1.2.15.3-r0.1.x86_64");
+        assert!(ext_skip_is_safe(
+            &matched, target, &sysroot, ext, true, true, true
+        ));
+
+        // Each of the other three terms still gates on its own.
+        assert!(!ext_skip_is_safe(
+            &matched, target, &sysroot, ext, false, true, true
+        ));
+        assert!(!ext_skip_is_safe(
+            &matched, target, &sysroot, ext, true, false, true
+        ));
+        assert!(!ext_skip_is_safe(
+            &matched, target, &sysroot, ext, true, true, false
+        ));
+    }
 
     /// The extension fast path reads the previous stamp as raw JSON; the same
     /// rule applies: rebuild only under an older (or no recorded) contract.
