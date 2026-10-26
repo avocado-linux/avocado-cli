@@ -1195,8 +1195,18 @@ impl SessionContainers {
         let mut held = slot
             .lock()
             .map_err(|_| anyhow::anyhow!("session container slot is poisoned"))?;
+        // Reuse the cached container only while it is still up. The keepalive
+        // backstop, a crash, or an outside `docker rm` can leave the name
+        // pointing at a container that is gone; handing it back would make every
+        // later `docker exec` fail with "No such container" and no fallback.
+        // Drop a dead entry and create a fresh one. One probe per reused step is
+        // cheap next to the exec it guards.
         if let Some(name) = held.as_ref() {
-            return Ok(name.clone());
+            let name = name.clone();
+            if block_in_place_if_async(|| container_is_running(container_tool, &name)) {
+                return Ok(name);
+            }
+            *held = None;
         }
 
         let name =
@@ -1235,15 +1245,19 @@ impl SessionContainers {
         // below. Running them as the container's own command would race: `run
         // -d` returns as soon as the container starts, not when its command has
         // finished, so the first caller could exec into a container whose
-        // /opt/src was not mounted yet. The timeout is a backstop for the case
-        // where teardown never runs — a leaked container dies within the hour
-        // instead of living until the next sweep.
+        // /opt/src was not mounted yet. The sleep is a leak backstop for the
+        // case where teardown never runs AND no later invocation sweeps it; the
+        // common leak is reaped by `sweep_abandoned` on the next run. It is set
+        // well past any realistic `avocado build`/`install` so the container
+        // never exits under an active step — main steps run inside it now, not
+        // just the quick capture reads, and a step losing its container
+        // mid-build was the regression a one-hour cap caused.
         //
         // `sh -c`, not `bash`: this has to work in the fallback images too,
         // which are reached when no project config names an SDK image.
         cmd.push("sh".to_string());
         cmd.push("-c".to_string());
-        cmd.push("sleep 3600".to_string());
+        cmd.push(format!("sleep {SESSION_KEEPALIVE_SECS}"));
 
         let out = std::process::Command::new(container_tool)
             .args(&cmd)
@@ -1485,13 +1499,45 @@ pub fn default_container_tool() -> String {
 /// The environment moves here from container creation, which is what lets steps
 /// with different `AVOCADO_RUNTIME`, `--dnf-arg` or signing variables share one
 /// container.
+/// Backstop lifetime for a parked session container, in seconds. Only reached
+/// when teardown never runs (a hard kill with no atexit) and no later
+/// invocation sweeps it; `sweep_abandoned` handles the common leak on the next
+/// run. Set well past any realistic single `avocado` invocation so an active
+/// build/install never loses its container mid-step. 24h.
+const SESSION_KEEPALIVE_SECS: u64 = 24 * 60 * 60;
+
+/// True while `name` is an existing, running container under `container_tool`.
+///
+/// Blocking: shells out to `<tool> inspect`. Used to drop a cached session
+/// container that has gone away (keepalive expired, crash, outside `rm`) before
+/// it is handed back for another `exec`.
+fn container_is_running(container_tool: &str, name: &str) -> bool {
+    let out = std::process::Command::new(container_tool)
+        .args(["inspect", "-f", "{{.State.Running}}", name])
+        .output();
+    matches!(
+        out,
+        Ok(o) if o.status.success()
+            && String::from_utf8_lossy(&o.stdout).trim() == "true"
+    )
+}
+
 fn build_exec_command(
     container_tool: &str,
     name: &str,
     env_pairs: &[String],
     command: &str,
+    stdio_flags: &[&str],
 ) -> Vec<String> {
     let mut cmd = vec![container_tool.to_string(), "exec".to_string()];
+    // The standalone `docker run` this replaces decides its stdin/tty flags
+    // with `ContainerStdio`; the exec needs the same ones or a piped
+    // `avocado sdk run -- cat` loses its stdin. Flags come from that module, so
+    // the source guard's single spelling of them still holds. Capture steps
+    // read no stdin and pass none.
+    for flag in stdio_flags {
+        cmd.push((*flag).to_string());
+    }
     for pair in env_pairs {
         cmd.push("-e".to_string());
         cmd.push(pair.clone());
@@ -1584,6 +1630,31 @@ fn session_containers_enabled() -> bool {
         env::var("AVOCADO_NO_SESSION_CONTAINER").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+/// Whether a step may be routed into the shared per-shape session container
+/// instead of its own `docker run`.
+///
+/// Read from the caller's request, never from the generated `avocado-run-<uuid>`
+/// name a non-detached run gets for Ctrl-C. That name is only for the one-off
+/// `docker run` fallback, and reading it back is what made the main-step path
+/// dead code: `effective_config.container_name` was always `Some` once the name
+/// was set, so eligibility was always false. `run_in_container_capture` never
+/// overrides the name, which is why only capture steps reused the container.
+///
+/// A detached run (its lifetime is the caller's, not one step's), an interactive
+/// run, a run with no entrypoint (no mount block for the exec to skip), a run
+/// the caller already named, a run that asks to keep its container (`rm` is
+/// false, so reuse would reap a container the caller wanted to retain), or the
+/// `AVOCADO_NO_SESSION_CONTAINER` hatch each keep their own container.
+fn session_reuse_eligible(
+    detach: bool,
+    interactive: bool,
+    use_entrypoint: bool,
+    caller_named: bool,
+    rm: bool,
+) -> bool {
+    rm && !detach && !interactive && use_entrypoint && !caller_named && session_containers_enabled()
 }
 
 /// Split a generated `docker run` argv into the container's shape and the
@@ -2049,6 +2120,18 @@ impl SdkContainer {
 
         let bash_cmd = vec!["bash".to_string(), "-c".to_string(), full_command];
 
+        // Read session-reuse eligibility from the caller's request now, before
+        // the generated name below is set on effective_config. Reading it back
+        // from effective_config.container_name is the B-10 bug that made this
+        // path dead.
+        let session_eligible = session_reuse_eligible(
+            config.detach,
+            config.interactive,
+            config.use_entrypoint,
+            config.container_name.is_some(),
+            config.rm,
+        );
+
         // For non-detached runs, ensure we have a container name for Ctrl-C handling
         // Generate a unique name if one wasn't provided
         let effective_container_name = if !config.detach && config.container_name.is_none() {
@@ -2081,12 +2164,8 @@ impl SdkContainer {
         // `docker run` — see SessionContainers. Failing to start or reach the
         // session container is never fatal: fall through to the run we would
         // have done anyway.
-        let eligible = !effective_config.detach
-            && !effective_config.interactive
-            && effective_config.use_entrypoint
-            && effective_config.container_name.is_none()
-            && session_containers_enabled();
-        if eligible {
+        let mut routed_to_session = false;
+        if session_eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
                 match self.session_container(&shape, &env_map(&env_pairs)) {
                     Ok(name) => {
@@ -2103,12 +2182,20 @@ impl SdkContainer {
                         );
                         exec_command.push('\n');
                         exec_command.push_str(&effective_config.command);
+                        let mut caps = crate::utils::interactivity::StdioCapabilities::detect();
+                        caps.tui_active |= effective_config.tui_context.is_some();
+                        let stdio = crate::utils::interactivity::ContainerStdio::decide(
+                            effective_config.interactive,
+                            &caps,
+                        );
                         container_cmd = build_exec_command(
                             &self.container_tool,
                             &name,
                             &env_pairs,
                             &exec_command,
+                            stdio.flags(),
                         );
+                        routed_to_session = true;
                     }
                     Err(e) => {
                         if effective_config.verbose || self.verbose {
@@ -2124,13 +2211,25 @@ impl SdkContainer {
             }
         }
 
+        // A step routed into a session container has no `avocado-run-<uuid>`
+        // container to stop: the SIGINT reaper force-removes the `avocado-sess-*`
+        // container on Ctrl-C, and `stop_interrupted_container(None)` kills the
+        // `docker exec` client. Pass no name, the same reliance on the reaper as
+        // the capture path. Otherwise keep the generated name for the one-off
+        // `docker run` and its Ctrl-C stop.
+        let run_container_name = if routed_to_session {
+            None
+        } else {
+            effective_container_name.as_deref()
+        };
+
         // Execute the command — route to TUI method if context is present
         if let Some(ref tui_ctx) = effective_config.tui_context {
             self.execute_container_command_with_tui(
                 &container_cmd,
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
-                effective_container_name.as_deref(),
+                run_container_name,
                 effective_config.rm,
                 tui_ctx,
             )
@@ -2140,7 +2239,7 @@ impl SdkContainer {
                 &container_cmd,
                 effective_config.detach,
                 effective_config.verbose || self.verbose,
-                effective_container_name.as_deref(),
+                run_container_name,
                 effective_config.rm,
             )
             .await
@@ -2821,11 +2920,16 @@ impl SdkContainer {
         // `docker run` — see SessionContainers. Failing to start or reach the
         // session container is never fatal: fall through to the run we would
         // have done anyway.
-        let eligible = !effective_config.detach
-            && !effective_config.interactive
-            && effective_config.use_entrypoint
-            && effective_config.container_name.is_none()
-            && session_containers_enabled();
+        // Capture steps leave container_name unset, so reading it here is
+        // correct — unlike the main path, which sets a generated name (B-10).
+        // The shared helper keeps both eligibility checks from drifting.
+        let eligible = session_reuse_eligible(
+            effective_config.detach,
+            effective_config.interactive,
+            effective_config.use_entrypoint,
+            effective_config.container_name.is_some(),
+            effective_config.rm,
+        );
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
                 match self.session_container(&shape, &env_map(&env_pairs)) {
@@ -2848,6 +2952,7 @@ impl SdkContainer {
                             &name,
                             &env_pairs,
                             &exec_command,
+                            &[],
                         );
                     }
                     Err(e) => {
@@ -5602,6 +5707,7 @@ extensions:
     }
 
     #[test]
+    #[serial_test::serial]
     fn session_key_shares_by_shape_and_the_hatch_stops_sharing() {
         let a = vec![
             "-v".to_string(),
@@ -5626,6 +5732,52 @@ extensions:
         assert_ne!(
             disabled.0, disabled.1,
             "with the hatch set, two calls for one shape must not share"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_reuse_eligible_reads_the_callers_request() {
+        // The normal non-detached, unnamed build step is eligible. This is the
+        // case run_in_container generates an `avocado-run-<uuid>` name for, and
+        // reading that generated name back (instead of the caller's) is what
+        // made the main-step session path dead code (B-10 / ENG-2793).
+        assert!(session_reuse_eligible(false, false, true, false, true));
+
+        // A detached run, an interactive run, a run with no entrypoint (no
+        // mount block to skip), a run the caller already named, or a run that
+        // asks to keep its container (rm == false, which reuse would reap) each
+        // keep their own container.
+        assert!(!session_reuse_eligible(true, false, true, false, true));
+        assert!(!session_reuse_eligible(false, true, true, false, true));
+        assert!(!session_reuse_eligible(false, false, false, false, true));
+        assert!(!session_reuse_eligible(false, false, true, true, true));
+        assert!(!session_reuse_eligible(false, false, true, false, false));
+
+        // The escape hatch forces the otherwise-eligible case back to its own
+        // `docker run`. Set around the assertion only, as the hatch is read per
+        // call.
+        std::env::set_var("AVOCADO_NO_SESSION_CONTAINER", "1");
+        let disabled = session_reuse_eligible(false, false, true, false, true);
+        std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+        assert!(!disabled, "the hatch must force a standalone run");
+    }
+
+    #[test]
+    fn build_exec_command_passes_through_stdio_flags() {
+        use crate::utils::interactivity::ContainerStdio;
+        // The main path hands the exec the same stdin/tty flags the standalone
+        // run would get, so a piped `sdk run -- cat` keeps its stdin. The flags
+        // come from ContainerStdio (never spelled here); capture passes none.
+        let keep = ContainerStdio::StdinOnly.flags();
+        let with = build_exec_command("docker", "sess", &[], "true", keep);
+        for f in keep {
+            assert!(with.iter().any(|a| a == f), "{with:?}");
+        }
+        let without = build_exec_command("docker", "sess", &[], "true", &[]);
+        assert!(
+            !without.iter().any(|a| keep.contains(&a.as_str())),
+            "{without:?}"
         );
     }
 
@@ -6023,7 +6175,7 @@ extensions:
         // guard and nothing from the first step.
         let (shape2, pairs2) = step(&HashMap::new());
         assert_eq!(shape1, shape2);
-        let exec = build_exec_command("docker", "sess", &pairs2, "true");
+        let exec = build_exec_command("docker", "sess", &pairs2, "true", &[]);
         assert!(exec.iter().any(|a| a == guard), "{exec:?}");
     }
 
@@ -6696,6 +6848,100 @@ extensions:
                 container_tool: tool,
                 ..SdkContainer::new()
             }
+        }
+
+        fn script(dir: &Path, name: &str, body: &str) -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p.display().to_string()
+        }
+
+        #[test]
+        fn container_is_running_reads_the_inspect_state() {
+            let dir = tempfile::tempdir().unwrap();
+            // A running container: inspect prints "true".
+            let up = script(dir.path(), "up", "echo true");
+            assert!(container_is_running(&up, "sess"));
+            // Stopped: inspect prints "false".
+            let down = script(dir.path(), "down", "echo false");
+            assert!(!container_is_running(&down, "sess"));
+            // Gone: inspect fails. A dead cached name must read as not running so
+            // get_or_create recreates instead of handing it back.
+            let gone = script(dir.path(), "gone", "exit 1");
+            assert!(!container_is_running(&gone, "sess"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn an_unnamed_main_step_routes_through_exec_not_run() {
+            // The B-10 regression (reading eligibility from
+            // effective_config.container_name, which is always Some once the
+            // generated avocado-run name is set) leaves session_reuse_eligible
+            // passing while the step still runs as a one-off `docker run`.
+            // Drive a real run_in_container through the stub tool and assert the
+            // step reaches the session container by `exec`, never a standalone
+            // `avocado-run-` run. Reintroducing the `&& container_name.is_none()`
+            // guard in front of the route flips this to a run and fails here.
+            std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+
+            // Pre-seed volume state so get_or_create_volume returns early: the
+            // stub exits 0 for `volume inspect`, so volume_exists() is true and
+            // no volume is minted.
+            crate::utils::volume::VolumeState::new(dir.path().to_path_buf(), tool.clone())
+                .save_to_dir(dir.path())
+                .unwrap();
+
+            let container = SdkContainer {
+                container_tool: tool.clone(),
+                cwd: dir.path().to_path_buf(),
+                src_dir: None,
+                config_path: None,
+                verbose: false,
+                cli_target_board: None,
+            };
+            let config = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo B10_ROUTE".to_string(),
+                // No avocado.yaml in the temp cwd; skip the derived mounts.
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+
+            let ok = container.run_in_container(config).await.unwrap();
+            assert!(ok, "the stubbed step should report success");
+
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+
+            // Drop the registry entry this run cached so it cannot leak into a
+            // later test. Clear the map directly rather than calling
+            // SessionContainers::shutdown, which reads the global FOREGROUND_RUNS
+            // and would log another concurrent test's container names into this
+            // stub's log and trip the assertions below.
+            let _ = SessionContainers::get()
+                .by_shape
+                .lock()
+                .map(|mut m| m.clear());
+            // The step actually ran, through the session container...
+            assert!(log.contains("echo B10_ROUTE"), "step never ran:\n{log}");
+            assert!(
+                log.contains("avocado-sess-"),
+                "no session container was used:\n{log}"
+            );
+            // ...and never as a one-off `docker run --name avocado-run-<uuid>`,
+            // which is the only path that carries the step under a run. Session
+            // creation is the sole `run` (`run -d ... avocado-sess-`).
+            assert!(
+                !log.contains("avocado-run-"),
+                "step took the standalone run path:\n{log}"
+            );
         }
 
         #[tokio::test]
