@@ -6918,10 +6918,17 @@ extensions:
             let ok = container.run_in_container(config).await.unwrap();
             assert!(ok, "the stubbed step should report success");
 
-            // Clear the global registry this run populated.
-            SessionContainers::shutdown(&tool);
-
             let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+
+            // Drop the registry entry this run cached so it cannot leak into a
+            // later test. Clear the map directly rather than calling
+            // SessionContainers::shutdown, which reads the global FOREGROUND_RUNS
+            // and would log another concurrent test's container names into this
+            // stub's log and trip the assertions below.
+            let _ = SessionContainers::get()
+                .by_shape
+                .lock()
+                .map(|mut m| m.clear());
             // The step actually ran, through the session container...
             assert!(log.contains("echo B10_ROUTE"), "step never ran:\n{log}");
             assert!(
