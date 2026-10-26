@@ -37,7 +37,7 @@ fn validate_runtime_arg(
     runtime: Option<&str>,
     runtimes: Option<&std::collections::HashMap<String, crate::utils::config::RuntimeConfig>>,
 ) -> Result<()> {
-    let (Some(runtime_name), Some(map)) = (runtime, runtimes) else {
+    let Some((runtime_name, map)) = runtime.zip(runtimes) else {
         return Ok(());
     };
     if map.is_empty() || map.contains_key(runtime_name) {
@@ -500,7 +500,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Runtime 'prodd' not found"), "got: {err}");
-        assert!(err.contains("dev, prod"), "lists sorted runtimes, got: {err}");
+        assert!(
+            err.contains("dev, prod"),
+            "lists sorted runtimes, got: {err}"
+        );
 
         // A defined runtime passes.
         assert!(validate_runtime_arg(Some("prod"), Some(&runtimes)).is_ok());
