@@ -1,0 +1,14 @@
+# Uses the singular `runtime:` alias of `runtimes:`. The on-disk runtime check
+# reads only the literal `runtimes:` key, so it used to reject a valid name
+# defined this way. `sdk run` now validates against the composed config, which
+# folds the alias, so `-r aliased` is accepted. See ENG-2352.
+default_target: x86_64-unknown-linux-gnu
+distro:
+  channel: apollo-edge
+  version: 0.1.0
+sdk:
+  image: ghcr.io/avocado-framework/avocado-sdk:latest
+runtime:
+  aliased:
+    target: x86_64-unknown-linux-gnu
+extensions: {}
