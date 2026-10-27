@@ -452,7 +452,11 @@ impl RuntimeBuildCommand {
                 compute_runtime_build_input_hash(
                     mr,
                     &self.runtime_name,
-                    parsed,
+                    &crate::utils::device_tree_overlay::with_boot_settings_for_target(
+                        config,
+                        parsed,
+                        target_arch,
+                    ),
                     &project_root,
                     &upstream_image_hashes,
                 )
@@ -1057,7 +1061,11 @@ impl RuntimeBuildCommand {
             let inputs = compute_runtime_build_input_hash(
                 &merged_runtime,
                 &self.runtime_name,
-                parsed,
+                &crate::utils::device_tree_overlay::with_boot_settings_for_target(
+                    config,
+                    parsed,
+                    target_arch,
+                ),
                 &config.project_root(&self.config_path),
                 &upstream_image_hashes,
             )?;
@@ -1554,10 +1562,15 @@ echo -n '}}'
         // runtime declares. It leads the script so a mismatch fails the build
         // before any image work, not after the rootfs, initramfs and FIT.
         let capability_check_section = {
+            let parsed = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+                config,
+                parsed,
+                target_arch,
+            );
             let overlays =
-                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, parsed)?;
+                crate::utils::device_tree_overlay::collect_for_runtime(&merged_runtime, &parsed)?;
             let boot_config =
-                crate::utils::device_tree_overlay::collect_boot_config(&merged_runtime, parsed)?;
+                crate::utils::device_tree_overlay::collect_boot_config(&merged_runtime, &parsed)?;
             crate::utils::device_tree_overlay::render_capability_check(&overlays, &boot_config)
         };
 

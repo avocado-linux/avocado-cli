@@ -81,6 +81,47 @@ pub struct DeviceTreeOverlay {
     pub ext_name: String,
 }
 
+/// The extension keys [`with_boot_settings_for_target`] resolves.
+const BOOT_SETTING_KEYS: [&str; 2] = ["device_tree_overlays", "boot_config"];
+
+/// `parsed` with each extension's `device_tree_overlays` and `boot_config`
+/// replaced by their values for `target`, so a declaration under an
+/// extension's `target-<name>:` reaches that board, and a sibling target's
+/// never does. `kernel-<spec>:` keys are stripped, not applied, as `ext build`
+/// and `ext image` do (see `resolve_remote_ext_config`).
+///
+/// Only these two keys change: everything else an extension declares stays as
+/// written, so the other readers of `parsed` (Docker priming among them) see
+/// what they saw before.
+///
+/// Every reader of the two keys takes its `parsed` from here: the SDK install
+/// (which hook packages to provision), the runtime build input hash, and the
+/// build section. Reading the raw value in any one of them silently drops a
+/// target-only declaration there.
+pub fn with_boot_settings_for_target(
+    config: &crate::utils::config::Config,
+    parsed: &Value,
+    target: &str,
+) -> Value {
+    let mut out = parsed.clone();
+    if let Some(exts) = out.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
+        for (name, ext) in exts.iter_mut() {
+            let path = format!("extensions.{}", name.as_str().unwrap_or_default());
+            let resolved = config.resolve_overrides_in_value(ext.clone(), target, None, &path);
+            let Some(ext) = ext.as_mapping_mut() else {
+                continue;
+            };
+            for key in BOOT_SETTING_KEYS {
+                match resolved.get(key) {
+                    Some(v) => ext.insert(key.into(), v.clone()),
+                    None => ext.remove(key),
+                };
+            }
+        }
+    }
+    out
+}
+
 /// Collect the device-tree overlays declared by every extension enabled on the
 /// runtime, in declaration order. `merged_runtime` is the resolved runtime
 /// value (its `extensions` sequence lists the enabled extensions); `parsed` is
@@ -1278,6 +1319,72 @@ extensions:
 "#);
         let got = collect_boot_config(&runtime_with(&["on"]), &parsed).unwrap();
         assert_eq!(got, vec!["dtparam=i2c_arm=on".to_string()]);
+    }
+
+    /// A declaration under an extension's `target-<name>:` reaches that target
+    /// and no other, through every reader: the build section's collectors and
+    /// the SDK install's hook-provisioning scan. Read raw, the target-only
+    /// lines were dropped without an error and the base lines reached every
+    /// target, so a board without boot_config support could not be excluded.
+    #[test]
+    fn target_overrides_scope_boot_settings_to_their_target() {
+        let yaml = r#"
+extensions:
+  board:
+    boot_config:
+      - dtparam=i2c_arm=on
+    docker_images:
+      - base/image
+    target-raspberrypi5:
+      boot_config:
+        - usb_max_current_enable=1
+      docker_images:
+        - pi/image
+      device_tree_overlays:
+        - name: disable-bt-pi5
+  pi-only:
+    target-raspberrypi5:
+      boot_config:
+        - dtparam=spi=on
+"#;
+        let config = crate::utils::config::Config::load_from_yaml_str(yaml).unwrap();
+        let raw = cfg(yaml);
+        let runtime = runtime_with(&["board", "pi-only"]);
+        let active: std::collections::HashSet<String> =
+            ["board".to_string(), "pi-only".to_string()].into();
+
+        let pi = with_boot_settings_for_target(&config, &raw, "raspberrypi5");
+        assert_eq!(
+            pi["extensions"]["board"]["docker_images"], raw["extensions"]["board"]["docker_images"],
+            "only the boot settings are resolved; other keys stay as written"
+        );
+        assert_eq!(
+            collect_boot_config(&runtime, &pi).unwrap(),
+            ["usb_max_current_enable=1", "dtparam=spi=on"],
+            "the target's list replaces the base, as every override does"
+        );
+        let names: Vec<String> = collect_for_runtime(&runtime, &pi)
+            .unwrap()
+            .into_iter()
+            .map(|o| o.name)
+            .collect();
+        assert_eq!(names, ["disable-bt-pi5"]);
+        assert_eq!(
+            active_extensions_declaring_overlays(&pi, &active),
+            ["board", "pi-only"]
+        );
+
+        let other = with_boot_settings_for_target(&config, &raw, "qemux86-64");
+        assert_eq!(
+            collect_boot_config(&runtime, &other).unwrap(),
+            ["dtparam=i2c_arm=on"]
+        );
+        assert!(collect_for_runtime(&runtime, &other).unwrap().is_empty());
+        assert_eq!(
+            active_extensions_declaring_overlays(&other, &active),
+            ["board"],
+            "a Pi-only extension must not provision the hook for another target"
+        );
     }
 
     #[test]
