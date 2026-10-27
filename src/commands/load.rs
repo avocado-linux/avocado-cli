@@ -5,7 +5,7 @@ use flate2::read::MultiGzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::utils::lockfile::LockFile;
@@ -146,24 +146,7 @@ fn import_archive(
             .progress_chars("#>-"),
         );
     }
-    // The volume entries are not unpacked here: they stream into the volume
-    // from the archive itself (`stream_volume_entries`), which keeps their
-    // owners, hardlinks and special files as `save` wrote them.
-    let mut has_volume = false;
-    for entry in archive
-        .entries()
-        .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?
-    {
-        let mut entry = entry
-            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
-        if entry.path()?.starts_with(VOLUME_PREFIX) {
-            has_volume = true;
-            continue;
-        }
-        entry
-            .unpack_in(temp_path)
-            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
-    }
+    let has_volume = unpack_host_entries(&mut archive, temp_path)?;
     pb.finish_and_clear();
 
     // Read and validate manifest
@@ -191,8 +174,106 @@ fn import_archive(
         );
     }
 
-    // Restore config files
     let config_dir = crate::utils::config::config_file_dir(config_path);
+
+    // Create new Docker volume
+    let volume_name = format!("avo-{}", uuid::Uuid::new_v4());
+
+    if verbose {
+        print_info(
+            &format!("Creating volume '{}'", volume_name),
+            OutputLevel::Normal,
+        );
+    }
+
+    let output = Command::new(container_tool)
+        .args([
+            "volume",
+            "create",
+            "--label",
+            &format!("avocado.source_path={}", config_dir.display()),
+            &volume_name,
+        ])
+        .output()
+        .with_context(|| "Failed to create Docker volume")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to create volume: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Import volume contents
+    if !has_volume {
+        anyhow::bail!("Archive does not contain volume data");
+    }
+
+    let pb = spinner();
+    pb.set_message("Importing volume");
+
+    // Over stdin rather than a bind mount: under the avocado-vm the daemon
+    // cannot see a host temp directory, and would mount an empty one.
+    // The CLI owns this stdin pipe, so `-i` without a TTY is the arrangement
+    // whatever the terminal is.
+    let mut child = Command::new(container_tool)
+        .args(["run", "--rm"])
+        .args(crate::utils::interactivity::ContainerStdio::StdinOnly.flags())
+        .args([
+            "-v",
+            &format!("{volume_name}:/data"),
+            "busybox",
+            "tar",
+            "xf",
+            "-",
+            "-C",
+            "/data",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "Failed to start container for volume import")?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open container stdin"))?;
+    // Drained on its own thread: tar prints a line per entry it cannot
+    // create, and a full stderr pipe would stop it reading stdin while this
+    // thread blocks writing it.
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            stderr.read_to_string(&mut buf).ok();
+            buf
+        })
+    });
+    // A write error usually means the container exited early; its stderr
+    // says why.
+    let streamed = stream_volume_entries(Path::new(input_path), stdin);
+    let status = child.wait()?;
+    let stderr_text = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    pb.finish_and_clear();
+
+    if !status.success() {
+        // Clean up the volume on failure
+        let _ = Command::new(container_tool)
+            .args(["volume", "rm", &volume_name])
+            .output();
+        anyhow::bail!("Volume import failed: {}", stderr_text.trim());
+    }
+    if let Err(e) = streamed {
+        let _ = Command::new(container_tool)
+            .args(["volume", "rm", &volume_name])
+            .output();
+        return Err(e.context("Volume import failed"));
+    }
+
+    // Restore config files. After the volume import, which reads the input
+    // archive a second time: a restored src_dir could overwrite that file.
     let archive_config_dir = temp_path.join("avocado-state/config");
 
     // Restore avocado.yaml
@@ -270,97 +351,55 @@ fn import_archive(
             .with_context(|| "Failed to restore src_dir")?;
     }
 
-    // Create new Docker volume
-    let volume_name = format!("avo-{}", uuid::Uuid::new_v4());
-
-    if verbose {
-        print_info(
-            &format!("Creating volume '{}'", volume_name),
-            OutputLevel::Normal,
-        );
-    }
-
-    let output = Command::new(container_tool)
-        .args([
-            "volume",
-            "create",
-            "--label",
-            &format!("avocado.source_path={}", config_dir.display()),
-            &volume_name,
-        ])
-        .output()
-        .with_context(|| "Failed to create Docker volume")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "Failed to create volume: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Import volume contents
-    if !has_volume {
-        anyhow::bail!("Archive does not contain volume data");
-    }
-
-    let pb = spinner();
-    pb.set_message("Importing volume");
-
-    // Over stdin rather than a bind mount: under the avocado-vm the daemon
-    // cannot see a host temp directory, and would mount an empty one.
-    // The CLI owns this stdin pipe, so `-i` without a TTY is the arrangement
-    // whatever the terminal is.
-    let mut child = Command::new(container_tool)
-        .args(["run", "--rm"])
-        .args(crate::utils::interactivity::ContainerStdio::StdinOnly.flags())
-        .args([
-            "-v",
-            &format!("{volume_name}:/data"),
-            "busybox",
-            "tar",
-            "xf",
-            "-",
-            "-C",
-            "/data",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| "Failed to start container for volume import")?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open container stdin"))?;
-    // A write error usually means the container exited early; its stderr,
-    // read below, says why.
-    let streamed = stream_volume_entries(Path::new(input_path), stdin);
-    let status = child.wait()?;
-    pb.finish_and_clear();
-
-    if !status.success() {
-        let stderr_text = if let Some(mut stderr) = child.stderr.take() {
-            let mut buf = String::new();
-            stderr.read_to_string(&mut buf).ok();
-            buf
-        } else {
-            String::new()
-        };
-        // Clean up the volume on failure
-        let _ = Command::new(container_tool)
-            .args(["volume", "rm", &volume_name])
-            .output();
-        anyhow::bail!("Volume import failed: {}", stderr_text.trim());
-    }
-    if let Err(e) = streamed {
-        let _ = Command::new(container_tool)
-            .args(["volume", "rm", &volume_name])
-            .output();
-        return Err(e.context("Volume import failed"));
-    }
-
     Ok((manifest, volume_name))
+}
+
+/// Unpack every entry except the volume's into `temp_path`, and say whether the
+/// archive has volume entries. Those are not unpacked here: they stream into the
+/// volume from the archive itself (`stream_volume_entries`), which keeps their
+/// owners, hardlinks and special files as `save` wrote them.
+fn unpack_host_entries<R: Read>(archive: &mut tar::Archive<R>, temp_path: &Path) -> Result<bool> {
+    let mut has_volume = false;
+    let mut dir_modes = Vec::new();
+    for entry in archive
+        .entries()
+        .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?
+    {
+        let mut entry = entry
+            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
+        let path = entry.path()?.into_owned();
+        if path.starts_with(VOLUME_PREFIX) {
+            has_volume = true;
+            continue;
+        }
+        // As `Archive::unpack` does, a directory gets its mode only after its
+        // children are written, so a read-only one does not refuse them.
+        if entry.header().entry_type().is_dir() {
+            if !path
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+            {
+                anyhow::bail!("Archive entry escapes the archive root: {}", path.display());
+            }
+            let dir = temp_path.join(&path);
+            fs::create_dir_all(&dir)?;
+            if let Ok(mode) = entry.header().mode() {
+                dir_modes.push((dir, mode));
+            }
+            continue;
+        }
+        entry
+            .unpack_in(temp_path)
+            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
+    }
+    #[cfg(unix)]
+    for (dir, mode) in dir_modes.iter().rev() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(*mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir_modes;
+    Ok(has_volume)
 }
 
 /// Where `save` puts the volume's contents in the archive.
@@ -437,6 +476,115 @@ mod tests {
     /// has to be the volume as `save` wrote it: prefix gone (hardlink targets
     /// too), symlink targets untouched, owners and modes kept, other entries
     /// left out.
+    /// The import must not deadlock when the container floods stderr before it
+    /// has read all of stdin (tar prints a line per entry it cannot create).
+    /// The fake tool writes 1 MiB to stderr before reading stdin, against a
+    /// 1 MiB volume: with stderr read only after `wait`, both sides block.
+    #[cfg(unix)]
+    #[test]
+    fn import_survives_a_container_that_floods_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let tool = temp.path().join("fake-docker");
+        fs::write(
+            &tool,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             run) head -c 1048576 /dev/zero >&2; cat >/dev/null; exit 0 ;;\n\
+             *) exit 0 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let archive = temp.path().join("state.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&archive).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            let mut add = |path: &str, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                tar.append_data(&mut h, path, data).unwrap();
+            };
+            let manifest = format!(
+                r#"{{"version":1,"created_at":"x","cli_version":"{}","target":"t","container_tool":"docker","volume_contents_path":"volume","include_src":false}}"#,
+                env!("CARGO_PKG_VERSION")
+            );
+            add("avocado-state/manifest.json", manifest.as_bytes());
+            add("avocado-state/volume/big", &vec![7u8; 1 << 20]);
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let config = project.join("avocado.yaml");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (archive, tool) = (archive.display().to_string(), tool.display().to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(import_archive(&archive, &config, &tool, false, false).map(|_| ()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("load hung with the container blocked on stderr")
+            .unwrap();
+    }
+
+    /// A read-only directory in an included src_dir gets its mode only after
+    /// its children are written, as `Archive::unpack` does; unpacking entry by
+    /// entry applied 0555 first and the child failed with Permission denied.
+    /// Volume entries are reported, not unpacked.
+    #[cfg(unix)]
+    #[test]
+    fn host_entries_unpack_under_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut buf = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut buf);
+            let mut add = |kind: tar::EntryType, path: &str, mode: u32, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(kind);
+                h.set_size(data.len() as u64);
+                h.set_mode(mode);
+                tar.append_data(&mut h, path, data).unwrap();
+            };
+            add(
+                tar::EntryType::Directory,
+                "avocado-state/src/ro",
+                0o555,
+                b"",
+            );
+            add(
+                tar::EntryType::Regular,
+                "avocado-state/src/ro/file",
+                0o644,
+                b"x",
+            );
+            add(
+                tar::EntryType::Regular,
+                "avocado-state/volume/sysroot/f",
+                0o644,
+                b"v",
+            );
+            tar.finish().unwrap();
+        }
+        let temp = TempDir::new().unwrap();
+        let has_volume =
+            unpack_host_entries(&mut tar::Archive::new(&buf[..]), temp.path()).unwrap();
+
+        assert!(has_volume);
+        let ro = temp.path().join("avocado-state/src/ro");
+        assert_eq!(fs::read_to_string(ro.join("file")).unwrap(), "x");
+        assert_eq!(
+            fs::metadata(&ro).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert!(!temp.path().join("avocado-state/volume").exists());
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn volume_entries_stream_relative_to_the_volume_root() {
         let temp = TempDir::new().unwrap();
