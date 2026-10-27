@@ -97,6 +97,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host temporary directory the VM cannot see, and now restores file owners,
   hardlinks and special files as saved; before, every file came back owned by
   the user who ran `load`.
+- **A kernel `compile:` section reached through a top-level `kernel:`
+  reference is now marked active.** (ENG-2801) A runtime may set `kernel:` to a
+  bare string that names an entry in the top-level `kernel:` map, a form the
+  config schema blesses. `find_active_compile_sections` read only the inline
+  `kernel.compile` mapping, so when `kernel:` was a string the section was never
+  collected and its `packages:` (for a from-source kernel, `kernel-dev` and
+  `kernel-devsrc`) were never installed into the target sysroot. The compile
+  script then failed later on a missing base `.config`. The scan now resolves a
+  string `kernel:` through the top-level map before reading `compile`, the same
+  lookup `resolve_runtime_kernel` already uses. The inline mapping form and the
+  `packages.<pkg>.compile` form are unchanged.
 - **`avocado update` and `avocado fetch` now route through the avocado-vm.**
   (ENG-2799) Both run a short-lived SDK container to refresh dnf repo metadata,
   but neither command was in the VM-routing set, so `DOCKER_HOST` was never set
