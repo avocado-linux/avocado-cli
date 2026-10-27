@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **`avocado save` and `avocado load` now route through the avocado-vm.** On
+  macOS they reached the local Docker daemon instead of the VM that holds the
+  build state, so `save` archived an empty volume the daemon created on the spot
+  and reported success, and `load` filled a volume the next build never used.
+  `load` also streams the volume into the container instead of bind-mounting a
+  host temporary directory the VM cannot see, and now restores file owners,
+  hardlinks and special files as saved; before, every file came back owned by
+  the user who ran `load`.
 - **`avocado update` and `avocado fetch` now route through the avocado-vm.**
   (ENG-2799) Both run a short-lived SDK container to refresh dnf repo metadata,
   but neither command was in the VM-routing set, so `DOCKER_HOST` was never set

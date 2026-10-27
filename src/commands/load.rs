@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -146,9 +146,24 @@ fn import_archive(
             .progress_chars("#>-"),
         );
     }
-    archive
-        .unpack(temp_path)
-        .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
+    // The volume entries are not unpacked here: they stream into the volume
+    // from the archive itself (`stream_volume_entries`), which keeps their
+    // owners, hardlinks and special files as `save` wrote them.
+    let mut has_volume = false;
+    for entry in archive
+        .entries()
+        .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?
+    {
+        let mut entry = entry
+            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
+        if entry.path()?.starts_with(VOLUME_PREFIX) {
+            has_volume = true;
+            continue;
+        }
+        entry
+            .unpack_in(temp_path)
+            .with_context(|| "Failed to extract archive (corrupted or not a valid tar.gz?)")?;
+    }
     pb.finish_and_clear();
 
     // Read and validate manifest
@@ -284,32 +299,43 @@ fn import_archive(
     }
 
     // Import volume contents
-    let volume_dir = temp_path.join("avocado-state/volume");
-    if !volume_dir.exists() {
+    if !has_volume {
         anyhow::bail!("Archive does not contain volume data");
     }
 
     let pb = spinner();
     pb.set_message("Importing volume");
 
+    // Over stdin rather than a bind mount: under the avocado-vm the daemon
+    // cannot see a host temp directory, and would mount an empty one.
+    // The CLI owns this stdin pipe, so `-i` without a TTY is the arrangement
+    // whatever the terminal is.
     let mut child = Command::new(container_tool)
+        .args(["run", "--rm"])
+        .args(crate::utils::interactivity::ContainerStdio::StdinOnly.flags())
         .args([
-            "run",
-            "--rm",
             "-v",
             &format!("{volume_name}:/data"),
-            "-v",
-            &format!("{}:/in:ro", volume_dir.display()),
             "busybox",
-            "sh",
-            "-c",
-            "cd /in && tar cf - . | (cd /data && tar xf -)",
+            "tar",
+            "xf",
+            "-",
+            "-C",
+            "/data",
         ])
-        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| "Failed to start container for volume import")?;
 
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open container stdin"))?;
+    // A write error usually means the container exited early; its stderr,
+    // read below, says why.
+    let streamed = stream_volume_entries(Path::new(input_path), stdin);
     let status = child.wait()?;
     pb.finish_and_clear();
 
@@ -327,8 +353,62 @@ fn import_archive(
             .output();
         anyhow::bail!("Volume import failed: {}", stderr_text.trim());
     }
+    if let Err(e) = streamed {
+        let _ = Command::new(container_tool)
+            .args(["volume", "rm", &volume_name])
+            .output();
+        return Err(e.context("Volume import failed"));
+    }
 
     Ok((manifest, volume_name))
+}
+
+/// Where `save` puts the volume's contents in the archive.
+const VOLUME_PREFIX: &str = "avocado-state/volume";
+
+/// Re-write the archive's volume entries, relative to the volume root, as a
+/// tar stream into `out`. The inverse of `save`'s re-prefixing: headers are
+/// kept, and hardlink targets lose the prefix too.
+fn stream_volume_entries(input_path: &Path, out: impl Write) -> Result<()> {
+    let file = File::open(input_path)
+        .with_context(|| format!("Failed to open {}", input_path.display()))?;
+    let mut archive = tar::Archive::new(MultiGzDecoder::new(file));
+    let mut tar = tar::Builder::new(out);
+    for entry in archive.entries()? {
+        let mut entry = entry.with_context(|| "Failed to read entry from archive")?;
+        let path = entry.path()?.into_owned();
+        let Ok(rel) = path.strip_prefix(VOLUME_PREFIX) else {
+            continue;
+        };
+        let rel = if rel.as_os_str().is_empty() {
+            Path::new(".").to_path_buf()
+        } else {
+            rel.to_path_buf()
+        };
+        let mut header = entry.header().clone();
+        let entry_type = header.entry_type();
+        if entry_type.is_hard_link() || entry_type.is_symlink() {
+            let link = entry
+                .link_name()?
+                .ok_or_else(|| anyhow::anyhow!("link entry missing link target"))?
+                .into_owned();
+            // Symlink targets are filesystem paths and stay as they are.
+            let link = if entry_type.is_hard_link() {
+                link.strip_prefix(VOLUME_PREFIX)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(link)
+            } else {
+                link
+            };
+            tar.append_link(&mut header, &rel, &link)?;
+        } else if entry_type.is_dir() {
+            tar.append_data(&mut header, &rel, std::io::empty())?;
+        } else {
+            tar.append_data(&mut header, &rel, &mut entry)?;
+        }
+    }
+    tar.into_inner()?.flush()?;
+    Ok(())
 }
 
 /// Recursively copy a directory tree.
@@ -351,6 +431,104 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The import streams the archive's volume entries instead of
+    /// bind-mounting a host directory the avocado-vm cannot see. The stream
+    /// has to be the volume as `save` wrote it: prefix gone (hardlink targets
+    /// too), symlink targets untouched, owners and modes kept, other entries
+    /// left out.
+    #[test]
+    fn volume_entries_stream_relative_to_the_volume_root() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("state.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&archive_path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            let mut add = |kind: tar::EntryType, path: &str, link: Option<&str>, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(kind);
+                h.set_size(data.len() as u64);
+                h.set_mode(0o4755);
+                h.set_uid(0);
+                h.set_gid(0);
+                match link {
+                    Some(l) => tar.append_link(&mut h, path, l).unwrap(),
+                    None => tar.append_data(&mut h, path, data).unwrap(),
+                }
+            };
+            add(
+                tar::EntryType::Regular,
+                "avocado-state/manifest.json",
+                None,
+                b"{}",
+            );
+            add(
+                tar::EntryType::Directory,
+                "avocado-state/volume/.",
+                None,
+                b"",
+            );
+            add(
+                tar::EntryType::Directory,
+                "avocado-state/volume/sysroot/bin",
+                None,
+                b"",
+            );
+            add(
+                tar::EntryType::Regular,
+                "avocado-state/volume/sysroot/bin/su",
+                None,
+                b"elf",
+            );
+            add(
+                tar::EntryType::Link,
+                "avocado-state/volume/sysroot/bin/su2",
+                Some("avocado-state/volume/sysroot/bin/su"),
+                b"",
+            );
+            add(
+                tar::EntryType::Symlink,
+                "avocado-state/volume/sysroot/sh",
+                Some("/bin/su"),
+                b"",
+            );
+            add(
+                tar::EntryType::Regular,
+                "avocado-state/config/avocado.yaml",
+                None,
+                b"x",
+            );
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let mut out = Vec::new();
+        stream_volume_entries(&archive_path, &mut out).unwrap();
+
+        let mut got = Vec::new();
+        for e in tar::Archive::new(&out[..]).entries().unwrap() {
+            let mut e = e.unwrap();
+            let h = e.header().clone();
+            let link = e.link_name().unwrap().map(|l| l.display().to_string());
+            let mut body = String::new();
+            e.read_to_string(&mut body).unwrap();
+            assert_eq!((h.uid().unwrap(), h.mode().unwrap()), (0, 0o4755));
+            got.push((e.path().unwrap().display().to_string(), link, body));
+        }
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            got,
+            vec![
+                (s("."), None, s("")),
+                (s("sysroot/bin"), None, s("")),
+                (s("sysroot/bin/su"), None, s("elf")),
+                (s("sysroot/bin/su2"), Some(s("sysroot/bin/su")), s("")),
+                (s("sysroot/sh"), Some(s("/bin/su")), s("")),
+            ]
+        );
+    }
 
     #[test]
     fn test_copy_dir_recursive() {

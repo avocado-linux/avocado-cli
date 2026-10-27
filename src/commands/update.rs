@@ -63,12 +63,10 @@ impl UpdateCommand {
         // re-locks within the new snapshot.
         lock_file.clear_all(&target);
 
-        // The SDK keeps dnf's repodata cache on the persistent volume, so a feed
-        // whose contents were replaced under the same URL (a dev repo, or a
-        // channel head between snapshots) stays invisible until the metadata
-        // expires - days. "Move forward" has to include forgetting what the
-        // feed used to say; the next install re-reads it. Best-effort: a
-        // missing SDK image or container is reported, not fatal.
+        // The install stamps cannot see a feed that changed under them, so a
+        // stamp that still reads current would make the next install skip dnf.
+        // "Move forward" has to include dropping them so the next install runs.
+        // Best-effort: a missing SDK image or container is reported, not fatal.
         self.refresh_sdk_metadata(&config, &target).await;
 
         match latest {
@@ -133,7 +131,7 @@ impl UpdateCommand {
         let Some(container_image) = config.get_sdk_image() else {
             if self.verbose {
                 print_info(
-                    "No SDK image configured; not refreshing the SDK's dnf metadata cache.",
+                    "No SDK image configured; not dropping the install stamps.",
                     OutputLevel::Normal,
                 );
             }
@@ -143,7 +141,7 @@ impl UpdateCommand {
             Ok(h) => h.verbose(self.verbose),
             Err(e) => {
                 print_info(
-                    &format!("Not refreshing the SDK's dnf metadata cache: {e}"),
+                    &format!("Not dropping the install stamps: {e}"),
                     OutputLevel::Normal,
                 );
                 return;
@@ -164,24 +162,23 @@ impl UpdateCommand {
         match helper.run_in_container(run).await {
             Ok(true) => {
                 if self.verbose {
-                    print_info("Expired the SDK's dnf metadata cache.", OutputLevel::Normal);
+                    print_info("Dropped the install stamps.", OutputLevel::Normal);
                 }
             }
             Ok(false) => print_info(
-                "Could not expire the SDK's dnf metadata cache; the next install may still see the previous feed contents.",
+                "Could not drop the install stamps; the next install may skip dnf and keep the previous feed contents.",
                 OutputLevel::Normal,
             ),
             Err(e) => print_info(
-                &format!("Could not expire the SDK's dnf metadata cache ({e}); the next install may still see the previous feed contents."),
+                &format!("Could not drop the install stamps ({e}); the next install may skip dnf and keep the previous feed contents."),
                 OutputLevel::Normal,
             ),
         }
     }
 }
 
-/// Expire dnf's cached repodata for both repo sets the SDK uses (host tools and
-/// target sysroots). `clean expire-cache` keeps the downloaded packages and only
-/// marks metadata stale, so the next dnf run re-fetches repomd and nothing else.
+/// Drop the sysroot install stamps so the next install runs dnf instead of
+/// skipping on stamps that still read current.
 fn metadata_refresh_script() -> &'static str {
     r#"
 # The sysroot install stamps record "these inputs produced this sysroot"; a

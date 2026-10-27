@@ -2143,17 +2143,25 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
         Commands::Build { .. }
             | Commands::Provision { .. }
             | Commands::Install { .. }
-            // `update` and `fetch` both refresh dnf repo metadata in a
-            // container: `update` expires the cache
-            // (`UpdateCommand::refresh_sdk_metadata`), `fetch` re-fetches it
-            // (`FetchCommand`). Without an arm here `ensure_routed_for_process`
-            // never runs, DOCKER_HOST stays unset, and on macOS the container
-            // start hits the local socket and fails. For `update` the pin
-            // advance still succeeds and the failure only prints at INFO, so the
-            // user sees success while the cache stays stale and the next install
-            // can resolve old feed metadata; `fetch` fails outright.
+            // `update` and `fetch` both start an SDK container: `update` drops
+            // the install stamps (`UpdateCommand::refresh_sdk_metadata`),
+            // `fetch` re-fetches repo metadata (`FetchCommand`). Without an arm
+            // here `ensure_routed_for_process` never runs, DOCKER_HOST stays
+            // unset, and on macOS the container start hits the local socket and
+            // fails. For `update` the pin advance still succeeds and the failure
+            // only prints at INFO, so the user sees success while the stamps
+            // still read current and the next install skips dnf; `fetch` fails
+            // outright.
             | Commands::Update { .. }
             | Commands::Fetch { .. }
+            // `save` and `load` read and write the state volume, which lives in
+            // whichever daemon the build commands use. Unrouted on macOS they
+            // talk to the local daemon instead, where `docker run -v avo-…`
+            // creates an empty volume of the same name: `save` archived nothing
+            // and reported success, and `load` filled a volume the next routed
+            // build never saw.
+            | Commands::Save { .. }
+            | Commands::Load { .. }
             | Commands::Uninstall { .. }
             | Commands::Sdk { .. }
             | Commands::Ext { .. }
@@ -5560,13 +5568,13 @@ mod tests {
         );
     }
 
-    /// `avocado update` runs an SDK container to expire the dnf metadata cache
+    /// `avocado update` runs an SDK container to drop the install stamps
     /// (`UpdateCommand::refresh_sdk_metadata`). Without an arm here,
     /// `ensure_routed_for_process` never runs, `DOCKER_HOST` is never pointed at
-    /// the avocado-vm socket, and on macOS the cache-expire container start
-    /// hits the local Docker socket and fails. The pin advance still succeeds
-    /// and the failure only prints at INFO, so the user sees success while the
-    /// cache stays stale and the next install can resolve old feed metadata.
+    /// the avocado-vm socket, and on macOS the container start hits the local
+    /// Docker socket and fails. The pin advance still succeeds and the failure
+    /// only prints at INFO, so the user sees success while the stamps still
+    /// read current and the next install skips dnf.
     #[test]
     fn needs_vm_routing_gates_update() {
         let cmd = |args: &[&str]| {
@@ -5577,7 +5585,7 @@ mod tests {
 
         assert!(
             needs_vm_routing(&cmd(&["avocado", "update"])),
-            "`update` runs the metadata-cache-expire container and must route to the VM"
+            "`update` runs the stamp-dropping container and must route to the VM"
         );
         assert!(
             needs_vm_routing(&cmd(&["avocado", "update", "--target", "qemux86-64"])),
@@ -5605,6 +5613,28 @@ mod tests {
         assert!(
             needs_vm_routing(&cmd(&["avocado", "fetch", "--runtime", "dev"])),
             "`fetch --runtime` must route too"
+        );
+    }
+
+    /// `save` and `load` read and write the state volume, so they must reach
+    /// the daemon the build commands use. Unrouted, `save` on macOS archived an
+    /// empty volume the local daemon created on the spot and still reported
+    /// success, and `load` filled a volume the next routed build never saw.
+    #[test]
+    fn needs_vm_routing_gates_save_and_load() {
+        let cmd = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        };
+
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "save", "-o", "state.tar.gz"])),
+            "`save` reads the state volume and must route to the VM"
+        );
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "load", "--input", "state.tar.gz"])),
+            "`load` writes the state volume and must route to the VM"
         );
     }
 }
