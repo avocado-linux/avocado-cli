@@ -2143,6 +2143,17 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
         Commands::Build { .. }
             | Commands::Provision { .. }
             | Commands::Install { .. }
+            // `update` and `fetch` both refresh dnf repo metadata in a
+            // container: `update` expires the cache
+            // (`UpdateCommand::refresh_sdk_metadata`), `fetch` re-fetches it
+            // (`FetchCommand`). Without an arm here `ensure_routed_for_process`
+            // never runs, DOCKER_HOST stays unset, and on macOS the container
+            // start hits the local socket and fails. For `update` the pin
+            // advance still succeeds and the failure only prints at INFO, so the
+            // user sees success while the cache stays stale and the next install
+            // can resolve old feed metadata; `fetch` fails outright.
+            | Commands::Update { .. }
+            | Commands::Fetch { .. }
             | Commands::Uninstall { .. }
             | Commands::Sdk { .. }
             | Commands::Ext { .. }
@@ -5546,6 +5557,54 @@ mod tests {
             !needs_vm_routing(&cmd(&["avocado", "container", "dev", "status"])),
             "`container dev status` only reads the session record; routing it \
              would let a status query auto-start the VM"
+        );
+    }
+
+    /// `avocado update` runs an SDK container to expire the dnf metadata cache
+    /// (`UpdateCommand::refresh_sdk_metadata`). Without an arm here,
+    /// `ensure_routed_for_process` never runs, `DOCKER_HOST` is never pointed at
+    /// the avocado-vm socket, and on macOS the cache-expire container start
+    /// hits the local Docker socket and fails. The pin advance still succeeds
+    /// and the failure only prints at INFO, so the user sees success while the
+    /// cache stays stale and the next install can resolve old feed metadata.
+    #[test]
+    fn needs_vm_routing_gates_update() {
+        let cmd = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        };
+
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "update"])),
+            "`update` runs the metadata-cache-expire container and must route to the VM"
+        );
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "update", "--target", "qemux86-64"])),
+            "`update --target` must route too"
+        );
+    }
+
+    /// `avocado fetch` re-fetches dnf repo metadata for the sysroots in a
+    /// container (`FetchCommand`). Same class as `update`: without an arm in
+    /// `needs_vm_routing`, `DOCKER_HOST` is never pointed at the avocado-vm and
+    /// on macOS the container start fails against the local socket. Unlike
+    /// `update`, `fetch` propagates the error, so it fails outright.
+    #[test]
+    fn needs_vm_routing_gates_fetch() {
+        let cmd = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        };
+
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "fetch"])),
+            "`fetch` runs the metadata container and must route to the VM"
+        );
+        assert!(
+            needs_vm_routing(&cmd(&["avocado", "fetch", "--runtime", "dev"])),
+            "`fetch --runtime` must route too"
         );
     }
 }
