@@ -89,6 +89,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **`avocado update` and `avocado fetch` now route through the avocado-vm.**
+  (ENG-2799) Both run a short-lived SDK container to refresh dnf repo metadata,
+  but neither command was in the VM-routing set, so `DOCKER_HOST` was never set
+  to the VM socket. On macOS the container start went to the local Docker socket
+  and failed. For `update` the snapshot pin still advanced and the failure only
+  printed at INFO, so the run reported success while the cache stayed stale and
+  the next `avocado install` could resolve against old feed metadata; `fetch`
+  failed outright. Both now route like every other command that starts a
+  container.
 - **An extension's `target-<name>:` overrides now apply to
   `device_tree_overlays` and `boot_config`.** Every reader of the two keys used
   the extension's base value, so a declaration under `target-<name>:` was
