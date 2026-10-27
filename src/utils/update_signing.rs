@@ -243,22 +243,29 @@ pub fn generate_root_json(signer: &TufSigner) -> Result<String> {
 /// The build-time warning for a baked trust anchor that a plain, locally-signed
 /// `avocado deploy` cannot satisfy, or `None` when a local deploy is accepted.
 ///
-/// The two inputs are the ones `avocado build` already resolves: whether a local
-/// signing key is present, and whether this is a Connect project (`connect.org`
-/// set). The mapping mirrors the anchor decision in `runtime build`:
+/// The inputs are the ones `avocado build` already resolves: whether a local
+/// signing key is present, whether this is a Connect project (`connect.org`
+/// set), and whether the Connect `server_key` equals the local signing key (by
+/// TUF key id). The mapping mirrors the anchor decision in `runtime build`:
 ///
-/// - Connect + signing key: the anchor trusts the Connect server key for the
-///   update metadata roles (Level 2), so a key-local deploy is rejected.
-/// - Connect, no signing key: no anchor is baked; it arrives at claim time
-///   (Level 0), so a deploy before the device is claimed is rejected.
+/// - Connect + signing key, server key differs from the local key: the anchor
+///   trusts the server key for the update metadata roles (Level 2), so a
+///   key-local deploy is rejected.
+/// - Connect + signing key, server key equals the local key: the anchor
+///   authorizes that one key for every role (the sideload self-override), so a
+///   key-local deploy is accepted.
+/// - Connect, no signing key: no anchor is baked (Level 0); a plain deploy of
+///   this build has no baked anchor to sign against, and updates arrive through
+///   Connect once the device is claimed.
 /// - Otherwise (sideload, or an auto-generated dev key): one local key signs
 ///   every role, so a plain deploy with it is accepted.
 pub fn baked_anchor_deploy_warning(
     has_signing_key: bool,
     is_connect: bool,
+    server_key_matches_local: bool,
 ) -> Option<&'static str> {
     match (has_signing_key, is_connect) {
-        (true, true) => Some(
+        (true, true) if !server_key_matches_local => Some(
             "The baked trust anchor trusts the Connect server key for update \
              metadata, so a plain `avocado deploy` signed with your local key is \
              rejected by the device. Sign through Connect with \
@@ -266,9 +273,10 @@ pub fn baked_anchor_deploy_warning(
              key's own public hex to build a sideload-capable image.",
         ),
         (false, true) => Some(
-            "No trust anchor is baked into this image; the device receives one at \
-             claim time. A plain `avocado deploy` before the device is claimed is \
-             rejected.",
+            "No trust anchor is baked into this image. A Connect device receives \
+             its root.json at claim time and gets its updates through Connect. A \
+             plain `avocado deploy` of this build has no baked anchor to sign \
+             against, so it will not work.",
         ),
         _ => None,
     }
@@ -277,32 +285,15 @@ pub fn baked_anchor_deploy_warning(
 /// The deploy-time warning when `avocado deploy` is about to sign an update with
 /// a local key, or `None` when a local signature is expected to be accepted.
 ///
-/// This covers only the local-signing path (not `--connect-sign`). The inputs
-/// describe the project setup for the runtime being deployed:
-///
-/// - A configured server key: the device may hold a server-key anchor from a
-///   Connect OTA, so the local signature can be rejected.
-/// - A Connect project with no server key and no signing key: the Level-0 case
-///   where `deploy` generates a development key and local-signs, which a device
-///   that is not yet claimed rejects with "No root authority configured".
-pub fn local_deploy_signing_warning(
-    is_connect: bool,
-    has_server_key: bool,
-    has_signing_key: bool,
-) -> Option<&'static str> {
+/// This covers only the local-signing path (not `--connect-sign`). A configured
+/// Connect server key means the device may hold a server-key anchor from a
+/// Connect OTA, so a locally-signed deploy can be rejected.
+pub fn local_deploy_signing_warning(has_server_key: bool) -> Option<&'static str> {
     if has_server_key {
         Some(
             "This project has a Connect server key configured. A locally-signed \
              deploy may be rejected by a device that has received a Connect OTA \
              update. Use `--connect-sign` to sign via Connect.",
-        )
-    } else if is_connect && !has_signing_key {
-        Some(
-            "This Connect project has no baked trust anchor; the device receives \
-             one at claim time. This deploy signs with a local development key, so \
-             a device that is not yet claimed rejects it with \"No root authority \
-             configured\". Claim the device first, or use `--connect-sign` to sign \
-             via Connect.",
         )
     } else {
         None
@@ -486,30 +477,43 @@ mod tests {
     // --- build-time anchor/deploy mismatch warnings (ENG-2802) ---
 
     #[test]
-    fn test_baked_anchor_level_2_warns() {
-        // Connect project with a local signing key bakes a server-key anchor.
-        let warning = baked_anchor_deploy_warning(true, true).expect("Level 2 warns");
+    fn test_baked_anchor_level_2_differing_key_warns() {
+        // Connect + signing key, server key differs from the local key: the
+        // anchor trusts the server key, so a key-local deploy is rejected.
+        let warning = baked_anchor_deploy_warning(true, true, false).expect("Level 2 warns");
         assert!(warning.contains("--connect-sign"));
         assert!(warning.contains("server_key"));
         assert!(!warning.contains('—'));
     }
 
     #[test]
+    fn test_baked_anchor_level_2_matching_key_is_silent() {
+        // Connect + signing key, server key equals the local key: the anchor
+        // authorizes that one key for every role, so a plain deploy is accepted.
+        assert!(baked_anchor_deploy_warning(true, true, true).is_none());
+    }
+
+    #[test]
     fn test_baked_anchor_level_0_warns() {
-        // Connect project with no local signing key bakes no anchor.
-        let warning = baked_anchor_deploy_warning(false, true).expect("Level 0 warns");
-        assert!(warning.contains("claim"));
-        assert!(warning.contains("rejected"));
-        assert!(!warning.contains('—'));
+        // Connect project with no local signing key bakes no anchor. The server
+        // key match flag does not apply, so it reads the same either way.
+        for server_key_matches_local in [false, true] {
+            let warning = baked_anchor_deploy_warning(false, true, server_key_matches_local)
+                .expect("Level 0 warns");
+            assert!(warning.contains("claim"));
+            assert!(warning.contains("Connect"));
+            assert!(warning.contains("will not work"));
+            assert!(!warning.contains('—'));
+        }
     }
 
     #[test]
     fn test_baked_anchor_sideload_is_silent() {
         // A single local key signs every role; a plain deploy with it is accepted.
-        assert!(baked_anchor_deploy_warning(true, false).is_none());
+        assert!(baked_anchor_deploy_warning(true, false, false).is_none());
         // No key and not Connect: build auto-generates a dev key, then behaves
         // as sideload.
-        assert!(baked_anchor_deploy_warning(false, false).is_none());
+        assert!(baked_anchor_deploy_warning(false, false, false).is_none());
     }
 
     // --- deploy-time local-signing warnings (ENG-2802) ---
@@ -517,23 +521,14 @@ mod tests {
     #[test]
     fn test_local_deploy_warns_on_server_key() {
         // A configured server key means the device may hold a server-key anchor.
-        let warning = local_deploy_signing_warning(true, true, true).expect("server key warns");
+        let warning = local_deploy_signing_warning(true).expect("server key warns");
         assert!(warning.contains("--connect-sign"));
+        assert!(!warning.contains('—'));
     }
 
     #[test]
-    fn test_local_deploy_warns_on_level_0() {
-        // Connect project, no server key, no signing key: the Level-0 path that
-        // used to local-sign in silence.
-        let warning = local_deploy_signing_warning(true, false, false).expect("Level 0 warns");
-        assert!(warning.contains("No root authority configured"));
-        assert!(warning.contains("--connect-sign"));
-    }
-
-    #[test]
-    fn test_local_deploy_silent_for_sideload() {
-        // Not a Connect project: a plain sideload deploy is fine.
-        assert!(local_deploy_signing_warning(false, false, true).is_none());
-        assert!(local_deploy_signing_warning(false, false, false).is_none());
+    fn test_local_deploy_silent_without_server_key() {
+        // No server key: a plain local deploy is expected to be accepted.
+        assert!(local_deploy_signing_warning(false).is_none());
     }
 }

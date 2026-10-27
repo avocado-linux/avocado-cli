@@ -2269,7 +2269,7 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                     OutputLevel::Normal,
                 );
                 if let Some(warning) =
-                    crate::utils::update_signing::baked_anchor_deploy_warning(false, true)
+                    crate::utils::update_signing::baked_anchor_deploy_warning(false, true, false)
                 {
                     print_warning(warning, OutputLevel::Normal);
                 }
@@ -2288,8 +2288,18 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                             ),
                             OutputLevel::Normal,
                         );
+                        // The anchor authorizes the server key for the metadata
+                        // roles only when it differs from the local signing key.
+                        // When a project sets `server_key` to the signing key's
+                        // own public hex, every role collapses onto that one key
+                        // and a plain local deploy is accepted, so skip the warning.
+                        let server_key_matches_local = keyid == signer.key_id;
                         if let Some(warning) =
-                            crate::utils::update_signing::baked_anchor_deploy_warning(true, true)
+                            crate::utils::update_signing::baked_anchor_deploy_warning(
+                                true,
+                                true,
+                                server_key_matches_local,
+                            )
                         {
                             print_warning(warning, OutputLevel::Normal);
                         }
