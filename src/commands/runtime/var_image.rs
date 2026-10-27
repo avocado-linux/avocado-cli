@@ -66,10 +66,15 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
     let ext_list: Vec<&str> = ext_list.iter().map(|s| s.as_str()).collect();
 
     let device_tree_overlay_section = {
+        let parsed = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+            config,
+            parsed,
+            target_arch,
+        );
         let overlays =
-            crate::utils::device_tree_overlay::collect_for_runtime(merged_runtime, parsed)?;
+            crate::utils::device_tree_overlay::collect_for_runtime(merged_runtime, &parsed)?;
         let boot_config =
-            crate::utils::device_tree_overlay::collect_boot_config(merged_runtime, parsed)?;
+            crate::utils::device_tree_overlay::collect_boot_config(merged_runtime, &parsed)?;
         crate::utils::device_tree_overlay::render_build_section(&overlays, &boot_config)?
     };
 

@@ -5406,6 +5406,49 @@ extensions:
         );
     }
 
+    /// The build hashes the per-target boot settings, so editing a line under
+    /// an extension's `target-<name>:` rebuilds that target's runtime and
+    /// leaves a sibling target's alone.
+    #[test]
+    fn test_runtime_input_hash_follows_target_boot_config() {
+        let runtime: serde_yaml::Value = serde_yaml::from_str("extensions:\n  - board\n").unwrap();
+        let yaml = |line: &str| {
+            format!(
+                "extensions:\n  board:\n    target-raspberrypi5:\n      boot_config:\n        - {line}\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let hash = |line: &str, target: &str| {
+            let y = yaml(line);
+            let config = crate::utils::config::Config::load_from_yaml_str(&y).unwrap();
+            let parsed = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+                &config,
+                &serde_yaml::from_str(&y).unwrap(),
+                target,
+            );
+            compute_runtime_build_input_hash(
+                &runtime,
+                "dev",
+                &parsed,
+                dir.path(),
+                &Default::default(),
+            )
+            .unwrap()
+            .config_hash
+        };
+
+        assert_ne!(
+            hash("dtparam=spi=on", "raspberrypi5"),
+            hash("dtparam=spi=off", "raspberrypi5"),
+            "editing a target-only boot_config line must rebuild that target"
+        );
+        assert_eq!(
+            hash("dtparam=spi=on", "qemux86-64"),
+            hash("dtparam=spi=off", "qemux86-64"),
+            "another target's boot_config must not rebuild this one"
+        );
+    }
+
     #[test]
     fn test_runtime_input_hash_tracks_dtso_content() {
         let runtime: serde_yaml::Value = serde_yaml::from_str(

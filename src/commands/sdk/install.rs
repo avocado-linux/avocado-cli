@@ -720,9 +720,14 @@ impl SdkInstallCommand {
         // An extension declaring device-tree overlays needs the delivery
         // hook in the target-sysroot, so provision the target-sysroot even when
         // there is no compile section (a no-#include overlay needs no kernel-devsrc).
+        let dto_parsed = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+            config,
+            &composed.merged_value,
+            target,
+        );
         let provision_dto =
             !crate::utils::device_tree_overlay::active_extensions_declaring_overlays(
-                &composed.merged_value,
+                &dto_parsed,
                 active_extensions,
             )
             .is_empty();
@@ -730,7 +735,7 @@ impl SdkInstallCommand {
         // compile; stock overlays and boot_config need the hook alone.
         let provision_dto_compiler =
             !crate::utils::device_tree_overlay::active_extensions_compiling_overlays(
-                &composed.merged_value,
+                &dto_parsed,
                 active_extensions,
             )
             .is_empty();

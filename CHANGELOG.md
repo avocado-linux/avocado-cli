@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **An extension's `target-<name>:` overrides now apply to
+  `device_tree_overlays` and `boot_config`.** Every reader of the two keys used
+  the extension's base value, so a declaration under `target-<name>:` was
+  dropped without an error, and a base declaration reached every target, with
+  no way to keep `boot_config` off a board whose hook does not support it. The
+  SDK install, the runtime build input hash and the build section now read the
+  per-target value, the same one `ext build` and `ext image` use. As with every
+  override, a target's list replaces the base list.
 - **The initramfs build id now reads its own packages and matches across
   runtimes that share a config.** The derivation ran `rpm -qa` with no
   `--dbpath`, so rpm read the SDK default database (0 packages), not the
