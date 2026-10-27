@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. `--output json` carries it as `sbom_state`.
 
 ### Changed
+- **`avocado build` and `avocado deploy` now warn when a baked trust anchor
+  will reject a plain, locally-signed deploy.** (ENG-2802) In a Connect project
+  with a signing key, `build` bakes a Level-2 anchor that trusts the Connect
+  server key for update metadata, so a key-local `deploy` is rejected on the
+  device; `build` now says so and points to `--connect-sign` or a
+  sideload-capable image. In a Connect project with no signing key, `build`
+  bakes no anchor (it arrives at claim time) and `deploy` would sign with a
+  development key in silence; both commands now warn that an unclaimed device
+  rejects such an update with "No root authority configured". No change to what
+  gets signed or baked.
 - **`avocado connect upload` sends the runtime's SBOM through the same upload
   path as its images, one per uploaded image, instead of inline in the create
   request.** A server that does not accept SBOMs is unaffected, and a failed

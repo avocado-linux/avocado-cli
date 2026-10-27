@@ -473,17 +473,29 @@ impl RuntimeDeployCommand {
                     OutputLevel::Normal,
                 );
             } else {
-                // Default: sign locally with the project or dev key.
-                if config
+                // Default: sign locally with the project or dev key. Warn when the
+                // device's baked anchor is unlikely to trust a local signature:
+                // either a Connect server key is configured (Level 2), or this is
+                // a Connect project with no anchor and no signing key (Level 0),
+                // where the dev-key fallback below would otherwise local-sign in
+                // silence.
+                let is_connect = config
+                    .connect
+                    .as_ref()
+                    .and_then(|c| c.org.as_ref())
+                    .is_some();
+                let has_server_key = config
                     .get_server_key_for_runtime(&self.runtime_name)
-                    .is_some()
-                {
-                    print_warning(
-                        "This project has a Connect server key configured. \
-                         A locally-signed deploy may be rejected by a device that has \
-                         received a Connect OTA update. Use `--connect-sign` to sign via Connect.",
-                        OutputLevel::Normal,
-                    );
+                    .is_some();
+                let has_signing_key = config
+                    .get_runtime_signing_key_name(&self.runtime_name)
+                    .is_some();
+                if let Some(warning) = crate::utils::update_signing::local_deploy_signing_warning(
+                    is_connect,
+                    has_server_key,
+                    has_signing_key,
+                ) {
+                    print_warning(warning, OutputLevel::Normal);
                 }
 
                 let signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);

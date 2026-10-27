@@ -2268,6 +2268,11 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                     "Connect Level 0: root.json will be delivered at device claim time",
                     OutputLevel::Normal,
                 );
+                if let Some(warning) =
+                    crate::utils::update_signing::baked_anchor_deploy_warning(false, true)
+                {
+                    print_warning(warning, OutputLevel::Normal);
+                }
                 "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
             }
             // Level 2: user's root key + Connect with server key
@@ -2283,6 +2288,11 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                             ),
                             OutputLevel::Normal,
                         );
+                        if let Some(warning) =
+                            crate::utils::update_signing::baked_anchor_deploy_warning(true, true)
+                        {
+                            print_warning(warning, OutputLevel::Normal);
+                        }
                         let root_json_content =
                             crate::utils::update_signing::generate_multi_key_root_json(
                                 signer,
