@@ -1718,6 +1718,18 @@ pub struct SdkContainer {
     /// so `type: path` extension `source.path` values referencing
     /// `{{ avocado.target.board }}` mount from the flag's board.
     pub cli_target_board: Option<String>,
+    /// Whether this helper's steps may reuse the shared per-shape session
+    /// container. True for ordinary commands; the SDK install turns it off.
+    ///
+    /// The SDK host-package install (`nativesdk-*`) runs post-install scriptlets
+    /// that drive `update-alternatives` against the container's own `/usr/bin`.
+    /// On a cold volume those scriptlets leave the coreutils symlinks
+    /// (`uname`, `mkdir`, `tr`, `mv`, `ln`, ...) dangling. That is harmless in a
+    /// throwaway `docker run`, but once #343 let steps reuse one session
+    /// container, a later step execs into the poisoned container and its
+    /// entrypoint dies with `uname: command not found`. Running the SDK install
+    /// in its own per-step containers keeps the damage out of the shared one.
+    pub session_reuse_enabled: bool,
 }
 
 impl Default for SdkContainer {
@@ -1736,6 +1748,7 @@ impl SdkContainer {
             config_path: None,
             verbose: false,
             cli_target_board: None,
+            session_reuse_enabled: true,
         }
     }
 
@@ -1749,7 +1762,18 @@ impl SdkContainer {
             config_path: None,
             verbose: false,
             cli_target_board: None,
+            session_reuse_enabled: true,
         }
+    }
+
+    /// Opt this helper's steps out of (or back into) session-container reuse.
+    ///
+    /// The SDK install sets this `false` so its container-root mutations cannot
+    /// poison a shared session container that a later step reuses. See the
+    /// `session_reuse_enabled` field docs.
+    pub fn session_reuse(mut self, enabled: bool) -> Self {
+        self.session_reuse_enabled = enabled;
+        self
     }
 
     /// Set the CLI `--target-board` override used when deriving `type: path`
@@ -2123,14 +2147,15 @@ impl SdkContainer {
         // Read session-reuse eligibility from the caller's request now, before
         // the generated name below is set on effective_config. Reading it back
         // from effective_config.container_name is the B-10 bug that made this
-        // path dead.
-        let session_eligible = session_reuse_eligible(
-            config.detach,
-            config.interactive,
-            config.use_entrypoint,
-            config.container_name.is_some(),
-            config.rm,
-        );
+        // path dead. A helper that opted out (the SDK install) never reuses.
+        let session_eligible = self.session_reuse_enabled
+            && session_reuse_eligible(
+                config.detach,
+                config.interactive,
+                config.use_entrypoint,
+                config.container_name.is_some(),
+                config.rm,
+            );
 
         // For non-detached runs, ensure we have a container name for Ctrl-C handling
         // Generate a unique name if one wasn't provided
@@ -2922,14 +2947,16 @@ impl SdkContainer {
         // have done anyway.
         // Capture steps leave container_name unset, so reading it here is
         // correct — unlike the main path, which sets a generated name (B-10).
-        // The shared helper keeps both eligibility checks from drifting.
-        let eligible = session_reuse_eligible(
-            effective_config.detach,
-            effective_config.interactive,
-            effective_config.use_entrypoint,
-            effective_config.container_name.is_some(),
-            effective_config.rm,
-        );
+        // The shared helper keeps both eligibility checks from drifting. A
+        // helper that opted out (the SDK install) never reuses.
+        let eligible = self.session_reuse_enabled
+            && session_reuse_eligible(
+                effective_config.detach,
+                effective_config.interactive,
+                effective_config.use_entrypoint,
+                effective_config.container_name.is_some(),
+                effective_config.rm,
+            );
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
                 match self.session_container(&shape, &env_map(&env_pairs)) {
@@ -5764,6 +5791,29 @@ extensions:
     }
 
     #[test]
+    fn session_reuse_defaults_on_and_the_sdk_install_opts_out() {
+        // Ordinary helpers reuse the per-shape session container. The SDK
+        // install opts out so its nativesdk post-install scriptlets, which
+        // mutate the container's own `/usr/bin` via update-alternatives, cannot
+        // poison a container a later step would reuse (`uname: command not
+        // found` on a cold install, the ENG-2793 regression). The two eligibility
+        // sites in run_in_container / run_in_container_capture AND this flag, so
+        // an opted-out helper never routes a step into the session container.
+        assert!(SdkContainer::new().session_reuse_enabled);
+        assert!(
+            !SdkContainer::new()
+                .session_reuse(false)
+                .session_reuse_enabled
+        );
+        assert!(
+            SdkContainer::new()
+                .session_reuse(false)
+                .session_reuse(true)
+                .session_reuse_enabled
+        );
+    }
+
+    #[test]
     fn build_exec_command_passes_through_stdio_flags() {
         use crate::utils::interactivity::ContainerStdio;
         // The main path hands the exec the same stdin/tty flags the standalone
@@ -6905,6 +6955,7 @@ extensions:
                 config_path: None,
                 verbose: false,
                 cli_target_board: None,
+                session_reuse_enabled: true,
             };
             let config = RunConfig {
                 container_image: "img".to_string(),
@@ -6941,6 +6992,91 @@ extensions:
             assert!(
                 !log.contains("avocado-run-"),
                 "step took the standalone run path:\n{log}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn the_sdk_install_opt_out_keeps_each_step_in_its_own_run() {
+            // The companion to the routing test above: with
+            // session_reuse(false) (what the SDK install sets), a step must NOT
+            // reach a session container, so its container-root mutations cannot
+            // poison one a later step reuses. Drive both the main and the
+            // capture path through the stub and assert neither creates
+            // (`run -d ... avocado-sess-`) nor execs into (`exec ... avocado-sess-`)
+            // a session container. Dropping the `self.session_reuse_enabled &&`
+            // guard at either eligibility site flips these to an `exec` and fails
+            // here. The hatch is left unset so only the opt-out is under test.
+            std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+
+            crate::utils::volume::VolumeState::new(dir.path().to_path_buf(), tool.clone())
+                .save_to_dir(dir.path())
+                .unwrap();
+
+            let container = SdkContainer {
+                container_tool: tool.clone(),
+                cwd: dir.path().to_path_buf(),
+                src_dir: None,
+                config_path: None,
+                verbose: false,
+                cli_target_board: None,
+                session_reuse_enabled: false,
+            };
+
+            let main_cfg = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo MAIN_STEP".to_string(),
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+            assert!(
+                container.run_in_container(main_cfg).await.unwrap(),
+                "the stubbed main step should report success"
+            );
+
+            let capture_cfg = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo CAPTURE_STEP".to_string(),
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+            container
+                .run_in_container_capture(capture_cfg)
+                .await
+                .unwrap();
+
+            // Defensive: drop any registry entry so it cannot leak into a later
+            // test, matching the routing test above.
+            let _ = SessionContainers::get()
+                .by_shape
+                .lock()
+                .map(|mut m| m.clear());
+
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            // Both steps actually ran...
+            assert!(
+                log.contains("echo MAIN_STEP"),
+                "main step never ran:\n{log}"
+            );
+            assert!(
+                log.contains("echo CAPTURE_STEP"),
+                "capture step never ran:\n{log}"
+            );
+            // ...and neither touched a session container: no `run -d` creating
+            // one and no `exec` into one.
+            assert!(
+                !log.contains("avocado-sess-"),
+                "an opted-out step still created or used a session container:\n{log}"
+            );
+            // The main step carries its own one-off `docker run` name, proving it
+            // took the standalone path rather than silently doing nothing.
+            assert!(
+                log.contains("--name avocado-run-"),
+                "the opted-out main step did not take the standalone run path:\n{log}"
             );
         }
 

@@ -560,9 +560,16 @@ impl SdkInstallCommand {
             .materialize_feeds(&target, FeedStage::SdkTarget, &self.config_path)
             .await?;
 
-        // Use the container helper to run the installation
-        let container_helper =
-            SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
+        // Use the container helper to run the installation. The SDK host-package
+        // install runs nativesdk post-install scriptlets that mutate the
+        // container's own `/usr/bin` (update-alternatives), which on a cold
+        // volume leaves coreutils symlinks dangling. Keep these steps in their
+        // own per-step containers so that damage never lands in a shared session
+        // container a later step would reuse (`uname: command not found`). See
+        // the `SdkContainer::session_reuse_enabled` field docs.
+        let container_helper = SdkContainer::from_config(&self.config_path, config)?
+            .verbose(self.verbose)
+            .session_reuse(false);
 
         // Create shared RunsOnContext if running on remote host
         // This allows reusing the NFS server and volumes for all container runs
