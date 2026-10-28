@@ -473,22 +473,16 @@ impl RuntimeDeployCommand {
                     OutputLevel::Normal,
                 );
             } else {
-                // Default: sign locally with the project or dev key. Warn when the
-                // device's baked anchor is unlikely to trust a local signature:
-                // a Connect server key that differs from the local key, or a
-                // Level-0 project (Connect, no server key, no signing key) that
-                // falls back to an auto-generated dev key below. A server key that
-                // equals the local key collapses every role onto that one key, so
-                // it stays silent, matching the build side.
-                let is_connect = config
-                    .connect
-                    .as_ref()
-                    .and_then(|c| c.org.as_ref())
-                    .is_some();
+                // Default: sign locally with the project or dev key. Warn when a
+                // Connect server key differs from the local key: the device may
+                // hold a server-key anchor the local signature does not satisfy.
+                // A server key that equals the local key collapses every role
+                // onto that one key, so it stays silent, matching the build side.
+                // (A Level-0 build bakes no root.json, so Phase 1 has already
+                // stopped with its own remedy before this point.)
                 let warn_signing_key_name = config.get_runtime_signing_key_name(&self.runtime_name);
                 let warn_server_key = config.get_server_key_for_runtime(&self.runtime_name);
                 let has_server_key = warn_server_key.is_some();
-                let has_signing_key = warn_signing_key_name.is_some();
                 let server_key_matches_local = match (&warn_server_key, &warn_signing_key_name) {
                     (Some(server_key_hex), Some(key_name)) => {
                         let server_key_id =
@@ -505,8 +499,6 @@ impl RuntimeDeployCommand {
                 if let Some(warning) = crate::utils::update_signing::local_deploy_signing_warning(
                     has_server_key,
                     server_key_matches_local,
-                    is_connect,
-                    has_signing_key,
                 ) {
                     print_warning(warning, OutputLevel::Normal);
                 }

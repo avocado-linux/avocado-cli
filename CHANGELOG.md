@@ -82,12 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected on the device; `build` now warns and points to `--connect-sign` or a
   sideload-capable image (set `server_key` to the signing key's own public hex).
   When `server_key` already equals the signing key, every role collapses onto
-  that one key and both commands stay silent. `deploy` warns when the server key
-  differs from the local key, and also for a Level-0 project (Connect, no server
-  key, no signing key), where it signs with an auto-generated development key the
-  device does not trust. The Level-0 `build` path, the normal server-managed
-  setup, now reads as an info line rather than a warning. No change to what gets
-  signed or baked.
+  that one key and both commands stay silent. `deploy` warns only when the
+  server key differs from the local key. The Level-0 `build` path, the normal
+  server-managed setup, now reads as an info line rather than a warning. No
+  change to what gets signed or baked.
 - **`avocado connect upload` sends the runtime's SBOM through the same upload
   path as its images, one per uploaded image, instead of inline in the create
   request.** A server that does not accept SBOMs is unaffected, and a failed
