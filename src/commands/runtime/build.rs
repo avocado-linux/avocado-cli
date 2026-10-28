@@ -2462,6 +2462,14 @@ fi"#
             .transpose()
             .context("rootfs")?
             .unwrap_or(false);
+        // The kernel the lock pins for the rootfs: the same pin that chose the
+        // rootfs's modules, so it is the kernel the build hands to the hooks.
+        let pinned_rootfs_kver = LockFile::load(&config.project_root(&self.config_path))
+            .ok()
+            .and_then(|lock| {
+                lock.get_kernel_version(target_arch, &SysrootType::Rootfs)
+                    .cloned()
+            });
         let rootfs_fs = config.get_rootfs_filesystem();
         let rootfs_output = format!("$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{rootfs_fs}");
         let rootfs_build_section = crate::commands::rootfs::image::gate_image_section(
@@ -2615,13 +2623,10 @@ echo "Copying required extension images to runtime-specific directory..."
 {initramfs_build_section}
 {fit_section}
 
-# Resolve kernel image staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
+# The kernel image staged by `rootfs install` at $AVOCADO_PREFIX/kernel/<kver>/Image.
 # Done in shell so the optional KAB wrap below can rewrite the env var
 # uniformly across rootfs / initramfs / kernel.
-KERNEL_IMAGE_GLOB=$(ls "$AVOCADO_PREFIX"/kernel/*/Image 2>/dev/null | head -1)
-if [ -n "$KERNEL_IMAGE_GLOB" ]; then
-    export AVOCADO_KERNEL_IMAGE="$KERNEL_IMAGE_GLOB"
-fi
+{kernel_image_section}
 
 # Read VERSION_ID from rootfs os-release for use as a stable version
 # identifier in kab-wrap args (matches the version field that the AMF
@@ -2661,6 +2666,7 @@ export AVOCADO_OS_VERSION_ID
             capability_check_section = capability_check_section,
             copy_section = copy_section,
             rootfs_build_section = rootfs_build_section,
+            kernel_image_section = render_kernel_image_section(pinned_rootfs_kver.as_deref()),
             fit_section = fit_section,
             initramfs_build_section = initramfs_build_section,
             rootfs_kab_wrap = rootfs_kab_wrap,
@@ -3472,8 +3478,92 @@ fi"#,
     )
 }
 
+/// Shell that exports `AVOCADO_KERNEL_IMAGE` (and `AVOCADO_KERNEL_VERSION`)
+/// for the build hooks, from the kernels `rootfs install` staged at
+/// `$AVOCADO_PREFIX/kernel/<kver>/Image`.
+///
+/// That directory keeps one entry per kernel ever installed: a pin that moves
+/// to a newer kernel, or a switch between a stock and an RT kernel, leaves the
+/// old one there. Taking the first entry by name handed the hooks a kernel
+/// other than the one whose modules are in the rootfs, and the board booted
+/// with no modular driver. So the pinned kernel is selected by version, and a
+/// pin whose kernel is not staged fails the build while others are. With no
+/// pin, a single staged kernel is unambiguous; several are not. Nothing staged
+/// leaves the variable unset, as for targets that stage no kernel.
+pub(crate) fn render_kernel_image_section(pinned_kver: Option<&str>) -> String {
+    match pinned_kver {
+        Some(kver) => format!(
+            r#"if [ -e "$AVOCADO_PREFIX/kernel/{kver}/Image" ]; then
+    export AVOCADO_KERNEL_IMAGE="$AVOCADO_PREFIX/kernel/{kver}/Image"
+    export AVOCADO_KERNEL_VERSION="{kver}"
+elif ls "$AVOCADO_PREFIX"/kernel/*/Image >/dev/null 2>&1; then
+    echo "[ERROR] the lock pins kernel {kver} for the rootfs, but $AVOCADO_PREFIX/kernel/{kver}/Image is not staged; run 'avocado install'" >&2
+    exit 1
+fi"#
+        ),
+        // A function, so `set --` does not replace the script's own arguments.
+        None => r#"avocado_staged_kernel() {
+    set -- "$AVOCADO_PREFIX"/kernel/*/Image
+    if [ "$#" -gt 1 ]; then
+        echo "[ERROR] several kernels are staged under $AVOCADO_PREFIX/kernel and no lock pins one; run 'avocado install'" >&2
+        exit 1
+    elif [ -e "$1" ]; then
+        export AVOCADO_KERNEL_IMAGE="$1"
+        export AVOCADO_KERNEL_VERSION="$(basename "$(dirname "$1")")"
+    fi
+}
+avocado_staged_kernel"#
+        .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Runs `render_kernel_image_section` in sh against a fake
+    /// `$AVOCADO_PREFIX/kernel` and returns (exit status, exported image).
+    fn run_kernel_image_section(pinned: Option<&str>, staged: &[&str]) -> (i32, String) {
+        let dir = tempfile::tempdir().unwrap();
+        for k in staged {
+            let d = dir.path().join("kernel").join(k);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("Image"), b"").unwrap();
+        }
+        let script = format!(
+            "AVOCADO_PREFIX='{}'\n{}\nprintf '%s' \"${{AVOCADO_KERNEL_IMAGE:-}}\"",
+            dir.path().display(),
+            super::render_kernel_image_section(pinned)
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let image =
+            String::from_utf8_lossy(&out.stdout).replace(&dir.path().display().to_string(), "$P");
+        (out.status.code().unwrap_or(-1), image)
+    }
+
+    /// The pinned kernel wins even when another sorts first by name (the
+    /// stock-before-RT and old-before-new cases), and a pin that is not staged
+    /// fails rather than handing the hooks some other kernel.
+    #[test]
+    fn kernel_image_is_the_pinned_one_not_the_first_staged() {
+        let old = "6.18.37-02315-gbfeb0e5567c0-dirty";
+        let new = "6.18.52-03016-g143c1172c89b-dirty";
+        assert_eq!(
+            run_kernel_image_section(Some(new), &[old, new]),
+            (0, format!("$P/kernel/{new}/Image"))
+        );
+        assert_eq!(run_kernel_image_section(Some(new), &[old]).0, 1);
+        assert_eq!(run_kernel_image_section(Some(new), &[]), (0, String::new()));
+        assert_eq!(
+            run_kernel_image_section(None, &[old]),
+            (0, format!("$P/kernel/{old}/Image"))
+        );
+        assert_eq!(run_kernel_image_section(None, &[old, new]).0, 1);
+        assert_eq!(run_kernel_image_section(None, &[]), (0, String::new()));
+    }
+
     use super::{Config, SdkContainer};
 
     /// Each staging call gets its own directory under the project root, so
