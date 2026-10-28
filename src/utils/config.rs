@@ -6866,13 +6866,33 @@ pub fn find_active_compile_sections(
                 config.get_merged_runtime_config(runtime_name, target, config_path)?;
             let runtime_val = merged_runtime.as_ref().unwrap_or(raw_runtime);
 
-            if let Some(section_name) = runtime_val
-                .get("kernel")
-                .and_then(|k| k.get("compile"))
-                .and_then(|c| c.as_str())
-            {
-                if seen.insert(section_name.to_string()) {
-                    active_sections.push(section_name.to_string());
+            // A runtime's `kernel:` is either an inline mapping carrying
+            // `compile:` directly, or a bare string naming a top-level `kernel:`
+            // entry that carries it. The inline form reads straight off the
+            // merged value; the string-ref form resolves through the top-level
+            // `kernel:` map, the same lookup `resolve_runtime_kernel` and
+            // `get_kernel_config_from_runtime` already use. Reading only the
+            // inline shape left the documented reference form with its compile
+            // section never marked active, so its `packages:` were silently
+            // dropped.
+            let kernel_val = runtime_val.get("kernel");
+            let section_name = match kernel_val {
+                Some(kernel) if kernel.is_mapping() => kernel
+                    .get("compile")
+                    .and_then(|c| c.as_str())
+                    .map(String::from),
+                Some(kernel) => kernel.as_str().and_then(|ref_name| {
+                    config
+                        .kernel
+                        .as_ref()
+                        .and_then(|kernels| kernels.get(ref_name))
+                        .and_then(|kc| kc.compile.clone())
+                }),
+                None => None,
+            };
+            if let Some(section_name) = section_name {
+                if seen.insert(section_name.clone()) {
+                    active_sections.push(section_name);
                 }
             }
 
@@ -7604,6 +7624,41 @@ sdk:
       packages:
         glibc-dev: '*'
         libelf1: '*'
+"#;
+        let no_extensions = std::collections::HashSet::new();
+
+        let active = active_compile_sections_for(config_content, &no_extensions, "qemux86-64");
+
+        assert_eq!(active, vec!["kernel"]);
+    }
+
+    #[test]
+    fn test_find_active_compile_sections_via_runtime_kernel_string_ref() {
+        // A runtime whose `kernel:` is a bare string naming a top-level
+        // `kernel:` entry that carries `compile:` must mark that section active,
+        // exactly as the inline `kernel.compile` form does. The schema blesses
+        // this reference form, so the section's `packages:` have to be installed
+        // too. Before the fix the section was skipped: `.get("kernel")` returned
+        // a string, `.get("compile")` on it was `None`, and the section was
+        // never collected.
+        let config_content = r#"
+kernel:
+  yocto-ipv6:
+    compile: kernel
+    install: kernel-install.sh
+
+runtimes:
+  dev:
+    kernel: yocto-ipv6
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    kernel:
+      compile: kernel-compile.sh
+      packages:
+        kernel-dev: '*'
+        kernel-devsrc: '*'
 "#;
         let no_extensions = std::collections::HashSet::new();
 
