@@ -75,6 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. `--output json` carries it as `sbom_state`.
 
 ### Changed
+- **`avocado build` and `avocado deploy` now flag when a plain, locally-signed
+  deploy will be rejected.** (ENG-2802) In a Connect project with a signing key
+  whose `server_key` differs from that key, `build` bakes a Level-2 anchor that
+  trusts the Connect server key for update metadata, so a key-local `deploy` is
+  rejected on the device; `build` now warns and points to `--connect-sign` or a
+  sideload-capable image (set `server_key` to the signing key's own public hex).
+  When `server_key` already equals the signing key, every role collapses onto
+  that one key and both commands stay silent. `deploy` warns only when the
+  server key differs from the local key. The Level-0 `build` path, the normal
+  server-managed setup, now reads as an info line rather than a warning. No
+  change to what gets signed or baked.
 - **`avocado connect upload` sends the runtime's SBOM through the same upload
   path as its images, one per uploaded image, instead of inline in the create
   request.** A server that does not accept SBOMs is unaffected, and a failed

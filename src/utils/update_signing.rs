@@ -240,6 +240,65 @@ pub fn generate_root_json(signer: &TufSigner) -> Result<String> {
     generate_multi_key_root_json(signer, &signer.public_key_hex, 1, 365)
 }
 
+/// The build-time warning for a baked trust anchor that a plain, locally-signed
+/// `avocado deploy` cannot satisfy, or `None` when a local deploy is accepted.
+///
+/// The inputs are the ones `avocado build` already resolves: whether a local
+/// signing key is present, whether this is a Connect project (`connect.org`
+/// set), and whether the Connect `server_key` equals the local signing key (by
+/// TUF key id). Only the Level-2 split produces a warning here:
+///
+/// - Connect + signing key, server key differs from the local key: the anchor
+///   trusts the server key for the update metadata roles (Level 2), so a
+///   key-local deploy is rejected.
+/// - Connect + signing key, server key equals the local key: the anchor
+///   authorizes that one key for every role (the sideload self-override), so a
+///   key-local deploy is accepted.
+/// - Every other case (Level 0, sideload, or an auto-generated dev key) returns
+///   `None`. The Level-0 server-managed setup is the normal Connect path, so
+///   `build` describes it with an info line rather than a warning.
+pub fn baked_anchor_deploy_warning(
+    has_signing_key: bool,
+    is_connect: bool,
+    server_key_matches_local: bool,
+) -> Option<&'static str> {
+    match (has_signing_key, is_connect) {
+        (true, true) if !server_key_matches_local => Some(
+            "The baked trust anchor trusts the Connect server key for update \
+             metadata, so a plain `avocado deploy` signed with your local key is \
+             rejected by the device. Sign through Connect with \
+             `avocado deploy --connect-sign`, or set `server_key` to this signing \
+             key's own public hex to build a sideload-capable image.",
+        ),
+        _ => None,
+    }
+}
+
+/// The deploy-time warning when `avocado deploy` is about to sign an update with
+/// a local key, or `None` when a local signature is expected to be accepted.
+///
+/// This covers only the local-signing path (not `--connect-sign`). A server key
+/// that differs from the local signing key means the device may hold a
+/// server-key anchor from a Connect OTA that the local signature does not
+/// satisfy. A server key that equals the local key collapses every role onto
+/// that one key, so a local deploy is accepted and this returns `None`. A
+/// Level-0 deploy never gets here: its build bakes no root.json, so Phase 1
+/// stops first.
+pub fn local_deploy_signing_warning(
+    has_server_key: bool,
+    server_key_matches_local: bool,
+) -> Option<&'static str> {
+    if has_server_key && !server_key_matches_local {
+        Some(
+            "This project has a Connect server key configured. A locally-signed \
+             deploy may be rejected by a device that has received a Connect OTA \
+             update. Use `--connect-sign` to sign via Connect.",
+        )
+    } else {
+        None
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
@@ -412,5 +471,69 @@ mod tests {
             assert_eq!(role_keys.threshold.get(), 1);
             assert_eq!(role_keys.keyids.len(), 1);
         }
+    }
+
+    // --- build-time anchor/deploy mismatch warnings (ENG-2802) ---
+
+    #[test]
+    fn test_baked_anchor_level_2_differing_key_warns() {
+        // Connect + signing key, server key differs from the local key: the
+        // anchor trusts the server key, so a key-local deploy is rejected.
+        let warning = baked_anchor_deploy_warning(true, true, false).expect("Level 2 warns");
+        assert!(warning.contains("--connect-sign"));
+        assert!(warning.contains("server_key"));
+        assert!(!warning.contains('—'));
+    }
+
+    #[test]
+    fn test_baked_anchor_level_2_matching_key_is_silent() {
+        // Connect + signing key, server key equals the local key: the anchor
+        // authorizes that one key for every role, so a plain deploy is accepted.
+        assert!(baked_anchor_deploy_warning(true, true, true).is_none());
+    }
+
+    #[test]
+    fn test_baked_anchor_level_0_is_silent() {
+        // Connect with no local signing key is the normal server-managed path.
+        // `build` describes it with an info line, not a warning, so the helper
+        // returns None regardless of the server-key match flag.
+        for server_key_matches_local in [false, true] {
+            assert!(baked_anchor_deploy_warning(false, true, server_key_matches_local).is_none());
+        }
+    }
+
+    #[test]
+    fn test_baked_anchor_sideload_is_silent() {
+        // A single local key signs every role; a plain deploy with it is accepted.
+        assert!(baked_anchor_deploy_warning(true, false, false).is_none());
+        // No key and not Connect: build auto-generates a dev key, then behaves
+        // as sideload.
+        assert!(baked_anchor_deploy_warning(false, false, false).is_none());
+    }
+
+    // --- deploy-time local-signing warnings (ENG-2802) ---
+
+    #[test]
+    fn test_local_deploy_warns_when_server_key_differs() {
+        // A configured server key that differs from the local key: the device
+        // may hold a server-key anchor the local signature does not satisfy.
+        let warning =
+            local_deploy_signing_warning(true, false).expect("differing server key warns");
+        assert!(warning.contains("--connect-sign"));
+        assert!(!warning.contains('—'));
+    }
+
+    #[test]
+    fn test_local_deploy_silent_when_server_key_matches() {
+        // Server key equals the local key: every role collapses onto one key,
+        // so a local deploy is accepted. Matches the build side.
+        assert!(local_deploy_signing_warning(true, true).is_none());
+    }
+
+    #[test]
+    fn test_local_deploy_silent_without_server_key() {
+        // No server key (sideload, or a Level-0 project, which Phase 1 stops
+        // before signing): nothing to warn about here.
+        assert!(local_deploy_signing_warning(false, false).is_none());
     }
 }

@@ -2265,7 +2265,10 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             // Level 0/1: Connect project, no local signing key — device gets root.json at claim time
             (None, true) => {
                 print_info(
-                    "Connect Level 0: root.json will be delivered at device claim time",
+                    "Connect Level 0: no trust anchor is baked into this image. The \
+                     device receives its root.json from Connect at claim time and \
+                     gets its updates through Connect. A plain `avocado deploy` of \
+                     this build has no baked anchor to sign against.",
                     OutputLevel::Normal,
                 );
                 "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
@@ -2283,6 +2286,21 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                             ),
                             OutputLevel::Normal,
                         );
+                        // The anchor authorizes the server key for the metadata
+                        // roles only when it differs from the local signing key.
+                        // When a project sets `server_key` to the signing key's
+                        // own public hex, every role collapses onto that one key
+                        // and a plain local deploy is accepted, so skip the warning.
+                        let server_key_matches_local = keyid == signer.key_id;
+                        if let Some(warning) =
+                            crate::utils::update_signing::baked_anchor_deploy_warning(
+                                true,
+                                true,
+                                server_key_matches_local,
+                            )
+                        {
+                            print_warning(warning, OutputLevel::Normal);
+                        }
                         let root_json_content =
                             crate::utils::update_signing::generate_multi_key_root_json(
                                 signer,
