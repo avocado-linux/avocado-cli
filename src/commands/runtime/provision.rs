@@ -1205,6 +1205,7 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
             interactive: false,
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
+            sdk_arch: self.config.sdk_arch.clone(),
             env_vars: Some(query_env),
             ..Default::default()
         };

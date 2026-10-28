@@ -945,6 +945,7 @@ impl ExtImageCommand {
             dnf_args: self.dnf_args.clone(),
             runs_on: self.runs_on.clone(),
             nfs_port: self.nfs_port,
+            sdk_arch: self.sdk_arch.clone(),
             tui_context: effective_tui_context.clone(),
             env_vars: self.merge_runtime_env(extra_env_vars),
             ..Default::default()
