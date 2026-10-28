@@ -2265,14 +2265,12 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
             // Level 0/1: Connect project, no local signing key — device gets root.json at claim time
             (None, true) => {
                 print_info(
-                    "Connect Level 0: root.json will be delivered at device claim time",
+                    "Connect Level 0: no trust anchor is baked into this image. The \
+                     device receives its root.json from Connect at claim time and \
+                     gets its updates through Connect. A plain `avocado deploy` of \
+                     this build has no baked anchor to sign against.",
                     OutputLevel::Normal,
                 );
-                if let Some(warning) =
-                    crate::utils::update_signing::baked_anchor_deploy_warning(false, true, false)
-                {
-                    print_warning(warning, OutputLevel::Normal);
-                }
                 "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
             }
             // Level 2: user's root key + Connect with server key
