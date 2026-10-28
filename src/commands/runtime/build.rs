@@ -3115,10 +3115,6 @@ struct RuntimeCompileEntry {
     install_script: String,
 }
 
-/// The rootfs and initramfs image stamps a runtime build reads. Each runtime
-/// has its own images, so each has its own stamps: a stamp shared across
-/// runtimes would let one runtime reuse a stale image because another runtime
-/// rebuilt its own.
 /// Level 0/1 bakes no trust anchor, but var-staging persists across builds,
 /// so a `root.json` from an earlier signed build would still ship in the var
 /// image and the device would trust that old key instead of the one Connect
@@ -3130,6 +3126,10 @@ rm -f "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1
 rm -rf "$VAR_DIR/lib/avocado/tuf-staging""#
 }
 
+/// The rootfs and initramfs image stamps a runtime build reads. Each runtime
+/// has its own images, so each has its own stamps: a stamp shared across
+/// runtimes would let one runtime reuse a stale image because another runtime
+/// rebuilt its own.
 fn image_stamp_requirements(runtime_name: &str) -> [crate::utils::stamps::StampRequirement; 2] {
     [
         crate::utils::stamps::StampRequirement::rootfs_image(runtime_name),
