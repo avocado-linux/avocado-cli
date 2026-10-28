@@ -2271,7 +2271,7 @@ echo "Set active runtime -> runtimes/$BUILD_ID""#,
                      this build has no baked anchor to sign against.",
                     OutputLevel::Normal,
                 );
-                "# Level 0: root.json delivered at claim time (not baked into image)".to_string()
+                level0_clear_baked_anchor_script().to_string()
             }
             // Level 2: user's root key + Connect with server key
             (Some(signer), true) => {
@@ -3131,6 +3131,17 @@ struct RuntimeCompileEntry {
     name: String,
     compile_section: String,
     install_script: String,
+}
+
+/// Level 0/1 bakes no trust anchor, but var-staging persists across builds,
+/// so a `root.json` from an earlier signed build would still ship in the var
+/// image and the device would trust that old key instead of the one Connect
+/// hands it at claim time. `tuf-staging` goes too: `connect upload` would send
+/// its stale delegation. Level 1 rewrites `tuf-staging` after this script runs.
+fn level0_clear_baked_anchor_script() -> &'static str {
+    r#"# Level 0/1: root.json delivered at claim time (not baked into image)
+rm -f "$VAR_DIR/lib/avocado/metadata/root.json" "$VAR_DIR/lib/avocado/metadata/1.root.json"
+rm -rf "$VAR_DIR/lib/avocado/tuf-staging""#
 }
 
 /// The rootfs and initramfs image stamps a runtime build reads. Each runtime
@@ -4562,6 +4573,33 @@ packages:
         assert_eq!(cmd.target, Some("x86_64".to_string()));
     }
 
+    /// A project that switches to Level 0 must not keep shipping the anchor
+    /// (or upload the delegation) an earlier signed build left in var-staging.
+    #[test]
+    fn level0_build_removes_a_stale_anchor_and_tuf_staging() {
+        let dir = TempDir::new().unwrap();
+        let meta = dir.path().join("lib/avocado/metadata");
+        let tuf = dir.path().join("lib/avocado/tuf-staging/delegations");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::create_dir_all(&tuf).unwrap();
+        for f in ["root.json", "1.root.json", "keep.json"] {
+            std::fs::write(meta.join(f), "{}").unwrap();
+        }
+        std::fs::write(tuf.join("runtime-old.json"), "{}").unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(level0_clear_baked_anchor_script())
+            .env("VAR_DIR", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!meta.join("root.json").exists());
+        assert!(!meta.join("1.root.json").exists());
+        assert!(!dir.path().join("lib/avocado/tuf-staging").exists());
+        assert!(meta.join("keep.json").exists(), "only the anchor goes");
+    }
+
     #[test]
     fn test_create_build_script() {
         let temp_dir = TempDir::new().unwrap();
@@ -4606,6 +4644,8 @@ runtimes:
         assert!(script.contains("RUNTIME_NAME=\"test-runtime\""));
         assert!(script.contains("TARGET_ARCH=\"x86_64\""));
         assert!(script.contains("VAR_DIR=$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"));
+        // Connect with no signing key is Level 0: clear any earlier anchor.
+        assert!(script.contains(level0_clear_baked_anchor_script()));
         // The split: what an OTA needs is here, what only provisioning
         // consumes is not. Asserted in both directions, because getting it
         // backwards does not fail a build — it produces a `deploy` that reports
