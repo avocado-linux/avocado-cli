@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-28
+
 ### Added
 - **Add-on feeds by name: `distro.feeds: [ros2-jazzy]`.** A `distro.feeds`
   entry that `repos:` does not define names an add-on the distro feed
@@ -68,11 +70,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse errors, every schema violation, and the loader's own checks are
   errors, and keys the CLI ignores are warnings. `-c -` reads stdin, and
   `--output json` prints `{ok, errors, warnings}`. It exits 1 when there are
-  errors. avocado-mcp's `validate-yaml` calls it. (ENG-2775)
+  errors. (ENG-2775)
 - `avocado connect upload --no-sbom` skips SBOM generation.
 - `avocado connect runtimes list` gains an `SBOM` column: `indexed`,
   `pending`, `failed` or `none`, and `?` against a server that does not report
   it. `--output json` carries it as `sbom_state`.
+
+- **Warnings for avocado.yaml keys the CLI ignores.** A misspelled or retired
+  key (`extentions:`, `ext:`, `sdk.host_uid`) prints a warning with a "did you
+  mean", and so does a one-block section whose keys are all misspelled, which
+  is otherwise read as a named entry. Warnings go to stderr and never fail a
+  load; under `--output json`, `config show` carries them in a `warnings`
+  array. The JSON Schema now lives in this repo, and `avocado init` adds a
+  `yaml-language-server` comment so editors validate against it.
+- **Git works on `/opt/src` in a linked worktree.** The SDK container mounts a
+  linked worktree's git common dir at the path git resolves, and passes
+  `gc.worktreePruneExpire=never` so a gc in the container cannot prune the
+  host's other worktrees. A worktree with submodules, a `.git` pointer that is
+  not a linked worktree git writes, or a common dir outside `/opt`, `/Users`,
+  `/home` or the avocado-vm share gets a warning and no mount. A repository
+  with `extensions.relativeWorktrees` needs git 2.48 in the SDK; the 2024 SDK
+  ships 2.44 and the CLI warns. A `GIT_CONFIG_PARAMETERS` in the environment
+  or `sdk.container_args`, in any `-e`/`--env` form, is merged with the CLI's
+  own settings and no longer replaces them.
+- **`kernel.cmdline_extra` reaches the kernel on FIT machines.** The runtime
+  build writes it into every FIT configuration node as
+  `avocado,cmdline-extra`, covered by the FIT signature. A value holding `"`,
+  `\`, `#`, `&`, `'` or a newline is refused, and setting it without
+  `signing.fit_key` or `signing.fit_unsigned` fails the build.
+- `avocado provision --list` shows each profile's input fields (type,
+  required or optional, label, description) with an `--env NAME=<value>` hint.
 
 ### Changed
 - **`avocado build` and `avocado deploy` now flag when a plain, locally-signed
@@ -96,10 +123,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace now covers each package's RPM header, so the namespace and every
   package `spdxId` differ from rc.5 for the same image.
 
+- **`avocado init` defaults new projects to `release: 2026`** (channel `edge`)
+  and the `avocadolinux/sdk:2026` image.
+- **Target package scriptlets get OE's offline-install environment.** `D` and
+  the `*OFFLINE_ROOT` variables point at the sysroot, so `$D`-relative
+  postinst writes land in it and not in the SDK container. Images now carry
+  what an OE build of the same packages has: systemd's `nsswitch.conf`
+  entries, `/usr/lib/clock-epoch` and `/etc/shells` entries. `depmod` runs
+  once after the rootfs and initramfs installs, as OE does. The first install
+  after the upgrade reinstalls the rootfs and initramfs once.
+- Main install and build steps reuse the per-command session container
+  instead of starting a fresh `docker run` each. Set
+  `AVOCADO_NO_SESSION_CONTAINER=1` to turn this off.
+
 ### Removed
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **Build hooks get the kernel the lock pins, not the first one staged.**
+  `$AVOCADO_PREFIX/kernel` keeps a directory for every kernel ever installed,
+  and `avocado build` exported `AVOCADO_KERNEL_IMAGE` (and `avocado kernel
+  image` printed) whichever sorted first, so after a pin moved, a hook such as
+  a UKI rebuild could package an old kernel whose modules the rootfs does not
+  carry. Both now use the rootfs kernel pin from the lock and also export
+  `AVOCADO_KERNEL_VERSION`. A build fails if the pinned kernel is not staged
+  while others are, or if nothing is pinned and more than one is staged.
 - **A project that switches to Connect Level 0 no longer ships its old trust
   anchor.** Level 0 bakes no `root.json`, but the build's var staging persists,
   so a `root.json` from an earlier signed or sideload build stayed in the var
@@ -138,14 +186,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared one; ext, runtime and build steps keep reuse. Setting
   `AVOCADO_NO_SESSION_CONTAINER=1` is no longer needed for a clean cold install.
 - **`avocado update` and `avocado fetch` now route through the avocado-vm.**
-  (ENG-2799) Both run a short-lived SDK container to refresh dnf repo metadata,
-  but neither command was in the VM-routing set, so `DOCKER_HOST` was never set
-  to the VM socket. On macOS the container start went to the local Docker socket
-  and failed. For `update` the snapshot pin still advanced and the failure only
-  printed at INFO, so the run reported success while the cache stayed stale and
-  the next `avocado install` could resolve against old feed metadata; `fetch`
-  failed outright. Both now route like every other command that starts a
-  container.
+  (ENG-2799) Both start a short-lived SDK container (`update` drops the install
+  stamps, `fetch` re-fetches repo metadata), but neither command was in the
+  VM-routing set, so on macOS the container start went to the local Docker
+  socket and failed. For `update` the snapshot pin still advanced and the
+  failure only printed at INFO, so the run reported success while the stamps
+  still read current and the next `avocado install` skipped dnf; `fetch` failed
+  outright. Both now route like every other command that starts a container.
 - **An extension's `target-<name>:` overrides now apply to
   `device_tree_overlays` and `boot_config`.** Every reader of the two keys used
   the extension's base value, so a declaration under `target-<name>:` was
@@ -164,9 +211,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids. The query now uses `--dbpath /var/lib/rpm`, the same as the rootfs. Every
   initramfs build id changes once.
 - **`avocado build -r <rt>` works right after a plain `avocado install` on a
-  project with more than one runtime.** (ENG-2691) Before, a plain `install`
-  populated only the per-target extension sysroot, so a `build -r <rt>` for a
-  project with two or more runtimes stopped on each package extension with
+  project with more than one runtime.** (ENG-2791) A plain `install`
+  populated only the per-target extension sysroot. In rc.5 a `build -r <rt>`
+  for a project with two or more runtimes then built empty extension images;
+  with the package database check above, it stopped on each package extension
+  with
   "its sysroot for runtime '<rt>' has no package database. Run 'avocado install
   -r <rt>' first", even though `avocado build` (all runtimes) passed on the same
   volume. A multi-runtime `install` now seeds each runtime's per-runtime
@@ -217,6 +266,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directories that an interrupted or killed run left.
 - A `path:` feed outside the avocado-vm workspace now fails early with a
   message that says to set `AVOCADO_VM_WORKSPACE`.
+
+- **OS updates from projects with two or more runtimes no longer roll back.**
+  Rootfs and initramfs image stamps were per target, so a second runtime
+  reused its old image. The bundle took its build id from the shared sysroot,
+  which held the last-built runtime's id, so avocadoctl rolled the update
+  back with `AVOCADO_OS_BUILD_ID mismatch`. Stamps are now per runtime, and
+  the id comes from the os-release inside the shipped image. The build fails
+  when the bundle's expected id does not match. Images rebuild once after the
+  upgrade. Rebuild any multi-runtime bundle made with rc.4 or rc.5.
+  Regression in 1.0.0-rc.4.
+- **An exact version pin in avocado.yaml wins over a stale lock entry.** When
+  the locked version does not match an exact pin, the install uses the pin
+  and re-locks, including when the extension would otherwise be skipped as
+  "up to date". `*`, globs and matching pins keep the lock. `avocado unlock
+  -e <ext>` also clears the extension's runtime-scoped entries.
+- **Parallel extension installs no longer revert each other's lock entries.**
+  A save now does a three-way merge against the lock it loaded, so each
+  install writes only the entries it changed.
+- **Files dropped from an overlay are removed from the sysroot.** Extension,
+  rootfs and initramfs overlays, and `enable_services` links, used to persist
+  after removal from the config. `ext build` (extension overlays and
+  `enable_services` links) and `avocado install` (rootfs and initramfs
+  overlays) record what they placed and remove what is gone, printing
+  `Removed /<path>`. After a rootfs or initramfs overlay edit, run `avocado
+  install` before `avocado build`. A package-owned path is kept with a notice.
+  The first run after the upgrade only records.
+- **Overlays no longer strip setuid/setgid from package files.** The overlay
+  merge no longer runs `chown -R` over the sysroot. Only paths the overlay
+  creates become root-owned, and existing directories keep their mode. An
+  overlay directory that lands on a symlink or file is refused. An overlay
+  file over a sysroot symlink now replaces the link instead of writing
+  through it.
+- **Images no longer link the bare `getty@.service` template.** The offline
+  systemctl enables a template's preset instances or its `DefaultInstance`,
+  never the template itself, and reads preset instance lists. Sysroots
+  reinstall once.
+- **`ext install` checks the rpm database, not the directory, before
+  skipping.** An empty or half-seeded extension sysroot is installed instead
+  of reported "up to date", and a failed first transaction removes the seeded
+  database. `ext build` refuses a package extension whose sysroot has no
+  package database, so empty extension images are no longer shipped
+  silently. Without a TTY, a failed task prints its error message.
+- **Rootfs verity off no longer deletes the BSP's verity placeholder.** The
+  dm-verity tree is written to `rootfs-verity/` outside the dnf install root,
+  so verity-off builds on i.MX targets pass `stone validate`.
+- **Rootfs verity with no initramfs fails the build** instead of booting the
+  feed's FIT without the root hash, unverified.
+- **A failed `sdk run` command exits non-zero.** An unknown `-r` is refused,
+  and `sdk run --rm false` keeps its container on Ctrl+C. A failed clean
+  before a runtime reinstall aborts the reinstall.
+- **`provision` fails when the SD card write is not confirmed.** Answering no,
+  or having no terminal, used to print success, write the stamp and exit 0.
+  `--force` never skips this confirmation.
+- **`deploy` no longer hangs or reports a stale success.** SSH keepalives end
+  a dropped session in about 15 s. Ctrl+C stops the deploy container, and a
+  repo server left by an earlier run is refused rather than served to the
+  device.
+- **`sdk dnf`, `sdk run`, `sdk compile`, `ext build` and `build` use the feed
+  snapshot `avocado.lock` pins**, as `install` does. `sdk run` passes named
+  feeds, except with `--detach` or `--runs-on`, where it warns.
+- **`cli_requirement: "=1.0.0"` no longer accepts 1.0.0-rc builds.**
+- `permissions:` fixes: no leading comma in a group's member list, membership
+  matched by whole name, a user without `gid:` takes its first group's GID
+  (or gets a private group), and a group that exists with another GID fails
+  the build.
+- `clean -f` succeeds when the recorded volume is already gone, and waits for
+  removed containers to release the volume.
+- A git extension `ref` that is a tag or commit SHA is fetched directly. A ref
+  that does not exist now fails instead of silently building the default
+  branch.
+- `repos:` feeds scoped to `sdk` reach the SDK target sysroot install, so
+  `sdk.compile` packages from them resolve.
+- Projects with `src_dir` and the config in a subdirectory: TUF staging is
+  written, and package extensions merge.
+- A pinned PREEMPT_RT kernel whose version extends the stock kernel's
+  installs.
+- erofs images use `$AVOCADO_EROFS_BLOCK_SIZE` when the SDK exports it, which
+  16 KiB-page kernels such as the Pi 5 need.
+- Extension `modprobe` entries are written even when the extension ships no
+  `.ko`.
+- Under the avocado-vm, capture steps and provision check that the workspace
+  share is mounted.
+- A `sdk.compile` section with no `compile:` script says so, and five stale
+  hints are corrected.
+- The schema refuses `fit_key` together with `fit_unsigned: true`, and
+  encodes the `var.recovery` rules.
+
+### Security
+- **Dependency bumps for RUSTSEC advisories.** `quinn-proto` 0.11.19
+  (RUSTSEC-2026-0338 to -0342), `rustls` 0.23.46 (-0346 to -0349),
+  `rustls-webpki` 0.103.16 (-0382) and `webpki-root-certs` 1.0.10 (-0383).
+  Lockfile bumps only.
 
 ## [1.0.0-rc.5] - 2026-09-17
 
@@ -1332,6 +1473,8 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.0.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0
+[1.0.0-rc.5]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.4
 [1.0.0-rc.3]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.2
