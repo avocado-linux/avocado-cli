@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string `kernel:` through the top-level map before reading `compile`, the same
   lookup `resolve_runtime_kernel` already uses. The inline mapping form and the
   `packages.<pkg>.compile` form are unchanged.
+- **Cold `avocado install` no longer fails under session-container reuse.**
+  (ENG-2806) #343 let main and ext steps share one per-shape session container.
+  The cold SDK host-package install runs nativesdk post-install scriptlets whose
+  `update-alternatives` calls leave the container's own `/usr/bin` coreutils
+  symlinks dangling, so a later step that reuses the container fails its
+  entrypoint with `uname: command not found`, then `Failed to clean sysroot` and
+  `One or more tasks failed`. The SDK-install phase now runs each step in its own
+  container (`SdkContainer::session_reuse(false)`), so that damage never reaches a
+  shared one; ext, runtime and build steps keep reuse. Setting
+  `AVOCADO_NO_SESSION_CONTAINER=1` is no longer needed for a clean cold install.
 - **`avocado update` and `avocado fetch` now route through the avocado-vm.**
   (ENG-2799) Both run a short-lived SDK container to refresh dnf repo metadata,
   but neither command was in the VM-routing set, so `DOCKER_HOST` was never set
