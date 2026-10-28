@@ -5800,7 +5800,11 @@ extensions:
         // sites in run_in_container / run_in_container_capture AND this flag, so
         // an opted-out helper never routes a step into the session container.
         assert!(SdkContainer::new().session_reuse_enabled);
-        assert!(!SdkContainer::new().session_reuse(false).session_reuse_enabled);
+        assert!(
+            !SdkContainer::new()
+                .session_reuse(false)
+                .session_reuse_enabled
+        );
         assert!(
             SdkContainer::new()
                 .session_reuse(false)
@@ -6988,6 +6992,91 @@ extensions:
             assert!(
                 !log.contains("avocado-run-"),
                 "step took the standalone run path:\n{log}"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn the_sdk_install_opt_out_keeps_each_step_in_its_own_run() {
+            // The companion to the routing test above: with
+            // session_reuse(false) (what the SDK install sets), a step must NOT
+            // reach a session container, so its container-root mutations cannot
+            // poison one a later step reuses. Drive both the main and the
+            // capture path through the stub and assert neither creates
+            // (`run -d ... avocado-sess-`) nor execs into (`exec ... avocado-sess-`)
+            // a session container. Dropping the `self.session_reuse_enabled &&`
+            // guard at either eligibility site flips these to an `exec` and fails
+            // here. The hatch is left unset so only the opt-out is under test.
+            std::env::remove_var("AVOCADO_NO_SESSION_CONTAINER");
+            let dir = tempfile::tempdir().unwrap();
+            let tool = stub_tool(dir.path());
+
+            crate::utils::volume::VolumeState::new(dir.path().to_path_buf(), tool.clone())
+                .save_to_dir(dir.path())
+                .unwrap();
+
+            let container = SdkContainer {
+                container_tool: tool.clone(),
+                cwd: dir.path().to_path_buf(),
+                src_dir: None,
+                config_path: None,
+                verbose: false,
+                cli_target_board: None,
+                session_reuse_enabled: false,
+            };
+
+            let main_cfg = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo MAIN_STEP".to_string(),
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+            assert!(
+                container.run_in_container(main_cfg).await.unwrap(),
+                "the stubbed main step should report success"
+            );
+
+            let capture_cfg = RunConfig {
+                container_image: "img".to_string(),
+                target: "qemuarm64".to_string(),
+                command: "echo CAPTURE_STEP".to_string(),
+                ext_path_mounts: Some(std::collections::HashMap::new()),
+                ..Default::default()
+            };
+            container
+                .run_in_container_capture(capture_cfg)
+                .await
+                .unwrap();
+
+            // Defensive: drop any registry entry so it cannot leak into a later
+            // test, matching the routing test above.
+            let _ = SessionContainers::get()
+                .by_shape
+                .lock()
+                .map(|mut m| m.clear());
+
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            // Both steps actually ran...
+            assert!(
+                log.contains("echo MAIN_STEP"),
+                "main step never ran:\n{log}"
+            );
+            assert!(
+                log.contains("echo CAPTURE_STEP"),
+                "capture step never ran:\n{log}"
+            );
+            // ...and neither touched a session container: no `run -d` creating
+            // one and no `exec` into one.
+            assert!(
+                !log.contains("avocado-sess-"),
+                "an opted-out step still created or used a session container:\n{log}"
+            );
+            // The main step carries its own one-off `docker run` name, proving it
+            // took the standalone path rather than silently doing nothing.
+            assert!(
+                log.contains("--name avocado-run-"),
+                "the opted-out main step did not take the standalone run path:\n{log}"
             );
         }
 
