@@ -156,18 +156,21 @@ impl KernelImageCommand {
         // (The raw rootfs/boot/ file keeps its arch-specific name, so scanning
         // it only ever matched arm64's `Image`.)
         let internal_output_dir = "$AVOCADO_PREFIX/output/images";
-        let locate_section = r#"
-# Take the first staged kernel (bash sorts the glob, matching how
-# runtime/build.rs resolves this path). The for-glob idiom leaves
-# KERNEL_SRC empty on no match instead of failing the pipeline, so the
-# actionable error below fires rather than `set -euo pipefail` aborting
-# the script on the bare `ls` exit code.
-KERNEL_SRC=""
-for f in "$AVOCADO_PREFIX"/kernel/*/Image; do
-    [ -e "$f" ] || continue
-    KERNEL_SRC="$f"
-    break
-done
+        // The pinned kernel, picked the way the runtime build picks it.
+        let pinned_rootfs_kver =
+            crate::utils::lockfile::LockFile::load(&config.project_root(&self.config_path))
+                .ok()
+                .and_then(|lock| {
+                    lock.get_kernel_version(
+                        &target_arch,
+                        &crate::utils::lockfile::SysrootType::Rootfs,
+                    )
+                    .cloned()
+                });
+        let locate_section = format!(
+            r#"
+{pick}
+KERNEL_SRC="${{AVOCADO_KERNEL_IMAGE:-}}"
 if [ -z "$KERNEL_SRC" ]; then
     echo "ERROR: no staged kernel image at $AVOCADO_PREFIX/kernel/*/Image — run 'avocado rootfs install' first" >&2
     exit 1
@@ -179,7 +182,11 @@ AVOCADO_KERNEL_IMAGE="$OUTPUT_DIR/$KERNEL_BASENAME"
 cp -f "$KERNEL_SRC" "$AVOCADO_KERNEL_IMAGE"
 export AVOCADO_KERNEL_IMAGE
 echo "Staged kernel image: $AVOCADO_KERNEL_IMAGE"
-"#;
+"#,
+            pick = crate::commands::runtime::build::render_kernel_image_section(
+                pinned_rootfs_kver.as_deref()
+            )
+        );
 
         let script = format!(
             r#"set -euo pipefail
