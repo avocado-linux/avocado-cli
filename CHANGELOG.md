@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AVOCADO_UPLOAD_NO_SBOM=1`; use `avocado connect upload --no-sbom`.
 
 ### Fixed
+- **A project that switches to Connect Level 0 no longer ships its old trust
+  anchor.** Level 0 bakes no `root.json`, but the build's var staging persists,
+  so a `root.json` from an earlier signed or sideload build stayed in the var
+  image and the device trusted that key instead of the one Connect delivers at
+  claim time; `connect upload` likewise sent the earlier build's content
+  delegation. A Level 0 or Level 1 build now removes both. `connect.org` and
+  `connect.server_key` are also build inputs now, so adding or changing either
+  rebuilds instead of reusing images made under the previous trust level.
 - **`avocado save` and `avocado load` now route through the avocado-vm.** On
   macOS they reached the local Docker daemon instead of the VM that holds the
   build state, so `save` archived an empty volume the daemon created on the spot

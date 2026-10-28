@@ -2886,6 +2886,17 @@ pub fn compute_runtime_build_input_hash(
         );
     }
 
+    // `connect.org` and `connect.server_key` pick the trust anchor baked into
+    // the var image (Level 0, Level 2 or sideload); the runtime's own
+    // `signing` block is folded above.
+    if let Some(connect) = parsed.get("connect") {
+        for k in ["org", "server_key"] {
+            if let Some(v) = connect.get(k) {
+                hash_data.insert(serde_yaml::Value::String(format!("connect.{k}")), v.clone());
+            }
+        }
+    }
+
     // rootfs / initramfs: filesystem picks the mkfs; `image` carries the kab
     // args and the dm-verity opt-in, both of which change what is built here.
     // `permissions` is baked into the image's /etc.
@@ -6436,6 +6447,19 @@ extensions:
             base,
             hash("rootfs:\n  filesystem: erofs\n", &signed),
             "signing"
+        );
+        let connect = hash(
+            "rootfs:\n  filesystem: erofs\nconnect:\n  org: acme\n",
+            &runtime,
+        );
+        assert_ne!(base, connect, "connect.org picks Level 0 over sideload");
+        assert_ne!(
+            connect,
+            hash(
+                "rootfs:\n  filesystem: erofs\nconnect:\n  org: acme\n  server_key: ab\n",
+                &runtime
+            ),
+            "connect.server_key picks the Level 2 anchor"
         );
     }
 
