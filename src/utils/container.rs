@@ -1718,6 +1718,18 @@ pub struct SdkContainer {
     /// so `type: path` extension `source.path` values referencing
     /// `{{ avocado.target.board }}` mount from the flag's board.
     pub cli_target_board: Option<String>,
+    /// Whether this helper's steps may reuse the shared per-shape session
+    /// container. True for ordinary commands; the SDK install turns it off.
+    ///
+    /// The SDK host-package install (`nativesdk-*`) runs post-install scriptlets
+    /// that drive `update-alternatives` against the container's own `/usr/bin`.
+    /// On a cold volume those scriptlets leave the coreutils symlinks
+    /// (`uname`, `mkdir`, `tr`, `mv`, `ln`, ...) dangling. That is harmless in a
+    /// throwaway `docker run`, but once #343 let steps reuse one session
+    /// container, a later step execs into the poisoned container and its
+    /// entrypoint dies with `uname: command not found`. Running the SDK install
+    /// in its own per-step containers keeps the damage out of the shared one.
+    pub session_reuse_enabled: bool,
 }
 
 impl Default for SdkContainer {
@@ -1736,6 +1748,7 @@ impl SdkContainer {
             config_path: None,
             verbose: false,
             cli_target_board: None,
+            session_reuse_enabled: true,
         }
     }
 
@@ -1749,7 +1762,18 @@ impl SdkContainer {
             config_path: None,
             verbose: false,
             cli_target_board: None,
+            session_reuse_enabled: true,
         }
+    }
+
+    /// Opt this helper's steps out of (or back into) session-container reuse.
+    ///
+    /// The SDK install sets this `false` so its container-root mutations cannot
+    /// poison a shared session container that a later step reuses. See the
+    /// `session_reuse_enabled` field docs.
+    pub fn session_reuse(mut self, enabled: bool) -> Self {
+        self.session_reuse_enabled = enabled;
+        self
     }
 
     /// Set the CLI `--target-board` override used when deriving `type: path`
@@ -2123,14 +2147,15 @@ impl SdkContainer {
         // Read session-reuse eligibility from the caller's request now, before
         // the generated name below is set on effective_config. Reading it back
         // from effective_config.container_name is the B-10 bug that made this
-        // path dead.
-        let session_eligible = session_reuse_eligible(
-            config.detach,
-            config.interactive,
-            config.use_entrypoint,
-            config.container_name.is_some(),
-            config.rm,
-        );
+        // path dead. A helper that opted out (the SDK install) never reuses.
+        let session_eligible = self.session_reuse_enabled
+            && session_reuse_eligible(
+                config.detach,
+                config.interactive,
+                config.use_entrypoint,
+                config.container_name.is_some(),
+                config.rm,
+            );
 
         // For non-detached runs, ensure we have a container name for Ctrl-C handling
         // Generate a unique name if one wasn't provided
@@ -2922,14 +2947,16 @@ impl SdkContainer {
         // have done anyway.
         // Capture steps leave container_name unset, so reading it here is
         // correct — unlike the main path, which sets a generated name (B-10).
-        // The shared helper keeps both eligibility checks from drifting.
-        let eligible = session_reuse_eligible(
-            effective_config.detach,
-            effective_config.interactive,
-            effective_config.use_entrypoint,
-            effective_config.container_name.is_some(),
-            effective_config.rm,
-        );
+        // The shared helper keeps both eligibility checks from drifting. A
+        // helper that opted out (the SDK install) never reuses.
+        let eligible = self.session_reuse_enabled
+            && session_reuse_eligible(
+                effective_config.detach,
+                effective_config.interactive,
+                effective_config.use_entrypoint,
+                effective_config.container_name.is_some(),
+                effective_config.rm,
+            );
         if eligible {
             if let Some((shape, env_pairs)) = split_run_argv(&container_cmd, bash_cmd.len()) {
                 match self.session_container(&shape, &env_map(&env_pairs)) {
@@ -5764,6 +5791,25 @@ extensions:
     }
 
     #[test]
+    fn session_reuse_defaults_on_and_the_sdk_install_opts_out() {
+        // Ordinary helpers reuse the per-shape session container. The SDK
+        // install opts out so its nativesdk post-install scriptlets, which
+        // mutate the container's own `/usr/bin` via update-alternatives, cannot
+        // poison a container a later step would reuse (`uname: command not
+        // found` on a cold install, the ENG-2793 regression). The two eligibility
+        // sites in run_in_container / run_in_container_capture AND this flag, so
+        // an opted-out helper never routes a step into the session container.
+        assert!(SdkContainer::new().session_reuse_enabled);
+        assert!(!SdkContainer::new().session_reuse(false).session_reuse_enabled);
+        assert!(
+            SdkContainer::new()
+                .session_reuse(false)
+                .session_reuse(true)
+                .session_reuse_enabled
+        );
+    }
+
+    #[test]
     fn build_exec_command_passes_through_stdio_flags() {
         use crate::utils::interactivity::ContainerStdio;
         // The main path hands the exec the same stdin/tty flags the standalone
@@ -6905,6 +6951,7 @@ extensions:
                 config_path: None,
                 verbose: false,
                 cli_target_board: None,
+                session_reuse_enabled: true,
             };
             let config = RunConfig {
                 container_image: "img".to_string(),
