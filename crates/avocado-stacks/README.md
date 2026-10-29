@@ -1,4 +1,4 @@
-# avocado-stacks (PoC)
+# avocado-stacks
 
 A content-addressed layer cache for Avocado build state, in the composefs model:
 every file's bytes are stored once by sha256, a layer is a *complete tree* described by
@@ -8,8 +8,8 @@ host. Moving layers between machines (an OCI registry, fetching only the objects
 lacks) is a later step: it needs signed layer records, TLS and auth first.
 
 This crate is the stacks engine. It runs as root inside a short-lived privileged helper
-container (`avocado-stacks:poc`, see `Dockerfile.helper`), so native Linux hosts and
-avocado-vm take the same code path. The CLI side is `src/utils/stacks.rs`.
+container (`ghcr.io/avocado-linux/avocado-stacks`, built from `Dockerfile.helper`), so native
+Linux hosts and avocado-vm take the same code path. The CLI side is `src/utils/stacks.rs`.
 
 ## On-disk format
 
@@ -113,18 +113,36 @@ change a view (mount, use, commit, umount, drop) also hold a per-view lock.
 ## Tests
 
 `cargo test`: unit tests (dump validation, private paths, GC order and alias handling, space
-accounting); needs `mkcomposefs` on PATH. `tests/integration.sh <scratch dir>`: the `#[ignore]`d
-mount tests (commit/use round trip, renames, failed-commit recovery, busy views) as root in the
-helper image; needs privileged docker, kernel 6.12+ and a scratch directory on ext4, xfs or btrfs.
-`scripts/stacks-e2e.sh` (repo root) drives the CLI end to end against real feeds: shared
-and unshared layers, warm re-runs, `unlock`, a compile section, a busy project, `status`,
-`prune`, `clean`, `gc`, and a host whose helper cannot run.
+accounting, the kernel floor); needs `mkcomposefs` on PATH. `tests/integration.sh <scratch
+dir>`: the `#[ignore]`d mount tests (commit/use round trip, renames, failed-commit recovery,
+busy views, taking over a plain install, the mount mode and loop-device release) as root in the
+helper image, run twice: the way the kernel mounts EROFS, then forced through loop devices
+(`AVOCADO_STACKS_FORCE_LOOP=1`). Needs privileged docker, kernel 6.5+ and a scratch directory
+on ext4, xfs or btrfs. CI runs both on every pull request (`pr.yml`, on a runner whose kernel
+needs the loop path).
+
+`scripts/stacks-e2e.sh` (repo root) drives the CLI end to end against real feeds: shared and
+unshared layers, warm re-runs, `unlock`, stacks against plain volumes (the same inputs must give
+byte-identical trees, including a project built only from another's stored layers), parallel
+installs, `commit: false`, migrating a plain project, a compile section, a busy project,
+`status`, `prune`, `clean`, `gc`, and a host whose helper cannot run. CI runs it nightly and on
+pull requests that touch stacks (`stacks-e2e.yml`).
+
+In the CLI, `every_config_field_is_classified_for_stack_keys` (`src/commands/sdk/install.rs`)
+holds every field of the config schema to a decision: an install input must move the layer
+keys when it changes, anything else says why it is not one. A new schema field fails it until
+it is classified.
 
 ## Requirements
 
-Rootful docker on Linux 6.12+ (file-backed EROFS; data-only overlay lowers need 6.5+, and
-6.5-6.11 would need a loop-device fallback that is not implemented yet), or avocado-vm.
-`preflight` mounts a real view; the CLI runs it once per process and falls back to plain
-volumes (with a warning) when it fails.
-Build: `cargo build --release --target x86_64-unknown-linux-musl`, then
-`docker build -f Dockerfile.helper -t avocado-stacks:poc` with the binary in the context.
+Rootful docker that can run `--privileged`, on Linux 6.5+ (data-only overlay lowers), or
+avocado-vm. Layers mount file-backed on 6.12+ and through read-only loop devices on 6.5-6.11:
+only metadata goes through the loop device (file data comes from `objects/`), and it is
+attached with autoclear, so it goes away with the view's last unmount. The helper binds the
+host's `/dev` for the loop nodes the kernel creates on demand. The stacks root must be on ext4,
+xfs or btrfs. `preflight` mounts a real view and reports the kernel and the mount mode; the CLI
+runs it once per process and falls back to plain volumes when it fails.
+
+Build: `docker build -f Dockerfile.helper -t avocado-stacks:dev .` (multi-stage: it compiles
+the crate). CI publishes `:edge` from main and `:<version>` from release tags
+(`stacks-helper.yml`), for amd64 and arm64.

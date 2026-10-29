@@ -557,10 +557,16 @@ pub struct ViewRecord {
     /// `report` shows and what the CLI's orphan check reads.
     #[serde(default)]
     pub meta: serde_json::Value,
+    /// The upper holds work no layer has: a step ran here without committing (`taint`). The
+    /// view is not "on" its layer until it next switches layers, which empties the upper.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 pub struct Stacks {
     pub root: PathBuf,
+    /// How this process last mounted an EROFS image (what `preflight` reports).
+    last_mode: Mutex<Option<ErofsMode>>,
 }
 
 /// A held flock; released on drop.
@@ -598,23 +604,63 @@ pub fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn mount_erofs(image: &Path, at: &Path) -> Result<()> {
-    let (src, dst) = (cstr(image), cstr(at));
-    let fstype = CString::new("erofs").unwrap();
-    let r = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            fstype.as_ptr(),
-            libc::MS_RDONLY,
-            std::ptr::null(),
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("mount erofs {}", image.display()));
+/// How a layer's EROFS image gets mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ErofsMode {
+    /// mount(2) on the image file itself (EROFS_FS_BACKED_BY_FILE, kernel 6.12+).
+    File,
+    /// Through a read-only loop device (kernels 6.5-6.11). Only metadata goes through it: file
+    /// data comes from objects/ via the overlay's data-only lower.
+    Loop,
+}
+
+/// `AVOCADO_STACKS_FORCE_LOOP=1` takes the loop path even where file-backed mounts work, so the
+/// fallback is testable on any kernel.
+fn force_loop() -> bool {
+    std::env::var("AVOCADO_STACKS_FORCE_LOOP").is_ok_and(|v| v == "1")
+}
+
+/// Mount `image` read-only at `at`: file-backed where the kernel can, else through a loop device.
+pub fn mount_erofs(image: &Path, at: &Path) -> Result<ErofsMode> {
+    let mut file_err = None;
+    if !force_loop() {
+        // mount(2) directly, not mount(8): the syscall autoloads erofs and mounts the image file
+        // itself; util-linux would reach for a loop device when the module is not loaded yet.
+        let (src, dst) = (cstr(image), cstr(at));
+        let fstype = CString::new("erofs").unwrap();
+        let r = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                libc::MS_RDONLY,
+                std::ptr::null(),
+            )
+        };
+        if r == 0 {
+            return Ok(ErofsMode::File);
+        }
+        // A kernel without file-backed EROFS rejects a regular file as the source (ENOTBLK
+        // on the kernels we have seen); try the loop device, and report both if it fails too.
+        file_err = Some(std::io::Error::last_os_error());
     }
-    Ok(())
+    // mount(8) with `loop` attaches a read-only loop device with autoclear in the same call, so
+    // the device goes away with the last unmount (the overlay's, since the staging mount is
+    // detached right after). The helper binds the host's /dev: loop nodes the kernel creates
+    // after the container started are not in a container's own /dev.
+    run(Command::new("mount")
+        .args(["-t", "erofs", "-o", "ro,loop"])
+        .arg(image)
+        .arg(at))
+    .with_context(|| match &file_err {
+        Some(e) => format!(
+            "mount erofs {}: file-backed: {e}; through a loop device",
+            image.display()
+        ),
+        None => format!("mount erofs {} through a loop device", image.display()),
+    })?;
+    Ok(ErofsMode::Loop)
 }
 
 pub fn is_mounted(p: &Path) -> bool {
@@ -662,6 +708,7 @@ impl Stacks {
         }
         let s = Stacks {
             root: root.to_path_buf(),
+            last_mode: Mutex::new(None),
         };
         if !s.has_layer(EMPTY_KEY) {
             let root_entry = Entry {
@@ -975,6 +1022,82 @@ impl Stacks {
     }
 
     /// Mount view `name` on its recorded layer (or `layer`, for a new view). Idempotent.
+    /// Before mounting at `merged`: what lies there on the volume would be hidden by the mount.
+    /// Without `adopt` that refuses (`NEEDS_ADOPT`), so nothing is ever hidden or deleted
+    /// unasked; the CLI first makes sure no container uses the volume. With `adopt`, the view's
+    /// private paths (project outputs) merge into its upper file by file, the files on the
+    /// volume winning, since they were written while the view was not mounted; the rest is an
+    /// SDK install the layers reproduce, and is deleted.
+    fn adopt(&self, v: &ViewRecord, merged: &Path, adopt: bool) -> Result<()> {
+        if v.at.is_none() || fs::read_dir(merged).map_or(true, |mut d| d.next().is_none()) {
+            return Ok(());
+        }
+        // Never through a mount: a view this process failed to see as mounted would have its
+        // whole tree deleted through the overlay.
+        let dev = |p: &Path| fs::metadata(p).map(|m| m.dev());
+        if let (Ok(d), Some(Ok(pd))) = (dev(merged), merged.parent().map(dev)) {
+            if d != pd {
+                bail!(
+                    "{} is a mount point; not adopting through it",
+                    merged.display()
+                );
+            }
+        }
+        if !adopt {
+            bail!(
+                "NEEDS_ADOPT: {} holds files a plain (non-stacks) install left; mounting the view \
+                 would hide them",
+                merged.display()
+            );
+        }
+        let upper = self.view_dir(&v.name).join("upper");
+        for rel in Private::new(&v.private).present_under(merged) {
+            let (from, to) = (merged.join(&rel), upper.join(&rel));
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Nothing there yet: one rename (when on the same filesystem). Otherwise merge, so
+            // outputs only the upper has (another runtime's images) survive.
+            if fs::symlink_metadata(&to).is_err() && fs::rename(&from, &to).is_ok() {
+                continue;
+            }
+            // Types as they are, links not followed: a symlink is copied as a link, never through.
+            let is_dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+            let cp = || {
+                let mut c = Command::new("cp");
+                c.args(["-a", "--reflink=auto", "--remove-destination"]);
+                c
+            };
+            if is_dir(&from) && is_dir(&to) {
+                run(cp().arg(from.join(".")).arg(&to))?;
+            } else {
+                // Different types: stage the copy first, so a failed copy deletes nothing.
+                let staged = to.with_extension("adopt-tmp");
+                rm_rf(&staged)?;
+                run(cp().arg(&from).arg(&staged))?;
+                rm_rf(&to)?;
+                fs::rename(&staged, &to)?;
+            }
+            rm_rf(&from)?;
+        }
+        for e in fs::read_dir(merged)? {
+            rm_rf(&e?.path())?;
+        }
+        Ok(())
+    }
+
+    /// Mark a view's upper as holding uncommitted work (see `ViewRecord::dirty`).
+    pub fn taint(&self, name: &str) -> Result<()> {
+        let mut v = self.view(name)?.ok_or_else(|| anyhow!("no view {name}"))?;
+        v.dirty = true;
+        self.save_view(&v)
+    }
+
+    /// How this process last mounted an EROFS image, if it mounted one.
+    pub fn last_mode(&self) -> Option<ErofsMode> {
+        *self.last_mode.lock().unwrap()
+    }
+
     pub fn merged(&self, v: &ViewRecord) -> PathBuf {
         v.at.clone()
             .unwrap_or_else(|| self.view_dir(&v.name).join("merged"))
@@ -986,7 +1109,7 @@ impl Stacks {
         layer: Option<&str>,
         private: &[String],
     ) -> Result<ViewRecord> {
-        self.mount_view_at(name, layer, private, None, None)
+        self.mount_view_at(name, layer, private, None, None, false)
     }
 
     pub fn mount_view_at(
@@ -996,6 +1119,7 @@ impl Stacks {
         private: &[String],
         at: Option<&Path>,
         meta: Option<serde_json::Value>,
+        adopt: bool,
     ) -> Result<ViewRecord> {
         // Shared GC lock: GC clears tmp/ (where the staging mount lives) and must see the lease.
         let _gc = self.gc_lock(false)?;
@@ -1006,6 +1130,7 @@ impl Stacks {
             updated: now_secs(),
             at: None,
             meta: serde_json::Value::Null,
+            dirty: false,
         });
         if !private.is_empty() {
             v.private = private.to_vec();
@@ -1074,10 +1199,9 @@ impl Stacks {
             .join("tmp")
             .join(format!("erofs.{name}.{}", crate::uniq()));
         fs::create_dir_all(&tmp)?;
-        // mount(2) directly, not mount(8): the syscall autoloads erofs and mounts the image file
-        // itself (EROFS_FS_BACKED_BY_FILE, kernel >= 6.12); util-linux would instead reach for a
-        // loop device when the module is not loaded yet, and the helper has none.
-        mount_erofs(&self.erofs_path(&v.layer), &tmp)?;
+        self.adopt(&v, &merged, adopt)?;
+        let mode = mount_erofs(&self.erofs_path(&v.layer), &tmp)?;
+        *self.last_mode.lock().unwrap() = Some(mode);
         let opts = format!(
             "lowerdir={}::{},upperdir={},workdir={},metacopy=on,redirect_dir=on",
             tmp.display(),
@@ -1144,6 +1268,7 @@ impl Stacks {
         self.umount_view(name)?;
         self.reset_upper(&v)?;
         v.layer = key.to_string();
+        v.dirty = false;
         self.save_view(&v)?;
         self.mount_view(name, Some(key), &[])
     }
@@ -1265,6 +1390,7 @@ impl Stacks {
         self.reset_upper(&v)?;
         let mut v = v;
         v.layer = key.to_string();
+        v.dirty = false;
         self.save_view(&v)?;
         self.mount_view(name, Some(key), &[])?;
         Ok(rec)
@@ -1328,15 +1454,21 @@ impl Stacks {
 
     /// Mount every recorded view whose name starts with `prefix` that is not mounted (after a
     /// reboot, or on a project's first command of the day).
-    pub fn remount(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut out = Vec::new();
+    /// Mount every recorded, unmounted view whose name starts with `prefix`. A view whose
+    /// mount point holds a plain install is left unmounted and listed in the second vector: only
+    /// an install (`mount --adopt`, with the volume idle) may take that over.
+    pub fn remount(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>)> {
+        let (mut out, mut blocked) = (Vec::new(), Vec::new());
         for v in self.views()? {
             if v.name.starts_with(prefix) && !is_mounted(&self.merged(&v)) {
-                self.mount_view(&v.name, None, &[])?;
-                out.push(v.name);
+                match self.mount_view(&v.name, None, &[]) {
+                    Ok(_) => out.push(v.name),
+                    Err(e) if format!("{e:#}").contains("NEEDS_ADOPT") => blocked.push(v.name),
+                    Err(e) => return Err(e),
+                }
             }
         }
-        Ok(out)
+        Ok((out, blocked))
     }
 
     /// Make `alias` another name for layer `key` (symlinked files; evicting `key` breaks it,
@@ -2251,6 +2383,92 @@ mod tests {
         assert_eq!(st.ancestors("k1"), vec![EMPTY_KEY.to_string()]);
         let (ok, _, _) = st.verify("k1").unwrap();
         assert!(ok, "verify digest");
+        it_cleanup(&dir, &st);
+    }
+
+    /// The mode follows `AVOCADO_STACKS_FORCE_LOOP` (tests/integration.sh runs the suite both
+    /// ways), and a loop-mounted layer leaves no loop device behind once its view is gone.
+    #[test]
+    #[ignore = "needs root and real mounts: tests/integration.sh"]
+    fn it_mount_mode_and_loop_release() {
+        let Some((dir, st)) = it_stacks() else { return };
+        let v = st.mount_view("v", Some(EMPTY_KEY), &[]).unwrap();
+        fs::write(st.merged(&v).join("f"), b"data").unwrap();
+        st.commit_view("v", "k", serde_json::json!({})).unwrap();
+        let mode = st.last_mode().unwrap();
+        if force_loop() {
+            assert_eq!(mode, ErofsMode::Loop);
+        }
+        assert_eq!(fs::read(st.merged(&v).join("f")).unwrap(), b"data");
+        st.drop_view("v").unwrap();
+        let attached = Command::new("losetup")
+            .arg("-j")
+            .arg(st.erofs_path("k"))
+            .output()
+            .unwrap();
+        assert!(
+            attached.stdout.is_empty(),
+            "{mode:?}: loop device left attached: {}",
+            String::from_utf8_lossy(&attached.stdout)
+        );
+        it_cleanup(&dir, &st);
+    }
+
+    /// Mounting over what a plain install left: refused unless asked (nothing hidden or deleted
+    /// unasked, and `remount` leaves such a view alone); asked, the private paths merge into the
+    /// upper file by file and the rest is cleared, not hidden.
+    #[test]
+    #[ignore = "needs root and real mounts: tests/integration.sh"]
+    fn it_adopts_a_plain_install() {
+        let Some((dir, st)) = it_stacks() else { return };
+        let at = dir.join("volume/qemux86-64");
+        fs::create_dir_all(at.join("sdk/bin")).unwrap();
+        fs::write(at.join("sdk/bin/old"), b"plain sdk").unwrap();
+        fs::create_dir_all(at.join("runtimes/dev")).unwrap();
+        fs::write(at.join("runtimes/dev/image"), b"built").unwrap();
+        let private = vec!["runtimes".to_string()];
+        let mount =
+            |adopt| st.mount_view_at("v", Some(EMPTY_KEY), &private, Some(&at), None, adopt);
+        let e = mount(false).unwrap_err();
+        assert!(format!("{e:#}").contains("NEEDS_ADOPT"), "{e:#}");
+        assert!(at.join("sdk/bin/old").exists(), "refusing touched nothing");
+        mount(true).unwrap();
+        assert!(!at.join("sdk").exists(), "plain SDK hidden, not cleared");
+        assert_eq!(fs::read(at.join("runtimes/dev/image")).unwrap(), b"built");
+        // Outputs only the view has: another runtime's.
+        fs::create_dir_all(at.join("runtimes/prod")).unwrap();
+        fs::write(at.join("runtimes/prod/image"), b"prod").unwrap();
+        st.umount_view("v").unwrap();
+        assert_eq!(
+            fs::read_dir(&at).unwrap().count(),
+            0,
+            "left under the mount"
+        );
+        // A plain run while the view was unmounted rebuilt dev only.
+        fs::create_dir_all(at.join("runtimes/dev")).unwrap();
+        fs::write(at.join("runtimes/dev/image"), b"rebuilt").unwrap();
+        let (mounted, blocked) = st.remount("v").unwrap();
+        assert!(
+            mounted.is_empty() && blocked == ["v"],
+            "{mounted:?} {blocked:?}"
+        );
+        st.mount_view_at("v", None, &private, Some(&at), None, true)
+            .unwrap();
+        assert_eq!(fs::read(at.join("runtimes/dev/image")).unwrap(), b"rebuilt");
+        assert_eq!(fs::read(at.join("runtimes/prod/image")).unwrap(), b"prod");
+        it_cleanup(&dir, &st);
+    }
+
+    /// A step that ran without committing marks the view; switching layers clears it.
+    #[test]
+    #[ignore = "needs root and real mounts: tests/integration.sh"]
+    fn it_taint_until_the_next_switch() {
+        let Some((dir, st)) = it_stacks() else { return };
+        st.mount_view("v", Some(EMPTY_KEY), &[]).unwrap();
+        st.taint("v").unwrap();
+        assert!(st.view("v").unwrap().unwrap().dirty);
+        st.use_layer("v", EMPTY_KEY, &[]).unwrap();
+        assert!(!st.view("v").unwrap().unwrap().dirty);
         it_cleanup(&dir, &st);
     }
 
