@@ -193,8 +193,10 @@ jobs:
             --pattern '*.sha256'
 
       - name: Concatenate into SHA256SUMS
+        # `awk 1`, not `cat`: the Windows leg writes its .sha256 without a trailing newline,
+        # and `cat` ran that line into the next one, so `sha256sum -c` failed for both.
         run: |
-          cat sums/*.sha256 > SHA256SUMS
+          awk 1 sums/*.sha256 > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload SHA256SUMS to release
@@ -278,10 +280,13 @@ jobs:
           PY
           cat Formula/avocado-cli.rb
 
-      - name: Commit and push
+      # The tap's main only takes changes through a reviewed pull request, so the bump goes
+      # up as a branch and a PR rather than a push to main.
+      - name: Open a pull request with the bump
         working-directory: homebrew-tap
         env:
           TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config user.name "avocado-release-bot"
           git config user.email "release-bot@avocadolinux.org"
@@ -289,6 +294,15 @@ jobs:
             echo "Formula already up to date for ${TAG}; nothing to commit."
             exit 0
           fi
+          branch="avocado-cli-${TAG}"
+          git checkout -b "$branch"
           git add Formula/avocado-cli.rb
           git commit -m "avocado-cli ${TAG}"
-          git push
+          git push --force origin "$branch"
+          if gh pr view "$branch" --repo avocado-linux/homebrew-tap >/dev/null 2>&1; then
+            echo "Pull request for ${branch} already open; branch updated."
+          else
+            gh pr create --repo avocado-linux/homebrew-tap --base main --head "$branch" \
+              --title "avocado-cli ${TAG}" \
+              --body "Formula bump for avocado-cli ${TAG}: version and the four sha256 values from the release's per-archive .sha256 assets."
+          fi
