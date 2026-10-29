@@ -2,7 +2,7 @@
 name = "avocado-stacks"
 version = "0.1.0"
 edition = "2021"
-description = "Content-addressed layer cache for Avocado build state (composefs model). PoC."
+description = "Content-addressed layer cache for Avocado build state (composefs model)."
 license = "Apache-2.0"
 
 [[bin]]

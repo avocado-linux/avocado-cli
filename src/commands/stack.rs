@@ -398,39 +398,55 @@ impl StackCommand {
             path.display(),
             if path.exists() { "" } else { " (not present)" }
         );
-        for (var, val) in [
-            ("AVOCADO_STACKS", std::env::var("AVOCADO_STACKS").ok()),
-            (
-                "AVOCADO_STACKS_HELPER",
-                std::env::var("AVOCADO_STACKS_HELPER").ok(),
-            ),
+        for var in [
+            "AVOCADO_STACKS",
+            "AVOCADO_STACKS_HELPER",
+            "AVOCADO_STACKS_COMMIT",
         ] {
-            if let Some(v) = val {
+            if let Ok(v) = std::env::var(var) {
                 println!("Environment: {var}={v} (overrides the file)");
             }
         }
-        println!("\n{}", serde_yaml::to_string(&s)?);
+        println!(
+            "Helper image: {}\nCommits layers: {}\n\n{}",
+            s.helper_image(),
+            if s.commits() {
+                "yes"
+            } else {
+                "no (commit: false)"
+            },
+            serde_yaml::to_string(&s)?
+        );
         match &s.root {
             None => println!(
-                "Stacks are not configured. To enable them, write {}:\n\n\
-                 root: /var/lib/avocado/stacks   # absolute path on the docker host, on a\n\
-                 \x20                              # filesystem with room (not tmpfs)\n\
-                 # helper_image: avocado-stacks:poc   # not published yet: build it from\n\
-                 \x20                                     # crates/avocado-stacks (see its README)\n\
-                 # gc:\n\
-                 #   max_size: 200G   # evict unused layers to stay under this\n\
-                 #   min_free: 20G    # ...or to keep this much free on that filesystem\n",
-                path.display()
+                "Stacks are off (`enabled: false` or AVOCADO_STACKS=off): installs use plain \
+                 volumes. Remove that to turn them back on."
             ),
             Some(root) => {
-                match crate::utils::stacks::active_root(&self.container_tool).await {
-                    Some(_) => print_success(
-                        &format!("Stacks at {root} work on this host."),
+                let Some(h) = Helper::configured(&self.container_tool)? else {
+                    unreachable!("a root means a helper")
+                };
+                // Always a fresh answer, and no cached failure outliving a fix.
+                if let Ok(d) = crate::utils::signing_keys::get_avocado_config_dir() {
+                    let _ = std::fs::remove_file(d.join("stacks-preflight.json"));
+                }
+                match h.json(&["preflight"]).await {
+                    Ok(p) => print_success(
+                        &format!(
+                            "Stacks at {root} work on this host (kernel {}, layers mount {}).",
+                            p["kernel"].as_str().unwrap_or("?"),
+                            match p["erofs"].as_str() {
+                                Some("loop") => "through loop devices",
+                                _ => "file-backed",
+                            }
+                        ),
                         OutputLevel::Normal,
                     ),
-                    None => {
-                        bail!("stacks at {root} cannot run on this host (see the warning above)")
-                    }
+                    Err(e) => bail!(
+                        "stacks at {root} cannot run on this host ({e:#}); installs use plain \
+                         volumes. They need rootful docker that can run --privileged and Linux \
+                         6.5+, with the root on ext4, xfs or btrfs."
+                    ),
                 }
             }
         }

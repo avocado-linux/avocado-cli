@@ -165,6 +165,45 @@ fn part_layer_inputs(p: &PartKeyInputs) -> serde_json::Value {
     v
 }
 
+/// Everything the L0 (SDK bootstrap) layer's installs read.
+struct L0KeyInputs<'a> {
+    releasever: Option<&'a str>,
+    target: &'a str,
+    host_arch: &'a str,
+    /// The SDK image's id (its name in tests).
+    image_id: &'a str,
+    repo_url: Option<&'a str>,
+    repo_release: Option<&'a str>,
+    feeds_fingerprint: Option<&'a str>,
+    /// The target's section of the lock file, as JSON.
+    lock: &'a serde_json::Value,
+    sdk_target_pkg: &'a str,
+    dnf_args: Option<&'a [String]>,
+    no_weak_deps: bool,
+    container_args: Option<&'a [String]>,
+}
+
+/// L0's key inputs. Lock pins are in them, so a project pinned to other versions gets its own
+/// layer.
+fn l0_layer_inputs(p: &L0KeyInputs) -> serde_json::Value {
+    const BOOTSTRAP: &str = "avocado-sdk-bootstrap";
+    let pins = &p.lock["sdk"][p.host_arch];
+    let mut v = crate::utils::stacks::base_inputs(p.releasever);
+    v["step"] = "L0 sdk bootstrap".into();
+    v["target"] = p.target.into();
+    v["host_arch"] = p.host_arch.into();
+    v["image"] = p.image_id.into();
+    v["repo_url"] = p.repo_url.into();
+    v["repo_release"] = p.repo_release.into();
+    v["feeds"] = p.feeds_fingerprint.into();
+    v["pins"] = serde_json::json!([pins[p.sdk_target_pkg], pins[BOOTSTRAP]]);
+    v["pins_of"] = serde_json::json!([p.sdk_target_pkg, BOOTSTRAP]);
+    v["dnf_args"] = p.dnf_args.into();
+    v["no_weak_deps"] = p.no_weak_deps.into();
+    v["container_args"] = p.container_args.into();
+    v
+}
+
 struct BootstrapResult {
     /// Reloaded composed config (after fetching remote extensions)
     composed: ComposedConfig,
@@ -767,9 +806,22 @@ impl SdkInstallCommand {
                 // One install at a time per view: the steps switch the view's layer.
                 _install_lock = Some(s.lock_install().await?);
                 s.ensure_view().await?;
+                if !vs.stacks {
+                    let mut vs = vs.clone();
+                    vs.stacks = true;
+                    vs.save_to_dir(&container_helper.cwd)?;
+                }
                 Some(s)
             }
-            None => None,
+            None => {
+                if self.runs_on.is_none() {
+                    let on_stacks =
+                        crate::utils::volume::VolumeState::load_from_dir(&container_helper.cwd)?
+                            .is_some_and(|v| v.stacks);
+                    crate::utils::stacks::refuse_plain_install(on_stacks)?;
+                }
+                None
+            }
         };
 
         // Phase 1: Bootstrap — sets up SDK env, installs bootstrap package, fetches extensions
@@ -1851,31 +1903,24 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
         // project pinned to other versions gets its own layer.
         let l0_inputs = match stacks {
             Some(s) => {
-                let pins = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
-                let pins = &pins["sdk"][host_arch.as_str()];
-                let mut v = crate::utils::stacks::base_inputs(
-                    std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
-                );
-                v["step"] = "L0 sdk bootstrap".into();
-                v["target"] = target.into();
-                v["host_arch"] = host_arch.as_str().into();
-                v["image"] = crate::utils::stacks::image_id(
-                    &container_helper.container_tool,
-                    container_image,
-                )
-                .await?
-                .into();
-                v["repo_url"] = repo_url.into();
-                v["repo_release"] = repo_release.into();
-                v["feeds"] = feeds.map(|f| f.fingerprint.clone()).into();
-                v["pins"] = serde_json::json!([
-                    pins[sdk_target_pkg_name.as_str()],
-                    pins[bootstrap_pkg_name]
-                ]);
-                v["pins_of"] = serde_json::json!([sdk_target_pkg_name, bootstrap_pkg_name]);
-                v["dnf_args"] = self.dnf_args.clone().into();
-                v["no_weak_deps"] = config.get_sdk_disable_weak_dependencies().into();
-                v["container_args"] = merged_container_args.cloned().into();
+                let mut v = l0_layer_inputs(&L0KeyInputs {
+                    releasever: std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
+                    target,
+                    host_arch: host_arch.as_str(),
+                    image_id: &crate::utils::stacks::image_id(
+                        &container_helper.container_tool,
+                        container_image,
+                    )
+                    .await?,
+                    repo_url,
+                    repo_release,
+                    feeds_fingerprint: feeds.map(|f| f.fingerprint.as_str()),
+                    lock: &serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default(),
+                    sdk_target_pkg: &sdk_target_pkg_name,
+                    dnf_args: self.dnf_args.as_deref(),
+                    no_weak_deps: config.get_sdk_disable_weak_dependencies(),
+                    container_args: merged_container_args.map(|a| a.as_slice()),
+                });
                 s.scope(&mut v);
                 Some((s, v))
             }
@@ -2861,6 +2906,525 @@ runtimes:
             let got = base_inputs_of(t.path(), &edited);
             assert_ne!(got, base, "{what} must change the Base layer key");
         }
+    }
+
+    /// The layer a config field's install changes: its key, and so every layer above, must move.
+    const L0: usize = 0;
+    const L1: usize = 1;
+    const L2: usize = 2;
+
+    /// How one config field relates to the stack layer keys.
+    enum KeyRole {
+        /// Changes what `sdk install` puts in this layer: setting the field to this YAML value
+        /// must change the layer's key.
+        Keyed(usize, &'static str),
+        /// Like `Keyed`, on a base that first sets these other fields (on both sides).
+        KeyedOver(usize, &'static [(&'static str, &'static str)], &'static str),
+        /// An old name for another field: the same value under either name gives the same keys,
+        /// and this layer's key differs from the base config's.
+        Alias(usize, &'static str, &'static str),
+        /// Not read by `sdk install` (or read without changing the installed tree): why.
+        #[allow(dead_code)]
+        Unread(&'static str),
+        /// A section whose fields are classified one by one.
+        Section,
+    }
+
+    /// Every field of the config schema, top level and inside the sections `sdk install` reads.
+    /// A field added to the schema fails `every_config_field_is_classified_for_stack_keys` until
+    /// it is classified here, so nobody adds an install input that silently shares layers
+    /// between projects that differ in it.
+    const STACK_KEY_ROLES: &[(&str, KeyRole)] = &[
+        (
+            "cli_requirement",
+            KeyRole::Unread("checked before anything runs"),
+        ),
+        (
+            "connect",
+            KeyRole::Unread("Connect provisioning, after install"),
+        ),
+        (
+            "default_runtime",
+            KeyRole::Unread("picks the runtime; the install's own inputs are keyed"),
+        ),
+        (
+            "default_target",
+            KeyRole::Unread("picks the target, which every key carries"),
+        ),
+        (
+            "default_target_board",
+            KeyRole::Unread("picks the board; its packages are keyed"),
+        ),
+        ("distro", KeyRole::Section),
+        ("distro.channel", KeyRole::Keyed(L0, "next")),
+        (
+            "distro.feeds",
+            // A declared repo alone already makes layers private; enabling it must move the
+            // key on top of that.
+            KeyRole::KeyedOver(
+                L1,
+                &[(
+                    "repos.extra",
+                    "{url: 'https://example.com/extra/$releasever'}",
+                )],
+                "[extra]",
+            ),
+        ),
+        ("distro.release", KeyRole::Keyed(L0, "'2099'")),
+        (
+            "distro.repo",
+            KeyRole::Keyed(L0, "{url: 'https://example.com/other'}"),
+        ),
+        (
+            "distro.version",
+            KeyRole::Alias(L0, "distro.release", "'2099'"),
+        ),
+        (
+            "ext",
+            KeyRole::Unread("old top-level name, rejected by the schema's newer form"),
+        ),
+        (
+            "extensions",
+            KeyRole::Keyed(L2, "{app: {sdk: {packages: {vim: '*'}}}}"),
+        ),
+        ("initramfs", KeyRole::Section),
+        (
+            "initramfs.dependencies",
+            KeyRole::Alias(L1, "initramfs.packages", "{busybox: '*'}"),
+        ),
+        (
+            "initramfs.filesystem",
+            KeyRole::Unread("image build, after install"),
+        ),
+        (
+            "initramfs.image",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("initramfs.overlay", KeyRole::Keyed(L1, "rootfs-overlay")),
+        ("initramfs.packages", KeyRole::Keyed(L1, "{busybox: '*'}")),
+        (
+            "initramfs.permissions",
+            KeyRole::Keyed(L1, "{users: {app: {}}}"),
+        ),
+        (
+            "initramfs.post_install",
+            KeyRole::Keyed(L1, "post-install.sh"),
+        ),
+        (
+            "initramfs.source",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("kernel", KeyRole::Section),
+        (
+            "kernel.cmdline",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.cmdline_extra",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.compile",
+            KeyRole::Unread("names an sdk.compile section, keyed there"),
+        ),
+        (
+            "kernel.image",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.install",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        ("kernel.package", KeyRole::Keyed(L1, "kernel-image-other")),
+        (
+            "kernel.source",
+            KeyRole::Unread("kernel compile, after install"),
+        ),
+        ("kernel.version", KeyRole::Keyed(L1, "'6.6.99'")),
+        ("permissions", KeyRole::Keyed(L1, "{users: {app: {}}}")),
+        ("provision", KeyRole::Unread("provisioning, after install")),
+        (
+            "provision_profiles",
+            KeyRole::Unread("provisioning, after install"),
+        ),
+        (
+            "repos",
+            KeyRole::Unread(
+                "definitions only: distro.feeds enables them (keyed); declaring any makes the \
+                 project's layers private (stacks::shareable)",
+            ),
+        ),
+        ("rootfs", KeyRole::Section),
+        (
+            "rootfs.dependencies",
+            KeyRole::Alias(L1, "rootfs.packages", "{vim: '*'}"),
+        ),
+        (
+            "rootfs.filesystem",
+            KeyRole::Unread("image build, after install"),
+        ),
+        (
+            "rootfs.image",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("rootfs.overlay", KeyRole::Keyed(L1, "other-overlay")),
+        ("rootfs.packages", KeyRole::Keyed(L1, "{vim: '*'}")),
+        (
+            "rootfs.permissions",
+            KeyRole::Keyed(L1, "{users: {app: {}}}"),
+        ),
+        (
+            "rootfs.post_install",
+            KeyRole::Keyed(L1, "other-post-install.sh"),
+        ),
+        (
+            "rootfs.source",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("runtime", KeyRole::Unread("old top-level name")),
+        (
+            "runtimes",
+            KeyRole::Keyed(L2, "{dev: {target: qemux86-64}}"),
+        ),
+        ("sdk", KeyRole::Section),
+        (
+            "sdk.compile",
+            KeyRole::Keyed(L2, "{app: {packages: {make: '*'}}}"),
+        ),
+        ("sdk.container_args", KeyRole::Keyed(L0, "['-e', 'X=1']")),
+        (
+            "sdk.dependencies",
+            // ponytail: install reads only `packages` (get_sdk_dependencies_for_target), so the old
+            // name installs nothing and cannot split layers. When that is fixed, make this
+            // Alias("sdk.packages", ...) and the test checks it keys like `packages`.
+            KeyRole::Unread("sdk install ignores the old name (reads only sdk.packages)"),
+        ),
+        ("sdk.disable_weak_dependencies", KeyRole::Keyed(L0, "true")),
+        ("sdk.host_gid", KeyRole::Unread("schema: no effect")),
+        (
+            "sdk.host_uid",
+            KeyRole::Unread("schema: no effect; overlays copy as root regardless"),
+        ),
+        (
+            "sdk.image",
+            KeyRole::Keyed(L0, "docker.io/avocadolinux/sdk:2099"),
+        ),
+        ("sdk.packages", KeyRole::Keyed(L2, "{nano: '*'}")),
+        ("sdk.repo_release", KeyRole::Keyed(L0, "'2099'")),
+        (
+            "sdk.repo_url",
+            KeyRole::Keyed(L0, "https://example.com/repo"),
+        ),
+        ("signing_keys", KeyRole::Unread("signing, after install")),
+        (
+            "source_date_epoch",
+            KeyRole::Unread("image and runtime builds, after install"),
+        ),
+        (
+            "src_dir",
+            KeyRole::Unread("where sources are; their contents are keyed"),
+        ),
+        (
+            "supported_targets",
+            KeyRole::Unread("validates the target, which every key carries"),
+        ),
+    ];
+
+    /// The three layer keys `sdk install` computes for a config, each on its parent, from the
+    /// same input builders the install uses (`l0_layer_inputs`, `part_layer_inputs`) fed by the
+    /// same config readers. Left at fixed values: what does not come from the config (the SDK
+    /// image's id, which stands in as its name, lock pins, the CLI build, `--dnf-arg`) and the
+    /// target-dev package names (rendered with the dnf command; their sources, the compile
+    /// sections, are keyed through `compile_deps`).
+    fn stack_layer_keys(dir: &std::path::Path, yaml: &str) -> anyhow::Result<[String; 3]> {
+        use crate::utils::device_tree_overlay as dto;
+        let config_path = dir.join("avocado.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let path = config_path.to_string_lossy().to_string();
+        let target = "qemux86-64";
+        let composed = Config::load_composed(&path, Some(target))?;
+        let (config, merged) = (&composed.config, &composed.merged_value);
+        let root = config.project_root(&path);
+        let lock = LockFile::load(&root)?;
+        let lock_json = serde_json::to_value(lock.targets.get(target))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let feeds = |stage| -> anyhow::Result<Option<String>> {
+            Ok(rt
+                .block_on(config.materialize_feeds(target, stage, &path))?
+                .map(|f| f.fingerprint))
+        };
+        let (sdk_feeds, target_dev_feeds) = (feeds(FeedStage::Sdk)?, feeds(FeedStage::SdkTarget)?);
+        let (repo_url, repo_release) = (config.get_sdk_repo_url(), config.get_sdk_repo_release());
+        let container_args = config.merge_sdk_container_args(None);
+        let no_weak_deps = config.get_sdk_disable_weak_dependencies();
+        let image = config.get_sdk_image().cloned().unwrap_or_default();
+
+        let l0 = l0_layer_inputs(&L0KeyInputs {
+            releasever: None,
+            target,
+            host_arch: "x86_64",
+            image_id: &image,
+            repo_url: repo_url.as_deref(),
+            repo_release: repo_release.as_deref(),
+            feeds_fingerprint: sdk_feeds.as_deref(),
+            lock: &lock_json,
+            sdk_target_pkg: "avocado-sdk-qemux86-64",
+            dnf_args: None,
+            no_weak_deps,
+            container_args: container_args.as_deref(),
+        });
+
+        let active =
+            crate::utils::config::find_active_extensions(config, merged, target, &path, None)?;
+        let sections = crate::utils::config::find_active_compile_sections(
+            config, merged, &active, target, &path, None,
+        )?;
+        let sdk_deps = config.get_sdk_dependencies_for_target(&path, target)?;
+        let base_sdk_deps = sdk_deps.as_ref().map(|m| {
+            m.iter()
+                .filter(|(k, _)| k.starts_with("avocado-sdk-"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>()
+        });
+        let ext_deps: HashMap<String, HashMap<String, Value>> = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                yaml,
+                Some(&path),
+                Some(target),
+            )?
+            .into_iter()
+            .filter(|(name, _)| active.contains(name))
+            .collect();
+        let no_ext = HashMap::new();
+        let dto_parsed = dto::with_boot_settings_for_target(config, merged, target);
+        let part = |part, sdk_deps, ext_deps, sysroots, compile_deps| {
+            part_layer_inputs(&PartKeyInputs {
+                part,
+                releasever: None,
+                target,
+                sdk_deps,
+                ext_deps,
+                feeds_fingerprint: sdk_feeds.as_deref(),
+                feeds_config: &merged["feeds"],
+                repo_url: repo_url.as_deref(),
+                repo_release: repo_release.as_deref(),
+                dnf_args: None,
+                no_weak_deps,
+                container_args: container_args.as_deref(),
+                lock: &lock_json,
+                sysroots,
+                target_dev: None,
+                target_dev_feeds: target_dev_feeds.as_deref(),
+                compile_deps,
+                provision_dto: part == Part::Project
+                    && !dto::active_extensions_declaring_overlays(&dto_parsed, &active).is_empty(),
+                provision_dto_compiler: part == Part::Project
+                    && !dto::active_extensions_compiling_overlays(&dto_parsed, &active).is_empty(),
+            })
+        };
+        let l1 = part(
+            Part::Base,
+            &base_sdk_deps,
+            &no_ext,
+            Some(base_layer_sysroot_inputs(
+                config,
+                merged,
+                &root,
+                target,
+                None,
+                repo_url.as_deref(),
+                repo_release.as_deref(),
+                None,
+                &lock,
+            )?),
+            None,
+        );
+        let l2 = part(
+            Part::Project,
+            &sdk_deps,
+            &ext_deps,
+            None,
+            Some(
+                crate::utils::stamps::compute_compile_deps_input_hash(merged, &sections)?
+                    .config_hash,
+            ),
+        );
+        let key = |parent: &str, inputs| {
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": parent, "inputs": inputs}))
+        };
+        let k0 = key("empty", l0);
+        let k1 = key(&k0, l1);
+        let k2 = key(&k1, l2);
+        Ok([k0, k1, k2])
+    }
+
+    /// `STACKS_BASE_CONFIG` plus what makes every field observable: a distro (release and
+    /// channel together form the releasever), and an extension and a compile section the runtime
+    /// uses (only active ones are installed).
+    fn key_roles_config() -> String {
+        let with_ext = STACKS_BASE_CONFIG.replace(
+            "runtimes:",
+            "extensions:\n  app:\n    sdk:\n      packages:\n        nano: '*'\nruntimes:",
+        );
+        [
+            ("distro", "{release: '2024', channel: edge}"),
+            ("sdk.compile", "{app: {packages: {gcc: '*'}}}"),
+            (
+                "runtimes",
+                "{dev: {target: qemux86-64, kernel: {compile: app}, extensions: [app]}}",
+            ),
+        ]
+        .iter()
+        .fold(with_ext, |y, (f, v)| with_field(&y, f, v))
+    }
+
+    /// `yaml` with `path` (dotted) set to `value` (YAML), creating sections on the way.
+    fn with_field(yaml: &str, path: &str, value: &str) -> String {
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut node = &mut doc;
+        let parts: Vec<&str> = path.split('.').collect();
+        for p in &parts[..parts.len() - 1] {
+            let m = node.as_mapping_mut().unwrap();
+            node = m
+                .entry(Value::from(*p))
+                .or_insert_with(|| Value::Mapping(Default::default()));
+        }
+        node.as_mapping_mut().unwrap().insert(
+            Value::from(*parts.last().unwrap()),
+            serde_yaml::from_str(value).unwrap(),
+        );
+        serde_yaml::to_string(&doc).unwrap()
+    }
+
+    /// `yaml` without `path` (dotted).
+    fn without_field(yaml: &str, path: &str) -> String {
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut node = &mut doc;
+        for p in &parts[..parts.len() - 1] {
+            node = node.get_mut(*p).unwrap();
+        }
+        node.as_mapping_mut()
+            .unwrap()
+            .remove(Value::from(*parts.last().unwrap()));
+        serde_yaml::to_string(&doc).unwrap()
+    }
+
+    /// The schema's fields: the top level, and one level into each section classified
+    /// `Section`.
+    fn schema_fields() -> Vec<String> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/avocado-config.json")).unwrap();
+        let defs = schema
+            .get("definitions")
+            .or_else(|| schema.get("$defs"))
+            .cloned()
+            .unwrap_or_default();
+        fn resolve(n: &serde_json::Value, defs: &serde_json::Value) -> serde_json::Value {
+            let mut n = n.clone();
+            while let Some(r) = n.get("$ref").and_then(|r| r.as_str()) {
+                n = defs[r.rsplit('/').next().unwrap()].clone();
+            }
+            for k in ["anyOf", "oneOf"] {
+                if let Some(alts) = n.get(k).and_then(|a| a.as_array()) {
+                    if let Some(o) = alts
+                        .iter()
+                        .map(|a| resolve(a, defs))
+                        .find(|a| a.get("properties").is_some())
+                    {
+                        return o;
+                    }
+                }
+            }
+            n
+        }
+        let mut out = Vec::new();
+        for (top, node) in schema["properties"].as_object().unwrap() {
+            out.push(top.clone());
+            let is_section = STACK_KEY_ROLES
+                .iter()
+                .any(|(f, r)| f == top && matches!(r, KeyRole::Section));
+            if is_section {
+                if let Some(props) = resolve(node, &defs)["properties"].as_object() {
+                    out.extend(props.keys().map(|k| format!("{top}.{k}")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Cross-project pollution guard: every schema field is classified, and every field
+    /// classified as an install input moves the key material when it changes. A new schema field
+    /// fails here until someone decides which it is.
+    #[test]
+    #[serial_test::serial]
+    fn every_config_field_is_classified_for_stack_keys() {
+        let mut classified: Vec<String> =
+            STACK_KEY_ROLES.iter().map(|(f, _)| f.to_string()).collect();
+        classified.sort();
+        assert_eq!(
+            schema_fields(),
+            classified,
+            "schema fields and STACK_KEY_ROLES differ: classify the new field (Keyed if \
+             `sdk install` reads it, Unread with the reason if not)"
+        );
+
+        let t = stacks_project();
+        std::fs::create_dir_all(t.path().join("other-overlay/etc")).unwrap();
+        std::fs::write(t.path().join("other-overlay/etc/x"), "x\n").unwrap();
+        std::fs::write(
+            t.path().join("other-post-install.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        let base_config = key_roles_config();
+        let base = stack_layer_keys(t.path(), &base_config).unwrap();
+        let (mut unmoved, mut invalid) = (Vec::new(), Vec::new());
+        for (field, role) in STACK_KEY_ROLES {
+            let keys = |yaml: &str| {
+                stack_layer_keys(t.path(), yaml).map_err(|e| format!("{field}: {e:#}"))
+            };
+            match role {
+                KeyRole::Keyed(layer, value) => {
+                    match keys(&with_field(&base_config, field, value)) {
+                        Ok(k) if k[*layer] == base[*layer] => unmoved.push(*field),
+                        Ok(_) => {}
+                        Err(e) => invalid.push(e),
+                    }
+                }
+                KeyRole::KeyedOver(layer, pre, value) => {
+                    let over = pre
+                        .iter()
+                        .fold(base_config.clone(), |y, (f, v)| with_field(&y, f, v));
+                    match (keys(&over), keys(&with_field(&over, field, value))) {
+                        (Ok(b), Ok(k)) if b[*layer] == k[*layer] => unmoved.push(*field),
+                        (Ok(_), Ok(_)) => {}
+                        (Err(e), _) | (_, Err(e)) => invalid.push(e),
+                    }
+                }
+                KeyRole::Alias(layer, new_name, value) => {
+                    let new = with_field(&base_config, new_name, value);
+                    let old = with_field(&without_field(&base_config, new_name), field, value);
+                    match (keys(&new), keys(&old)) {
+                        (Ok(n), Ok(o)) if n != o => {
+                            invalid.push(format!("{field} does not key like {new_name}"))
+                        }
+                        (Ok(_), Ok(o)) if o[*layer] == base[*layer] => unmoved.push(*field),
+                        (Ok(_), Ok(_)) => {}
+                        (Err(e), _) | (_, Err(e)) => invalid.push(e),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(invalid.is_empty(), "fix these test values: {invalid:#?}");
+        assert!(
+            unmoved.is_empty(),
+            "these install inputs do not reach the stack keys: {unmoved:?}"
+        );
     }
 
     fn key_inputs<'a>(

@@ -20,6 +20,9 @@ pub struct VolumeState {
     pub source_path: String,
     /// Container tool being used (docker/podman)
     pub container_tool: String,
+    /// The project's SDK lives in a stack view inside this volume (set once a view is mounted).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stacks: bool,
 }
 
 /// What `volume rm` says about a volume that does not exist. Docker prints
@@ -55,6 +58,7 @@ impl VolumeState {
             volume_name,
             source_path: source_path.to_string_lossy().to_string(),
             container_tool,
+            stacks: false,
         }
     }
 
@@ -165,6 +169,7 @@ impl VolumeManager {
                 crate::utils::stacks::remount_volume_views(
                     &self.container_tool,
                     &existing_state.volume_name,
+                    existing_state.stacks,
                 )
                 .await?;
                 if self.verbose {

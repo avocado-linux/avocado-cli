@@ -1,12 +1,12 @@
-//! Stacks client. When stacks are configured (`avocado stack config`), a project's
+//! Stacks client. Unless turned off (`avocado stack config`), a project's
 //! `/opt/_avocado/<target>` is a stack view (an EROFS layer + a private upper) mounted inside
 //! its `avo-<uuid>` volume, and `sdk install` produces layers other projects with the same
 //! inputs share.
 //!
 //! Every stacks operation runs in the privileged helper container (`crates/avocado-stacks`) on
 //! the same docker daemon as the SDK containers, so native hosts and avocado-vm take the same
-//! path. A host that cannot run it (kernel older than 6.12, no privileged containers) falls
-//! back to plain volumes with a warning.
+//! path. A host that cannot run it (kernel older than 6.5, no privileged containers, a root on
+//! a filesystem that cannot hold an overlay upper) uses plain volumes.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,19 @@ use tokio::process::{Child, Command};
 
 use crate::utils::output::{print_info, print_warning, OutputLevel};
 
-pub const DEFAULT_HELPER_IMAGE: &str = "avocado-stacks:poc";
+/// Where stacks live on the docker host when the config names no root.
+pub const DEFAULT_ROOT: &str = "/var/lib/avocado/stacks";
+
+/// With no `gc:` limit configured, keep this much free on the stacks filesystem.
+pub const DEFAULT_MIN_FREE: &str = "20G";
+
+/// The helper image this CLI build uses unless configured: its release's tag (release
+/// candidates included), or `edge` (built from main) for `-dev` builds.
+pub fn default_helper_image() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    let tag = if v.ends_with("-dev") { "edge" } else { v };
+    format!("ghcr.io/avocado-linux/avocado-stacks:{tag}")
+}
 
 /// Paths under `/opt/_avocado/<target>` that are project-private: never in a layer, and kept
 /// across layer switches. Extension/runtime outputs (where confext claim tokens and signed
@@ -42,13 +54,26 @@ pub const PRIVATE: &[&str] = &[
 ];
 
 /// Per-machine stacks settings: `<avocado config dir>/stacks.yaml`, then the
-/// environment (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`).
+/// environment (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`, `AVOCADO_STACKS_COMMIT`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Stacks directory on the docker host (absolute). Unset = stacks off.
+    /// `false` turns stacks off (plain volumes). On by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Stacks directory on the docker host (absolute); `DEFAULT_ROOT` when unset. `None` after
+    /// resolving means stacks are off.
     #[serde(default)]
     pub root: Option<String>,
+    /// `false`: reuse layers but never commit new ones; what a step builds stays private to the
+    /// project's view. For jobs whose inputs are not trusted (a CI runner building pull requests
+    /// from forks next to release builds), so they cannot publish a layer others reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<bool>,
+    /// Whether `root` came from the file or the environment (warn on fallback) rather than the
+    /// default (note it quietly).
+    #[serde(skip)]
+    pub explicit: bool,
     /// Helper image (pin by digest in production).
     #[serde(default)]
     pub helper_image: Option<String>,
@@ -70,8 +95,14 @@ pub struct GcSettings {
 }
 
 impl Settings {
-    pub fn helper_image(&self) -> &str {
-        self.helper_image.as_deref().unwrap_or(DEFAULT_HELPER_IMAGE)
+    pub fn helper_image(&self) -> String {
+        self.helper_image
+            .clone()
+            .unwrap_or_else(default_helper_image)
+    }
+
+    pub fn commits(&self) -> bool {
+        self.commit != Some(false)
     }
 
     /// `(--high, --low, --min-free)` for the helper's `gc`, or `None` when no limit is set.
@@ -101,27 +132,58 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(crate::utils::signing_keys::get_avocado_config_dir()?.join("stacks.yaml"))
 }
 
-/// Settings from a config file's text and the two environment variables, validated.
-/// `AVOCADO_STACKS=off` (or `0`, or empty) turns configured stacks off.
-pub fn resolve_settings(
-    file: Option<&str>,
-    env_root: Option<&str>,
-    env_helper: Option<&str>,
-) -> Result<Settings> {
+/// The environment's overrides (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`,
+/// `AVOCADO_STACKS_COMMIT`).
+#[derive(Default)]
+pub struct EnvSettings<'a> {
+    pub root: Option<&'a str>,
+    pub helper: Option<&'a str>,
+    pub commit: Option<&'a str>,
+}
+
+fn off(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "off" | "false" | "no"
+    )
+}
+
+fn on(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
+}
+
+/// Settings from a config file's text and the environment, validated. Stacks are on unless
+/// `enabled: false` or `AVOCADO_STACKS=off` (or `0`, or empty).
+pub fn resolve_settings(file: Option<&str>, env: &EnvSettings) -> Result<Settings> {
     let mut s: Settings = match file {
         Some(t) if !t.trim().is_empty() => {
             serde_yaml::from_str(t).context("invalid stacks config")?
         }
         _ => Settings::default(),
     };
-    if let Some(r) = env_root {
-        s.root = match r.trim() {
-            "" | "0" | "off" | "false" => None,
-            r => Some(r.to_string()),
-        };
-    }
-    if let Some(h) = env_helper.filter(|h| !h.is_empty()) {
+    s.explicit = s.root.is_some();
+    let file_root = s.root.take().unwrap_or_else(|| DEFAULT_ROOT.to_string());
+    s.root = match env.root.map(str::trim) {
+        // `AVOCADO_STACKS=1` (or `on`): on, at the file's root or the default.
+        Some(r) if on(r) => Some(file_root),
+        Some(r) if off(r) => None,
+        Some(r) => Some(r.to_string()),
+        None => (s.enabled != Some(false)).then_some(file_root),
+    };
+    s.explicit |= env.root.is_some();
+    if let Some(h) = env.helper.filter(|h| !h.is_empty()) {
         s.helper_image = Some(h.to_string());
+    }
+    // Fails closed: only a clear yes commits, so a typo in an untrusted job cannot turn
+    // committing back on.
+    if let Some(c) = env.commit {
+        s.commit = Some(on(c));
+    }
+    if s.gc.max_size.is_none() && s.gc.min_free.is_none() {
+        s.gc.min_free = Some(DEFAULT_MIN_FREE.to_string());
     }
     if let Some(r) = &s.root {
         // A path on the docker host (Linux, or the avocado-vm), whatever OS runs the CLI.
@@ -144,10 +206,18 @@ pub fn settings() -> Result<Settings> {
         let file = config_path()
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
+        let (root, helper, commit) = (
+            std::env::var("AVOCADO_STACKS").ok(),
+            std::env::var("AVOCADO_STACKS_HELPER").ok(),
+            std::env::var("AVOCADO_STACKS_COMMIT").ok(),
+        );
         resolve_settings(
             file.as_deref(),
-            std::env::var("AVOCADO_STACKS").ok().as_deref(),
-            std::env::var("AVOCADO_STACKS_HELPER").ok().as_deref(),
+            &EnvSettings {
+                root: root.as_deref(),
+                helper: helper.as_deref(),
+                commit: commit.as_deref(),
+            },
         )
         .map_err(|e| format!("{e:#}"))
     })
@@ -213,21 +283,140 @@ pub async fn active_root(tool: &str) -> Option<String> {
                 }
             };
             let root = s.root.clone()?;
-            match Helper::new(tool, &root, &s).json(&["preflight"]).await {
-                Ok(_) => Some(root),
-                Err(e) => {
-                    print_warning(
-                        &format!(
-                            "Stacks at {root} cannot run on this host ({e:#}). Using plain volumes."
-                        ),
-                        OutputLevel::Normal,
+            match preflight(tool, &root, &s).await {
+                (Ok(()), _) => Some(root),
+                (Err(e), fresh) => {
+                    let msg = format!(
+                        "Stacks at {root} cannot run on this host ({e}). Using plain volumes \
+                         (`avocado stack config` checks again)."
                     );
+                    // Configured on purpose: say it every time. On by default: a note when the
+                    // check ran, not on every command after, since plain volumes are then this
+                    // host's normal path (`AVOCADO_STACKS=off` silences it).
+                    if s.explicit {
+                        print_warning(&msg, OutputLevel::Normal);
+                    } else if fresh {
+                        print_info(&msg, OutputLevel::Normal);
+                    }
                     None
                 }
             }
         })
         .await
         .clone()
+}
+
+/// The helper's preflight (a real view mounted and dropped), remembered per docker host,
+/// kernel, image and root in `<config dir>/stacks-preflight.json`: a day when it worked, an hour
+/// when the host answered no, so hosts that cannot run stacks do not pay for it on every
+/// command. Transient failures (a pull, a daemon hiccup, no answer) are not remembered. The
+/// second value says whether the check ran now (false: from the cache).
+async fn preflight(
+    tool: &str,
+    root: &str,
+    s: &Settings,
+) -> (std::result::Result<(), String>, bool) {
+    let info = Command::new(tool)
+        .args(["info", "-f", "{{.ID}} {{.KernelVersion}}"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let image = s.helper_image();
+    let key = format!(
+        "{info}|{image}|{root}|{}",
+        std::env::var("AVOCADO_STACKS_FORCE_LOOP").unwrap_or_default()
+    );
+    let path = crate::utils::signing_keys::get_avocado_config_dir()
+        .ok()
+        .map(|d| d.join("stacks-preflight.json"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut cache: serde_json::Map<String, Value> = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if let Some(c) = cache.get(&key) {
+        let ok = c["ok"].as_bool() == Some(true);
+        let ttl = if ok { 86_400 } else { 3_600 };
+        if now.saturating_sub(c["at"].as_u64().unwrap_or(0)) < ttl {
+            let r = if ok {
+                Ok(())
+            } else {
+                Err(c["error"]
+                    .as_str()
+                    .unwrap_or("preflight failed")
+                    .to_string())
+            };
+            return (r, false);
+        }
+    }
+    let bounded = |c: &mut Command| {
+        let o = c.kill_on_drop(true).output();
+        tokio::time::timeout(std::time::Duration::from_secs(300), o)
+    };
+    // A tag can move (`:edge`, a re-pushed release): refresh it with each real check, so a
+    // newer CLI never drives an engine pulled long ago. An image with no registry (a local
+    // build) is used as it is.
+    if image.contains('/') && !image.contains("@sha256:") {
+        let _ = bounded(Command::new(tool).args(["pull", "-q", &image])).await;
+    }
+    let image_present = || async {
+        Command::new(tool)
+            .args(["image", "inspect", &image])
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success())
+    };
+    let mut a = match Helper::new(tool, root, s).args() {
+        Ok(a) => a,
+        Err(e) => return (Err(format!("{e:#}")), true),
+    };
+    a.push("preflight".into());
+    let (r, remember) = match bounded(Command::new(&a[0]).args(&a[1..]).stdin(Stdio::null())).await
+    {
+        Ok(Ok(o)) if o.status.success() => (Ok(()), true),
+        Ok(Ok(o)) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // The helper answered no (exit 1), or docker refused to run it with the image at
+            // hand (privileged containers or the bind mounts not allowed): this host's answer.
+            // A missing image is a pull problem, which may pass.
+            let answer = o.status.code() == Some(1) || image_present().await;
+            (Err(err), answer)
+        }
+        Ok(Err(e)) => (Err(format!("run the stacks helper: {e}")), false),
+        Err(_) => (
+            Err("the helper did not answer within 5 minutes".to_string()),
+            false,
+        ),
+    };
+    // Only what a known docker host answered: without `info`, nothing is known about it.
+    if remember && !info.is_empty() {
+        if let Some(p) = path {
+            cache.retain(|_, c| now.saturating_sub(c["at"].as_u64().unwrap_or(0)) < 86_400);
+            cache.insert(
+                key,
+                json!({"ok": r.is_ok(), "error": r.as_ref().err(), "at": now}),
+            );
+            let tmp = p.with_extension(format!("json.{}", std::process::id()));
+            let _ = p
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| {
+                    std::fs::write(
+                        &tmp,
+                        serde_json::to_string_pretty(&cache).unwrap_or_default(),
+                    )
+                })
+                .and_then(|_| std::fs::rename(&tmp, &p));
+        }
+    }
+    (r, true)
 }
 
 /// One helper invocation context: the container tool, the stacks root and the helper image.
@@ -259,9 +448,18 @@ impl Helper {
             "--rm".into(),
             "--privileged".into(),
             "--network=none".into(),
+            // The host's /dev: on kernels without file-backed EROFS layers mount through loop
+            // devices, and nodes the kernel creates after the container started are not in a
+            // container's own /dev.
+            "-v".into(),
+            "/dev:/dev".into(),
             "-v".into(),
             format!("{}:{}:rshared", self.root, self.root),
         ];
+        // Testing the loop path on a kernel that would not need it.
+        if std::env::var("AVOCADO_STACKS_FORCE_LOOP").is_ok_and(|v| v == "1") {
+            a.extend(["-e".into(), "AVOCADO_STACKS_FORCE_LOOP=1".into()]);
+        }
         // Views are mounted inside the project's docker volume, so the helper needs the volumes
         // directory with shared propagation for its mounts to reach the daemon's namespace.
         let v = volumes_dir(&self.tool)?;
@@ -276,6 +474,7 @@ impl Helper {
         Command::new(&a[0])
             .args(&a[1..])
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await
             .context("run the stacks helper")
@@ -357,18 +556,55 @@ static REMOUNTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Called whenever a project's volume is resolved: remount any of its views that are recorded
 /// but not mounted (a reboot drops mounts). Without this, a command would silently see the
 /// volume's own (empty) directory where the view belongs.
-pub async fn remount_volume_views(tool: &str, volume: &str) -> Result<()> {
+///
+/// `on_stacks`: the project's `.avocado-state` says its SDK lives in a stack view. When stacks
+/// cannot run now, say so loudly: commands would see an empty SDK, and `sdk install` refuses to
+/// put a plain install where the view belongs (`refuse_plain_install`).
+pub async fn remount_volume_views(tool: &str, volume: &str, on_stacks: bool) -> Result<()> {
     let Some(root) = active_root(tool).await else {
+        if on_stacks && settings().is_ok_and(|s| s.root.is_some()) {
+            print_warning(
+                "This project's SDK lives in stacks, which cannot run on this host right now \
+                 (see above), so its SDK is not mounted. Fix that (`avocado stack config` checks \
+                 again), or run `avocado clean` to start the project over on plain volumes.",
+                OutputLevel::Normal,
+            );
+        }
         return Ok(());
     };
     if REMOUNTED.lock().unwrap().iter().any(|v| v == volume) {
         return Ok(());
     }
     let h = Helper::new(tool, &root, &settings()?);
-    h.json(&["remount", &format!("{volume}-")])
+    let r = h
+        .json(&["remount", &format!("{volume}-")])
         .await
         .with_context(|| format!("remount the stack views of {volume}"))?;
+    if r["needs_adopt"].as_array().is_some_and(|a| !a.is_empty()) {
+        print_warning(
+            "This project's stack view is not mounted: its volume holds a plain install made \
+             while stacks could not run. The next `avocado sdk install` takes it over.",
+            OutputLevel::Normal,
+        );
+    }
     REMOUNTED.lock().unwrap().push(volume.to_string());
+    Ok(())
+}
+
+/// Before a plain install into a project whose SDK lives in a stack view: refuse when stacks
+/// are on but cannot run (the install would land where the view belongs and be taken over, or
+/// hide nothing useful, once stacks work again). Turned off on purpose (`enabled: false`,
+/// `AVOCADO_STACKS=off`), the plain install is the user's choice.
+pub fn refuse_plain_install(on_stacks: bool) -> Result<()> {
+    // An unreadable config counts as on: the project is on stacks until told otherwise.
+    if on_stacks && settings().map_or(true, |s| s.root.is_some()) {
+        bail!(
+            "this project's SDK lives in stacks, which cannot run on this host right now (see \
+             above). Fix that and retry (`avocado stack config` checks again), run `avocado \
+             clean` to start the project over on plain volumes, or set AVOCADO_STACKS=off to \
+             install plain anyway."
+        );
+    }
     Ok(())
 }
 
@@ -406,8 +642,8 @@ pub async fn drop_volume_views(tool: &str, volume: &str) -> Result<Vec<String>> 
             let mounted = mounts_inside_volume(volume);
             if !mounted.is_empty() {
                 bail!(
-                    "volume {volume} has stack views mounted ({}) but stacks are not \
-                     configured; configure them (`avocado stack config`) so they can be dropped first",
+                    "volume {volume} has stack views mounted ({}) but stacks cannot run here \
+                     now (see `avocado stack config`); fix that so they can be dropped first",
                     mounted.join(", ")
                 );
             }
@@ -459,6 +695,10 @@ pub fn shareable(
 /// Whether the view already holds `key`'s tree: it is on that layer, or on one built on top
 /// of it (a re-run whose earlier steps are unchanged must not switch the view down and back).
 pub fn already_in_view(check: &Value, key: &str) -> bool {
+    // A dirty view (a step ran without committing) is on no layer until it switches.
+    if check["dirty"].as_bool() == Some(true) {
+        return false;
+    }
     let canon = check["canonical"].as_str().unwrap_or(key);
     let current = check["current"].as_str();
     current == Some(canon)
@@ -661,6 +901,11 @@ pub struct Stacks {
     shareable: bool,
     /// (parent, inputs, key) of each step this session ran or hit, in order.
     steps: Mutex<Vec<(String, Value, String)>>,
+    /// `commit: false`: misses build in the view and stay there, uncommitted.
+    commit: bool,
+    /// A step ran without committing: the view's tree is no longer any layer's, so every later
+    /// step builds on it as it is (no hits, no switches).
+    uncommitted: std::sync::atomic::AtomicBool,
 }
 
 /// Holds a build lock (a helper container blocked on our stdin); dropping it releases.
@@ -677,9 +922,12 @@ impl Stacks {
         project: &Path,
         shareable: bool,
     ) -> Result<Self> {
+        let s = settings()?;
         Ok(Self {
             view: view_name(volume, target),
-            helper: Helper::new(tool, root, &settings()?),
+            helper: Helper::new(tool, root, &s),
+            commit: s.commits(),
+            uncommitted: false.into(),
             volume: volume.to_string(),
             target: target.to_string(),
             project: project.to_path_buf(),
@@ -717,8 +965,23 @@ impl Stacks {
         for p in PRIVATE {
             a.extend(["--private", p]);
         }
-        self.helper.json(&a).await?;
-        Ok(())
+        match self.helper.json(&a).await {
+            Err(e) if format!("{e:#}").contains("NEEDS_ADOPT") => {
+                // A plain install is where the view goes (a project from before stacks, or one
+                // installed while stacks could not run). Taking it over deletes its SDK tree,
+                // so nothing may be using it.
+                self.assert_idle().await?;
+                a.push("--adopt");
+                self.helper.json(&a).await?;
+                print_info(
+                    "Stacks: took over this project's plain install (its outputs kept, its SDK \
+                     tree replaced by layers).",
+                    OutputLevel::Normal,
+                );
+                Ok(())
+            }
+            r => r.map(|_| ()),
+        }
     }
 
     /// Serialize installs into this view (two `sdk install`s in one project).
@@ -780,6 +1043,9 @@ impl Stacks {
     /// After the install saved the lock file, alias the keys the next run will compute (with
     /// this run's pins) to this run's layers, so the re-run hits instead of rebuilding.
     pub async fn alias_for_lock(&self, lock: &Value) -> Result<()> {
+        if !self.commit {
+            return Ok(());
+        }
         let steps = self.steps.lock().unwrap().clone();
         for (next, key) in next_keys(&steps, lock) {
             self.helper.json(&["alias", &next, &key]).await?;
@@ -804,6 +1070,9 @@ impl Stacks {
     {
         let t = std::time::Instant::now();
         let key = key_of(&json!({"parent": parent, "inputs": inputs}));
+        if self.uncommitted.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.build_uncommitted(label, key, step).await;
+        }
         self.steps
             .lock()
             .unwrap()
@@ -849,6 +1118,9 @@ impl Stacks {
             });
         }
         self.helper.json(&["use", &self.view, parent]).await?;
+        if !self.commit {
+            return self.build_uncommitted(label, key, step).await;
+        }
         let lock = step().await?;
         let rec = self
             .helper
@@ -880,11 +1152,41 @@ impl Stacks {
         })
     }
 
+    /// `commit: false`: run the step in the view as it is and leave the result there, private
+    /// to this project.
+    async fn build_uncommitted<F, Fut>(
+        &self,
+        label: &str,
+        key: String,
+        step: F,
+    ) -> Result<StepResult>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        self.uncommitted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.helper.json(&["taint", &self.view]).await?;
+        step().await?;
+        print_info(
+            &format!("Stacks: {label} built in the view, not committed (commit: false)."),
+            OutputLevel::Normal,
+        );
+        Ok(StepResult {
+            key,
+            outcome: Outcome::Built,
+            lock: Value::Null,
+        })
+    }
+
     /// Put the view on exactly `key` (not a layer built on it): for a project whose last
     /// part fell away.
     pub async fn settle_on(&self, key: &str) -> Result<()> {
+        if self.uncommitted.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let c = self.helper.json(&["check", &self.view, key]).await?;
-        if c["current"] == c["canonical"] {
+        if c["current"] == c["canonical"] && c["dirty"].as_bool() != Some(true) {
             return Ok(());
         }
         self.assert_idle().await?;
@@ -955,6 +1257,10 @@ mod tests {
             &json!({"current": "l2", "ancestors": [], "canonical": "l2"}),
             "l2"
         ));
+        // A step ran here without committing: the view is on no layer until it switches.
+        let mut dirty = c.clone();
+        dirty["dirty"] = true.into();
+        assert!(!already_in_view(&dirty, "l1-alias"));
         // Not on the chain: switch.
         let other = json!({"current": "l2", "ancestors": ["l1", "l0", "empty"], "has": true, "canonical": "other"});
         assert!(!already_in_view(&other, "other"));
@@ -1028,35 +1334,116 @@ mod tests {
         );
     }
 
+    fn env<'a>(
+        root: Option<&'a str>,
+        helper: Option<&'a str>,
+        commit: Option<&'a str>,
+    ) -> EnvSettings<'a> {
+        EnvSettings {
+            root,
+            helper,
+            commit,
+        }
+    }
+
     #[test]
     fn settings_come_from_the_file_then_the_environment() {
-        let file = "root: /var/lib/avocado/stacks\nhelper_image: reg/avocado-stacks@sha256:abc\ngc:\n  max_size: 200G\n  min_free: 20G\n";
-        let s = resolve_settings(Some(file), None, None).unwrap();
-        assert_eq!(s.root.as_deref(), Some("/var/lib/avocado/stacks"));
+        let file = "root: /srv/stacks\nhelper_image: reg/avocado-stacks@sha256:abc\ngc:\n  max_size: 200G\n  min_free: 20G\n";
+        let s = resolve_settings(Some(file), &EnvSettings::default()).unwrap();
+        assert_eq!(s.root.as_deref(), Some("/srv/stacks"));
+        assert!(s.explicit && s.commits());
         assert_eq!(s.helper_image(), "reg/avocado-stacks@sha256:abc");
         let gc = s.gc_args().unwrap().unwrap();
         assert_eq!(gc[1], (200u64 << 30).to_string());
         assert_eq!(gc[3], ((200u64 << 30) / 10 * 8).to_string());
         assert_eq!(gc[5], (20u64 << 30).to_string());
-        // The environment overrides, and can turn configured stacks off.
-        let e = resolve_settings(Some(file), Some("/srv/stacks"), Some("img:2")).unwrap();
+        // The environment overrides.
+        let e = resolve_settings(Some(file), &env(Some("/x"), Some("img:2"), Some("0"))).unwrap();
         assert_eq!(
-            (e.root.as_deref(), e.helper_image()),
-            (Some("/srv/stacks"), "img:2")
+            (e.root.as_deref(), e.helper_image().as_str()),
+            (Some("/x"), "img:2")
         );
+        assert!(!e.commits());
+        // `on` keeps the file's root; `off` (or 0, or empty) turns stacks off.
+        let on = resolve_settings(Some(file), &env(Some("on"), None, None)).unwrap();
+        assert_eq!(on.root.as_deref(), Some("/srv/stacks"));
+        for v in ["off", "0", "", "false"] {
+            let r = resolve_settings(Some(file), &env(Some(v), None, None)).unwrap();
+            assert_eq!(r.root, None, "AVOCADO_STACKS={v:?}");
+        }
+    }
+
+    /// `AVOCADO_STACKS_COMMIT` fails closed: only a clear yes commits, so a typo in an
+    /// untrusted job cannot turn committing back on; values are case-insensitive.
+    #[test]
+    fn commit_setting_fails_closed() {
+        let commits = |v| {
+            resolve_settings(None, &env(None, None, Some(v)))
+                .unwrap()
+                .commits()
+        };
+        for v in ["1", "on", "TRUE", "Yes"] {
+            assert!(commits(v), "{v}");
+        }
+        for v in ["0", "off", "False", "NO", "never", "disabled", ""] {
+            assert!(!commits(v), "{v}");
+        }
         assert_eq!(
-            resolve_settings(Some(file), Some("off"), None)
+            resolve_settings(None, &env(Some("OFF"), None, None))
                 .unwrap()
                 .root,
             None
         );
-        // No config at all: stacks off.
-        let none = resolve_settings(None, None, None).unwrap();
-        assert_eq!(
-            (none.root.as_deref(), none.helper_image()),
-            (None, DEFAULT_HELPER_IMAGE)
+    }
+
+    /// Stacks are the default: no file and no environment means on, at the default root, with
+    /// the release's helper image and a free-space floor; only `enabled: false` or
+    /// `AVOCADO_STACKS=off` turns them off, and `AVOCADO_STACKS=on` overrides the file.
+    #[test]
+    fn stacks_are_on_by_default() {
+        let d = resolve_settings(None, &EnvSettings::default()).unwrap();
+        assert_eq!(d.root.as_deref(), Some(DEFAULT_ROOT));
+        assert!(!d.explicit, "a default root falls back quietly");
+        assert!(d.commits());
+        assert!(d
+            .helper_image()
+            .starts_with("ghcr.io/avocado-linux/avocado-stacks:"));
+        assert_eq!(d.gc.min_free.as_deref(), Some(DEFAULT_MIN_FREE));
+        assert!(d.gc_args().unwrap().is_some());
+        assert!(
+            !resolve_settings(Some("commit: false\n"), &EnvSettings::default())
+                .unwrap()
+                .commits()
         );
-        assert!(none.gc_args().unwrap().is_none());
+        let disabled = "enabled: false\n";
+        assert_eq!(
+            resolve_settings(Some(disabled), &EnvSettings::default())
+                .unwrap()
+                .root,
+            None
+        );
+        assert_eq!(
+            resolve_settings(Some(disabled), &env(Some("on"), None, None))
+                .unwrap()
+                .root
+                .as_deref(),
+            Some(DEFAULT_ROOT)
+        );
+        // A configured limit replaces the default floor rather than adding to it.
+        let max =
+            resolve_settings(Some("gc:\n  max_size: 100G\n"), &EnvSettings::default()).unwrap();
+        assert_eq!(max.gc.min_free, None);
+    }
+
+    #[test]
+    fn helper_image_tag_follows_the_release() {
+        let tag = default_helper_image()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(tag, if v.ends_with("-dev") { "edge" } else { v });
     }
 
     #[test]
@@ -1067,9 +1454,12 @@ mod tests {
             "gc:\n  max_size: 10X\n",
             "rot: /x\n",
         ] {
-            assert!(resolve_settings(Some(bad), None, None).is_err(), "{bad}");
+            assert!(
+                resolve_settings(Some(bad), &EnvSettings::default()).is_err(),
+                "{bad}"
+            );
         }
-        assert!(resolve_settings(None, Some("relative"), None).is_err());
+        assert!(resolve_settings(None, &env(Some("relative"), None, None)).is_err());
     }
 
     #[test]

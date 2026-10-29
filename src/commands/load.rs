@@ -91,6 +91,7 @@ impl LoadCommand {
             volume_name: volume_name.clone(),
             source_path: config_dir_abs.to_string_lossy().to_string(),
             container_tool: self.container_tool.clone(),
+            stacks: false,
         };
         volume_state.save_to_dir(config_dir)?;
 

@@ -11,12 +11,12 @@ jobs:
 
   # The stacks engine is its own crate (it runs in the privileged helper image), so the
   # workspace jobs above never build it. Fedora ships mkcomposefs, which its GC tests need.
-  # Its mount tests need root and kernel 6.12+ (`crates/avocado-stacks/tests/integration.sh`),
-  # which hosted runners do not offer.
   stacks-crate:
     name: Stacks crate
     runs-on: ubuntu-latest
     container: fedora:44
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: crates/avocado-stacks
@@ -30,6 +30,30 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --locked
+
+  # The engine's real-mount tests, as root in the helper image, both ways it mounts layers: as the
+  # runner's kernel does (the loop-device path while hosted kernels predate file-backed EROFS,
+  # 6.12), then forced through loop devices.
+  stacks-mounts:
+    name: Stacks mount tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the helper image
+        run: docker build -f crates/avocado-stacks/Dockerfile.helper -t avocado-stacks:ci crates/avocado-stacks
+      - name: Kernel modules
+        # Hosted runner kernels may ship erofs in the extra modules package.
+        run: |
+          uname -r
+          sudo modprobe erofs || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe erofs; }
+          sudo modprobe loop
+      - name: Mount tests
+        env:
+          AVOCADO_STACKS_HELPER: avocado-stacks:ci
+        run: crates/avocado-stacks/tests/integration.sh "$RUNNER_TEMP/stacks-it"
 
   security:
     name: Security Audit

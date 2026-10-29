@@ -57,6 +57,14 @@ enum Cmd {
         /// Owner metadata to record on the view (JSON).
         #[arg(long)]
         meta: Option<String>,
+        /// Take over a plain install at the mount point (see `Stacks::adopt`). Only when no
+        /// container uses the volume.
+        #[arg(long)]
+        adopt: bool,
+    },
+    /// Mark VIEW's upper as holding work no layer has (a step ran without committing).
+    Taint {
+        view: String,
     },
     /// Mount every recorded, unmounted view whose name starts with PREFIX.
     Remount {
@@ -135,7 +143,9 @@ fn kernel_ok(release: &str) -> bool {
         .split(|c: char| !c.is_ascii_digit())
         .filter_map(|s| s.parse::<u32>().ok());
     let (maj, min) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
-    (maj, min) >= (6, 12)
+    // Overlay data-only lowers (the objects/ layer under every view) arrived in 6.5. EROFS
+    // images mount file-backed from 6.12 and through a loop device below that.
+    (maj, min) >= (6, 5)
 }
 
 fn main() -> Result<()> {
@@ -147,7 +157,7 @@ fn main() -> Result<()> {
                 .trim()
                 .to_string();
             if !kernel_ok(&rel) {
-                bail!("kernel {rel} is older than 6.12 (file-backed EROFS)");
+                bail!("kernel {rel} is older than 6.5 (overlay data-only lowers)");
             }
             let name = format!("preflight-{}", avocado_stacks::uniq());
             let r = stacks.mount_view(&name, Some(EMPTY_KEY), &[]);
@@ -155,7 +165,7 @@ fn main() -> Result<()> {
             if let Err(e) = r {
                 bail!("cannot mount an EROFS + overlay view here: {e:#}");
             }
-            write_out(&json!({"ok": true, "kernel": rel}));
+            write_out(&json!({"ok": true, "kernel": rel, "erofs": stacks.last_mode()}));
         }
         Cmd::Import {
             src,
@@ -172,8 +182,9 @@ fn main() -> Result<()> {
                 .as_deref()
                 .map(|c| stacks.ancestors(c))
                 .unwrap_or_default();
+            let dirty = stacks.view(&view)?.is_some_and(|v| v.dirty);
             write_out(&json!({
-                "current": current, "ancestors": ancestors,
+                "current": current, "ancestors": ancestors, "dirty": dirty,
                 "has": stacks.has_layer(&key), "canonical": stacks.canonical(&key),
             }));
         }
@@ -189,18 +200,37 @@ fn main() -> Result<()> {
             private,
             at,
             meta,
+            adopt,
         } => {
             let _l = stacks.view_lock(&view)?;
             let meta = meta.map(|m| serde_json::from_str(&m)).transpose()?;
-            write_out(&serde_json::to_value(stacks.mount_view_at(
+            let existed = stacks.view(&view)?.is_some();
+            let r = stacks.mount_view_at(
                 &view,
                 layer.as_deref(),
                 &private,
                 at.as_deref(),
                 meta,
-            )?)?)
+                adopt,
+            );
+            // A new view refused before anything moved (NEEDS_ADOPT) leaves no record behind,
+            // or `remount` would later report a project as stuck on stacks that never was. Any
+            // other failure may have moved project outputs into the upper: keep it.
+            if let Err(e) = &r {
+                if !existed && format!("{e:#}").contains("NEEDS_ADOPT") {
+                    let _ = stacks.drop_view(&view);
+                }
+            }
+            write_out(&serde_json::to_value(r?)?)
         }
-        Cmd::Remount { prefix } => write_out(&json!({"mounted": stacks.remount(&prefix)?})),
+        Cmd::Taint { view } => {
+            let _l = stacks.view_lock(&view)?;
+            stacks.taint(&view)?
+        }
+        Cmd::Remount { prefix } => {
+            let (mounted, blocked) = stacks.remount(&prefix)?;
+            write_out(&json!({"mounted": mounted, "needs_adopt": blocked}))
+        }
         Cmd::Alias { alias, key } => stacks.alias(&alias, &key)?,
         Cmd::Umount { view } => {
             let _l = stacks.view_lock(&view)?;
@@ -284,9 +314,13 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn kernel_floor_is_file_backed_erofs() {
-        assert!(!super::kernel_ok("6.8.0-45-generic"));
-        assert!(!super::kernel_ok("6.11.9"));
+    fn kernel_floor_is_overlay_data_only_lowers() {
+        assert!(!super::kernel_ok("5.15.0-125-generic"));
+        assert!(!super::kernel_ok("6.1.0-26-amd64"));
+        assert!(!super::kernel_ok("6.4.16"));
+        assert!(super::kernel_ok("6.5.0"));
+        assert!(super::kernel_ok("6.8.0-45-generic"));
+        assert!(super::kernel_ok("6.11.9"));
         assert!(super::kernel_ok("6.12.1"));
         assert!(super::kernel_ok("7.1.7-200.fc44.x86_64"));
     }
