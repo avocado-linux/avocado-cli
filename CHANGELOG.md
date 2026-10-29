@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Layer store (experimental, opt-in): SDK installs shared across projects.**
+  With `root:` set in `<config dir>/avocado/layer-store.yaml` (or
+  `AVOCADO_LAYER_STORE`), `sdk install` builds a project's
+  `/opt/_avocado/<target>` as content-addressed layers: the SDK bootstrap,
+  the target base (rootfs, initramfs and the platform SDK packages) and the
+  project's own additions. Another project whose inputs match reuses them
+  instead of installing, and gets the lock pins of what it reused. Layers are
+  shared only when the feed is pinned to a snapshot and the project has no
+  `repos:` of its own. Files are stored once by content; each project keeps
+  its private paths (extension and runtime outputs, build stamps) out of
+  shared layers. Needs rootful docker and Linux 6.12+; a host that cannot run
+  it falls back to plain volumes with a warning.
+- **`avocado store`: see and reclaim the layer store's space.** `status`
+  shows totals, what is reclaimable now, every project's view and every
+  layer with what evicting it alone would free and what holds it. `gc`
+  evicts layers no project uses (all of them, or down to `--max-size` /
+  `--min-free`; leaves first, so shared base layers go last), `prune` drops
+  views whose project or volume is gone, `drop` releases one project's
+  views, `destroy --yes` deletes the whole store (its files are root-owned),
+  and `config` shows the effective settings and whether the store works on
+  this host. The ones that change something take `--dry-run`. `gc:` limits in
+  the config file run the same cleanup after each `sdk install`. The helper
+  image is not published yet: build it from `crates/avocado-store`.
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

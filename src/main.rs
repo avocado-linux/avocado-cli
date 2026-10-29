@@ -645,6 +645,63 @@ enum Commands {
         #[command(subcommand)]
         command: ConnectCommands,
     },
+    /// Layer store: where its space goes, and reclaiming it
+    Store {
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker", global = true)]
+        container_tool: String,
+        #[command(subcommand)]
+        command: StoreCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommands {
+    /// Space used: totals, what is reclaimable, per project and per layer
+    Status {
+        /// Print the full report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evict layers no project uses (leaves first, then least recently used); with no
+    /// limit, all of them
+    Gc {
+        /// Evict until the store is at or under this size (e.g. 100G)
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Evict until the store's filesystem has at least this much free (e.g. 20G)
+        #[arg(long)]
+        min_free: Option<String>,
+        /// Show what would be evicted and freed, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drop views whose project or volume is gone
+    Prune {
+        /// Show what would be dropped, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drop a project's views (its private files and its hold on layers)
+    Drop {
+        /// Project directory (default: the current directory)
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Only this target's view
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Show what would be dropped, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the effective settings, where they come from, and whether the store works here
+    Config,
+    /// Delete the whole store (every view and layer)
+    Destroy {
+        /// Confirm: every project reinstalls its SDK afterwards
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2175,6 +2232,8 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Hitl { .. }
             | Commands::Prune { .. }
             | Commands::Clean { .. }
+            // The store's helper runs on the docker daemon that holds the views.
+            | Commands::Store { .. }
             | Commands::Sign { .. }
             | Commands::Deploy { .. }
             // `connect upload` runs a prerequisite stamp check + in-container
@@ -3825,6 +3884,28 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Login(args) => args.run().await,
+        Commands::Store {
+            container_tool,
+            command,
+        } => {
+            let store = commands::store::StoreCommand::new(container_tool);
+            match command {
+                StoreCommands::Status { json } => store.status(json).await,
+                StoreCommands::Gc {
+                    max_size,
+                    min_free,
+                    dry_run,
+                } => store.gc(max_size, min_free, dry_run).await,
+                StoreCommands::Prune { dry_run } => store.prune(dry_run).await,
+                StoreCommands::Drop {
+                    path,
+                    target,
+                    dry_run,
+                } => store.drop_project(&path, target.as_deref(), dry_run).await,
+                StoreCommands::Config => store.config().await,
+                StoreCommands::Destroy { yes } => store.destroy(yes).await,
+            }
+        }
         Commands::Connect { command } => match command {
             ConnectCommands::Auth { command } => match command {
                 ConnectAuthCommands::Login(args) => args.run().await,

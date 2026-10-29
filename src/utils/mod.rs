@@ -21,6 +21,7 @@ pub mod jcs;
 pub mod kab_wrap;
 pub mod kernel_resolver;
 pub mod kernel_version;
+pub mod layer_store;
 pub mod lockfile;
 pub mod nfs_server;
 pub mod output;

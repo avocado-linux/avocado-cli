@@ -162,6 +162,11 @@ impl VolumeManager {
         if let Some(existing_state) = VolumeState::load_from_dir(source_dir)? {
             // Verify the volume still exists
             if self.volume_exists(&existing_state.volume_name).await? {
+                crate::utils::layer_store::remount_volume_views(
+                    &self.container_tool,
+                    &existing_state.volume_name,
+                )
+                .await?;
                 if self.verbose {
                     print_info(
                         &format!("Using existing volume: {}", existing_state.volume_name),
@@ -356,6 +361,9 @@ impl VolumeManager {
     /// Run `volume rm` one time. Returns `None` when the volume is gone
     /// (removed now, or not there), and the daemon's stderr when it is not.
     async fn try_remove_volume(&self, volume_name: &str) -> Result<Option<String>> {
+        // A view mounted inside the volume would be emptied by `volume rm` before it fails on
+        // the busy mount point: drop the project's store views first.
+        crate::utils::layer_store::drop_volume_views(&self.container_tool, volume_name).await?;
         let output = AsyncCommand::new(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()
