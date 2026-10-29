@@ -1,0 +1,6 @@
+# The store engine helper: a privileged, short-lived container that owns every mount and every
+# write to the store. mkcomposefs compiles dumps to EROFS; util-linux does the mounts.
+FROM docker.io/library/fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False composefs util-linux-core && dnf clean all
+COPY avocado-store /usr/local/bin/avocado-store
+ENTRYPOINT ["/usr/local/bin/avocado-store"]
