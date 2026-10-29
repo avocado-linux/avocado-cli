@@ -1,9 +1,9 @@
-//! Layer store client. When a store is configured (`avocado store config`), a project's
-//! `/opt/_avocado/<target>` is a store view (an EROFS layer + a private upper) mounted inside
+//! Stacks client. When stacks are configured (`avocado stack config`), a project's
+//! `/opt/_avocado/<target>` is a stack view (an EROFS layer + a private upper) mounted inside
 //! its `avo-<uuid>` volume, and `sdk install` produces layers other projects with the same
 //! inputs share.
 //!
-//! Every store operation runs in the privileged helper container (`crates/avocado-store`) on
+//! Every stacks operation runs in the privileged helper container (`crates/avocado-stacks`) on
 //! the same docker daemon as the SDK containers, so native hosts and avocado-vm take the same
 //! path. A host that cannot run it (kernel older than 6.12, no privileged containers) falls
 //! back to plain volumes with a warning.
@@ -20,7 +20,7 @@ use tokio::process::{Child, Command};
 
 use crate::utils::output::{print_info, print_warning, OutputLevel};
 
-pub const DEFAULT_HELPER_IMAGE: &str = "avocado-store:poc";
+pub const DEFAULT_HELPER_IMAGE: &str = "avocado-stacks:poc";
 
 /// Paths under `/opt/_avocado/<target>` that are project-private: never in a layer, and kept
 /// across layer switches. Extension/runtime outputs (where confext claim tokens and signed
@@ -41,12 +41,12 @@ pub const PRIVATE: &[&str] = &[
     ".stamps/initramfs/*",
 ];
 
-/// Per-machine store settings: `<avocado config dir>/layer-store.yaml`, then the
-/// environment (`AVOCADO_LAYER_STORE`, `AVOCADO_LAYER_STORE_HELPER`).
+/// Per-machine stacks settings: `<avocado config dir>/stacks.yaml`, then the
+/// environment (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Store directory on the docker host (absolute). Unset = no store.
+    /// Stacks directory on the docker host (absolute). Unset = stacks off.
     #[serde(default)]
     pub root: Option<String>,
     /// Helper image (pin by digest in production).
@@ -60,11 +60,11 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GcSettings {
-    /// Keep the store at or under this size: evict unused layers (leaves first, least
+    /// Keep stacks at or under this size: evict unused layers (leaves first, least
     /// recently used first) down to 80 % of it.
     #[serde(default)]
     pub max_size: Option<String>,
-    /// Keep at least this much free on the store's filesystem.
+    /// Keep at least this much free on the stacks filesystem.
     #[serde(default)]
     pub min_free: Option<String>,
 }
@@ -98,11 +98,11 @@ impl Settings {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    Ok(crate::utils::signing_keys::get_avocado_config_dir()?.join("layer-store.yaml"))
+    Ok(crate::utils::signing_keys::get_avocado_config_dir()?.join("stacks.yaml"))
 }
 
 /// Settings from a config file's text and the two environment variables, validated.
-/// `AVOCADO_LAYER_STORE=off` (or `0`, or empty) turns a configured store off.
+/// `AVOCADO_STACKS=off` (or `0`, or empty) turns configured stacks off.
 pub fn resolve_settings(
     file: Option<&str>,
     env_root: Option<&str>,
@@ -110,7 +110,7 @@ pub fn resolve_settings(
 ) -> Result<Settings> {
     let mut s: Settings = match file {
         Some(t) if !t.trim().is_empty() => {
-            serde_yaml::from_str(t).context("invalid layer store config")?
+            serde_yaml::from_str(t).context("invalid stacks config")?
         }
         _ => Settings::default(),
     };
@@ -126,10 +126,10 @@ pub fn resolve_settings(
     if let Some(r) = &s.root {
         // A path on the docker host (Linux, or the avocado-vm), whatever OS runs the CLI.
         if !r.starts_with('/') {
-            bail!("layer store root '{r}' must be an absolute path");
+            bail!("stacks root '{r}' must be an absolute path");
         }
         if r.contains(':') || r.contains(char::is_whitespace) {
-            bail!("layer store root '{r}' must not contain ':' or whitespace (it is a bind mount)");
+            bail!("stacks root '{r}' must not contain ':' or whitespace (it is a bind mount)");
         }
     }
     s.gc_args()?;
@@ -146,8 +146,8 @@ pub fn settings() -> Result<Settings> {
             .and_then(|p| std::fs::read_to_string(p).ok());
         resolve_settings(
             file.as_deref(),
-            std::env::var("AVOCADO_LAYER_STORE").ok().as_deref(),
-            std::env::var("AVOCADO_LAYER_STORE_HELPER").ok().as_deref(),
+            std::env::var("AVOCADO_STACKS").ok().as_deref(),
+            std::env::var("AVOCADO_STACKS_HELPER").ok().as_deref(),
         )
         .map_err(|e| format!("{e:#}"))
     })
@@ -196,7 +196,7 @@ pub fn human_bytes(b: u64) -> String {
     }
 }
 
-/// The store root to use for builds in this process: configured, and the helper's preflight
+/// The stacks root to use for builds in this process: configured, and the helper's preflight
 /// passed on this docker host. A failed preflight warns once and falls back to plain volumes.
 pub async fn active_root(tool: &str) -> Option<String> {
     static ACTIVE: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
@@ -206,7 +206,7 @@ pub async fn active_root(tool: &str) -> Option<String> {
                 Ok(s) => s,
                 Err(e) => {
                     print_warning(
-                        &format!("Layer store disabled: {e:#}. Using plain volumes."),
+                        &format!("Stacks disabled: {e:#}. Using plain volumes."),
                         OutputLevel::Normal,
                     );
                     return None;
@@ -218,7 +218,7 @@ pub async fn active_root(tool: &str) -> Option<String> {
                 Err(e) => {
                     print_warning(
                         &format!(
-                            "Layer store at {root} cannot run on this host ({e:#}). Using plain volumes."
+                            "Stacks at {root} cannot run on this host ({e:#}). Using plain volumes."
                         ),
                         OutputLevel::Normal,
                     );
@@ -230,7 +230,7 @@ pub async fn active_root(tool: &str) -> Option<String> {
         .clone()
 }
 
-/// One helper invocation context: the container tool, the store root and the helper image.
+/// One helper invocation context: the container tool, the stacks root and the helper image.
 pub struct Helper {
     tool: String,
     root: String,
@@ -246,7 +246,7 @@ impl Helper {
         }
     }
 
-    /// The helper for the configured store, or `None` when none is configured.
+    /// The helper for configured stacks, or `None` when none is configured.
     pub fn configured(tool: &str) -> Result<Option<Helper>> {
         let s = settings()?;
         Ok(s.root.as_deref().map(|r| Helper::new(tool, r, &s)))
@@ -278,14 +278,14 @@ impl Helper {
             .stdin(Stdio::null())
             .output()
             .await
-            .context("run the layer store helper")
+            .context("run the stacks helper")
     }
 
     pub async fn json(&self, args: &[&str]) -> Result<Value> {
         let o = self.output(args).await?;
         if !o.status.success() {
             bail!(
-                "layer store {}: {}",
+                "stacks {}: {}",
                 args.first().copied().unwrap_or(""),
                 String::from_utf8_lossy(&o.stderr).trim()
             );
@@ -319,13 +319,13 @@ impl Helper {
                     .unwrap_or(0.0);
                 if waited > 1.0 {
                     print_info(
-                        &format!("Layer store: waited {waited:.1}s for {name}."),
+                        &format!("Stacks: waited {waited:.1}s for {name}."),
                         OutputLevel::Normal,
                     );
                 }
                 Ok(BuildLock { _child: child })
             }
-            _ => bail!("layer store: could not take the lock {name}"),
+            _ => bail!("stacks: could not take the lock {name}"),
         }
     }
 }
@@ -341,7 +341,7 @@ fn volumes_dir(tool: &str) -> Result<String> {
         let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if !o.status.success() || dir.is_empty() {
             return Err(format!(
-                "{tool} did not report its data root (the layer store needs docker): {}",
+                "{tool} did not report its data root (stacks need docker): {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ));
         }
@@ -367,20 +367,20 @@ pub async fn remount_volume_views(tool: &str, volume: &str) -> Result<()> {
     let h = Helper::new(tool, &root, &settings()?);
     h.json(&["remount", &format!("{volume}-")])
         .await
-        .with_context(|| format!("remount the layer store views of {volume}"))?;
+        .with_context(|| format!("remount the stack views of {volume}"))?;
     REMOUNTED.lock().unwrap().push(volume.to_string());
     Ok(())
 }
 
-/// Before a project volume is removed: drop its store views (their uppers and leases), so
-/// `volume rm` never walks into a mounted view. With no store configured, refuse when views
+/// Before a project volume is removed: drop its stack views (their uppers and leases), so
+/// `volume rm` never walks into a mounted view. With stacks unconfigured, refuse when views
 /// are still mounted inside the volume (seen on a native Linux host): removing the volume
 /// would empty them first and then fail.
 pub async fn drop_volume_views(tool: &str, volume: &str) -> Result<Vec<String>> {
     if !volume.starts_with("avo-") {
         return Ok(Vec::new());
     }
-    // Only a store that can run here can hold views here: a configured store whose helper
+    // Only stacks that can run here can hold views here: configured stacks whose helper
     // cannot run (or an invalid config) means plain volumes, and `clean` must keep working.
     let active = match active_root(tool).await {
         Some(root) => Some(Helper::new(tool, &root, &settings()?)),
@@ -391,7 +391,7 @@ pub async fn drop_volume_views(tool: &str, volume: &str) -> Result<Vec<String>> 
             let r = h
                 .json(&["drop", "--prefix", &format!("{volume}-")])
                 .await
-                .with_context(|| format!("drop the layer store views of {volume}"))?;
+                .with_context(|| format!("drop the stack views of {volume}"))?;
             REMOUNTED.lock().unwrap().retain(|v| v != volume);
             Ok(r["dropped"]
                 .as_array()
@@ -406,8 +406,8 @@ pub async fn drop_volume_views(tool: &str, volume: &str) -> Result<Vec<String>> 
             let mounted = mounts_inside_volume(volume);
             if !mounted.is_empty() {
                 bail!(
-                    "volume {volume} has layer store views mounted ({}) but no layer store is \
-                     configured; configure it (`avocado store config`) so they can be dropped first",
+                    "volume {volume} has stack views mounted ({}) but stacks are not \
+                     configured; configure them (`avocado stack config`) so they can be dropped first",
                     mounted.join(", ")
                 );
             }
@@ -628,7 +628,7 @@ pub async fn image_id(tool: &str, image: &str) -> Result<String> {
 /// CLI, so two builds of the same version can install different trees.
 pub fn base_inputs(releasever: Option<&str>) -> Value {
     json!({
-        "layout": "layer-store/1",
+        "layout": "stacks/1",
         "cli": env!("AVOCADO_CLI_VERSION"),
         "releasever": releasever,
     })
@@ -652,7 +652,7 @@ pub struct StepResult {
     pub lock: Value,
 }
 
-pub struct LayerStore {
+pub struct Stacks {
     pub view: String,
     helper: Helper,
     volume: String,
@@ -668,7 +668,7 @@ pub struct BuildLock {
     _child: Child,
 }
 
-impl LayerStore {
+impl Stacks {
     pub fn new(
         root: &str,
         tool: &str,
@@ -695,7 +695,7 @@ impl LayerStore {
             .output()
             .await?;
         if !o.status.success() {
-            bail!("layer store: no volume {}", self.volume);
+            bail!("stacks: no volume {}", self.volume);
         }
         let at = format!(
             "{}/{}",
@@ -754,7 +754,7 @@ impl LayerStore {
             .collect();
         if !ids.is_empty() {
             bail!(
-                "layer store: {} container(s) are using this project's volume ({}): another \
+                "stacks: {} container(s) are using this project's volume ({}): another \
                  avocado command is running in this project. Wait for it to finish (or stop \
                  those containers) and retry.",
                 ids.len(),
@@ -811,7 +811,7 @@ impl LayerStore {
         let c = self.helper.json(&["check", &self.view, &key]).await?;
         if already_in_view(&c, &key) {
             print_info(
-                &format!("Layer store: {label} {} already in the view.", &key[..12]),
+                &format!("Stacks: {label} {} already in the view.", &key[..12]),
                 OutputLevel::Normal,
             );
             // The project's lock may have lost pins the view's tree still has (an `unlock`
@@ -828,7 +828,7 @@ impl LayerStore {
         }
         self.assert_idle().await?;
         let _lock = self.helper.lock(&key).await?;
-        // `use` re-checks under the store's GC lock: if GC evicted the layer since `check`, it
+        // `use` re-checks under the stacks GC lock: if GC evicted the layer since `check`, it
         // fails and this is a miss like any other.
         if self.helper.output(&["has", &key]).await?.status.success()
             && self.helper.json(&["use", &self.view, &key]).await.is_ok()
@@ -836,7 +836,7 @@ impl LayerStore {
             let rec = self.helper.json(&["record", &key]).await?;
             print_info(
                 &format!(
-                    "Layer store: {label} hit {} ({:.1}s).",
+                    "Stacks: {label} hit {} ({:.1}s).",
                     &key[..12],
                     t.elapsed().as_secs_f64()
                 ),
@@ -863,7 +863,7 @@ impl LayerStore {
             .await?;
         print_info(
             &format!(
-                "Layer store: {label} committed {} ({} files, {} new objects, {} new; commit {:.1}s, step total {:.1}s).",
+                "Stacks: {label} committed {} ({} files, {} new objects, {} new; commit {:.1}s, step total {:.1}s).",
                 &key[..12],
                 rec["files"],
                 rec["new_objects"],
@@ -890,7 +890,7 @@ impl LayerStore {
         self.assert_idle().await?;
         self.helper.json(&["use", &self.view, key]).await?;
         print_info(
-            &format!("Layer store: view back on {}.", &key[..key.len().min(12)]),
+            &format!("Stacks: view back on {}.", &key[..key.len().min(12)]),
             OutputLevel::Normal,
         );
         Ok(())
@@ -908,7 +908,7 @@ impl LayerStore {
         if freed > 0 {
             print_info(
                 &format!(
-                    "Layer store: freed {} ({} layers evicted).",
+                    "Stacks: freed {} ({} layers evicted).",
                     human_bytes(freed),
                     r["evicted_layers"].as_array().map(|a| a.len()).unwrap_or(0)
                 ),
@@ -1030,19 +1030,19 @@ mod tests {
 
     #[test]
     fn settings_come_from_the_file_then_the_environment() {
-        let file = "root: /var/lib/avocado/store\nhelper_image: reg/avocado-store@sha256:abc\ngc:\n  max_size: 200G\n  min_free: 20G\n";
+        let file = "root: /var/lib/avocado/stacks\nhelper_image: reg/avocado-stacks@sha256:abc\ngc:\n  max_size: 200G\n  min_free: 20G\n";
         let s = resolve_settings(Some(file), None, None).unwrap();
-        assert_eq!(s.root.as_deref(), Some("/var/lib/avocado/store"));
-        assert_eq!(s.helper_image(), "reg/avocado-store@sha256:abc");
+        assert_eq!(s.root.as_deref(), Some("/var/lib/avocado/stacks"));
+        assert_eq!(s.helper_image(), "reg/avocado-stacks@sha256:abc");
         let gc = s.gc_args().unwrap().unwrap();
         assert_eq!(gc[1], (200u64 << 30).to_string());
         assert_eq!(gc[3], ((200u64 << 30) / 10 * 8).to_string());
         assert_eq!(gc[5], (20u64 << 30).to_string());
-        // The environment overrides, and can turn a configured store off.
-        let e = resolve_settings(Some(file), Some("/srv/store"), Some("img:2")).unwrap();
+        // The environment overrides, and can turn configured stacks off.
+        let e = resolve_settings(Some(file), Some("/srv/stacks"), Some("img:2")).unwrap();
         assert_eq!(
             (e.root.as_deref(), e.helper_image()),
-            (Some("/srv/store"), "img:2")
+            (Some("/srv/stacks"), "img:2")
         );
         assert_eq!(
             resolve_settings(Some(file), Some("off"), None)
@@ -1050,7 +1050,7 @@ mod tests {
                 .root,
             None
         );
-        // No config at all: no store.
+        // No config at all: stacks off.
         let none = resolve_settings(None, None, None).unwrap();
         assert_eq!(
             (none.root.as_deref(), none.helper_image()),

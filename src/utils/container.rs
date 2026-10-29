@@ -1105,7 +1105,7 @@ impl SessionContainers {
     }
 
     /// Remove this process's parked session containers; later steps start new ones on
-    /// demand. A layer store view switch needs it: a parked container holds its own copy of
+    /// demand. A stack view switch needs it: a parked container holds its own copy of
     /// the project volume's mounts and would keep seeing the layer the view just left.
     pub fn release_sessions(container_tool: &str) {
         for name in Self::active_names() {

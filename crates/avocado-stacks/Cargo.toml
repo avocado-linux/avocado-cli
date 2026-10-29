@@ -1,12 +1,12 @@
 [package]
-name = "avocado-store"
+name = "avocado-stacks"
 version = "0.1.0"
 edition = "2021"
-description = "Content-addressed layer store for Avocado build state (composefs model). PoC."
+description = "Content-addressed layer cache for Avocado build state (composefs model). PoC."
 license = "Apache-2.0"
 
 [[bin]]
-name = "avocado-store"
+name = "avocado-stacks"
 path = "src/main.rs"
 
 [dependencies]

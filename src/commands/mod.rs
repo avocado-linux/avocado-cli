@@ -22,7 +22,7 @@ pub mod sbom;
 pub mod sdk;
 pub mod sign;
 pub mod signing_keys;
-pub mod store;
+pub mod stack;
 pub mod unlock;
 pub mod update;
 pub mod upgrade;

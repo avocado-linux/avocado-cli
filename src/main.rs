@@ -645,18 +645,18 @@ enum Commands {
         #[command(subcommand)]
         command: ConnectCommands,
     },
-    /// Layer store: where its space goes, and reclaiming it
-    Store {
+    /// Stacks: where the space goes, and reclaiming it
+    Stack {
         /// Container tool to use (docker/podman)
         #[arg(long, default_value = "docker", global = true)]
         container_tool: String,
         #[command(subcommand)]
-        command: StoreCommands,
+        command: StackCommands,
     },
 }
 
 #[derive(Subcommand)]
-enum StoreCommands {
+enum StackCommands {
     /// Space used: totals, what is reclaimable, per project and per layer
     Status {
         /// Print the full report as JSON
@@ -666,10 +666,10 @@ enum StoreCommands {
     /// Evict layers no project uses (leaves first, then least recently used); with no
     /// limit, all of them
     Gc {
-        /// Evict until the store is at or under this size (e.g. 100G)
+        /// Evict until stacks are at or under this size (e.g. 100G)
         #[arg(long)]
         max_size: Option<String>,
-        /// Evict until the store's filesystem has at least this much free (e.g. 20G)
+        /// Evict until the stacks filesystem has at least this much free (e.g. 20G)
         #[arg(long)]
         min_free: Option<String>,
         /// Show what would be evicted and freed, change nothing
@@ -694,9 +694,9 @@ enum StoreCommands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show the effective settings, where they come from, and whether the store works here
+    /// Show the effective settings, where they come from, and whether stacks work here
     Config,
-    /// Delete the whole store (every view and layer)
+    /// Delete all stacks (every view and layer)
     Destroy {
         /// Confirm: every project reinstalls its SDK afterwards
         #[arg(long)]
@@ -2232,8 +2232,8 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Hitl { .. }
             | Commands::Prune { .. }
             | Commands::Clean { .. }
-            // The store's helper runs on the docker daemon that holds the views.
-            | Commands::Store { .. }
+            // The stacks helper runs on the docker daemon that holds the views.
+            | Commands::Stack { .. }
             | Commands::Sign { .. }
             | Commands::Deploy { .. }
             // `connect upload` runs a prerequisite stamp check + in-container
@@ -3884,26 +3884,26 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Login(args) => args.run().await,
-        Commands::Store {
+        Commands::Stack {
             container_tool,
             command,
         } => {
-            let store = commands::store::StoreCommand::new(container_tool);
+            let stack = commands::stack::StackCommand::new(container_tool);
             match command {
-                StoreCommands::Status { json } => store.status(json).await,
-                StoreCommands::Gc {
+                StackCommands::Status { json } => stack.status(json).await,
+                StackCommands::Gc {
                     max_size,
                     min_free,
                     dry_run,
-                } => store.gc(max_size, min_free, dry_run).await,
-                StoreCommands::Prune { dry_run } => store.prune(dry_run).await,
-                StoreCommands::Drop {
+                } => stack.gc(max_size, min_free, dry_run).await,
+                StackCommands::Prune { dry_run } => stack.prune(dry_run).await,
+                StackCommands::Drop {
                     path,
                     target,
                     dry_run,
-                } => store.drop_project(&path, target.as_deref(), dry_run).await,
-                StoreCommands::Config => store.config().await,
-                StoreCommands::Destroy { yes } => store.destroy(yes).await,
+                } => stack.drop_project(&path, target.as_deref(), dry_run).await,
+                StackCommands::Config => stack.config().await,
+                StackCommands::Destroy { yes } => stack.destroy(yes).await,
             }
         }
         Commands::Connect { command } => match command {

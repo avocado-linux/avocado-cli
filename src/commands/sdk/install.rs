@@ -25,7 +25,7 @@ use crate::utils::{
 };
 
 /// Data produced by the bootstrap phase, consumed by the parallel install phase.
-/// Which slice of the parallel phase to run. Without a layer store it is all of it; with one, the
+/// Which slice of the parallel phase to run. Without stacks it is all of it; with stacks, the
 /// phase is split along the config's structure so the slice every project on a target shares is
 /// its own layer: `Base` = rootfs + initramfs + the platform's `avocado-sdk-*` SDK packages (the
 /// sections nearly every project leaves at their defaults), `Project` = what the project adds on
@@ -131,7 +131,7 @@ struct PartKeyInputs<'a> {
 }
 
 fn part_layer_inputs(p: &PartKeyInputs) -> serde_json::Value {
-    let mut v = crate::utils::layer_store::base_inputs(p.releasever);
+    let mut v = crate::utils::stacks::base_inputs(p.releasever);
     v["target"] = p.target.into();
     v["sdk_deps"] = serde_json::to_value(p.sdk_deps).unwrap_or_default();
     v["feeds"] = serde_json::json!([p.feeds_fingerprint]);
@@ -178,7 +178,7 @@ struct BootstrapResult {
     sdk_sysroot: SysrootType,
     /// Lock file (to be cloned for each parallel task)
     lock_file: LockFile,
-    /// The L0 layer the view is on (layer store), the parent of L1.
+    /// The L0 layer the view is on (stacks), the parent of L1.
     l0_key: Option<String>,
     /// Active extensions after config reload
     active_extensions: HashSet<String>,
@@ -725,14 +725,14 @@ impl SdkInstallCommand {
             None
         };
 
-        // Layer store: the project's /opt/_avocado/<target> becomes a store view and the
+        // Stacks: the project's /opt/_avocado/<target> becomes a stack view and the
         // install steps below become layers. Not with --runs-on (its own volume plumbing).
-        let store_root = match self.runs_on {
-            None => crate::utils::layer_store::active_root(&container_helper.container_tool).await,
+        let stacks_root = match self.runs_on {
+            None => crate::utils::stacks::active_root(&container_helper.container_tool).await,
             Some(_) => None,
         };
         let mut _install_lock = None;
-        let store = match store_root {
+        let stacks = match stacks_root {
             Some(root) => {
                 let vs = crate::utils::volume::VolumeManager::new(
                     container_helper.container_tool.clone(),
@@ -741,15 +741,15 @@ impl SdkInstallCommand {
                 .get_or_create_volume(&container_helper.cwd)
                 .await?;
                 let project = config.project_root(&self.config_path);
-                let shareable = crate::utils::layer_store::shareable(
+                let shareable = crate::utils::stacks::shareable(
                     LockFile::load(&project)?.get_repo_snapshot(&target),
                     std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
                     config.repos.as_ref().is_some_and(|r| !r.is_empty()),
                 );
                 // The volume's own source path (absolute, the one the volume reaper trusts),
-                // not the config-relative project root: `avocado store prune` judges the view
+                // not the config-relative project root: `avocado stack prune` judges the view
                 // by it from any directory.
-                let s = crate::utils::layer_store::LayerStore::new(
+                let s = crate::utils::stacks::Stacks::new(
                     &root,
                     &container_helper.container_tool,
                     &vs.volume_name,
@@ -759,7 +759,7 @@ impl SdkInstallCommand {
                 )?;
                 if !shareable {
                     print_info(
-                        "Layer store: the feed is not pinned to a snapshot (or the project declares \
+                        "Stacks: the feed is not pinned to a snapshot (or the project declares \
                          its own repos), so this project's layers are not shared.",
                         OutputLevel::Normal,
                     );
@@ -775,7 +775,7 @@ impl SdkInstallCommand {
         // Phase 1: Bootstrap — sets up SDK env, installs bootstrap package, fetches extensions
         let bootstrap_result = self
             .execute_bootstrap(
-                store.as_ref(),
+                stacks.as_ref(),
                 config,
                 &target,
                 container_image,
@@ -849,7 +849,7 @@ impl SdkInstallCommand {
         let this = &*self;
         let run = |part: Part, parent: Option<String>| {
             let bootstrap = &bootstrap;
-            let store = store.as_ref();
+            let stacks = stacks.as_ref();
             let container_helper = &container_helper;
             let off_kernel_excludes = &off_kernel_excludes;
             let feeds = feeds.as_ref();
@@ -860,7 +860,7 @@ impl SdkInstallCommand {
                 (repo_url.as_deref(), repo_release.as_deref(), &target);
             async move {
                 this.execute_parallel_phase(
-                    store,
+                    stacks,
                     part,
                     parent.as_deref(),
                     bootstrap,
@@ -878,7 +878,7 @@ impl SdkInstallCommand {
                 .await
             }
         };
-        let result = if store.is_some() {
+        let result = if stacks.is_some() {
             match run(Part::Base, bootstrap.l0_key.clone()).await {
                 Ok(base) => run(Part::Project, base).await.map(|_| ()),
                 Err(e) => Err(e),
@@ -910,7 +910,7 @@ impl SdkInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn execute_parallel_phase(
         &self,
-        store: Option<&crate::utils::layer_store::LayerStore>,
+        stacks: Option<&crate::utils::stacks::Stacks>,
         part: Part,
         parent: Option<&str>,
         bootstrap: &BootstrapResult,
@@ -1090,10 +1090,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // container work for rootfs/initramfs at all. Batching matters
         // because stamps live in the `/opt/_avocado` named volume, not a host
         // bind mount, so each read otherwise costs its own container run.
-        // With a layer store the sysroot stamps describe the layer the view is on *now*, and a
+        // With stacks the sysroot stamps describe the layer the view is on *now*, and a
         // missed step first moves the view to the step's parent: a stamp read here would then
         // skip an install the parent does not have. The step decides instead (hit or build).
-        let (rootfs_stamp, initramfs_stamp) = if self.no_stamps || store.is_some() {
+        let (rootfs_stamp, initramfs_stamp) = if self.no_stamps || stacks.is_some() {
             (None, None)
         } else {
             let rootfs_req = StampRequirement::rootfs_install();
@@ -1133,11 +1133,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
 
-        // Layer store: what this part's installs read, and nothing else, so a project that only
+        // Stacks: what this part's installs read, and nothing else, so a project that only
         // differs in another part's sections still shares this layer. The sysroots key on
         // exactly what their install stamp keys on (effective packages, overlay and post_install
         // contents, permissions, kernel, feeds, SDK image), so neither can drift from the other.
-        let sysroot_inputs = match (store, part) {
+        let sysroot_inputs = match (stacks, part) {
             (Some(_), Part::Base) if !adds_nothing => Some(base_layer_sysroot_inputs(
                 config,
                 &composed.merged_value,
@@ -1151,7 +1151,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             )?),
             _ => None,
         };
-        let compile_deps = match (store, part) {
+        let compile_deps = match (stacks, part) {
             (Some(_), Part::Project) if !adds_nothing => Some(
                 compute_compile_deps_input_hash(&composed.merged_value, &active_compile_sections)?
                     .config_hash,
@@ -1160,7 +1160,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         };
         let lock_json = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
         let releasever = std::env::var("AVOCADO_RELEASEVER").ok();
-        let l1_inputs = store.filter(|_| !adds_nothing).map(|s| {
+        let l1_inputs = stacks.filter(|_| !adds_nothing).map(|s| {
             let mut v = part_layer_inputs(&PartKeyInputs {
                 part,
                 releasever: releasever.as_deref(),
@@ -1547,11 +1547,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 let r = s
                     .step(&label, parent.unwrap_or("empty"), v, || phase)
                     .await?;
-                if r.outcome != crate::utils::layer_store::Outcome::Built && !r.lock.is_null() {
+                if r.outcome != crate::utils::stacks::Outcome::Built && !r.lock.is_null() {
                     let mut lf = LockFile::load(src_dir)?;
                     let mut current =
                         serde_json::to_value(lf.targets.get(target)).unwrap_or_default();
-                    crate::utils::layer_store::fill_missing(&mut current, &r.lock);
+                    crate::utils::stacks::fill_missing(&mut current, &r.lock);
                     lf.targets.insert(
                         target.to_string(),
                         serde_json::from_value(current)
@@ -1570,12 +1570,12 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 Some(key)
             }
             None if adds_nothing => {
-                if let (Some(s), Some(base)) = (store, parent) {
+                if let (Some(s), Some(base)) = (stacks, parent) {
                     // A project that no longer adds anything over Base: its view must be on
                     // Base itself, not on the Project layer it had, or what it removed stays.
                     s.settle_on(base).await?;
                 }
-                if let Some(s) = store {
+                if let Some(s) = stacks {
                     let saved = LockFile::load(src_dir)?;
                     s.alias_for_lock(
                         &serde_json::to_value(saved.targets.get(target)).unwrap_or_default(),
@@ -1589,10 +1589,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 None
             }
         };
-        if let (Some(s), Part::Project) = (store, part) {
+        if let (Some(s), Part::Project) = (stacks, part) {
             if let Err(e) = s.auto_gc().await {
                 print_warning(
-                    &format!("Layer store cleanup failed: {e:#}"),
+                    &format!("Stacks cleanup failed: {e:#}"),
                     OutputLevel::Normal,
                 );
             }
@@ -1784,7 +1784,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
     #[allow(clippy::too_many_arguments)]
     async fn execute_bootstrap(
         &self,
-        store: Option<&crate::utils::layer_store::LayerStore>,
+        stacks: Option<&crate::utils::stacks::Stacks>,
         config: &Config,
         target: &str,
         container_image: &str,
@@ -1847,19 +1847,19 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
         let all_sdk_package_names: Vec<String> =
             vec![sdk_target_pkg_name.clone(), bootstrap_pkg_name.to_string()];
 
-        // L0 (layer store): everything the four runs below read. Lock pins are in it, so a
+        // L0 (stacks): everything the four runs below read. Lock pins are in it, so a
         // project pinned to other versions gets its own layer.
-        let l0_inputs = match store {
+        let l0_inputs = match stacks {
             Some(s) => {
                 let pins = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
                 let pins = &pins["sdk"][host_arch.as_str()];
-                let mut v = crate::utils::layer_store::base_inputs(
+                let mut v = crate::utils::stacks::base_inputs(
                     std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
                 );
                 v["step"] = "L0 sdk bootstrap".into();
                 v["target"] = target.into();
                 v["host_arch"] = host_arch.as_str().into();
-                v["image"] = crate::utils::layer_store::image_id(
+                v["image"] = crate::utils::stacks::image_id(
                     &container_helper.container_tool,
                     container_image,
                 )
@@ -2756,7 +2756,7 @@ mod tests {
     use serde_yaml::Value;
     use std::collections::HashMap;
 
-    const STORE_BASE_CONFIG: &str = r#"
+    const STACKS_BASE_CONFIG: &str = r#"
 sdk:
   image: "docker.io/avocadolinux/sdk:2024"
   packages:
@@ -2793,7 +2793,7 @@ runtimes:
         .unwrap()
     }
 
-    fn store_project() -> tempfile::TempDir {
+    fn stacks_project() -> tempfile::TempDir {
         let t = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(t.path().join("rootfs-overlay/etc")).unwrap();
         std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "a\n").unwrap();
@@ -2806,8 +2806,8 @@ runtimes:
     /// file, would get project A's file).
     #[test]
     fn base_layer_key_moves_with_every_sysroot_input() {
-        let t = store_project();
-        let base = base_inputs_of(t.path(), STORE_BASE_CONFIG);
+        let t = stacks_project();
+        let base = base_inputs_of(t.path(), STACKS_BASE_CONFIG);
         assert!(
             base["rootfs"].is_string() && base["initramfs"].is_string(),
             "{base}"
@@ -2816,20 +2816,20 @@ runtimes:
         // File contents, not just config text.
         std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "b\n").unwrap();
         assert_ne!(
-            base_inputs_of(t.path(), STORE_BASE_CONFIG)["rootfs"],
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG)["rootfs"],
             base["rootfs"],
             "overlay content"
         );
         std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "a\n").unwrap();
         std::fs::write(t.path().join("post-install.sh"), "#!/bin/sh\nexit 0\n").unwrap();
         assert_ne!(
-            base_inputs_of(t.path(), STORE_BASE_CONFIG)["rootfs"],
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG)["rootfs"],
             base["rootfs"],
             "post_install content"
         );
         std::fs::write(t.path().join("post-install.sh"), "#!/bin/sh\ntrue\n").unwrap();
         assert_eq!(
-            base_inputs_of(t.path(), STORE_BASE_CONFIG),
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG),
             base,
             "restored"
         );
@@ -2837,25 +2837,25 @@ runtimes:
         for (what, edited) in [
             (
                 "rootfs packages",
-                STORE_BASE_CONFIG.replace("rootfs:\n", "rootfs:\n  packages:\n    vim: '*'\n"),
+                STACKS_BASE_CONFIG.replace("rootfs:\n", "rootfs:\n  packages:\n    vim: '*'\n"),
             ),
             (
                 "initramfs packages",
-                STORE_BASE_CONFIG.replace("avocado-pkg-initramfs", "avocado-pkg-initramfs-tiny"),
+                STACKS_BASE_CONFIG.replace("avocado-pkg-initramfs", "avocado-pkg-initramfs-tiny"),
             ),
             (
                 "permissions",
-                format!("{STORE_BASE_CONFIG}permissions:\n  app:\n    users:\n      app: {{}}\n"),
+                format!("{STACKS_BASE_CONFIG}permissions:\n  app:\n    users:\n      app: {{}}\n"),
             ),
             (
                 "kernel",
                 format!(
-                    "{STORE_BASE_CONFIG}kernel:\n  stock:\n    package: kernel-image\n    version: '6.6.1'\n"
+                    "{STACKS_BASE_CONFIG}kernel:\n  stock:\n    package: kernel-image\n    version: '6.6.1'\n"
                 ),
             ),
             (
                 "sdk image",
-                STORE_BASE_CONFIG.replace("sdk:2024", "sdk:2026"),
+                STACKS_BASE_CONFIG.replace("sdk:2024", "sdk:2026"),
             ),
         ] {
             let got = base_inputs_of(t.path(), &edited);
@@ -2943,18 +2943,16 @@ runtimes:
                 "{s} missing on a first install"
             );
         }
-        let k1 = crate::utils::layer_store::key_of(
-            &serde_json::json!({"parent": "l0", "inputs": first}),
-        );
+        let k1 =
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": "l0", "inputs": first}));
         let saved = a_lock();
-        let next = crate::utils::layer_store::next_keys(
+        let next = crate::utils::stacks::next_keys(
             &[("l0".to_string(), first.clone(), k1.clone())],
             &saved,
         );
         let rerun = part_layer_inputs(&key_inputs(Part::Base, &saved, &sdk, &ext, &feeds));
-        let k2 = crate::utils::layer_store::key_of(
-            &serde_json::json!({"parent": "l0", "inputs": rerun}),
-        );
+        let k2 =
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": "l0", "inputs": rerun}));
         assert_eq!(
             next,
             vec![(k2, k1)],
@@ -2969,14 +2967,14 @@ runtimes:
         let recorded = lock_sections(&a_lock(), part_lock_sections(Part::Project));
         let mut sparse = lock_sections(&serde_json::json!({}), part_lock_sections(Part::Base));
         let mut current = serde_json::json!({});
-        crate::utils::layer_store::fill_missing(&mut current, &recorded);
-        crate::utils::layer_store::fill_missing(&mut current, &sparse);
+        crate::utils::stacks::fill_missing(&mut current, &recorded);
+        crate::utils::stacks::fill_missing(&mut current, &sparse);
         let t: crate::utils::lockfile::TargetLocks =
             serde_json::from_value(current).expect("a filled lock deserializes");
         assert!(t.target_sysroot.contains_key("libfoo"));
         sparse["rootfs"] = serde_json::json!({"r": "1"});
         let mut c2 = serde_json::json!({"rootfs": {}});
-        crate::utils::layer_store::fill_missing(&mut c2, &sparse);
+        crate::utils::stacks::fill_missing(&mut c2, &sparse);
         let _: crate::utils::lockfile::TargetLocks = serde_json::from_value(c2).unwrap();
     }
 
@@ -2984,7 +2982,7 @@ runtimes:
     #[test]
     fn part_keys_move_with_their_own_inputs_only() {
         let (lock, sdk, ext, feeds) = (a_lock(), None, HashMap::new(), serde_yaml::Value::Null);
-        let key = |p: &PartKeyInputs| crate::utils::layer_store::key_of(&part_layer_inputs(p));
+        let key = |p: &PartKeyInputs| crate::utils::stacks::key_of(&part_layer_inputs(p));
         let base = key(&key_inputs(Part::Base, &lock, &sdk, &ext, &feeds));
         let proj = key(&key_inputs(Part::Project, &lock, &sdk, &ext, &feeds));
         let args = vec!["-e".to_string(), "FOO=1".to_string()];
@@ -3028,9 +3026,9 @@ runtimes:
     /// no two projects would ever share their base.
     #[test]
     fn base_layer_key_ignores_project_only_sections() {
-        let t = store_project();
-        let base = base_inputs_of(t.path(), STORE_BASE_CONFIG);
-        let edited = STORE_BASE_CONFIG.replace(
+        let t = stacks_project();
+        let base = base_inputs_of(t.path(), STACKS_BASE_CONFIG);
+        let edited = STACKS_BASE_CONFIG.replace(
             "    avocado-sdk-toolchain: '*'\n",
             "    avocado-sdk-toolchain: '*'\n    nativesdk-cmake: '*'\n",
         );
