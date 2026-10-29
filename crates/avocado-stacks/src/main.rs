@@ -1,14 +1,14 @@
 use anyhow::{bail, Result};
-use avocado_store::{free_bytes, write_out, Store, EMPTY_KEY};
+use avocado_stacks::{free_bytes, write_out, Stacks, EMPTY_KEY};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
 
-/// Content-addressed layer store. Runs as root in the privileged helper container.
+/// Content-addressed layer cache. Runs as root in the privileged helper container.
 #[derive(Parser)]
 struct Cli {
-    /// Store root (on the docker host's filesystem).
-    #[arg(long, env = "AVOCADO_STORE_ROOT")]
+    /// Stacks root (on the docker host's filesystem).
+    #[arg(long, env = "AVOCADO_STACKS_ROOT")]
     root: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,
@@ -104,7 +104,7 @@ enum Cmd {
         high: u64,
         #[arg(long, default_value_t = 0)]
         low: u64,
-        /// Evict while the store's filesystem has less than this many bytes free...
+        /// Evict while the stacks filesystem has less than this many bytes free...
         #[arg(long)]
         min_free: Option<u64>,
         /// ...until it has at least this many (default 1.5 × --min-free).
@@ -124,7 +124,7 @@ enum Cmd {
     Hold {
         key: String,
     },
-    /// Unmount every view and delete the whole store.
+    /// Unmount every view and delete all stacks.
     Destroy,
 }
 
@@ -140,7 +140,7 @@ fn kernel_ok(release: &str) -> bool {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let store = Store::open(&cli.root)?;
+    let stacks = Stacks::open(&cli.root)?;
     match cli.cmd {
         Cmd::Preflight => {
             let rel = std::fs::read_to_string("/proc/sys/kernel/osrelease")?
@@ -149,9 +149,9 @@ fn main() -> Result<()> {
             if !kernel_ok(&rel) {
                 bail!("kernel {rel} is older than 6.12 (file-backed EROFS)");
             }
-            let name = format!("preflight-{}", avocado_store::uniq());
-            let r = store.mount_view(&name, Some(EMPTY_KEY), &[]);
-            let _ = store.drop_view(&name);
+            let name = format!("preflight-{}", avocado_stacks::uniq());
+            let r = stacks.mount_view(&name, Some(EMPTY_KEY), &[]);
+            let _ = stacks.drop_view(&name);
             if let Err(e) = r {
                 bail!("cannot mount an EROFS + overlay view here: {e:#}");
             }
@@ -163,26 +163,26 @@ fn main() -> Result<()> {
             inputs,
             exclude,
         } => {
-            let r = store.import_dir(&src, &key, serde_json::from_str(&inputs)?, &exclude)?;
+            let r = stacks.import_dir(&src, &key, serde_json::from_str(&inputs)?, &exclude)?;
             write_out(&serde_json::to_value(r)?);
         }
         Cmd::Check { view, key } => {
-            let current = store.view(&view)?.map(|v| store.canonical(&v.layer));
+            let current = stacks.view(&view)?.map(|v| stacks.canonical(&v.layer));
             let ancestors = current
                 .as_deref()
-                .map(|c| store.ancestors(c))
+                .map(|c| stacks.ancestors(c))
                 .unwrap_or_default();
             write_out(&json!({
                 "current": current, "ancestors": ancestors,
-                "has": store.has_layer(&key), "canonical": store.canonical(&key),
+                "has": stacks.has_layer(&key), "canonical": stacks.canonical(&key),
             }));
         }
         Cmd::Has { key } => {
-            if !store.has_layer(&key) {
+            if !stacks.has_layer(&key) {
                 std::process::exit(1);
             }
         }
-        Cmd::Record { key } => write_out(&serde_json::to_value(store.record(&key)?)?),
+        Cmd::Record { key } => write_out(&serde_json::to_value(stacks.record(&key)?)?),
         Cmd::Mount {
             view,
             layer,
@@ -190,9 +190,9 @@ fn main() -> Result<()> {
             at,
             meta,
         } => {
-            let _l = store.view_lock(&view)?;
+            let _l = stacks.view_lock(&view)?;
             let meta = meta.map(|m| serde_json::from_str(&m)).transpose()?;
-            write_out(&serde_json::to_value(store.mount_view_at(
+            write_out(&serde_json::to_value(stacks.mount_view_at(
                 &view,
                 layer.as_deref(),
                 &private,
@@ -200,43 +200,43 @@ fn main() -> Result<()> {
                 meta,
             )?)?)
         }
-        Cmd::Remount { prefix } => write_out(&json!({"mounted": store.remount(&prefix)?})),
-        Cmd::Alias { alias, key } => store.alias(&alias, &key)?,
+        Cmd::Remount { prefix } => write_out(&json!({"mounted": stacks.remount(&prefix)?})),
+        Cmd::Alias { alias, key } => stacks.alias(&alias, &key)?,
         Cmd::Umount { view } => {
-            let _l = store.view_lock(&view)?;
-            store.umount_view(&view)?
+            let _l = stacks.view_lock(&view)?;
+            stacks.umount_view(&view)?
         }
         Cmd::Drop { view, prefix } => {
             if prefix {
-                write_out(&json!({"dropped": store.drop_prefix(&view)?}));
+                write_out(&json!({"dropped": stacks.drop_prefix(&view)?}));
             } else {
-                let _l = store.view_lock(&view)?;
-                store.drop_view(&view)?;
+                let _l = stacks.view_lock(&view)?;
+                stacks.drop_view(&view)?;
                 write_out(&json!({"dropped": [view]}));
             }
         }
         Cmd::Use { view, key, private } => {
-            let _l = store.view_lock(&view)?;
+            let _l = stacks.view_lock(&view)?;
             write_out(&serde_json::to_value(
-                store.use_layer(&view, &key, &private)?,
+                stacks.use_layer(&view, &key, &private)?,
             )?)
         }
         Cmd::Commit { view, key, inputs } => {
-            let _l = store.view_lock(&view)?;
-            write_out(&serde_json::to_value(store.commit_view(
+            let _l = stacks.view_lock(&view)?;
+            write_out(&serde_json::to_value(stacks.commit_view(
                 &view,
                 &key,
                 serde_json::from_str(&inputs)?,
             )?)?)
         }
         Cmd::Verify { key } => {
-            let (ok, got, secs) = store.verify(&key)?;
+            let (ok, got, secs) = stacks.verify(&key)?;
             write_out(&json!({"key": key, "ok": ok, "tree_digest": got, "secs": secs}));
             if !ok {
                 std::process::exit(2);
             }
         }
-        Cmd::Report => write_out(&store.report()?),
+        Cmd::Report => write_out(&stacks.report()?),
         Cmd::Gc {
             high,
             low,
@@ -247,7 +247,7 @@ fn main() -> Result<()> {
             let (mut high, mut low) = (high, low);
             if let Some(mf) = min_free {
                 // Free space is the budget: evicting X bytes frees X, so translate to watermarks.
-                let used = store.gc(u64::MAX, 0, true)?["before_bytes"]
+                let used = stacks.gc(u64::MAX, 0, true)?["before_bytes"]
                     .as_u64()
                     .unwrap_or(0);
                 let free = free_bytes(&cli.root);
@@ -255,19 +255,19 @@ fn main() -> Result<()> {
                 high = high.min((used + free).saturating_sub(mf));
                 low = low.max((used + free).saturating_sub(tf)).min(high);
             }
-            write_out(&store.gc(high, low, dry_run)?)
+            write_out(&stacks.gc(high, low, dry_run)?)
         }
-        Cmd::Pin { name, keys } => store.pin(&name, &keys)?,
-        Cmd::Unpin { name } => store.unpin(&name)?,
+        Cmd::Pin { name, keys } => stacks.pin(&name, &keys)?,
+        Cmd::Unpin { name } => stacks.unpin(&name)?,
         Cmd::Hold { key } => {
             let t = std::time::Instant::now();
-            let _l = store.key_lock(&key)?;
+            let _l = stacks.key_lock(&key)?;
             println!("held {:.3}", t.elapsed().as_secs_f64());
-            avocado_store::wait_stdin_eof();
+            avocado_stacks::wait_stdin_eof();
         }
         Cmd::Destroy => {
-            for v in store.views()? {
-                store.drop_view(&v.name)?;
+            for v in stacks.views()? {
+                stacks.drop_view(&v.name)?;
             }
             for d in ["objects", "layers", "views", "locks", "pins", "tmp"] {
                 let p = cli.root.join(d);

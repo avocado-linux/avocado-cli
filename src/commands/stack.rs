@@ -1,16 +1,14 @@
-//! `avocado store`: see and reclaim the layer store's space.
+//! `avocado stack`: see and reclaim the space stacks use.
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::utils::layer_store::{
-    config_path, human_bytes, orphan_reason, parse_size, settings, Helper,
-};
 use crate::utils::output::{print_info, print_success, OutputLevel};
+use crate::utils::stacks::{config_path, human_bytes, orphan_reason, parse_size, settings, Helper};
 use crate::utils::volume::VolumeState;
 
-pub struct StoreCommand {
+pub struct StackCommand {
     container_tool: String,
 }
 
@@ -40,7 +38,7 @@ fn bytes(v: &Value) -> String {
 pub fn render_status(r: &Value) -> String {
     let mut o = String::new();
     o += &format!(
-        "Layer store {} ({} free)\n",
+        "Stacks {} ({} free)\n",
         r["root"].as_str().unwrap_or(""),
         bytes(&r["free_bytes"])
     );
@@ -53,7 +51,7 @@ pub fn render_status(r: &Value) -> String {
         bytes(&r["upper_bytes"])
     );
     o += &format!(
-        "  reclaimable now (`avocado store gc`): {}\n",
+        "  reclaimable now (`avocado stack gc`): {}\n",
         bytes(&r["reclaimable_bytes"])
     );
     let empty = vec![];
@@ -154,7 +152,7 @@ pub fn render_status(r: &Value) -> String {
     o
 }
 
-impl StoreCommand {
+impl StackCommand {
     pub fn new(container_tool: String) -> Self {
         Self { container_tool }
     }
@@ -163,7 +161,7 @@ impl StoreCommand {
         match Helper::configured(&self.container_tool)? {
             Some(h) => Ok(h),
             None => bail!(
-                "no layer store is configured. Set `root:` in {} (see `avocado store config`)",
+                "stacks are not configured. Set `root:` in {} (see `avocado stack config`)",
                 config_path()?.display()
             ),
         }
@@ -224,7 +222,7 @@ impl StoreCommand {
         }
         print_success(
             &format!(
-                "{} {} ({} layers, {} unreferenced files); store {} -> {}.",
+                "{} {} ({} layers, {} unreferenced files); stacks {} -> {}.",
                 if dry_run { "Would free" } else { "Freed" },
                 bytes(&r["freed_bytes"]),
                 evicted.len(),
@@ -309,7 +307,7 @@ impl StoreCommand {
         }
         print_success(
             &format!(
-                "{} {dropped} orphaned view(s), {} of private files. Run `avocado store gc` to reclaim the layers only they used.",
+                "{} {dropped} orphaned view(s), {} of private files. Run `avocado stack gc` to reclaim the layers only they used.",
                 if dry_run { "Would drop" } else { "Dropped" },
                 human_bytes(freed)
             ),
@@ -334,7 +332,7 @@ impl StoreCommand {
             );
         };
         let prefix = match target {
-            Some(t) => crate::utils::layer_store::view_name(&state.volume_name, t),
+            Some(t) => crate::utils::stacks::view_name(&state.volume_name, t),
             None => format!("{}-", state.volume_name),
         };
         let r = h.json(&["report"]).await?;
@@ -346,10 +344,7 @@ impl StoreCommand {
             .filter(|v| v["name"].as_str().is_some_and(|n| n.starts_with(&prefix)))
             .collect();
         if mine.is_empty() {
-            print_info(
-                "No layer store views for this project.",
-                OutputLevel::Normal,
-            );
+            print_info("No stack views for this project.", OutputLevel::Normal);
             return Ok(());
         }
         for v in &mine {
@@ -369,7 +364,7 @@ impl StoreCommand {
         Ok(())
     }
 
-    /// Delete the whole store: every view (projects reinstall from scratch next time) and
+    /// Delete all stacks: every view (projects reinstall from scratch next time) and
     /// every layer. The files are root-owned, so this is the way to remove them.
     pub async fn destroy(&self, yes: bool) -> Result<()> {
         let h = self.helper()?;
@@ -377,7 +372,7 @@ impl StoreCommand {
         let views = r["views"].as_array().map(|v| v.len()).unwrap_or(0);
         if !yes {
             bail!(
-                "this deletes the store at {} ({}, {views} project view(s)); every project \
+                "this deletes all stacks at {} ({}, {views} project view(s)); every project \
                  reinstalls its SDK next time. Re-run with --yes to proceed",
                 r["root"].as_str().unwrap_or(""),
                 bytes(&r["total_bytes"])
@@ -386,7 +381,7 @@ impl StoreCommand {
         h.json(&["destroy"]).await?;
         print_success(
             &format!(
-                "Deleted the store's contents ({}). Remove `root:` from {} to stop using it.",
+                "Deleted all stacks ({}). Remove `root:` from {} to stop using stacks.",
                 bytes(&r["total_bytes"]),
                 config_path()?.display()
             ),
@@ -404,13 +399,10 @@ impl StoreCommand {
             if path.exists() { "" } else { " (not present)" }
         );
         for (var, val) in [
+            ("AVOCADO_STACKS", std::env::var("AVOCADO_STACKS").ok()),
             (
-                "AVOCADO_LAYER_STORE",
-                std::env::var("AVOCADO_LAYER_STORE").ok(),
-            ),
-            (
-                "AVOCADO_LAYER_STORE_HELPER",
-                std::env::var("AVOCADO_LAYER_STORE_HELPER").ok(),
+                "AVOCADO_STACKS_HELPER",
+                std::env::var("AVOCADO_STACKS_HELPER").ok(),
             ),
         ] {
             if let Some(v) = val {
@@ -420,24 +412,24 @@ impl StoreCommand {
         println!("\n{}", serde_yaml::to_string(&s)?);
         match &s.root {
             None => println!(
-                "No store configured. To enable one, write {}:\n\n\
-                 root: /var/lib/avocado/store   # absolute path on the docker host, on a\n\
+                "Stacks are not configured. To enable them, write {}:\n\n\
+                 root: /var/lib/avocado/stacks   # absolute path on the docker host, on a\n\
                  \x20                              # filesystem with room (not tmpfs)\n\
-                 # helper_image: avocado-store:poc   # not published yet: build it from\n\
-                 \x20                                     # crates/avocado-store (see its README)\n\
+                 # helper_image: avocado-stacks:poc   # not published yet: build it from\n\
+                 \x20                                     # crates/avocado-stacks (see its README)\n\
                  # gc:\n\
                  #   max_size: 200G   # evict unused layers to stay under this\n\
                  #   min_free: 20G    # ...or to keep this much free on that filesystem\n",
                 path.display()
             ),
             Some(root) => {
-                match crate::utils::layer_store::active_root(&self.container_tool).await {
+                match crate::utils::stacks::active_root(&self.container_tool).await {
                     Some(_) => print_success(
-                        &format!("The store at {root} works on this host."),
+                        &format!("Stacks at {root} work on this host."),
                         OutputLevel::Normal,
                     ),
                     None => {
-                        bail!("the store at {root} cannot run on this host (see the warning above)")
+                        bail!("stacks at {root} cannot run on this host (see the warning above)")
                     }
                 }
             }
@@ -454,7 +446,7 @@ mod tests {
     #[test]
     fn status_shows_projects_layers_and_what_is_reclaimable() {
         let r = json!({
-            "root": "/srv/store", "free_bytes": 10u64 << 30, "total_bytes": 5u64 << 30,
+            "root": "/srv/stacks", "free_bytes": 10u64 << 30, "total_bytes": 5u64 << 30,
             "object_bytes": 4u64 << 30, "objects": 100, "layer_meta_bytes": 1u64 << 20,
             "upper_bytes": 1u64 << 30, "reclaimable_bytes": 512u64 << 20,
             "views": [{"name": "avo-x-qemux86-64", "layer": "aaaaaaaaaaaaaaaa", "mounted": true,
@@ -469,9 +461,9 @@ mod tests {
             ]
         });
         let t = render_status(&r);
-        assert!(t.contains("/srv/store (10.0 GiB free)"), "{t}");
+        assert!(t.contains("/srv/stacks (10.0 GiB free)"), "{t}");
         assert!(
-            t.contains("reclaimable now (`avocado store gc`): 512.0 MiB"),
+            t.contains("reclaimable now (`avocado stack gc`): 512.0 MiB"),
             "{t}"
         );
         assert!(

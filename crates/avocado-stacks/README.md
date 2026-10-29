@@ -1,15 +1,15 @@
-# avocado-store (PoC)
+# avocado-stacks (PoC)
 
-A content-addressed layer store for Avocado build state, in the composefs model:
+A content-addressed layer cache for Avocado build state, in the composefs model:
 every file's bytes are stored once by sha256, a layer is a *complete tree* described by
 metadata only, and a project's `/opt/_avocado/<target>` is an overlay **view** of one layer
 plus a private upper. Layers are immutable once committed and shared across projects on one
-store. Moving layers between machines (an OCI registry, fetching only the objects the receiver
+host. Moving layers between machines (an OCI registry, fetching only the objects the receiver
 lacks) is a later step: it needs signed layer records, TLS and auth first.
 
-This crate is the store engine. It runs as root inside a short-lived privileged helper
-container (`avocado-store:poc`, see `Dockerfile.helper`), so native Linux hosts and
-avocado-vm take the same code path. The CLI side is `src/utils/layer_store.rs`.
+This crate is the stacks engine. It runs as root inside a short-lived privileged helper
+container (`avocado-stacks:poc`, see `Dockerfile.helper`), so native Linux hosts and
+avocado-vm take the same code path. The CLI side is `src/utils/stacks.rs`.
 
 ## On-disk format
 
@@ -69,7 +69,7 @@ beside them).
 
 ## Space and cleanup
 
-`report` is the accounting the CLI's `avocado store status` renders: totals (objects, layer
+`report` is the accounting the CLI's `avocado stack status` renders: totals (objects, layer
 metadata, private uppers, free space), what `gc` could reclaim now, every layer with its
 `unique_bytes` (what evicting it alone frees: its metadata plus objects no other layer
 references), its `logical_bytes`, its aliases, children and `protected_by` (`view <name>`,
@@ -77,8 +77,8 @@ references), its `logical_bytes`, its aliases, children and `protected_by` (`vie
 and private bytes. Sizes are bytes on disk (allocated blocks), so they add up to what a delete
 frees.
 
-`gc --high H --low L [--dry-run]` (or `--min-free F [--target-free T]`): when the store (objects
-+ layer files) is over H bytes, evict layers no pin and no view holds until it is at or under L,
+`gc --high H --low L [--dry-run]` (or `--min-free F [--target-free T]`): when stacks (objects
++ layer files) are over H bytes, evict layers no pin and no view holds until they are at or under L,
 then delete objects no remaining layer references. Order: leaves before the layers they were
 built on (a shared base frees little while its children exist, and every project needs it
 again), least recently used first among equals (record mtime, touched on every mount and use).
@@ -89,14 +89,14 @@ keeping its parent.
 
 `drop <view>` / `drop --prefix <prefix>` releases views (their uppers and their hold on layers):
 the CLI drops a project's views before its volume is removed (`avocado clean`, `prune`, the
-volume reaper) and for orphans (`avocado store prune`).
+volume reaper) and for orphans (`avocado stack prune`).
 
 ## Integrity
 
 Every dump read is validated: rooted, canonical paths (no empty, `.` or `..` component), object
 references `ab/` + 62 lowercase hex digits, hardlink targets rooted, and no `trusted.overlay.*`
 or `security.selinux` xattrs. A layer record (the commit point) is written only after a
-`syncfs`, so a record never names files a power loss truncated. Store directories are 0700:
+`syncfs`, so a record never names files a power loss truncated. Stacks directories are 0700:
 uppers hold project-private files and objects hold every project's files.
 
 ## Commands
@@ -116,7 +116,7 @@ change a view (mount, use, commit, umount, drop) also hold a per-view lock.
 accounting); needs `mkcomposefs` on PATH. `tests/integration.sh <scratch dir>`: the `#[ignore]`d
 mount tests (commit/use round trip, renames, failed-commit recovery, busy views) as root in the
 helper image; needs privileged docker, kernel 6.12+ and a scratch directory on ext4, xfs or btrfs.
-`scripts/layer-store-e2e.sh` (repo root) drives the CLI end to end against real feeds: shared
+`scripts/stacks-e2e.sh` (repo root) drives the CLI end to end against real feeds: shared
 and unshared layers, warm re-runs, `unlock`, a compile section, a busy project, `status`,
 `prune`, `clean`, `gc`, and a host whose helper cannot run.
 
@@ -127,4 +127,4 @@ Rootful docker on Linux 6.12+ (file-backed EROFS; data-only overlay lowers need 
 `preflight` mounts a real view; the CLI runs it once per process and falls back to plain
 volumes (with a warning) when it fails.
 Build: `cargo build --release --target x86_64-unknown-linux-musl`, then
-`docker build -f Dockerfile.helper -t avocado-store:poc` with the binary in the context.
+`docker build -f Dockerfile.helper -t avocado-stacks:poc` with the binary in the context.

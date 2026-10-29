@@ -1,12 +1,12 @@
 #!/bin/bash
-# Run the store's integration tests (#[ignore]d, real mounts) as root inside the helper image.
+# Run the stacks integration tests (#[ignore]d, real mounts) as root inside the helper image.
 # Needs: docker with --privileged, kernel 6.12+, and a scratch directory on a filesystem that can
 # hold an overlay upper (ext4, xfs or btrfs; not tmpfs). Usage:
-#   tests/integration.sh /var/tmp/avocado-store-it
+#   tests/integration.sh /var/tmp/avocado-stacks-it
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 scratch=${1:?scratch directory on a real filesystem}
-image=${AVOCADO_STORE_HELPER:-avocado-store:poc}
+image=${AVOCADO_STACKS_HELPER:-avocado-stacks:poc}
 mkdir -p "$scratch"
 bin=$(cd "$here" && cargo test --release --lib --no-run --message-format=json 2>/dev/null |
   python3 -c 'import json,sys
@@ -22,5 +22,5 @@ cleanup() {
 trap cleanup EXIT
 docker run --rm --privileged \
   -v "$bin:/it-tests:ro" -v "$scratch:$scratch:rshared" \
-  -e AVOCADO_STORE_IT_DIR="$scratch" --entrypoint /it-tests "$image" \
+  -e AVOCADO_STACKS_IT_DIR="$scratch" --entrypoint /it-tests "$image" \
   --ignored --test-threads=1

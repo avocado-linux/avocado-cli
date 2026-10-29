@@ -1,31 +1,31 @@
 #!/bin/bash
-# End-to-end check of the layer store against real feeds and docker.
+# End-to-end check of stacks against real feeds and docker.
 #
 # Needs: Linux 6.12+, rootful docker that can run --privileged, the helper image built from
-# crates/avocado-store (see its README), network access to the feeds, and a checkout of
+# crates/avocado-stacks (see its README), network access to the feeds, and a checkout of
 # https://github.com/avocado-linux/references. Takes 20-30 minutes; cleans up after itself.
 #
-#   AVOCADO=target/release/avocado REFS=~/src/references scripts/layer-store-e2e.sh
+#   AVOCADO=target/release/avocado REFS=~/src/references scripts/stacks-e2e.sh
 #
 # AVOCADO  the CLI under test (required)
 # REFS     references checkout (required)
-# WORK     scratch directory on ext4, xfs or btrfs (default /var/tmp/avocado-layer-store-e2e)
-# HELPER   helper image (default avocado-store:poc)
+# WORK     scratch directory on ext4, xfs or btrfs (default /var/tmp/avocado-stacks-e2e)
+# HELPER   helper image (default avocado-stacks:poc)
 set -uo pipefail
 AVO=$(realpath "${AVOCADO:?set AVOCADO to the avocado binary under test}")
 REFS=$(realpath "${REFS:?set REFS to a references checkout}")
-WORK=${WORK:-/var/tmp/avocado-layer-store-e2e}
-HELPER=${HELPER:-avocado-store:poc}
-export AVOCADO_LAYER_STORE=$WORK/store AVOCADO_LAYER_STORE_HELPER=$HELPER
+WORK=${WORK:-/var/tmp/avocado-stacks-e2e}
+HELPER=${HELPER:-avocado-stacks:poc}
+export AVOCADO_STACKS=$WORK/stacks AVOCADO_STACKS_HELPER=$HELPER
 P=$WORK/projects L=$WORK/logs
-mkdir -p "$AVOCADO_LAYER_STORE" "$P" "$L"
+mkdir -p "$AVOCADO_STACKS" "$P" "$L"
 pass=0 fail=0
 check() { if eval "$2"; then echo "PASS: $1"; pass=$((pass + 1)); else echo "FAIL: $1"; fail=$((fail + 1)); fi; }
 inst() { (cd "$1" && "$AVO" sdk install --no-tui "${@:3}") >"$2" 2>&1; }
 count() { grep -c "$1" "$2"; }
 inview() { count 'already in the view' "$1"; }
-hits() { count 'Layer store: .* hit ' "$1"; }
-built() { count 'Layer store: .* committed' "$1"; }
+hits() { count 'Stacks: .* hit ' "$1"; }
+built() { count 'Stacks: .* committed' "$1"; }
 peek() { (cd "$1" && "$AVO" sdk run --no-tui -- bash -lc "echo VAL:\$($2)") 2>/dev/null | sed -n 's/^VAL://p' | tail -1; }
 lock_has() { python3 - "$1/avocado.lock" "${@:2}" <<'PY'
 import json, sys
@@ -34,10 +34,10 @@ sys.exit(0 if all(t.get(k) for k in sys.argv[2:]) else 1)
 PY
 }
 volume_of() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['volume_name'])" "$1/.avocado-state"; }
-views() { "$AVO" store status --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['views']))"; }
+views() { "$AVO" stack status --json | python3 -c "import json,sys;print(len(json.load(sys.stdin)['views']))"; }
 
 teardown() {
-  local R=$AVOCADO_LAYER_STORE
+  local R=$AVOCADO_STACKS
   docker run --rm --privileged -v "$R:$R:rshared" -v /var/lib/docker/volumes:/var/lib/docker/volumes:rshared \
     "$HELPER" --root "$R" destroy >/dev/null 2>&1
   for v in $(docker volume ls -q --filter label=avocado.source_path | grep '^avo-'); do
@@ -45,7 +45,7 @@ teardown() {
       "$P"/*) docker volume rm -f "$v" >/dev/null ;;
     esac
   done
-  docker run --rm -v "$WORK:/w" --entrypoint rm "$HELPER" -rf /w/store
+  docker run --rm -v "$WORK:/w" --entrypoint rm "$HELPER" -rf /w/stacks
   rm -rf "$P"
   echo "teardown: $(grep -c " $WORK/" /proc/self/mountinfo) mounts left"
 }
@@ -115,34 +115,34 @@ wait $busy 2>/dev/null
 docker ps -q --filter "volume=$(volume_of "$P/a")" | xargs -r docker rm -f >/dev/null
 
 echo "== visibility"
-"$AVO" store status >"$L/status.txt" 2>&1
+"$AVO" stack status >"$L/status.txt" 2>&1
 cat "$L/status.txt"
 check "status lists all four projects by absolute path" '[ $(grep -c "$P/" "$L/status.txt") -eq 4 ]'
-check "status --json parses" '"$AVO" store status --json | python3 -c "import json,sys;json.load(sys.stdin)"'
+check "status --json parses" '"$AVO" stack status --json | python3 -c "import json,sys;json.load(sys.stdin)"'
 
 echo "== reclaiming"
 rm -rf "${P:?}/c"
-"$AVO" store prune --dry-run >"$L/prune-dry.log" 2>&1
+"$AVO" stack prune --dry-run >"$L/prune-dry.log" 2>&1
 check "prune --dry-run names C's view and changes nothing" 'grep -q "would drop" "$L/prune-dry.log" && [ $(views) -eq 4 ]'
-"$AVO" store prune >"$L/prune.log" 2>&1
+"$AVO" stack prune >"$L/prune.log" 2>&1
 check "prune drops only C's view" '[ $(views) -eq 3 ]'
 volA=$(volume_of "$P/a")
 (cd "$P/a" && "$AVO" clean) >"$L/a-clean.log" 2>&1; rc=$?
-check "clean succeeds in store mode" '[ $rc -eq 0 ]'
-check "clean removed A's volume and view" '! docker volume inspect "$volA" >/dev/null 2>&1 && ! "$AVO" store status --json | grep -q "$volA"'
+check "clean succeeds with stacks" '[ $rc -eq 0 ]'
+check "clean removed A's volume and view" '! docker volume inspect "$volA" >/dev/null 2>&1 && ! "$AVO" stack status --json | grep -q "$volA"'
 check "no mounts left inside A's volume" '! grep -q "volumes/$volA/" /proc/self/mountinfo'
-"$AVO" store gc --dry-run >"$L/gc-dry.log" 2>&1
-"$AVO" store gc >"$L/gc.log" 2>&1
+"$AVO" stack gc --dry-run >"$L/gc-dry.log" 2>&1
+"$AVO" stack gc >"$L/gc.log" 2>&1
 check "gc reclaims everything no project holds" \
-  '[ "$("$AVO" store status --json | python3 -c "import json,sys;print(json.load(sys.stdin)[\"reclaimable_bytes\"])")" -eq 0 ]'
+  '[ "$("$AVO" stack status --json | python3 -c "import json,sys;print(json.load(sys.stdin)[\"reclaimable_bytes\"])")" -eq 0 ]'
 inst "$P/b" "$L/b-after-gc.log"
 check "B still installs from its layers after gc" '[ $(built "$L/b-after-gc.log") -eq 0 ]'
 
-echo "== a configured store whose helper cannot run"
+echo "== configured stacks whose helper cannot run"
 mk e shell-heartbeat
-(cd "$P/e" && AVOCADO_LAYER_STORE_HELPER=avocado-store:does-not-exist "$AVO" sdk install --no-tui) >"$L/e.log" 2>&1; rc=$?
-check "install falls back to plain volumes with a warning" '[ $rc -eq 0 ] && grep -q "Using plain volumes" "$L/e.log" && ! grep -q "Layer store: .* committed" "$L/e.log"'
-(cd "$P/e" && AVOCADO_LAYER_STORE_HELPER=avocado-store:does-not-exist "$AVO" clean) >"$L/e-clean.log" 2>&1; rc=$?
+(cd "$P/e" && AVOCADO_STACKS_HELPER=avocado-stacks:does-not-exist "$AVO" sdk install --no-tui) >"$L/e.log" 2>&1; rc=$?
+check "install falls back to plain volumes with a warning" '[ $rc -eq 0 ] && grep -q "Using plain volumes" "$L/e.log" && ! grep -q "Stacks: .* committed" "$L/e.log"'
+(cd "$P/e" && AVOCADO_STACKS_HELPER=avocado-stacks:does-not-exist "$AVO" clean) >"$L/e-clean.log" 2>&1; rc=$?
 check "clean still works there" '[ $rc -eq 0 ]'
 
 echo "== $pass passed, $fail failed"

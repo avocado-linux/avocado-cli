@@ -26,7 +26,6 @@ pub mod jcs;
 pub mod kab_wrap;
 pub mod kernel_resolver;
 pub mod kernel_version;
-pub mod layer_store;
 pub mod lockfile;
 pub mod nfs_server;
 pub mod offline;
@@ -47,6 +46,7 @@ pub mod signing_keys;
 #[cfg(unix)]
 pub mod signing_service;
 pub mod snapshot;
+pub mod stacks;
 pub mod stamps;
 pub mod sysroot_scan;
 pub mod target;

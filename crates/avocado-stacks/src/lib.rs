@@ -1,4 +1,4 @@
-//! Content-addressed layer store for Avocado build state (the composefs model).
+//! Content-addressed layer cache for Avocado build state (the composefs model).
 //!
 //! On disk (see README.md):
 //!   objects/ab/cdef…     file contents by sha256: the only copy of any file
@@ -559,7 +559,7 @@ pub struct ViewRecord {
     pub meta: serde_json::Value,
 }
 
-pub struct Store {
+pub struct Stacks {
     pub root: PathBuf,
 }
 
@@ -651,8 +651,8 @@ fn threads() -> usize {
         .min(32)
 }
 
-impl Store {
-    pub fn open(root: &Path) -> Result<Store> {
+impl Stacks {
+    pub fn open(root: &Path) -> Result<Stacks> {
         for d in ["objects", "layers", "views", "locks", "pins", "tmp"] {
             let p = root.join(d);
             fs::create_dir_all(&p)?;
@@ -660,7 +660,7 @@ impl Store {
             // root (the helper, and the kernel through the overlay) reads them directly.
             fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         }
-        let s = Store {
+        let s = Stacks {
             root: root.to_path_buf(),
         };
         if !s.has_layer(EMPTY_KEY) {
@@ -689,7 +689,7 @@ impl Store {
         Ok(s)
     }
 
-    /// Flush the store's filesystem (one syncfs instead of an fsync per object).
+    /// Flush the stacks filesystem (one syncfs instead of an fsync per object).
     pub fn sync(&self) -> Result<()> {
         let f = File::open(&self.root)?;
         if unsafe { libc::syncfs(f.as_raw_fd()) } != 0 {
@@ -889,7 +889,7 @@ impl Store {
             parent: parent.map(String::from),
             tree_digest: sha256_hex(&dump),
             created: now_secs(),
-            producer: format!("avocado-store {}", env!("CARGO_PKG_VERSION")),
+            producer: format!("avocado-stacks {}", env!("CARGO_PKG_VERSION")),
             inputs,
             files: entries.len() as u64,
             objects: objects.len() as u64,
@@ -1041,7 +1041,7 @@ impl Store {
             v.layer = l.to_string();
         }
         if !self.has_layer(&v.layer) {
-            bail!("layer {} is not in this store", v.layer);
+            bail!("layer {} is not stored here", v.layer);
         }
         for d in ["upper", "work"] {
             fs::create_dir_all(dir.join(d))?;
@@ -1138,7 +1138,7 @@ impl Store {
     pub fn use_layer(&self, name: &str, key: &str, private: &[String]) -> Result<ViewRecord> {
         let _gc = self.gc_lock(false)?;
         if !self.has_layer(key) {
-            bail!("layer {key} is not in this store");
+            bail!("layer {key} is not stored here");
         }
         let mut v = self.mount_view(name, None, private)?;
         self.umount_view(name)?;
@@ -1514,7 +1514,7 @@ impl Store {
         Ok(m)
     }
 
-    /// Where the store's space goes, for people: per layer what evicting it alone would free
+    /// Where the space stacks use goes, for people: per layer what evicting it alone would free
     /// (`unique_bytes`), what holds it, and per view the private bytes it alone owns.
     pub fn report(&self) -> Result<serde_json::Value> {
         let m = self.model()?;
@@ -1643,7 +1643,7 @@ impl Store {
         }
     }
 
-    /// Evict layers (see `plan_gc`) until the store is at or under `low` bytes, if it is over
+    /// Evict layers (see `plan_gc`) until stacks are at or under `low` bytes, if they are over
     /// `high`, and drop objects no remaining layer references. Crash-safe: records go first (a
     /// layer without its json is garbage), objects last, all under the exclusive GC lock, so no
     /// writer can be mid-way referencing an object we drop.
@@ -1805,8 +1805,8 @@ mod tests {
     /// Needs `mkcomposefs` on PATH (no root: GC never mounts).
     #[test]
     fn gc_keeps_alias_targets_and_drops_the_rest() {
-        let dir = std::env::temp_dir().join(format!("avo-store-test-{}", uniq()));
-        let st = Store::open(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("avo-stacks-test-{}", uniq()));
+        let st = Stacks::open(&dir).unwrap();
         let file = |name: &str, body: &[u8]| {
             let p = dir.join(name);
             fs::write(&p, body).unwrap();
@@ -1861,14 +1861,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn test_store() -> (PathBuf, Store) {
-        let dir = std::env::temp_dir().join(format!("avo-store-test-{}", uniq()));
-        let st = Store::open(&dir).unwrap();
+    fn test_stacks() -> (PathBuf, Stacks) {
+        let dir = std::env::temp_dir().join(format!("avo-stacks-test-{}", uniq()));
+        let st = Stacks::open(&dir).unwrap();
         (dir, st)
     }
 
     /// A regular-file entry backed by a real object holding `body`.
-    fn obj_entry(st: &Store, dir: &Path, name: &str, body: &[u8]) -> Entry {
+    fn obj_entry(st: &Stacks, dir: &Path, name: &str, body: &[u8]) -> Entry {
         let p = dir.join(format!("src-{name}"));
         fs::write(&p, body).unwrap();
         let hex = sha256_hex(body);
@@ -1888,7 +1888,7 @@ mod tests {
         }
     }
 
-    fn layer(st: &Store, key: &str, parent: Option<&str>, files: &[Entry]) {
+    fn layer(st: &Stacks, key: &str, parent: Option<&str>, files: &[Entry]) {
         let mut entries = vec![st.dump(EMPTY_KEY).unwrap().remove(0)];
         entries.extend(files.iter().cloned());
         st.write_layer(
@@ -1902,7 +1902,7 @@ mod tests {
         .unwrap();
     }
 
-    fn age(st: &Store, key: &str, secs_ago: i64) {
+    fn age(st: &Stacks, key: &str, secs_ago: i64) {
         let p = cstr(&st.layer_file(key, "json"));
         let t = now_secs() as i64 - secs_ago;
         let ts = [libc::timespec {
@@ -1916,7 +1916,7 @@ mod tests {
     /// base is what every project needs again.
     #[test]
     fn gc_evicts_leaves_before_the_base_they_were_built_on() {
-        let (dir, st) = test_store();
+        let (dir, st) = test_stacks();
         let shared = obj_entry(&st, &dir, "shared", &[b's'; 4096]);
         let top = obj_entry(&st, &dir, "top", &[b't'; 4096]);
         layer(&st, "base", None, std::slice::from_ref(&shared));
@@ -1943,7 +1943,7 @@ mod tests {
     /// either name finds it in the view's chain.
     #[test]
     fn alias_chains_resolve_to_the_real_layer() {
-        let (dir, st) = test_store();
+        let (dir, st) = test_stacks();
         let a = obj_entry(&st, &dir, "a", &[b'a'; 4096]);
         layer(&st, "real", None, &[a]);
         st.alias("one", "real").unwrap();
@@ -1961,7 +1961,7 @@ mod tests {
     /// install rebuild what the view already contains.
     #[test]
     fn gc_keeps_the_layers_a_view_was_built_on() {
-        let (dir, st) = test_store();
+        let (dir, st) = test_stacks();
         let a = obj_entry(&st, &dir, "a", &[b'a'; 4096]);
         let b = obj_entry(&st, &dir, "b", &[b'b'; 4096]);
         layer(&st, "l0", None, std::slice::from_ref(&a));
@@ -2000,7 +2000,7 @@ mod tests {
     /// with its target.
     #[test]
     fn gc_folds_aliases_into_their_target() {
-        let (dir, st) = test_store();
+        let (dir, st) = test_stacks();
         let a = obj_entry(&st, &dir, "a", &[b'a'; 4096]);
         layer(&st, "real", None, &[a]);
         st.alias("other-name", "real").unwrap();
@@ -2033,7 +2033,7 @@ mod tests {
     /// layer don't count.
     #[test]
     fn report_unique_bytes_excludes_shared_objects() {
-        let (dir, st) = test_store();
+        let (dir, st) = test_stacks();
         let shared = obj_entry(&st, &dir, "shared", &[b's'; 8192]);
         let mine = obj_entry(&st, &dir, "mine", &[b'm'; 4096]);
         layer(&st, "one", None, &[shared.clone(), mine]);
@@ -2184,25 +2184,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Integration tests: real mounts. They need root, `mkcomposefs`, kernel 6.12+ and a store
+    /// Integration tests: real mounts. They need root, `mkcomposefs`, kernel 6.12+ and a stacks root
     /// directory on a filesystem that can hold an overlay upper (not overlayfs or tmpfs inside
     /// a container): `tests/integration.sh` runs them in the helper image with
-    /// AVOCADO_STORE_IT_DIR set. Without it they are skipped.
-    fn it_store() -> Option<(PathBuf, Store)> {
-        let base = std::env::var("AVOCADO_STORE_IT_DIR").ok()?;
+    /// AVOCADO_STACKS_IT_DIR set. Without it they are skipped.
+    fn it_stacks() -> Option<(PathBuf, Stacks)> {
+        let base = std::env::var("AVOCADO_STACKS_IT_DIR").ok()?;
         let dir = Path::new(&base).join(format!("it-{}", uniq()));
-        let st = Store::open(&dir).unwrap();
+        let st = Stacks::open(&dir).unwrap();
         Some((dir, st))
     }
 
-    fn it_cleanup(dir: &Path, st: &Store) {
+    fn it_cleanup(dir: &Path, st: &Stacks) {
         for v in st.views().unwrap() {
             let _ = st.drop_view(&v.name);
         }
         let _ = fs::remove_dir_all(dir);
     }
 
-    fn file_object(st: &Store, key: &str, path: &str) -> Option<String> {
+    fn file_object(st: &Stacks, key: &str, path: &str) -> Option<String> {
         st.dump(key)
             .unwrap()
             .into_iter()
@@ -2213,7 +2213,7 @@ mod tests {
     #[test]
     #[ignore = "needs root and real mounts: tests/integration.sh"]
     fn it_commit_use_round_trip_and_verify() {
-        let Some((dir, st)) = it_store() else { return };
+        let Some((dir, st)) = it_stacks() else { return };
         let priv_ = vec!["includes".to_string(), ".stamps/ext".to_string()];
         let v = st.mount_view("v", Some(EMPTY_KEY), &priv_).unwrap();
         let m = st.merged(&v);
@@ -2259,7 +2259,7 @@ mod tests {
     #[test]
     #[ignore = "needs root and real mounts: tests/integration.sh"]
     fn it_commit_after_an_equal_size_swap_records_the_view() {
-        let Some((dir, st)) = it_store() else { return };
+        let Some((dir, st)) = it_stacks() else { return };
         let v = st.mount_view("v", Some(EMPTY_KEY), &[]).unwrap();
         let m = st.merged(&v);
         fs::write(m.join("a"), vec![b'A'; 4096]).unwrap();
@@ -2286,7 +2286,7 @@ mod tests {
     #[test]
     #[ignore = "needs root and real mounts: tests/integration.sh"]
     fn it_failed_commit_leaves_the_view_on_its_parent() {
-        let Some((dir, st)) = it_store() else { return };
+        let Some((dir, st)) = it_stacks() else { return };
         let v = st
             .mount_view("v", Some(EMPTY_KEY), &["includes".to_string()])
             .unwrap();
@@ -2321,7 +2321,7 @@ mod tests {
     #[test]
     #[ignore = "needs root and real mounts: tests/integration.sh"]
     fn it_drop_refuses_a_busy_view() {
-        let Some((dir, st)) = it_store() else { return };
+        let Some((dir, st)) = it_stacks() else { return };
         let v = st.mount_view("v", Some(EMPTY_KEY), &[]).unwrap();
         let m = st.merged(&v);
         fs::write(m.join("f"), b"x").unwrap();
