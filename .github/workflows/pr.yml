@@ -32,8 +32,8 @@ jobs:
         run: cargo test --locked
 
   # The engine's real-mount tests, as root in the helper image, both ways it mounts layers: as the
-  # runner's kernel does (the loop-device path while hosted kernels predate file-backed EROFS,
-  # 6.12), then forced through loop devices.
+  # runner's kernel does (file-backed on 6.12+), then forced through loop devices (the 6.5-6.11
+  # path).
   stacks-mounts:
     name: Stacks mount tests
     runs-on: ubuntu-24.04

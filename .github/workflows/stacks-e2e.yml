@@ -3,8 +3,9 @@ name: Stacks end to end
 # scripts/stacks-e2e.sh against the real feeds: cold, warm and shared installs, stacks vs plain
 # volumes (identical trees, including one built only from another project's stored layers),
 # parallel installs, commit: false, migrating a plain project, busy-view refusal, status, prune,
-# clean, gc, and the fallback to plain volumes. While hosted kernels predate file-backed EROFS
-# (6.12), every layer here mounts through a loop device (`stack config` prints which).
+# clean, gc, and the fallback to plain volumes. Layers are forced through loop devices (the
+# 6.5-6.11 path): hosted kernels mount file-backed, as do the 6.12+ machines stacks run on day to
+# day, so this is where the fallback gets its full run (`stack config` prints the mode).
 #
 # Nightly (a stored layer against a fresh rebuild catches inputs that drift outside the config,
 # such as feed contents), on demand, and on pull requests that touch stacks.
@@ -60,6 +61,7 @@ jobs:
         run: docker build -f crates/avocado-stacks/Dockerfile.helper -t avocado-stacks:ci crates/avocado-stacks
       - name: Stacks on this host
         env:
+          AVOCADO_STACKS_FORCE_LOOP: '1'
           AVOCADO_STACKS: /mnt/avocado-stacks-e2e/stacks
           AVOCADO_STACKS_HELPER: avocado-stacks:ci
         run: |
@@ -67,6 +69,7 @@ jobs:
           target/release/avocado stack config
       - name: End to end
         env:
+          AVOCADO_STACKS_FORCE_LOOP: '1'
           AVOCADO: target/release/avocado
           REFS: references
           WORK: /mnt/avocado-stacks-e2e
