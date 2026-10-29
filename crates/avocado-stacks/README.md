@@ -118,15 +118,14 @@ dir>`: the `#[ignore]`d mount tests (commit/use round trip, renames, failed-comm
 busy views, taking over a plain install, the mount mode and loop-device release) as root in the
 helper image, run twice: the way the kernel mounts EROFS, then forced through loop devices
 (`AVOCADO_STACKS_FORCE_LOOP=1`). Needs privileged docker, kernel 6.5+ and a scratch directory
-on ext4, xfs or btrfs. CI runs both on every pull request (`pr.yml`, on a runner whose kernel
-needs the loop path).
+on ext4, xfs or btrfs. CI runs both on every pull request (`pr.yml`).
 
 `scripts/stacks-e2e.sh` (repo root) drives the CLI end to end against real feeds: shared and
 unshared layers, warm re-runs, `unlock`, stacks against plain volumes (the same inputs must give
 byte-identical trees, including a project built only from another's stored layers), parallel
 installs, `commit: false`, migrating a plain project, a compile section, a busy project,
 `status`, `prune`, `clean`, `gc`, and a host whose helper cannot run. CI runs it nightly and on
-pull requests that touch stacks (`stacks-e2e.yml`).
+pull requests that touch stacks (`stacks-e2e.yml`), with layers forced through loop devices.
 
 In the CLI, `every_config_field_is_classified_for_stack_keys` (`src/commands/sdk/install.rs`)
 holds every field of the config schema to a decision: an install input must move the layer
