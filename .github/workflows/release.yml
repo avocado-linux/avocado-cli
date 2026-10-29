@@ -300,7 +300,11 @@ jobs:
           git add Formula/avocado-cli.rb
           git commit -m "avocado-cli ${TAG}"
           git push --force origin "$branch"
-          if gh pr view "$branch" --repo avocado-linux/homebrew-tap >/dev/null 2>&1; then
+          # Only an open PR counts: `gh pr view` also succeeds for a closed one, which would leave
+          # the tap unbumped on a rerun.
+          open=$(gh pr list --repo avocado-linux/homebrew-tap --head "$branch" --base main \
+            --state open --json number --jq length)
+          if [ "$open" -gt 0 ]; then
             echo "Pull request for ${branch} already open; branch updated."
           else
             gh pr create --repo avocado-linux/homebrew-tap --base main --head "$branch" \
