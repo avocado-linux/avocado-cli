@@ -12,7 +12,7 @@ use crate::utils::{
     container::{normalize_sdk_arch, RunConfig, SdkContainer, TuiContext},
     kernel_resolver::{off_kernel_dnf_excludes, resolve_and_pin_kernel_version, ResolveParams},
     lockfile::{build_package_spec_with_lock, LockFile, SysrootType},
-    output::{print_error, print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, print_warning, OutputLevel},
     prerequisites::read_stamps_batch,
     runs_on::RunsOnContext,
     stamps::{
@@ -25,6 +25,185 @@ use crate::utils::{
 };
 
 /// Data produced by the bootstrap phase, consumed by the parallel install phase.
+/// Which slice of the parallel phase to run. Without stacks it is all of it; with stacks, the
+/// phase is split along the config's structure so the slice every project on a target shares is
+/// its own layer: `Base` = rootfs + initramfs + the platform's `avocado-sdk-*` SDK packages (the
+/// sections nearly every project leaves at their defaults), `Project` = what the project adds on
+/// top (other sdk.packages, extension SDK deps, compile deps / target-dev, the DT-overlay hook).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Part {
+    All,
+    Base,
+    Project,
+}
+
+/// What the Base layer's rootfs and initramfs installs read: each sysroot's install-stamp
+/// input hash (without lock pins, which the layer key carries separately so a re-run can
+/// alias them). Shared with the stamp on purpose: a new install input added there reaches the
+/// layer key too.
+#[allow(clippy::too_many_arguments)]
+fn base_layer_sysroot_inputs(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    project_root: &std::path::Path,
+    target: &str,
+    target_board: Option<&str>,
+    repo_url: Option<&str>,
+    repo_release: Option<&str>,
+    dnf_args: Option<&[String]>,
+    lock_file: &LockFile,
+) -> Result<serde_json::Value> {
+    use crate::commands::rootfs::install::{
+        compute_sysroot_install_inputs, sysroot_packages, SysrootStampContext,
+    };
+    let mut out = serde_json::Map::new();
+    for sysroot in [SysrootType::Rootfs, SysrootType::Initramfs] {
+        let packages = sysroot_packages(config, &sysroot, target, Some(parsed)).unwrap_or_default();
+        let inputs = compute_sysroot_install_inputs(
+            &SysrootStampContext {
+                sysroot_type: &sysroot,
+                config,
+                parsed,
+                src_dir: project_root,
+                target,
+                target_board,
+                repo_url,
+                repo_release,
+                dnf_args,
+                lock_file,
+            },
+            &packages,
+        )?;
+        out.insert(sysroot.lock_key(), inputs.map(|i| i.config_hash).into());
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// The lock sections (by their lock-file names) a part's installs read and write: what its
+/// layer key carries and what its layer records for projects that reuse it.
+fn part_lock_sections(part: Part) -> &'static [&'static str] {
+    match part {
+        Part::Base => &["sdk", "rootfs", "initramfs", "kernel-versions", "kernels"],
+        Part::Project | Part::All => &["sdk", "target-sysroot"],
+    }
+}
+
+/// Just `sections` of a target's lock section, every one present (null when the lock has
+/// none yet): the re-run aliases refresh exactly the sections a key names, so a section left
+/// out on a first install would never reach the next run's key.
+fn lock_sections(lock: &serde_json::Value, sections: &[&str]) -> serde_json::Value {
+    serde_json::Value::Object(
+        sections
+            .iter()
+            .map(|s| (s.to_string(), lock.get(*s).cloned().unwrap_or_default()))
+            .collect(),
+    )
+}
+
+/// Everything a Base or Project layer's installs read. Built in one place, so a test can
+/// check that each input reaches the key.
+struct PartKeyInputs<'a> {
+    part: Part,
+    releasever: Option<&'a str>,
+    target: &'a str,
+    sdk_deps: &'a Option<HashMap<String, serde_yaml::Value>>,
+    ext_deps: &'a HashMap<String, HashMap<String, serde_yaml::Value>>,
+    feeds_fingerprint: Option<&'a str>,
+    feeds_config: &'a serde_yaml::Value,
+    repo_url: Option<&'a str>,
+    repo_release: Option<&'a str>,
+    dnf_args: Option<&'a [String]>,
+    no_weak_deps: bool,
+    /// Extra `docker run` args: `-e`/`-v` can change what dnf installs.
+    container_args: Option<&'a [String]>,
+    /// The target's section of the lock file, as JSON.
+    lock: &'a serde_json::Value,
+    /// Base: the sysroots' install-stamp inputs (`base_layer_sysroot_inputs`).
+    sysroots: Option<serde_json::Value>,
+    /// Project: the target-dev install (package names, base package, kernel excludes).
+    target_dev: Option<serde_json::Value>,
+    target_dev_feeds: Option<&'a str>,
+    /// Project: the compile-deps stamp hash (compile sections' packages, version pins
+    /// included).
+    compile_deps: Option<String>,
+    provision_dto: bool,
+    provision_dto_compiler: bool,
+}
+
+fn part_layer_inputs(p: &PartKeyInputs) -> serde_json::Value {
+    let mut v = crate::utils::stacks::base_inputs(p.releasever);
+    v["target"] = p.target.into();
+    v["sdk_deps"] = serde_json::to_value(p.sdk_deps).unwrap_or_default();
+    v["feeds"] = serde_json::json!([p.feeds_fingerprint]);
+    v["feeds_config"] = serde_json::to_value(p.feeds_config).unwrap_or_default();
+    v["repo"] = serde_json::json!([p.repo_url, p.repo_release]);
+    v["dnf_args"] = p.dnf_args.into();
+    v["no_weak_deps"] = p.no_weak_deps.into();
+    v["container_args"] = p.container_args.into();
+    v["lock"] = lock_sections(p.lock, part_lock_sections(p.part));
+    match p.part {
+        Part::Base => {
+            v["step"] = "L1 target base".into();
+            v["sysroots"] = p.sysroots.clone().unwrap_or_default();
+            v["writes"] = serde_json::json!(["rootfs", "initramfs"]);
+        }
+        Part::Project | Part::All => {
+            v["step"] = "L2 project".into();
+            v["ext_sdk_deps"] = serde_json::to_value(p.ext_deps).unwrap_or_default();
+            v["target_dev"] = p.target_dev.clone().unwrap_or_default();
+            v["target_dev_feeds"] = p.target_dev_feeds.into();
+            v["compile_deps"] = p.compile_deps.clone().into();
+            v["provision_dto"] = p.provision_dto.into();
+            v["provision_dto_compiler"] = p.provision_dto_compiler.into();
+            v["writes"] = if p.target_dev.is_some() {
+                serde_json::json!(["target-sysroot"])
+            } else {
+                serde_json::json!([])
+            };
+        }
+    }
+    v
+}
+
+/// Everything the L0 (SDK bootstrap) layer's installs read.
+struct L0KeyInputs<'a> {
+    releasever: Option<&'a str>,
+    target: &'a str,
+    host_arch: &'a str,
+    /// The SDK image's id (its name in tests).
+    image_id: &'a str,
+    repo_url: Option<&'a str>,
+    repo_release: Option<&'a str>,
+    feeds_fingerprint: Option<&'a str>,
+    /// The target's section of the lock file, as JSON.
+    lock: &'a serde_json::Value,
+    sdk_target_pkg: &'a str,
+    dnf_args: Option<&'a [String]>,
+    no_weak_deps: bool,
+    container_args: Option<&'a [String]>,
+}
+
+/// L0's key inputs. Lock pins are in them, so a project pinned to other versions gets its own
+/// layer.
+fn l0_layer_inputs(p: &L0KeyInputs) -> serde_json::Value {
+    const BOOTSTRAP: &str = "avocado-sdk-bootstrap";
+    let pins = &p.lock["sdk"][p.host_arch];
+    let mut v = crate::utils::stacks::base_inputs(p.releasever);
+    v["step"] = "L0 sdk bootstrap".into();
+    v["target"] = p.target.into();
+    v["host_arch"] = p.host_arch.into();
+    v["image"] = p.image_id.into();
+    v["repo_url"] = p.repo_url.into();
+    v["repo_release"] = p.repo_release.into();
+    v["feeds"] = p.feeds_fingerprint.into();
+    v["pins"] = serde_json::json!([pins[p.sdk_target_pkg], pins[BOOTSTRAP]]);
+    v["pins_of"] = serde_json::json!([p.sdk_target_pkg, BOOTSTRAP]);
+    v["dnf_args"] = p.dnf_args.into();
+    v["no_weak_deps"] = p.no_weak_deps.into();
+    v["container_args"] = p.container_args.into();
+    v
+}
+
 struct BootstrapResult {
     /// Reloaded composed config (after fetching remote extensions)
     composed: ComposedConfig,
@@ -38,6 +217,8 @@ struct BootstrapResult {
     sdk_sysroot: SysrootType,
     /// Lock file (to be cloned for each parallel task)
     lock_file: LockFile,
+    /// The L0 layer the view is on (stacks), the parent of L1.
+    l0_key: Option<String>,
     /// Active extensions after config reload
     active_extensions: HashSet<String>,
     /// Resolved src_dir for lock file save path
@@ -583,9 +764,70 @@ impl SdkInstallCommand {
             None
         };
 
+        // Stacks: the project's /opt/_avocado/<target> becomes a stack view and the
+        // install steps below become layers. Not with --runs-on (its own volume plumbing).
+        let stacks_root = match self.runs_on {
+            None => crate::utils::stacks::active_root(&container_helper.container_tool).await,
+            Some(_) => None,
+        };
+        let mut _install_lock = None;
+        let stacks = match stacks_root {
+            Some(root) => {
+                let vs = crate::utils::volume::VolumeManager::new(
+                    container_helper.container_tool.clone(),
+                    self.verbose,
+                )
+                .get_or_create_volume(&container_helper.cwd)
+                .await?;
+                let project = config.project_root(&self.config_path);
+                let shareable = crate::utils::stacks::shareable(
+                    LockFile::load(&project)?.get_repo_snapshot(&target),
+                    std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
+                    config.repos.as_ref().is_some_and(|r| !r.is_empty()),
+                );
+                // The volume's own source path (absolute, the one the volume reaper trusts),
+                // not the config-relative project root: `avocado stack prune` judges the view
+                // by it from any directory.
+                let s = crate::utils::stacks::Stacks::new(
+                    &root,
+                    &container_helper.container_tool,
+                    &vs.volume_name,
+                    &target,
+                    std::path::Path::new(&vs.source_path),
+                    shareable,
+                )?;
+                if !shareable {
+                    print_info(
+                        "Stacks: the feed is not pinned to a snapshot (or the project declares \
+                         its own repos), so this project's layers are not shared.",
+                        OutputLevel::Normal,
+                    );
+                }
+                // One install at a time per view: the steps switch the view's layer.
+                _install_lock = Some(s.lock_install().await?);
+                s.ensure_view().await?;
+                if !vs.stacks {
+                    let mut vs = vs.clone();
+                    vs.stacks = true;
+                    vs.save_to_dir(&container_helper.cwd)?;
+                }
+                Some(s)
+            }
+            None => {
+                if self.runs_on.is_none() {
+                    let on_stacks =
+                        crate::utils::volume::VolumeState::load_from_dir(&container_helper.cwd)?
+                            .is_some_and(|v| v.stacks);
+                    crate::utils::stacks::refuse_plain_install(on_stacks)?;
+                }
+                None
+            }
+        };
+
         // Phase 1: Bootstrap — sets up SDK env, installs bootstrap package, fetches extensions
         let bootstrap_result = self
             .execute_bootstrap(
+                stacks.as_ref(),
                 config,
                 &target,
                 container_image,
@@ -656,21 +898,46 @@ impl SdkInstallCommand {
 
         // Phase 2: Run SDK packages, rootfs, initramfs, and target-dev in parallel.
         // Each task gets its own lock_file clone since they write to different sections.
-        let result = self
-            .execute_parallel_phase(
-                &bootstrap,
-                container_image,
-                repo_url.as_deref(),
-                repo_release.as_deref(),
-                feeds.as_ref(),
-                &container_helper,
-                merged_container_args.as_ref(),
-                runs_on_context.as_ref(),
-                &target,
-                &off_kernel_excludes,
-                target_dev_feeds.as_ref(),
-            )
-            .await;
+        let this = &*self;
+        let run = |part: Part, parent: Option<String>| {
+            let bootstrap = &bootstrap;
+            let stacks = stacks.as_ref();
+            let container_helper = &container_helper;
+            let off_kernel_excludes = &off_kernel_excludes;
+            let feeds = feeds.as_ref();
+            let target_dev_feeds = target_dev_feeds.as_ref();
+            let merged_container_args = merged_container_args.as_ref();
+            let runs_on_context = runs_on_context.as_ref();
+            let (repo_url, repo_release, target) =
+                (repo_url.as_deref(), repo_release.as_deref(), &target);
+            async move {
+                this.execute_parallel_phase(
+                    stacks,
+                    part,
+                    parent.as_deref(),
+                    bootstrap,
+                    container_image,
+                    repo_url,
+                    repo_release,
+                    feeds,
+                    container_helper,
+                    merged_container_args,
+                    runs_on_context,
+                    target,
+                    off_kernel_excludes,
+                    target_dev_feeds,
+                )
+                .await
+            }
+        };
+        let result = if stacks.is_some() {
+            match run(Part::Base, bootstrap.l0_key.clone()).await {
+                Ok(base) => run(Part::Project, base).await.map(|_| ()),
+                Err(e) => Err(e),
+            }
+        } else {
+            run(Part::All, None).await.map(|_| ())
+        };
 
         // Always teardown the context if it was created
         if let Some(ref mut context) = runs_on_context {
@@ -695,6 +962,9 @@ impl SdkInstallCommand {
     #[allow(clippy::too_many_arguments)]
     async fn execute_parallel_phase(
         &self,
+        stacks: Option<&crate::utils::stacks::Stacks>,
+        part: Part,
+        parent: Option<&str>,
         bootstrap: &BootstrapResult,
         container_image: &str,
         repo_url: Option<&str>,
@@ -706,7 +976,7 @@ impl SdkInstallCommand {
         target: &str,
         off_kernel_excludes: &[String],
         target_dev_feeds: Option<&crate::utils::feeds::FeedMaterialization>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let composed = &bootstrap.composed;
         let config = &composed.config;
         let active_extensions = &bootstrap.active_extensions;
@@ -746,8 +1016,37 @@ impl SdkInstallCommand {
                 active_extensions,
             )
             .is_empty();
-        let need_target_dev =
-            (config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto;
+        let provision_dto = provision_dto && part != Part::Base;
+        let provision_dto_compiler = provision_dto_compiler && part != Part::Base;
+        let need_target_dev = part != Part::Base
+            && ((config.has_compile_sections() && !active_compile_sections.is_empty())
+                || provision_dto);
+        // This part's SDK package set: the platform's avocado-sdk-* packages for Base, all of them
+        // (dnf installs only the delta over Base) otherwise.
+        let empty_ext: HashMap<String, HashMap<String, serde_yaml::Value>> = HashMap::new();
+        let (sdk_deps, ext_deps) = match part {
+            Part::Base => (
+                bootstrap.sdk_dependencies.as_ref().map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with("avocado-sdk-"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<HashMap<_, _>>()
+                }),
+                &empty_ext,
+            ),
+            _ => (
+                bootstrap.sdk_dependencies.clone(),
+                &bootstrap.extension_sdk_dependencies,
+            ),
+        };
+        let run_sysroots = part != Part::Project;
+        // A project that adds nothing over Base: no Project layer, no Project work.
+        let adds_nothing = part == Part::Project
+            && !need_target_dev
+            && ext_deps.values().all(|d| d.is_empty())
+            && sdk_deps
+                .as_ref()
+                .is_none_or(|m| m.keys().all(|k| k.starts_with("avocado-sdk-")));
 
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)
         let target_dev_command = if need_target_dev {
@@ -843,7 +1142,10 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         // container work for rootfs/initramfs at all. Batching matters
         // because stamps live in the `/opt/_avocado` named volume, not a host
         // bind mount, so each read otherwise costs its own container run.
-        let (rootfs_stamp, initramfs_stamp) = if self.no_stamps {
+        // With stacks the sysroot stamps describe the layer the view is on *now*, and a
+        // missed step first moves the view to the step's parent: a stamp read here would then
+        // skip an install the parent does not have. The step decides instead (hit or build).
+        let (rootfs_stamp, initramfs_stamp) = if self.no_stamps || stacks.is_some() {
             (None, None)
         } else {
             let rootfs_req = StampRequirement::rootfs_install();
@@ -883,311 +1185,357 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
 
-        // Clone lock files for each parallel task (they write to different sections)
-        let mut sdk_pkg_lock = lock_file.clone();
-        let mut rootfs_lock = lock_file.clone();
-        let mut initramfs_lock = lock_file.clone();
-        #[allow(unused_variables)]
-        let target_dev_lock = lock_file.clone();
-
-        // Build SDK packages future
-        let sdk_pkg_fut = self.install_sdk_packages(
-            config,
-            &bootstrap.sdk_dependencies,
-            &bootstrap.extension_sdk_dependencies,
-            provision_dto_compiler,
-            &mut sdk_pkg_lock,
-            &bootstrap.all_sdk_package_names,
-            &bootstrap.sdk_sysroot,
-            container_image,
-            target,
-            repo_url,
-            repo_release,
-            feeds,
-            container_helper,
-            merged_container_args,
-            runs_on_context,
-        );
-
-        // Build sysroot install params
-        // Build TUI contexts for each sysroot task
-        let rootfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
-            task_id: TaskId::RootfsInstall,
-            renderer: ctx.renderer.clone(),
-        });
-        let initramfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
-            task_id: TaskId::InitramfsInstall,
-            renderer: ctx.renderer.clone(),
-        });
-
-        // These two run the rootfs/initramfs dnf transactions, so they take
-        // their own stage's feeds rather than the sdk-stage set this fn holds.
-        let rootfs_feeds = config
-            .materialize_feeds(target, FeedStage::Rootfs, &self.config_path)
-            .await?;
-        let initramfs_feeds = config
-            .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
-            .await?;
-        let mut rootfs_params = SysrootInstallParams {
-            sysroot_type: SysrootType::Rootfs,
-            config,
-            lock_file: &mut rootfs_lock,
-            src_dir,
-            container_helper,
-            container_image,
-            target,
-            target_board: self.target_board.as_deref(),
-            repo_url,
-            repo_release,
-            feeds: rootfs_feeds.as_ref(),
-            merged_container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            runs_on_context,
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-            prefetched_stamp: rootfs_stamp,
-            tui_context: rootfs_tui,
-            pins_recorded: false,
+        // Stacks: what this part's installs read, and nothing else, so a project that only
+        // differs in another part's sections still shares this layer. The sysroots key on
+        // exactly what their install stamp keys on (effective packages, overlay and post_install
+        // contents, permissions, kernel, feeds, SDK image), so neither can drift from the other.
+        let sysroot_inputs = match (stacks, part) {
+            (Some(_), Part::Base) if !adds_nothing => Some(base_layer_sysroot_inputs(
+                config,
+                &composed.merged_value,
+                &config.project_root(&self.config_path),
+                target,
+                self.target_board.as_deref(),
+                repo_url,
+                repo_release,
+                self.dnf_args.as_deref(),
+                lock_file,
+            )?),
+            _ => None,
         };
-        let mut initramfs_params = SysrootInstallParams {
-            sysroot_type: SysrootType::Initramfs,
-            config,
-            lock_file: &mut initramfs_lock,
-            src_dir,
-            container_helper,
-            container_image,
-            target,
-            target_board: self.target_board.as_deref(),
-            repo_url,
-            repo_release,
-            feeds: initramfs_feeds.as_ref(),
-            merged_container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            verbose: self.verbose,
-            runs_on_context,
-            sdk_arch: self.sdk_arch.as_ref(),
-            no_stamps: self.no_stamps,
-            parsed: Some(&composed.merged_value),
-            prefetched_stamp: initramfs_stamp,
-            tui_context: initramfs_tui,
-            pins_recorded: false,
-        };
-
-        // Build the target-dev future (or a no-op if not needed)
-        let target_dev_tui_ctx = if need_target_dev {
-            self.tui_context.as_ref().map(|ctx| TuiContext {
-                task_id: TaskId::TargetDevInstall,
-                renderer: ctx.renderer.clone(),
-            })
-        } else {
-            None
-        };
-
-        let target_dev_fut = async {
-            if let Some((ref cmd, _, _)) = target_dev_command {
-                let run_config = RunConfig {
-                    container_image: container_image.to_string(),
-                    target: target.to_string(),
-                    command: cmd.clone(),
-                    verbose: self.verbose,
-                    source_environment: false,
-                    // dnf runs with -y, so nothing here can prompt: no PTY, ever.
-                    interactive: false,
-                    repo_url: repo_url.map(|s| s.to_string()),
-                    feeds: target_dev_feeds.cloned(),
-                    repo_release: repo_release.map(|s| s.to_string()),
-                    container_args: merged_container_args.cloned(),
-                    dnf_args: self.dnf_args.clone(),
-                    disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-                    tui_context: target_dev_tui_ctx.clone(),
-                    ..Default::default()
-                };
-                let success = run_container_command(
-                    container_helper,
-                    run_config,
-                    runs_on_context,
-                    self.sdk_arch.as_ref(),
-                )
-                .await?;
-                if success {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Failed to install target-sysroot with compile dependencies."
-                    ))
-                }
-            } else {
-                Ok(())
-            }
-        };
-
-        // Same rule AND the same number as the install and build DAGs. Reading
-        // it as a plain yes/no is what the fixed four tasks here invite, and it
-        // is wrong: at `AVOCADO_PARALLEL_TASKS=2` all four would still start at
-        // once, so the override only ever meant anything at `1`. Bounding by
-        // the limit also removes the separate sequential path -- at `1` the
-        // permits serialize these in the order `tokio::join!` first polls them,
-        // because tokio hands out permits first-come-first-served.
-        let limit = crate::utils::scheduler::max_parallel(self.runs_on.is_some());
-        let permits = tokio::sync::Semaphore::new(limit);
-
-        // Helper: hold a permit for the whole task, and set TUI status
-        // immediately on completion.
-        macro_rules! with_tui_status {
-            ($fut:expr, $task_id:expr) => {
-                async {
-                    let _permit = permits
-                        .acquire()
-                        .await
-                        .expect("the parallelism semaphore is never closed");
-                    let result = $fut.await;
-                    if let Some(r) = crate::utils::tui::get_active_renderer() {
-                        match &result {
-                            Ok(_) => r.set_status(&$task_id, TaskStatus::Success),
-                            Err(e) => {
-                                // Same shape as the scheduler executor: the
-                                // message must be set for --json to emit a
-                                // step_error event; a bare Failed status
-                                // carries no reason and print_error is
-                                // suppressed in that mode.
-                                r.set_error(&$task_id, format!("{e:#}"));
-                                r.set_status(&$task_id, TaskStatus::Failed);
-                            }
-                        }
-                    }
-                    result
-                }
-            };
-        }
-
-        let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
-            with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
-            with_tui_status!(install_sysroot(&mut rootfs_params), TaskId::RootfsInstall),
-            with_tui_status!(
-                install_sysroot(&mut initramfs_params),
-                TaskId::InitramfsInstall
+        let compile_deps = match (stacks, part) {
+            (Some(_), Part::Project) if !adds_nothing => Some(
+                compute_compile_deps_input_hash(&composed.merged_value, &active_compile_sections)?
+                    .config_hash,
             ),
-            with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
-        );
+            _ => None,
+        };
+        let lock_json = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
+        let releasever = std::env::var("AVOCADO_RELEASEVER").ok();
+        let l1_inputs = stacks.filter(|_| !adds_nothing).map(|s| {
+            let mut v = part_layer_inputs(&PartKeyInputs {
+                part,
+                releasever: releasever.as_deref(),
+                target,
+                sdk_deps: &sdk_deps,
+                ext_deps,
+                feeds_fingerprint: feeds.map(|f| f.fingerprint.as_str()),
+                feeds_config: &composed.merged_value["feeds"],
+                repo_url,
+                repo_release,
+                dnf_args: self.dnf_args.as_deref(),
+                no_weak_deps: config.get_sdk_disable_weak_dependencies(),
+                container_args: merged_container_args.map(|a| a.as_slice()),
+                lock: &lock_json,
+                sysroots: sysroot_inputs.clone(),
+                // Names, not the rendered dnf command: the command embeds versions from the
+                // lock, which the key carries as its lock sections (and re-run aliases refresh).
+                target_dev: target_dev_command.as_ref().map(|(_, names, base)| {
+                    serde_json::json!({"packages": names, "base": base, "excludes": off_kernel_excludes})
+                }),
+                target_dev_feeds: target_dev_feeds.map(|f| f.fingerprint.as_str()),
+                compile_deps: compile_deps.clone(),
+                provision_dto,
+                provision_dto_compiler,
+            });
+            s.scope(&mut v);
+            (s, v)
+        });
+        let phase = async {
+            // Clone lock files for each parallel task (they write to different sections)
+            let mut sdk_pkg_lock = lock_file.clone();
+            let mut rootfs_lock = lock_file.clone();
+            let mut initramfs_lock = lock_file.clone();
+            #[allow(unused_variables)]
+            let target_dev_lock = lock_file.clone();
 
-        // Merge lock file changes back into a single lock file for saving
-        let mut final_lock = lock_file.clone();
+            // Build SDK packages future
+            let sdk_pkg_fut = self.install_sdk_packages(
+                config,
+                &sdk_deps,
+                ext_deps,
+                provision_dto_compiler,
+                &mut sdk_pkg_lock,
+                &bootstrap.all_sdk_package_names,
+                &bootstrap.sdk_sysroot,
+                container_image,
+                target,
+                repo_url,
+                repo_release,
+                feeds,
+                container_helper,
+                merged_container_args,
+                runs_on_context,
+            );
 
-        // A sysroot install that failed *after* recording its pins still has
-        // pins worth merging — they describe the packages that landed. See
-        // `SysrootInstallParams::pins_recorded`.
-        let rootfs_landed = rootfs_result.is_ok() || rootfs_params.pins_recorded;
-        let initramfs_landed = initramfs_result.is_ok() || initramfs_params.pins_recorded;
+            // Build sysroot install params
+            // Build TUI contexts for each sysroot task
+            let rootfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
+                task_id: TaskId::RootfsInstall,
+                renderer: ctx.renderer.clone(),
+            });
+            let initramfs_tui = self.tui_context.as_ref().map(|ctx| TuiContext {
+                task_id: TaskId::InitramfsInstall,
+                renderer: ctx.renderer.clone(),
+            });
 
-        // Merge SDK packages lock
-        if sdk_pkg_result.is_ok() {
-            if let Some(target_locks) = sdk_pkg_lock.targets.get(target) {
-                let entry = final_lock.targets.entry(target.to_string()).or_default();
-                entry.sdk = target_locks.sdk.clone();
-            }
-        }
-        // Merge rootfs lock — both the package map and the per-sysroot kernel
-        // version pin the resolver wrote into the clone. Also pull in the
-        // `kernels` entries staged from the rootfs install (Phase 2c) — they
-        // live on the clone too and would otherwise be dropped on the merge
-        // floor.
-        if rootfs_landed {
-            if let Some(target_locks) = rootfs_lock.targets.get(target) {
-                let entry = final_lock.targets.entry(target.to_string()).or_default();
-                entry.rootfs = target_locks.rootfs.clone();
-                // `cleared_sections` is `#[serde(skip)]`, so it lives only on the
-                // clone `install_sysroot` ran against. Carry it over or the flag
-                // dies here: `final_lock.save()` would merge the old kernel's
-                // keys back off disk, and a kernel repin would never stick.
-                entry
-                    .cleared_sections
-                    .extend(target_locks.cleared_sections.iter().cloned());
-                if let Some(kver) = target_locks
-                    .kernel_versions
-                    .get(&SysrootType::Rootfs.lock_key())
-                {
-                    entry
-                        .kernel_versions
-                        .insert(SysrootType::Rootfs.lock_key(), kver.clone());
-                }
-                // Per-kernel sysroot package state (Phase 2c). The clone may
-                // hold one or more entries keyed by KERNEL_VERSION; merge
-                // each into the final lock.
-                for (kver, pkgs) in &target_locks.kernels {
-                    entry.kernels.insert(kver.clone(), pkgs.clone());
-                }
-            }
-        }
-        // Merge initramfs lock.
-        if initramfs_landed {
-            if let Some(target_locks) = initramfs_lock.targets.get(target) {
-                let entry = final_lock.targets.entry(target.to_string()).or_default();
-                entry.initramfs = target_locks.initramfs.clone();
-                // Same as the rootfs merge above — the in-memory-only flag has to
-                // cross the clone boundary or the save re-merges stale keys.
-                entry
-                    .cleared_sections
-                    .extend(target_locks.cleared_sections.iter().cloned());
-                if let Some(kver) = target_locks
-                    .kernel_versions
-                    .get(&SysrootType::Initramfs.lock_key())
-                {
-                    entry
-                        .kernel_versions
-                        .insert(SysrootType::Initramfs.lock_key(), kver.clone());
-                }
-            }
-        }
-        // Merge target-dev lock
-        if need_target_dev && target_dev_result.is_ok() {
-            if let Some(target_locks) = target_dev_lock.targets.get(target) {
-                final_lock
-                    .targets
-                    .entry(target.to_string())
-                    .or_default()
-                    .target_sysroot = target_locks.target_sysroot.clone();
-            }
-            // Post-install: query versions and update lock file
-            if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
-                print_success(
-                    "Installed target-sysroot with compile dependencies.",
-                    OutputLevel::Normal,
-                );
-                let mut packages_to_query = all_compile_package_names.clone();
-                packages_to_query.push(base_pkg.clone());
+            // These two run the rootfs/initramfs dnf transactions, so they take
+            // their own stage's feeds rather than the sdk-stage set this fn holds.
+            let rootfs_feeds = config
+                .materialize_feeds(target, FeedStage::Rootfs, &self.config_path)
+                .await?;
+            let initramfs_feeds = config
+                .materialize_feeds(target, FeedStage::Initramfs, &self.config_path)
+                .await?;
+            let mut rootfs_params = SysrootInstallParams {
+                sysroot_type: SysrootType::Rootfs,
+                config,
+                lock_file: &mut rootfs_lock,
+                src_dir,
+                container_helper,
+                container_image,
+                target,
+                target_board: self.target_board.as_deref(),
+                repo_url,
+                repo_release,
+                feeds: rootfs_feeds.as_ref(),
+                merged_container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                verbose: self.verbose,
+                runs_on_context,
+                sdk_arch: self.sdk_arch.as_ref(),
+                no_stamps: self.no_stamps,
+                parsed: Some(&composed.merged_value),
+                prefetched_stamp: rootfs_stamp,
+                tui_context: rootfs_tui,
+                pins_recorded: false,
+            };
+            let mut initramfs_params = SysrootInstallParams {
+                sysroot_type: SysrootType::Initramfs,
+                config,
+                lock_file: &mut initramfs_lock,
+                src_dir,
+                container_helper,
+                container_image,
+                target,
+                target_board: self.target_board.as_deref(),
+                repo_url,
+                repo_release,
+                feeds: initramfs_feeds.as_ref(),
+                merged_container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                verbose: self.verbose,
+                runs_on_context,
+                sdk_arch: self.sdk_arch.as_ref(),
+                no_stamps: self.no_stamps,
+                parsed: Some(&composed.merged_value),
+                prefetched_stamp: initramfs_stamp,
+                tui_context: initramfs_tui,
+                pins_recorded: false,
+            };
 
-                let installed_versions = container_helper
-                    .query_installed_packages(
-                        &SysrootType::TargetSysroot,
-                        &packages_to_query,
-                        container_image,
-                        target,
-                        repo_url.map(|s| s.to_string()),
-                        repo_release.map(|s| s.to_string()),
-                        merged_container_args.cloned(),
+            // Build the target-dev future (or a no-op if not needed)
+            let target_dev_tui_ctx = if need_target_dev {
+                self.tui_context.as_ref().map(|ctx| TuiContext {
+                    task_id: TaskId::TargetDevInstall,
+                    renderer: ctx.renderer.clone(),
+                })
+            } else {
+                None
+            };
+
+            let target_dev_fut = async {
+                if let Some((ref cmd, _, _)) = target_dev_command {
+                    let run_config = RunConfig {
+                        container_image: container_image.to_string(),
+                        target: target.to_string(),
+                        command: cmd.clone(),
+                        verbose: self.verbose,
+                        source_environment: false,
+                        // dnf runs with -y, so nothing here can prompt: no PTY, ever.
+                        interactive: false,
+                        repo_url: repo_url.map(|s| s.to_string()),
+                        feeds: target_dev_feeds.cloned(),
+                        repo_release: repo_release.map(|s| s.to_string()),
+                        container_args: merged_container_args.cloned(),
+                        dnf_args: self.dnf_args.clone(),
+                        disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                        tui_context: target_dev_tui_ctx.clone(),
+                        ..Default::default()
+                    };
+                    let success = run_container_command(
+                        container_helper,
+                        run_config,
                         runs_on_context,
                         self.sdk_arch.as_ref(),
-                        None,
                     )
                     .await?;
+                    if success {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "Failed to install target-sysroot with compile dependencies."
+                        ))
+                    }
+                } else {
+                    Ok(())
+                }
+            };
 
-                if !installed_versions.is_empty() {
-                    final_lock.update_sysroot_versions(
-                        target,
-                        &SysrootType::TargetSysroot,
-                        installed_versions,
+            // Same rule AND the same number as the install and build DAGs. Reading
+            // it as a plain yes/no is what the fixed four tasks here invite, and it
+            // is wrong: at `AVOCADO_PARALLEL_TASKS=2` all four would still start at
+            // once, so the override only ever meant anything at `1`. Bounding by
+            // the limit also removes the separate sequential path -- at `1` the
+            // permits serialize these in the order `tokio::join!` first polls them,
+            // because tokio hands out permits first-come-first-served.
+            let limit = crate::utils::scheduler::max_parallel(self.runs_on.is_some());
+            let permits = tokio::sync::Semaphore::new(limit);
+
+            // Helper: hold a permit for the whole task, and set TUI status
+            // immediately on completion.
+            macro_rules! with_tui_status {
+                ($fut:expr, $task_id:expr) => {
+                    async {
+                        let _permit = permits
+                            .acquire()
+                            .await
+                            .expect("the parallelism semaphore is never closed");
+                        let result = $fut.await;
+                        if let Some(r) = crate::utils::tui::get_active_renderer() {
+                            match &result {
+                                Ok(_) => r.set_status(&$task_id, TaskStatus::Success),
+                                Err(e) => {
+                                    // Same shape as the scheduler executor: the
+                                    // message must be set for --json to emit a
+                                    // step_error event; a bare Failed status
+                                    // carries no reason and print_error is
+                                    // suppressed in that mode.
+                                    r.set_error(&$task_id, format!("{e:#}"));
+                                    r.set_status(&$task_id, TaskStatus::Failed);
+                                }
+                            }
+                        }
+                        result
+                    }
+                };
+            }
+
+            let (sdk_pkg_result, rootfs_result, initramfs_result, target_dev_result) = tokio::join!(
+                with_tui_status!(sdk_pkg_fut, TaskId::SdkPackages),
+                with_tui_status!(
+                    async {
+                        if run_sysroots {
+                            install_sysroot(&mut rootfs_params).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    TaskId::RootfsInstall
+                ),
+                with_tui_status!(
+                    async {
+                        if run_sysroots {
+                            install_sysroot(&mut initramfs_params).await
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    TaskId::InitramfsInstall
+                ),
+                with_tui_status!(target_dev_fut, TaskId::TargetDevInstall),
+            );
+
+            // Merge lock file changes back into a single lock file for saving
+            let mut final_lock = lock_file.clone();
+
+            // A sysroot install that failed *after* recording its pins still has
+            // pins worth merging — they describe the packages that landed. See
+            // `SysrootInstallParams::pins_recorded`.
+            let rootfs_landed = rootfs_result.is_ok() || rootfs_params.pins_recorded;
+            let initramfs_landed = initramfs_result.is_ok() || initramfs_params.pins_recorded;
+
+            // Merge SDK packages lock
+            if sdk_pkg_result.is_ok() {
+                if let Some(target_locks) = sdk_pkg_lock.targets.get(target) {
+                    let entry = final_lock.targets.entry(target.to_string()).or_default();
+                    entry.sdk = target_locks.sdk.clone();
+                }
+            }
+            // Merge rootfs lock — both the package map and the per-sysroot kernel
+            // version pin the resolver wrote into the clone. Also pull in the
+            // `kernels` entries staged from the rootfs install (Phase 2c) — they
+            // live on the clone too and would otherwise be dropped on the merge
+            // floor.
+            if rootfs_landed {
+                if let Some(target_locks) = rootfs_lock.targets.get(target) {
+                    let entry = final_lock.targets.entry(target.to_string()).or_default();
+                    entry.rootfs = target_locks.rootfs.clone();
+                    // `cleared_sections` is `#[serde(skip)]`, so it lives only on the
+                    // clone `install_sysroot` ran against. Carry it over or the flag
+                    // dies here: `final_lock.save()` would merge the old kernel's
+                    // keys back off disk, and a kernel repin would never stick.
+                    entry
+                        .cleared_sections
+                        .extend(target_locks.cleared_sections.iter().cloned());
+                    if let Some(kver) = target_locks
+                        .kernel_versions
+                        .get(&SysrootType::Rootfs.lock_key())
+                    {
+                        entry
+                            .kernel_versions
+                            .insert(SysrootType::Rootfs.lock_key(), kver.clone());
+                    }
+                    // Per-kernel sysroot package state (Phase 2c). The clone may
+                    // hold one or more entries keyed by KERNEL_VERSION; merge
+                    // each into the final lock.
+                    for (kver, pkgs) in &target_locks.kernels {
+                        entry.kernels.insert(kver.clone(), pkgs.clone());
+                    }
+                }
+            }
+            // Merge initramfs lock.
+            if initramfs_landed {
+                if let Some(target_locks) = initramfs_lock.targets.get(target) {
+                    let entry = final_lock.targets.entry(target.to_string()).or_default();
+                    entry.initramfs = target_locks.initramfs.clone();
+                    // Same as the rootfs merge above — the in-memory-only flag has to
+                    // cross the clone boundary or the save re-merges stale keys.
+                    entry
+                        .cleared_sections
+                        .extend(target_locks.cleared_sections.iter().cloned());
+                    if let Some(kver) = target_locks
+                        .kernel_versions
+                        .get(&SysrootType::Initramfs.lock_key())
+                    {
+                        entry
+                            .kernel_versions
+                            .insert(SysrootType::Initramfs.lock_key(), kver.clone());
+                    }
+                }
+            }
+            // Merge target-dev lock
+            if need_target_dev && target_dev_result.is_ok() {
+                if let Some(target_locks) = target_dev_lock.targets.get(target) {
+                    final_lock
+                        .targets
+                        .entry(target.to_string())
+                        .or_default()
+                        .target_sysroot = target_locks.target_sysroot.clone();
+                }
+                // Post-install: query versions and update lock file
+                if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
+                    print_success(
+                        "Installed target-sysroot with compile dependencies.",
+                        OutputLevel::Normal,
                     );
-                    // Then where each one came from. Best effort, and separate
-                    // from the versions for a reason: `rpm` is authoritative
-                    // about what is installed and cannot say where it came
-                    // from, dnf knows the origin from the installroot's own
-                    // history. A lock records a bare version when the origin
-                    // cannot be determined, so this never fails a build.
-                    let origins = container_helper
-                        .query_installed_origins(
+                    let mut packages_to_query = all_compile_package_names.clone();
+                    packages_to_query.push(base_pkg.clone());
+
+                    let installed_versions = container_helper
+                        .query_installed_packages(
                             &SysrootType::TargetSysroot,
+                            &packages_to_query,
                             container_image,
                             target,
                             repo_url.map(|s| s.to_string()),
@@ -1197,18 +1545,114 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                             self.sdk_arch.as_ref(),
                             None,
                         )
-                        .await;
-                    final_lock.set_sysroot_origins(target, &SysrootType::TargetSysroot, &origins);
+                        .await?;
+
+                    if !installed_versions.is_empty() {
+                        final_lock.update_sysroot_versions(
+                            target,
+                            &SysrootType::TargetSysroot,
+                            installed_versions,
+                        );
+                        // Then where each one came from. Best effort, and separate
+                        // from the versions for a reason: `rpm` is authoritative
+                        // about what is installed and cannot say where it came
+                        // from, dnf knows the origin from the installroot's own
+                        // history. A lock records a bare version when the origin
+                        // cannot be determined, so this never fails a build.
+                        let origins = container_helper
+                            .query_installed_origins(
+                                &SysrootType::TargetSysroot,
+                                container_image,
+                                target,
+                                repo_url.map(|s| s.to_string()),
+                                repo_release.map(|s| s.to_string()),
+                                merged_container_args.cloned(),
+                                runs_on_context,
+                                self.sdk_arch.as_ref(),
+                                None,
+                            )
+                            .await;
+                        final_lock.set_sysroot_origins(
+                            target,
+                            &SysrootType::TargetSysroot,
+                            &origins,
+                        );
+                    }
                 }
             }
-        }
-        final_lock.save(src_dir)?;
+            final_lock.save(src_dir)?;
 
-        // Propagate errors
-        sdk_pkg_result?;
-        rootfs_result?;
-        initramfs_result?;
-        target_dev_result?;
+            // Propagate errors
+            sdk_pkg_result?;
+            rootfs_result?;
+            initramfs_result?;
+            target_dev_result?;
+            // The lock this part leaves behind: recorded on its layer, so a project that hits
+            // the layer gets the pins of what it now has.
+            let saved = serde_json::to_value(LockFile::load(src_dir)?.targets.get(target))
+                .unwrap_or_default();
+            Ok::<serde_json::Value, anyhow::Error>(lock_sections(&saved, part_lock_sections(part)))
+        };
+        let key = match l1_inputs {
+            Some((s, ref v)) => {
+                let label = v["step"].as_str().unwrap_or("step").to_string();
+                let r = s
+                    .step(&label, parent.unwrap_or("empty"), v, || phase)
+                    .await?;
+                if r.outcome != crate::utils::stacks::Outcome::Built && !r.lock.is_null() {
+                    let mut lf = LockFile::load(src_dir)?;
+                    let mut current =
+                        serde_json::to_value(lf.targets.get(target)).unwrap_or_default();
+                    crate::utils::stacks::fill_missing(&mut current, &r.lock);
+                    lf.targets.insert(
+                        target.to_string(),
+                        serde_json::from_value(current)
+                            .context("merge the layer's lock pins into the lock file")?,
+                    );
+                    lf.save(src_dir)?;
+                }
+                let key = r.key;
+                if part == Part::Project {
+                    let saved = LockFile::load(src_dir)?;
+                    s.alias_for_lock(
+                        &serde_json::to_value(saved.targets.get(target)).unwrap_or_default(),
+                    )
+                    .await?;
+                }
+                Some(key)
+            }
+            None if adds_nothing => {
+                if let (Some(s), Some(base)) = (stacks, parent) {
+                    // A project that no longer adds anything over Base: its view must be on
+                    // Base itself, not on the Project layer it had, or what it removed stays.
+                    s.settle_on(base).await?;
+                }
+                if let Some(s) = stacks {
+                    let saved = LockFile::load(src_dir)?;
+                    s.alias_for_lock(
+                        &serde_json::to_value(saved.targets.get(target)).unwrap_or_default(),
+                    )
+                    .await?;
+                }
+                parent.map(String::from)
+            }
+            None => {
+                phase.await?;
+                None
+            }
+        };
+        if let (Some(s), Part::Project) = (stacks, part) {
+            if let Err(e) = s.auto_gc().await {
+                print_warning(
+                    &format!("Stacks cleanup failed: {e:#}"),
+                    OutputLevel::Normal,
+                );
+            }
+        }
+        if part == Part::Base {
+            // The stamps below describe the whole install: they belong to the last part.
+            return Ok(key);
+        }
 
         // Write compile-deps stamp (unless --no-stamps)
         // This tracks which compile dependencies are installed in the target-sysroot.
@@ -1325,7 +1769,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
             }
         }
 
-        Ok(())
+        Ok(key)
     }
 
     /// Fetch remote extensions after SDK bootstrap
@@ -1392,6 +1836,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
     #[allow(clippy::too_many_arguments)]
     async fn execute_bootstrap(
         &self,
+        stacks: Option<&crate::utils::stacks::Stacks>,
         config: &Config,
         target: &str,
         container_image: &str,
@@ -1448,10 +1893,45 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
             );
         }
 
-        // Initialize SDK environment first (creates directories, copies configs, sets up wrappers)
-        print_info("Initializing SDK environment.", OutputLevel::Normal);
+        let sdk_target_pkg_name = format!("avocado-sdk-{target}");
+        let bootstrap_pkg_name = "avocado-sdk-bootstrap";
+        // Both are queried for the lock file later, whether installed now or taken from a layer.
+        let all_sdk_package_names: Vec<String> =
+            vec![sdk_target_pkg_name.clone(), bootstrap_pkg_name.to_string()];
 
-        let sdk_init_command = r#"
+        // L0 (stacks): everything the four runs below read. Lock pins are in it, so a
+        // project pinned to other versions gets its own layer.
+        let l0_inputs = match stacks {
+            Some(s) => {
+                let mut v = l0_layer_inputs(&L0KeyInputs {
+                    releasever: std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
+                    target,
+                    host_arch: host_arch.as_str(),
+                    image_id: &crate::utils::stacks::image_id(
+                        &container_helper.container_tool,
+                        container_image,
+                    )
+                    .await?,
+                    repo_url,
+                    repo_release,
+                    feeds_fingerprint: feeds.map(|f| f.fingerprint.as_str()),
+                    lock: &serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default(),
+                    sdk_target_pkg: &sdk_target_pkg_name,
+                    dnf_args: self.dnf_args.as_deref(),
+                    no_weak_deps: config.get_sdk_disable_weak_dependencies(),
+                    container_args: merged_container_args.map(|a| a.as_slice()),
+                });
+                s.scope(&mut v);
+                Some((s, v))
+            }
+            None => None,
+        };
+
+        let installs = async {
+            // Initialize SDK environment first (creates directories, copies configs, sets up wrappers)
+            print_info("Initializing SDK environment.", OutputLevel::Normal);
+
+            let sdk_init_command = r#"
 echo "[INFO] Initializing Avocado SDK."
 mkdir -p $AVOCADO_SDK_PREFIX/etc
 # $AVOCADO_EXT_SYSROOTS is a symlink into the active runtime. `avocado runtime
@@ -1700,78 +2180,77 @@ MACROS_EOF
         .replace("@POSTINST_INTERCEPT@", POSTINST_INTERCEPT)
         .replace("@SCRIPTLET_CONTRACT@", crate::utils::stamps::SCRIPTLET_CONTRACT);
 
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: sdk_init_command.to_string(),
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.map(|s| s.to_string()),
-            feeds: feeds.cloned(),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            // runs_on handled by shared context
-            tui_context: self.tui_context.clone(),
-            ..Default::default()
-        };
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: sdk_init_command.to_string(),
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
 
-        let init_success = run_container_command(
-            container_helper,
-            run_config,
-            runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
-        .await?;
+            let init_success = run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
 
-        if init_success {
-            print_success("Initialized SDK environment.", OutputLevel::Normal);
-        } else {
-            return Err(anyhow::anyhow!("Failed to initialize SDK environment."));
-        }
+            if init_success {
+                print_success("Initialized SDK environment.", OutputLevel::Normal);
+            } else {
+                return Err(anyhow::anyhow!("Failed to initialize SDK environment."));
+            }
 
-        // Install avocado-sdk-{target} with version from distro.version
-        print_info(
-            &format!("Installing SDK for target '{target}'."),
-            OutputLevel::Normal,
-        );
+            // Install avocado-sdk-{target} with version from distro.version
+            print_info(
+                &format!("Installing SDK for target '{target}'."),
+                OutputLevel::Normal,
+            );
 
-        // Build package name and spec with lock file support
-        let sdk_target_pkg_name = format!("avocado-sdk-{target}");
-        let sdk_target_config_version = "*";
-        let sdk_target_pkg = build_package_spec_with_lock(
-            &lock_file,
-            target,
-            &sdk_sysroot,
-            &sdk_target_pkg_name,
-            sdk_target_config_version,
-        );
+            // Build package name and spec with lock file support
+            let sdk_target_config_version = "*";
+            let sdk_target_pkg = build_package_spec_with_lock(
+                &lock_file,
+                target,
+                &sdk_sysroot,
+                &sdk_target_pkg_name,
+                sdk_target_config_version,
+            );
 
-        // `avocado update` clears this sysroot's pins (LockFile::clear_all), so an
-        // empty set means "follow the feed", exactly as it does for the rootfs.
-        //
-        // `dnf install` cannot express that on an existing SDK: it is additive and
-        // leaves an already-installed package at whatever version it has. That is
-        // invisible for the packages named above -- they are pinned or wildcarded
-        // and dnf reinstalls them -- but avocado-sdk-target arrives *transitively*
-        // through avocado-sdk-{target}, and it owns the two files a BSP rebuild
-        // most often changes: stone-<target>.json and the avocado-build-<target> /
-        // avocado-provision-<target> hooks. So a rebuilt-and-republished feed
-        // updated every sysroot except the one holding the build manifest, and the
-        // build kept running against a stale manifest with no diagnostic.
-        //
-        // Mirrors dnf_sync_step() in commands/rootfs/install.rs. Combined repo conf
-        // because avocado-sdk-target is built for SDKPKGARCH and published to the
-        // per-target SDK repo, which only target-repoconf carries.
-        let sdk_fresh_resolve = lock_file
-            .get_locked_package_names(target, &sdk_sysroot)
-            .is_empty();
-        let sdk_sync_snippet = sdk_dnf_sync_step(sdk_fresh_resolve);
+            // `avocado update` clears this sysroot's pins (LockFile::clear_all), so an
+            // empty set means "follow the feed", exactly as it does for the rootfs.
+            //
+            // `dnf install` cannot express that on an existing SDK: it is additive and
+            // leaves an already-installed package at whatever version it has. That is
+            // invisible for the packages named above -- they are pinned or wildcarded
+            // and dnf reinstalls them -- but avocado-sdk-target arrives *transitively*
+            // through avocado-sdk-{target}, and it owns the two files a BSP rebuild
+            // most often changes: stone-<target>.json and the avocado-build-<target> /
+            // avocado-provision-<target> hooks. So a rebuilt-and-republished feed
+            // updated every sysroot except the one holding the build manifest, and the
+            // build kept running against a stale manifest with no diagnostic.
+            //
+            // Mirrors dnf_sync_step() in commands/rootfs/install.rs. Combined repo conf
+            // because avocado-sdk-target is built for SDKPKGARCH and published to the
+            // per-target SDK repo, which only target-repoconf carries.
+            let sdk_fresh_resolve = lock_file
+                .get_locked_package_names(target, &sdk_sysroot)
+                .is_empty();
+            let sdk_sync_snippet = sdk_dnf_sync_step(sdk_fresh_resolve);
 
-        let sdk_target_command = format!(
-            r#"
+            let sdk_target_command = format!(
+                r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS \
@@ -1781,54 +2260,49 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     install \
     {sdk_target_pkg}
 {sdk_sync_snippet}"#
-        );
-
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: sdk_target_command,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.map(|s| s.to_string()),
-            feeds: feeds.cloned(),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            // runs_on handled by shared context
-            tui_context: self.tui_context.clone(),
-            ..Default::default()
-        };
-
-        let sdk_target_success = run_container_command(
-            container_helper,
-            run_config,
-            runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
-        .await?;
-
-        // Track all SDK packages installed for lock file update at the end
-        let mut all_sdk_package_names: Vec<String> = Vec::new();
-
-        if sdk_target_success {
-            print_success(
-                &format!("Installed SDK for target '{target}'."),
-                OutputLevel::Normal,
             );
-            // Add to list for later query (after environment is fully set up)
-            all_sdk_package_names.push(sdk_target_pkg_name);
-        } else {
-            return Err(anyhow::anyhow!(
-                "Failed to install SDK for target '{target}'."
-            ));
-        }
 
-        // Run check-update to refresh metadata using the combined repo config.
-        // This uses arch-specific varsdir for correct architecture filtering,
-        // with repos from both arch-specific SDK and target-repoconf.
-        let check_update_command = r#"
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: sdk_target_command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
+
+            let sdk_target_success = run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
+
+            if sdk_target_success {
+                print_success(
+                    &format!("Installed SDK for target '{target}'."),
+                    OutputLevel::Normal,
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to install SDK for target '{target}'."
+                ));
+            }
+
+            // Run check-update to refresh metadata using the combined repo config.
+            // This uses arch-specific varsdir for correct architecture filtering,
+            // with repos from both arch-specific SDK and target-repoconf.
+            let check_update_command = r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST \
@@ -1837,54 +2311,53 @@ $DNF_SDK_HOST \
     check-update || true
 "#;
 
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: check_update_command.to_string(),
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.map(|s| s.to_string()),
-            feeds: feeds.cloned(),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            // runs_on handled by shared context
-            tui_context: self.tui_context.clone(),
-            ..Default::default()
-        };
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: check_update_command.to_string(),
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
 
-        // check-update ends with `|| true` (exit 100 "updates available" is not a
-        // failure), so the in-container result is always success. Only a host or
-        // launch error, propagated by `?`, matters here. The bool is not acted on
-        // by design.
-        run_container_command(
-            container_helper,
-            run_config,
-            runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
-        .await?;
+            // check-update ends with `|| true` (exit 100 "updates available" is not a
+            // failure), so the in-container result is always success. Only a host or
+            // launch error, propagated by `?`, matters here. The bool is not acted on
+            // by design.
+            run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
 
-        // Install avocado-sdk-bootstrap — repo scoping via --releasever, lock file pins exact version
-        print_info("Installing SDK bootstrap.", OutputLevel::Normal);
+            // Install avocado-sdk-bootstrap — repo scoping via --releasever, lock file pins exact version
+            print_info("Installing SDK bootstrap.", OutputLevel::Normal);
 
-        let bootstrap_pkg_name = "avocado-sdk-bootstrap";
-        let bootstrap_config_version = "*";
-        let bootstrap_pkg = build_package_spec_with_lock(
-            &lock_file,
-            target,
-            &sdk_sysroot,
-            bootstrap_pkg_name,
-            bootstrap_config_version,
-        );
+            let bootstrap_config_version = "*";
+            let bootstrap_pkg = build_package_spec_with_lock(
+                &lock_file,
+                target,
+                &sdk_sysroot,
+                bootstrap_pkg_name,
+                bootstrap_config_version,
+            );
 
-        // Use combined repo config for bootstrap installation.
-        // The bootstrap package is a nativesdk package that needs both the base repos
-        // (from arch-specific SDK) and target-specific repos (from target-repoconf).
-        let bootstrap_command = format!(
-            r#"
+            // Use combined repo config for bootstrap installation.
+            // The bootstrap package is a nativesdk package that needs both the base repos
+            // (from arch-specific SDK) and target-specific repos (from target-repoconf).
+            let bootstrap_command = format!(
+                r#"
 RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
 RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS \
@@ -1894,41 +2367,55 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
     install \
     {bootstrap_pkg}
 "#
-        );
+            );
 
-        let run_config = RunConfig {
-            container_image: container_image.to_string(),
-            target: target.to_string(),
-            command: bootstrap_command,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: repo_url.map(|s| s.to_string()),
-            feeds: feeds.cloned(),
-            repo_release: repo_release.map(|s| s.to_string()),
-            container_args: merged_container_args.cloned(),
-            dnf_args: self.dnf_args.clone(),
-            disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
-            // runs_on handled by shared context
-            tui_context: self.tui_context.clone(),
-            ..Default::default()
+            let run_config = RunConfig {
+                container_image: container_image.to_string(),
+                target: target.to_string(),
+                command: bootstrap_command,
+                verbose: self.verbose,
+                source_environment: true,
+                interactive: false,
+                repo_url: repo_url.map(|s| s.to_string()),
+                feeds: feeds.cloned(),
+                repo_release: repo_release.map(|s| s.to_string()),
+                container_args: merged_container_args.cloned(),
+                dnf_args: self.dnf_args.clone(),
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                // runs_on handled by shared context
+                tui_context: self.tui_context.clone(),
+                ..Default::default()
+            };
+
+            let bootstrap_success = run_container_command(
+                container_helper,
+                run_config,
+                runs_on_context,
+                self.sdk_arch.as_ref(),
+            )
+            .await?;
+
+            if bootstrap_success {
+                print_success("Installed SDK bootstrap.", OutputLevel::Normal);
+            } else {
+                return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
+            }
+
+            Ok::<(), anyhow::Error>(())
         };
-
-        let bootstrap_success = run_container_command(
-            container_helper,
-            run_config,
-            runs_on_context,
-            self.sdk_arch.as_ref(),
-        )
-        .await?;
-
-        if bootstrap_success {
-            print_success("Installed SDK bootstrap.", OutputLevel::Normal);
-            // Add to list for later query (after environment is fully set up)
-            all_sdk_package_names.push(bootstrap_pkg_name.to_string());
-        } else {
-            return Err(anyhow::anyhow!("Failed to install SDK bootstrap."));
-        }
+        let l0_key = match l0_inputs {
+            Some((s, ref v)) => Some(
+                s.step("L0 sdk bootstrap", "empty", v, || async {
+                    installs.await.map(|_| serde_json::Value::Null)
+                })
+                .await?
+                .key,
+            ),
+            None => {
+                installs.await?;
+                None
+            }
+        };
 
         // Fetch remote extensions now that SDK repos are available
         // Only fetch extensions that are referenced by active runtimes
@@ -2040,6 +2527,7 @@ fi
             lock_file,
             active_extensions,
             src_dir,
+            l0_key,
         })
     }
 
@@ -2312,6 +2800,804 @@ mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    const STACKS_BASE_CONFIG: &str = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:2024"
+  packages:
+    avocado-sdk-toolchain: '*'
+rootfs:
+  overlay: rootfs-overlay
+  post_install: post-install.sh
+initramfs:
+  packages:
+    avocado-pkg-initramfs: '*'
+runtimes:
+  dev:
+    target: qemux86-64
+"#;
+
+    /// The Base layer's key inputs for the project in `dir` (config `yaml`).
+    fn base_inputs_of(dir: &std::path::Path, yaml: &str) -> serde_json::Value {
+        let config_path = dir.join("avocado.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let path = config_path.to_string_lossy().to_string();
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        let root = composed.config.project_root(&path);
+        base_layer_sysroot_inputs(
+            &composed.config,
+            &composed.merged_value,
+            &root,
+            "qemux86-64",
+            None,
+            None,
+            None,
+            None,
+            &LockFile::load(&root).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn stacks_project() -> tempfile::TempDir {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(t.path().join("rootfs-overlay/etc")).unwrap();
+        std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "a\n").unwrap();
+        std::fs::write(t.path().join("post-install.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        t
+    }
+
+    /// Every input the rootfs/initramfs install reads must move the Base layer's key, or two
+    /// projects that differ in it share one tree (project B, differing only in an overlay
+    /// file, would get project A's file).
+    #[test]
+    fn base_layer_key_moves_with_every_sysroot_input() {
+        let t = stacks_project();
+        let base = base_inputs_of(t.path(), STACKS_BASE_CONFIG);
+        assert!(
+            base["rootfs"].is_string() && base["initramfs"].is_string(),
+            "{base}"
+        );
+
+        // File contents, not just config text.
+        std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "b\n").unwrap();
+        assert_ne!(
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG)["rootfs"],
+            base["rootfs"],
+            "overlay content"
+        );
+        std::fs::write(t.path().join("rootfs-overlay/etc/app.conf"), "a\n").unwrap();
+        std::fs::write(t.path().join("post-install.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert_ne!(
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG)["rootfs"],
+            base["rootfs"],
+            "post_install content"
+        );
+        std::fs::write(t.path().join("post-install.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        assert_eq!(
+            base_inputs_of(t.path(), STACKS_BASE_CONFIG),
+            base,
+            "restored"
+        );
+
+        for (what, edited) in [
+            (
+                "rootfs packages",
+                STACKS_BASE_CONFIG.replace("rootfs:\n", "rootfs:\n  packages:\n    vim: '*'\n"),
+            ),
+            (
+                "initramfs packages",
+                STACKS_BASE_CONFIG.replace("avocado-pkg-initramfs", "avocado-pkg-initramfs-tiny"),
+            ),
+            (
+                "permissions",
+                format!("{STACKS_BASE_CONFIG}permissions:\n  app:\n    users:\n      app: {{}}\n"),
+            ),
+            (
+                "kernel",
+                format!(
+                    "{STACKS_BASE_CONFIG}kernel:\n  stock:\n    package: kernel-image\n    version: '6.6.1'\n"
+                ),
+            ),
+            (
+                "sdk image",
+                STACKS_BASE_CONFIG.replace("sdk:2024", "sdk:2026"),
+            ),
+        ] {
+            let got = base_inputs_of(t.path(), &edited);
+            assert_ne!(got, base, "{what} must change the Base layer key");
+        }
+    }
+
+    /// The layer a config field's install changes: its key, and so every layer above, must move.
+    const L0: usize = 0;
+    const L1: usize = 1;
+    const L2: usize = 2;
+
+    /// How one config field relates to the stack layer keys.
+    enum KeyRole {
+        /// Changes what `sdk install` puts in this layer: setting the field to this YAML value
+        /// must change the layer's key.
+        Keyed(usize, &'static str),
+        /// Like `Keyed`, on a base that first sets these other fields (on both sides).
+        KeyedOver(usize, &'static [(&'static str, &'static str)], &'static str),
+        /// An old name for another field: the same value under either name gives the same keys,
+        /// and this layer's key differs from the base config's.
+        Alias(usize, &'static str, &'static str),
+        /// Not read by `sdk install` (or read without changing the installed tree): why.
+        #[allow(dead_code)]
+        Unread(&'static str),
+        /// A section whose fields are classified one by one.
+        Section,
+    }
+
+    /// Every field of the config schema, top level and inside the sections `sdk install` reads.
+    /// A field added to the schema fails `every_config_field_is_classified_for_stack_keys` until
+    /// it is classified here, so nobody adds an install input that silently shares layers
+    /// between projects that differ in it.
+    const STACK_KEY_ROLES: &[(&str, KeyRole)] = &[
+        (
+            "cli_requirement",
+            KeyRole::Unread("checked before anything runs"),
+        ),
+        (
+            "connect",
+            KeyRole::Unread("Connect provisioning, after install"),
+        ),
+        (
+            "default_runtime",
+            KeyRole::Unread("picks the runtime; the install's own inputs are keyed"),
+        ),
+        (
+            "default_target",
+            KeyRole::Unread("picks the target, which every key carries"),
+        ),
+        (
+            "default_target_board",
+            KeyRole::Unread("picks the board; its packages are keyed"),
+        ),
+        ("distro", KeyRole::Section),
+        ("distro.channel", KeyRole::Keyed(L0, "next")),
+        (
+            "distro.feeds",
+            // A declared repo alone already makes layers private; enabling it must move the
+            // key on top of that.
+            KeyRole::KeyedOver(
+                L1,
+                &[(
+                    "repos.extra",
+                    "{url: 'https://example.com/extra/$releasever'}",
+                )],
+                "[extra]",
+            ),
+        ),
+        ("distro.release", KeyRole::Keyed(L0, "'2099'")),
+        (
+            "distro.repo",
+            KeyRole::Keyed(L0, "{url: 'https://example.com/other'}"),
+        ),
+        (
+            "distro.version",
+            KeyRole::Alias(L0, "distro.release", "'2099'"),
+        ),
+        (
+            "ext",
+            KeyRole::Unread("old top-level name, rejected by the schema's newer form"),
+        ),
+        (
+            "extensions",
+            KeyRole::Keyed(L2, "{app: {sdk: {packages: {vim: '*'}}}}"),
+        ),
+        ("initramfs", KeyRole::Section),
+        (
+            "initramfs.dependencies",
+            KeyRole::Alias(L1, "initramfs.packages", "{busybox: '*'}"),
+        ),
+        (
+            "initramfs.filesystem",
+            KeyRole::Unread("image build, after install"),
+        ),
+        (
+            "initramfs.image",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("initramfs.overlay", KeyRole::Keyed(L1, "rootfs-overlay")),
+        ("initramfs.packages", KeyRole::Keyed(L1, "{busybox: '*'}")),
+        (
+            "initramfs.permissions",
+            KeyRole::Keyed(L1, "{users: {app: {}}}"),
+        ),
+        (
+            "initramfs.post_install",
+            KeyRole::Keyed(L1, "post-install.sh"),
+        ),
+        (
+            "initramfs.source",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("kernel", KeyRole::Section),
+        (
+            "kernel.cmdline",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.cmdline_extra",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.compile",
+            KeyRole::Unread("names an sdk.compile section, keyed there"),
+        ),
+        (
+            "kernel.image",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        (
+            "kernel.install",
+            KeyRole::Unread("runtime build, after install"),
+        ),
+        ("kernel.package", KeyRole::Keyed(L1, "kernel-image-other")),
+        (
+            "kernel.source",
+            KeyRole::Unread("kernel compile, after install"),
+        ),
+        ("kernel.version", KeyRole::Keyed(L1, "'6.6.99'")),
+        ("permissions", KeyRole::Keyed(L1, "{users: {app: {}}}")),
+        ("provision", KeyRole::Unread("provisioning, after install")),
+        (
+            "provision_profiles",
+            KeyRole::Unread("provisioning, after install"),
+        ),
+        (
+            "repos",
+            KeyRole::Unread(
+                "definitions only: distro.feeds enables them (keyed); declaring any makes the \
+                 project's layers private (stacks::shareable)",
+            ),
+        ),
+        ("rootfs", KeyRole::Section),
+        (
+            "rootfs.dependencies",
+            KeyRole::Alias(L1, "rootfs.packages", "{vim: '*'}"),
+        ),
+        (
+            "rootfs.filesystem",
+            KeyRole::Unread("image build, after install"),
+        ),
+        (
+            "rootfs.image",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("rootfs.overlay", KeyRole::Keyed(L1, "other-overlay")),
+        ("rootfs.packages", KeyRole::Keyed(L1, "{vim: '*'}")),
+        (
+            "rootfs.permissions",
+            KeyRole::Keyed(L1, "{users: {app: {}}}"),
+        ),
+        (
+            "rootfs.post_install",
+            KeyRole::Keyed(L1, "other-post-install.sh"),
+        ),
+        (
+            "rootfs.source",
+            KeyRole::Unread("image build, after install"),
+        ),
+        ("runtime", KeyRole::Unread("old top-level name")),
+        (
+            "runtimes",
+            KeyRole::Keyed(L2, "{dev: {target: qemux86-64}}"),
+        ),
+        ("sdk", KeyRole::Section),
+        (
+            "sdk.compile",
+            KeyRole::Keyed(L2, "{app: {packages: {make: '*'}}}"),
+        ),
+        ("sdk.container_args", KeyRole::Keyed(L0, "['-e', 'X=1']")),
+        (
+            "sdk.dependencies",
+            // ponytail: install reads only `packages` (get_sdk_dependencies_for_target), so the old
+            // name installs nothing and cannot split layers. When that is fixed, make this
+            // Alias("sdk.packages", ...) and the test checks it keys like `packages`.
+            KeyRole::Unread("sdk install ignores the old name (reads only sdk.packages)"),
+        ),
+        ("sdk.disable_weak_dependencies", KeyRole::Keyed(L0, "true")),
+        ("sdk.host_gid", KeyRole::Unread("schema: no effect")),
+        (
+            "sdk.host_uid",
+            KeyRole::Unread("schema: no effect; overlays copy as root regardless"),
+        ),
+        (
+            "sdk.image",
+            KeyRole::Keyed(L0, "docker.io/avocadolinux/sdk:2099"),
+        ),
+        ("sdk.packages", KeyRole::Keyed(L2, "{nano: '*'}")),
+        ("sdk.repo_release", KeyRole::Keyed(L0, "'2099'")),
+        (
+            "sdk.repo_url",
+            KeyRole::Keyed(L0, "https://example.com/repo"),
+        ),
+        ("signing_keys", KeyRole::Unread("signing, after install")),
+        (
+            "source_date_epoch",
+            KeyRole::Unread("image and runtime builds, after install"),
+        ),
+        (
+            "src_dir",
+            KeyRole::Unread("where sources are; their contents are keyed"),
+        ),
+        (
+            "supported_targets",
+            KeyRole::Unread("validates the target, which every key carries"),
+        ),
+    ];
+
+    /// The three layer keys `sdk install` computes for a config, each on its parent, from the
+    /// same input builders the install uses (`l0_layer_inputs`, `part_layer_inputs`) fed by the
+    /// same config readers. Left at fixed values: what does not come from the config (the SDK
+    /// image's id, which stands in as its name, lock pins, the CLI build, `--dnf-arg`) and the
+    /// target-dev package names (rendered with the dnf command; their sources, the compile
+    /// sections, are keyed through `compile_deps`).
+    fn stack_layer_keys(dir: &std::path::Path, yaml: &str) -> anyhow::Result<[String; 3]> {
+        use crate::utils::device_tree_overlay as dto;
+        let config_path = dir.join("avocado.yaml");
+        std::fs::write(&config_path, yaml)?;
+        let path = config_path.to_string_lossy().to_string();
+        let target = "qemux86-64";
+        let composed = Config::load_composed(&path, Some(target))?;
+        let (config, merged) = (&composed.config, &composed.merged_value);
+        let root = config.project_root(&path);
+        let lock = LockFile::load(&root)?;
+        let lock_json = serde_json::to_value(lock.targets.get(target))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let feeds = |stage| -> anyhow::Result<Option<String>> {
+            Ok(rt
+                .block_on(config.materialize_feeds(target, stage, &path))?
+                .map(|f| f.fingerprint))
+        };
+        let (sdk_feeds, target_dev_feeds) = (feeds(FeedStage::Sdk)?, feeds(FeedStage::SdkTarget)?);
+        let (repo_url, repo_release) = (config.get_sdk_repo_url(), config.get_sdk_repo_release());
+        let container_args = config.merge_sdk_container_args(None);
+        let no_weak_deps = config.get_sdk_disable_weak_dependencies();
+        let image = config.get_sdk_image().cloned().unwrap_or_default();
+
+        let l0 = l0_layer_inputs(&L0KeyInputs {
+            releasever: None,
+            target,
+            host_arch: "x86_64",
+            image_id: &image,
+            repo_url: repo_url.as_deref(),
+            repo_release: repo_release.as_deref(),
+            feeds_fingerprint: sdk_feeds.as_deref(),
+            lock: &lock_json,
+            sdk_target_pkg: "avocado-sdk-qemux86-64",
+            dnf_args: None,
+            no_weak_deps,
+            container_args: container_args.as_deref(),
+        });
+
+        let active =
+            crate::utils::config::find_active_extensions(config, merged, target, &path, None)?;
+        let sections = crate::utils::config::find_active_compile_sections(
+            config, merged, &active, target, &path, None,
+        )?;
+        let sdk_deps = config.get_sdk_dependencies_for_target(&path, target)?;
+        let base_sdk_deps = sdk_deps.as_ref().map(|m| {
+            m.iter()
+                .filter(|(k, _)| k.starts_with("avocado-sdk-"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<_, _>>()
+        });
+        let ext_deps: HashMap<String, HashMap<String, Value>> = config
+            .get_extension_sdk_dependencies_with_config_path_and_target(
+                yaml,
+                Some(&path),
+                Some(target),
+            )?
+            .into_iter()
+            .filter(|(name, _)| active.contains(name))
+            .collect();
+        let no_ext = HashMap::new();
+        let dto_parsed = dto::with_boot_settings_for_target(config, merged, target);
+        let part = |part, sdk_deps, ext_deps, sysroots, compile_deps| {
+            part_layer_inputs(&PartKeyInputs {
+                part,
+                releasever: None,
+                target,
+                sdk_deps,
+                ext_deps,
+                feeds_fingerprint: sdk_feeds.as_deref(),
+                feeds_config: &merged["feeds"],
+                repo_url: repo_url.as_deref(),
+                repo_release: repo_release.as_deref(),
+                dnf_args: None,
+                no_weak_deps,
+                container_args: container_args.as_deref(),
+                lock: &lock_json,
+                sysroots,
+                target_dev: None,
+                target_dev_feeds: target_dev_feeds.as_deref(),
+                compile_deps,
+                provision_dto: part == Part::Project
+                    && !dto::active_extensions_declaring_overlays(&dto_parsed, &active).is_empty(),
+                provision_dto_compiler: part == Part::Project
+                    && !dto::active_extensions_compiling_overlays(&dto_parsed, &active).is_empty(),
+            })
+        };
+        let l1 = part(
+            Part::Base,
+            &base_sdk_deps,
+            &no_ext,
+            Some(base_layer_sysroot_inputs(
+                config,
+                merged,
+                &root,
+                target,
+                None,
+                repo_url.as_deref(),
+                repo_release.as_deref(),
+                None,
+                &lock,
+            )?),
+            None,
+        );
+        let l2 = part(
+            Part::Project,
+            &sdk_deps,
+            &ext_deps,
+            None,
+            Some(
+                crate::utils::stamps::compute_compile_deps_input_hash(merged, &sections)?
+                    .config_hash,
+            ),
+        );
+        let key = |parent: &str, inputs| {
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": parent, "inputs": inputs}))
+        };
+        let k0 = key("empty", l0);
+        let k1 = key(&k0, l1);
+        let k2 = key(&k1, l2);
+        Ok([k0, k1, k2])
+    }
+
+    /// `STACKS_BASE_CONFIG` plus what makes every field observable: a distro (release and
+    /// channel together form the releasever), and an extension and a compile section the runtime
+    /// uses (only active ones are installed).
+    fn key_roles_config() -> String {
+        let with_ext = STACKS_BASE_CONFIG.replace(
+            "runtimes:",
+            "extensions:\n  app:\n    sdk:\n      packages:\n        nano: '*'\nruntimes:",
+        );
+        [
+            ("distro", "{release: '2024', channel: edge}"),
+            ("sdk.compile", "{app: {packages: {gcc: '*'}}}"),
+            (
+                "runtimes",
+                "{dev: {target: qemux86-64, kernel: {compile: app}, extensions: [app]}}",
+            ),
+        ]
+        .iter()
+        .fold(with_ext, |y, (f, v)| with_field(&y, f, v))
+    }
+
+    /// `yaml` with `path` (dotted) set to `value` (YAML), creating sections on the way.
+    fn with_field(yaml: &str, path: &str, value: &str) -> String {
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        let mut node = &mut doc;
+        let parts: Vec<&str> = path.split('.').collect();
+        for p in &parts[..parts.len() - 1] {
+            let m = node.as_mapping_mut().unwrap();
+            node = m
+                .entry(Value::from(*p))
+                .or_insert_with(|| Value::Mapping(Default::default()));
+        }
+        node.as_mapping_mut().unwrap().insert(
+            Value::from(*parts.last().unwrap()),
+            serde_yaml::from_str(value).unwrap(),
+        );
+        serde_yaml::to_string(&doc).unwrap()
+    }
+
+    /// `yaml` without `path` (dotted).
+    fn without_field(yaml: &str, path: &str) -> String {
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut node = &mut doc;
+        for p in &parts[..parts.len() - 1] {
+            node = node.get_mut(*p).unwrap();
+        }
+        node.as_mapping_mut()
+            .unwrap()
+            .remove(Value::from(*parts.last().unwrap()));
+        serde_yaml::to_string(&doc).unwrap()
+    }
+
+    /// The schema's fields: the top level, and one level into each section classified
+    /// `Section`.
+    fn schema_fields() -> Vec<String> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/avocado-config.json")).unwrap();
+        let defs = schema
+            .get("definitions")
+            .or_else(|| schema.get("$defs"))
+            .cloned()
+            .unwrap_or_default();
+        fn resolve(n: &serde_json::Value, defs: &serde_json::Value) -> serde_json::Value {
+            let mut n = n.clone();
+            while let Some(r) = n.get("$ref").and_then(|r| r.as_str()) {
+                n = defs[r.rsplit('/').next().unwrap()].clone();
+            }
+            for k in ["anyOf", "oneOf"] {
+                if let Some(alts) = n.get(k).and_then(|a| a.as_array()) {
+                    if let Some(o) = alts
+                        .iter()
+                        .map(|a| resolve(a, defs))
+                        .find(|a| a.get("properties").is_some())
+                    {
+                        return o;
+                    }
+                }
+            }
+            n
+        }
+        let mut out = Vec::new();
+        for (top, node) in schema["properties"].as_object().unwrap() {
+            out.push(top.clone());
+            let is_section = STACK_KEY_ROLES
+                .iter()
+                .any(|(f, r)| f == top && matches!(r, KeyRole::Section));
+            if is_section {
+                if let Some(props) = resolve(node, &defs)["properties"].as_object() {
+                    out.extend(props.keys().map(|k| format!("{top}.{k}")));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Cross-project pollution guard: every schema field is classified, and every field
+    /// classified as an install input moves the key material when it changes. A new schema field
+    /// fails here until someone decides which it is.
+    #[test]
+    #[serial_test::serial]
+    fn every_config_field_is_classified_for_stack_keys() {
+        let mut classified: Vec<String> =
+            STACK_KEY_ROLES.iter().map(|(f, _)| f.to_string()).collect();
+        classified.sort();
+        assert_eq!(
+            schema_fields(),
+            classified,
+            "schema fields and STACK_KEY_ROLES differ: classify the new field (Keyed if \
+             `sdk install` reads it, Unread with the reason if not)"
+        );
+
+        let t = stacks_project();
+        std::fs::create_dir_all(t.path().join("other-overlay/etc")).unwrap();
+        std::fs::write(t.path().join("other-overlay/etc/x"), "x\n").unwrap();
+        std::fs::write(
+            t.path().join("other-post-install.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        let base_config = key_roles_config();
+        let base = stack_layer_keys(t.path(), &base_config).unwrap();
+        let (mut unmoved, mut invalid) = (Vec::new(), Vec::new());
+        for (field, role) in STACK_KEY_ROLES {
+            let keys = |yaml: &str| {
+                stack_layer_keys(t.path(), yaml).map_err(|e| format!("{field}: {e:#}"))
+            };
+            match role {
+                KeyRole::Keyed(layer, value) => {
+                    match keys(&with_field(&base_config, field, value)) {
+                        Ok(k) if k[*layer] == base[*layer] => unmoved.push(*field),
+                        Ok(_) => {}
+                        Err(e) => invalid.push(e),
+                    }
+                }
+                KeyRole::KeyedOver(layer, pre, value) => {
+                    let over = pre
+                        .iter()
+                        .fold(base_config.clone(), |y, (f, v)| with_field(&y, f, v));
+                    match (keys(&over), keys(&with_field(&over, field, value))) {
+                        (Ok(b), Ok(k)) if b[*layer] == k[*layer] => unmoved.push(*field),
+                        (Ok(_), Ok(_)) => {}
+                        (Err(e), _) | (_, Err(e)) => invalid.push(e),
+                    }
+                }
+                KeyRole::Alias(layer, new_name, value) => {
+                    let new = with_field(&base_config, new_name, value);
+                    let old = with_field(&without_field(&base_config, new_name), field, value);
+                    match (keys(&new), keys(&old)) {
+                        (Ok(n), Ok(o)) if n != o => {
+                            invalid.push(format!("{field} does not key like {new_name}"))
+                        }
+                        (Ok(_), Ok(o)) if o[*layer] == base[*layer] => unmoved.push(*field),
+                        (Ok(_), Ok(_)) => {}
+                        (Err(e), _) | (_, Err(e)) => invalid.push(e),
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(invalid.is_empty(), "fix these test values: {invalid:#?}");
+        assert!(
+            unmoved.is_empty(),
+            "these install inputs do not reach the stack keys: {unmoved:?}"
+        );
+    }
+
+    fn key_inputs<'a>(
+        part: Part,
+        lock: &'a serde_json::Value,
+        sdk_deps: &'a Option<HashMap<String, serde_yaml::Value>>,
+        ext_deps: &'a HashMap<String, HashMap<String, serde_yaml::Value>>,
+        feeds_config: &'a serde_yaml::Value,
+    ) -> PartKeyInputs<'a> {
+        PartKeyInputs {
+            part,
+            releasever: Some("2026/edge/snapshots/1"),
+            target: "qemux86-64",
+            sdk_deps,
+            ext_deps,
+            feeds_fingerprint: None,
+            feeds_config,
+            repo_url: None,
+            repo_release: None,
+            dnf_args: None,
+            no_weak_deps: false,
+            container_args: None,
+            lock,
+            sysroots: Some(serde_json::json!({"rootfs": "r1", "initramfs": "i1"})),
+            target_dev: Some(serde_json::json!({"packages": ["libfoo"]})),
+            target_dev_feeds: None,
+            compile_deps: Some("c1".into()),
+            provision_dto: false,
+            provision_dto_compiler: false,
+        }
+    }
+
+    fn a_lock() -> serde_json::Value {
+        serde_json::json!({
+            "sdk": {"x86_64": {"avocado-sdk-toolchain": "1"}},
+            "rootfs": {"r": "1"}, "initramfs": {"i": "1"},
+            "kernel-versions": {"rootfs": "6.6.1"}, "kernels": {"6.6.1": {"k": "1"}},
+            "target-sysroot": {"libfoo": "1.0"},
+            "extensions": {"app": {"version": "0.1.0-r0.only-in-project-a"}},
+        })
+    }
+
+    /// Each part's key carries the lock sections its installs pin, under the lock file's own
+    /// names (`kernel-versions`, `target-sysroot`): a misspelled section reads as nothing and
+    /// a kernel repin would not move the key.
+    #[test]
+    fn part_keys_carry_their_lock_sections_by_their_real_names() {
+        let (lock, sdk, ext, feeds) = (a_lock(), None, HashMap::new(), serde_yaml::Value::Null);
+        let base = part_layer_inputs(&key_inputs(Part::Base, &lock, &sdk, &ext, &feeds));
+        for s in ["sdk", "rootfs", "initramfs", "kernel-versions", "kernels"] {
+            assert!(!base["lock"][s].is_null(), "Base key misses {s}: {base}");
+        }
+        assert!(base["lock"].get("target-sysroot").is_none());
+        let proj = part_layer_inputs(&key_inputs(Part::Project, &lock, &sdk, &ext, &feeds));
+        assert_eq!(proj["lock"]["target-sysroot"], lock["target-sysroot"]);
+        assert!(proj["lock"].get("rootfs").is_none());
+        // Another project's extension pins are in no key and in no recorded section.
+        for v in [&base, &proj] {
+            assert!(!v.to_string().contains("only-in-project-a"), "{v}");
+        }
+        assert!(!lock_sections(&lock, part_lock_sections(Part::Base))
+            .to_string()
+            .contains("only-in-project-a"));
+        assert!(!lock_sections(&lock, part_lock_sections(Part::Project))
+            .to_string()
+            .contains("only-in-project-a"));
+    }
+
+    /// A first install (empty lock) must alias the key its re-run computes once the lock is
+    /// saved: every section the key reads is present from the start, so the alias refresh
+    /// reaches it.
+    #[test]
+    fn a_first_install_aliases_the_key_its_rerun_computes() {
+        let (sdk, ext, feeds) = (None, HashMap::new(), serde_yaml::Value::Null);
+        let empty = serde_json::json!({});
+        let first = part_layer_inputs(&key_inputs(Part::Base, &empty, &sdk, &ext, &feeds));
+        for s in part_lock_sections(Part::Base) {
+            assert!(
+                first["lock"].get(*s).is_some(),
+                "{s} missing on a first install"
+            );
+        }
+        let k1 =
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": "l0", "inputs": first}));
+        let saved = a_lock();
+        let next = crate::utils::stacks::next_keys(
+            &[("l0".to_string(), first.clone(), k1.clone())],
+            &saved,
+        );
+        let rerun = part_layer_inputs(&key_inputs(Part::Base, &saved, &sdk, &ext, &feeds));
+        let k2 =
+            crate::utils::stacks::key_of(&serde_json::json!({"parent": "l0", "inputs": rerun}));
+        assert_eq!(
+            next,
+            vec![(k2, k1)],
+            "the re-run's key must alias the first run's layer"
+        );
+    }
+
+    /// What a layer records (null for sections it was built without) fills a project's lock
+    /// and the result is still a valid lock.
+    #[test]
+    fn a_layer_lock_fills_a_project_lock_that_stays_valid() {
+        let recorded = lock_sections(&a_lock(), part_lock_sections(Part::Project));
+        let mut sparse = lock_sections(&serde_json::json!({}), part_lock_sections(Part::Base));
+        let mut current = serde_json::json!({});
+        crate::utils::stacks::fill_missing(&mut current, &recorded);
+        crate::utils::stacks::fill_missing(&mut current, &sparse);
+        let t: crate::utils::lockfile::TargetLocks =
+            serde_json::from_value(current).expect("a filled lock deserializes");
+        assert!(t.target_sysroot.contains_key("libfoo"));
+        sparse["rootfs"] = serde_json::json!({"r": "1"});
+        let mut c2 = serde_json::json!({"rootfs": {}});
+        crate::utils::stacks::fill_missing(&mut c2, &sparse);
+        let _: crate::utils::lockfile::TargetLocks = serde_json::from_value(c2).unwrap();
+    }
+
+    /// The key-table for the parts: each input moves its own part's key and only that one.
+    #[test]
+    fn part_keys_move_with_their_own_inputs_only() {
+        let (lock, sdk, ext, feeds) = (a_lock(), None, HashMap::new(), serde_yaml::Value::Null);
+        let key = |p: &PartKeyInputs| crate::utils::stacks::key_of(&part_layer_inputs(p));
+        let base = key(&key_inputs(Part::Base, &lock, &sdk, &ext, &feeds));
+        let proj = key(&key_inputs(Part::Project, &lock, &sdk, &ext, &feeds));
+        let args = vec!["-e".to_string(), "FOO=1".to_string()];
+
+        // Version pins on compile deps reach the Project key through the compile-deps hash,
+        // and nothing about Project moves Base.
+        let mut p = key_inputs(Part::Project, &lock, &sdk, &ext, &feeds);
+        p.compile_deps = Some("c2".into());
+        assert_ne!(key(&p), proj, "compile deps");
+        let mut b = key_inputs(Part::Base, &lock, &sdk, &ext, &feeds);
+        b.compile_deps = Some("c2".into());
+        b.target_dev = Some(serde_json::json!({"packages": ["libbar"]}));
+        assert_eq!(key(&b), base, "Project inputs must not move Base");
+
+        // Sysroot inputs move Base and not Project.
+        let mut b = key_inputs(Part::Base, &lock, &sdk, &ext, &feeds);
+        b.sysroots = Some(serde_json::json!({"rootfs": "r2", "initramfs": "i1"}));
+        assert_ne!(key(&b), base, "sysroots");
+        let mut p = key_inputs(Part::Project, &lock, &sdk, &ext, &feeds);
+        p.sysroots = Some(serde_json::json!({"rootfs": "r2"}));
+        assert_eq!(key(&p), proj, "Base inputs must not move Project");
+
+        // Container args can change what dnf installs: both parts.
+        for part in [Part::Base, Part::Project] {
+            let mut x = key_inputs(part, &lock, &sdk, &ext, &feeds);
+            let before = key(&x);
+            x.container_args = Some(&args);
+            assert_ne!(key(&x), before, "container args, {part:?}");
+        }
+
+        // A kernel repin moves Base.
+        let mut relock = a_lock();
+        relock["kernel-versions"]["rootfs"] = "6.6.2".into();
+        assert_ne!(
+            key(&key_inputs(Part::Base, &relock, &sdk, &ext, &feeds)),
+            base
+        );
+    }
+
+    /// The other side: what only the Project layer reads must not move the Base key, or
+    /// no two projects would ever share their base.
+    #[test]
+    fn base_layer_key_ignores_project_only_sections() {
+        let t = stacks_project();
+        let base = base_inputs_of(t.path(), STACKS_BASE_CONFIG);
+        let edited = STACKS_BASE_CONFIG.replace(
+            "    avocado-sdk-toolchain: '*'\n",
+            "    avocado-sdk-toolchain: '*'\n    nativesdk-cmake: '*'\n",
+        );
+        assert_eq!(base_inputs_of(t.path(), &edited), base);
+    }
 
     /// Write `body` to `dir/name` as an executable script.
     #[cfg(unix)]

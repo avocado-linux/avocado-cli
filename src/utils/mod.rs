@@ -40,6 +40,7 @@ pub mod signing_keys;
 #[cfg(unix)]
 pub mod signing_service;
 pub mod snapshot;
+pub mod stacks;
 pub mod stamps;
 pub mod sysroot_scan;
 pub mod target;

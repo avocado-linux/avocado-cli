@@ -20,6 +20,9 @@ pub struct VolumeState {
     pub source_path: String,
     /// Container tool being used (docker/podman)
     pub container_tool: String,
+    /// The project's SDK lives in a stack view inside this volume (set once a view is mounted).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stacks: bool,
 }
 
 /// What `volume rm` says about a volume that does not exist. Docker prints
@@ -55,6 +58,7 @@ impl VolumeState {
             volume_name,
             source_path: source_path.to_string_lossy().to_string(),
             container_tool,
+            stacks: false,
         }
     }
 
@@ -162,6 +166,12 @@ impl VolumeManager {
         if let Some(existing_state) = VolumeState::load_from_dir(source_dir)? {
             // Verify the volume still exists
             if self.volume_exists(&existing_state.volume_name).await? {
+                crate::utils::stacks::remount_volume_views(
+                    &self.container_tool,
+                    &existing_state.volume_name,
+                    existing_state.stacks,
+                )
+                .await?;
                 if self.verbose {
                     print_info(
                         &format!("Using existing volume: {}", existing_state.volume_name),
@@ -356,6 +366,9 @@ impl VolumeManager {
     /// Run `volume rm` one time. Returns `None` when the volume is gone
     /// (removed now, or not there), and the daemon's stderr when it is not.
     async fn try_remove_volume(&self, volume_name: &str) -> Result<Option<String>> {
+        // A view mounted inside the volume would be emptied by `volume rm` before it fails on
+        // the busy mount point: drop the project's stack views first.
+        crate::utils::stacks::drop_volume_views(&self.container_tool, volume_name).await?;
         let output = AsyncCommand::new(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()

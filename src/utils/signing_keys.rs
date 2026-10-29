@@ -371,7 +371,7 @@ pub fn get_key_entries(key_names: &[String]) -> Result<Vec<(String, KeyEntry)>> 
 }
 
 // Add hex encoding since we need it for keyid generation
-mod hex {
+pub(crate) mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         use std::fmt::Write;
         bytes

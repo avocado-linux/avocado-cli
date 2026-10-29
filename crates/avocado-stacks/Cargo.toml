@@ -1,0 +1,21 @@
+[package]
+name = "avocado-stacks"
+version = "0.1.0"
+edition = "2021"
+description = "Content-addressed layer cache for Avocado build state (composefs model)."
+license = "Apache-2.0"
+
+[[bin]]
+name = "avocado-stacks"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,72 @@
+name: Stacks helper image
+
+# The privileged helper every stacks operation runs in. The CLI pulls
+# ghcr.io/avocado-linux/avocado-stacks:<its version> (release builds) or :edge (development
+# builds), so main publishes :edge and each release tag (release candidates too) publishes
+# :<version>. Pull requests
+# that touch the crate, and manual runs from other branches, only build it.
+on:
+  push:
+    branches: [main]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  pull_request:
+    paths:
+      - 'crates/avocado-stacks/**'
+      - '.github/workflows/stacks-helper.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/avocado-linux/avocado-stacks
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: docker build -f crates/avocado-stacks/Dockerfile.helper -t "$IMAGE:${{ github.sha }}-${{ matrix.arch }}" crates/avocado-stacks
+      - name: Smoke test
+        run: docker run --rm "$IMAGE:${{ github.sha }}-${{ matrix.arch }}" --help
+      - name: Push
+        if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:${{ github.sha }}-${{ matrix.arch }}"
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Tag the multi-arch image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if [ "${{ github.ref_type }}" = tag ]; then tag="${{ github.ref_name }}"; else tag=edge; fi
+          docker buildx imagetools create \
+            -t "$IMAGE:$tag" -t "$IMAGE:sha-${{ github.sha }}" \
+            "$IMAGE:${{ github.sha }}-amd64" "$IMAGE:${{ github.sha }}-arm64"
+          docker buildx imagetools inspect "$IMAGE:$tag"

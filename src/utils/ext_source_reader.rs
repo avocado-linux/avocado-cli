@@ -601,6 +601,7 @@ mod tests {
             volume_name: "avo-test".to_string(),
             source_path: "/projects/app".to_string(),
             container_tool: "docker".to_string(),
+            stacks: false,
         };
         let candidates = ExtSourceReader::candidates(
             "my-ext",
@@ -629,6 +630,7 @@ mod tests {
                 volume_name: "avo-test".to_string(),
                 source_path: "/projects/app".to_string(),
                 container_tool: "docker".to_string(),
+                stacks: false,
             },
             target: "qemux86-64".to_string(),
             ext_name: "my-ext".to_string(),
