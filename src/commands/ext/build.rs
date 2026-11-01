@@ -1502,14 +1502,24 @@ service="{}"
 # systemd resolves and prefers, but looking only in /usr/lib skipped it: the
 # extension merged, presented the unit, and left it disabled with nothing at
 # runtime to say why.
+#
+# An instance (foo@bar.service) is never a file: systemd loads it from its
+# template (foo@.service), and `systemctl enable` links the instance name to the
+# template. An exact instance file still wins, as it does in systemd.
+template=""
+case "$service" in
+    *@*.*) template="${{service%%@*}}@.${{service##*.}}" ;;
+esac
 unit_file=""
 unit_target=""
-for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do
-    if [ -f "$sysroot$unit_dir/$service" ]; then
-        unit_file="$sysroot$unit_dir/$service"
-        unit_target="$unit_dir/$service"
-        break
-    fi
+for name in "$service" $template; do
+    for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$sysroot$unit_dir/$name" ]; then
+            unit_file="$sysroot$unit_dir/$name"
+            unit_target="$unit_dir/$name"
+            break 2
+        fi
+    done
 done
 
 if [ -n "$unit_file" ]; then
@@ -1535,9 +1545,12 @@ if [ -n "$unit_file" ]; then
     wanted_by=""
     required_by=""
     _avocado_collect_install "$unit_file"
+    # An instance also reads its template's drop-ins, as systemd does.
     for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
-        for dropin in "$sysroot$dropin_dir/$service.d/"*.conf; do
-            [ -f "$dropin" ] && _avocado_collect_install "$dropin"
+        for name in $template "$service"; do
+            for dropin in "$sysroot$dropin_dir/$name.d/"*.conf; do
+                [ -f "$dropin" ] && _avocado_collect_install "$dropin"
+            done
         done
     done
     # Unquoted: collapses the separators left by accumulation so the
@@ -1568,6 +1581,11 @@ if [ -n "$unit_file" ]; then
         exit 1
     fi
     echo "Successfully enabled $service"
+elif [ -n "$template" ]; then
+    # The template can come from the rootfs (serial-getty@.service ships with
+    # systemd), which this build cannot see; AVOCADO_ENABLE_SERVICES still
+    # starts the instance when the extension merges.
+    echo "Warning: enable_services lists $service, but its template $template is not in the extension sysroot ($sysroot); it is not linked at build time; AVOCADO_ENABLE_SERVICES starts it when the extension merges."
 else
     echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
     exit 1
@@ -2347,14 +2365,14 @@ extensions:
         // The unit is searched for in systemd's own directories, in its
         // precedence order - not /usr/lib alone.
         assert!(script.contains("for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do"));
-        assert!(script.contains("if [ -f \"$sysroot$unit_dir/$service\" ]; then"));
+        assert!(script.contains("if [ -f \"$sysroot$unit_dir/$name\" ]; then"));
         // Check for WantedBy= parsing
         assert!(script.contains("/^WantedBy=/"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.wants"));
         // Check for RequiredBy= parsing
         assert!(script.contains("/^RequiredBy=/"));
         // [Install] is collected from drop-ins too, matching systemd.
-        assert!(script.contains("$service.d/\"*.conf"));
+        assert!(script.contains("$name.d/\"*.conf"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
         // The symlink points at wherever the unit was actually found, so a unit
         // under /etc is not linked to a /usr/lib path that holds nothing.
@@ -2916,6 +2934,47 @@ extensions:
                 "etc/systemd/system/multi-user.target.wants/keep.service",
                 "usr/local/bin/hello.sh"
             ]
+        );
+    }
+
+    /// An instance is enabled through its template, linked under the instance
+    /// name as `systemctl enable` does. One whose template comes from the
+    /// rootfs (serial-getty@.service) cannot be linked here, so it warns.
+    #[test]
+    #[cfg(unix)]
+    fn a_template_instance_is_enabled_through_its_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("wpa_supplicant@.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+        )
+        .unwrap();
+
+        let out = run_overlay_script(
+            &confext_script_for(
+                root,
+                OverlayMode::Merge,
+                &[
+                    "wpa_supplicant@wlan0.service",
+                    "serial-getty@ttyGS0.service",
+                ],
+            ),
+            root,
+            None,
+        );
+        let wants = root.join("sysroots/app/etc/systemd/system/multi-user.target.wants");
+        assert_eq!(
+            std::fs::read_link(wants.join("wpa_supplicant@wlan0.service")).unwrap(),
+            std::path::Path::new("/usr/lib/systemd/system/wpa_supplicant@.service")
+        );
+        assert!(!wants.join("serial-getty@ttyGS0.service").exists());
+        assert!(
+            out.contains("Warning: enable_services lists serial-getty@ttyGS0.service, but its template serial-getty@.service is not in the extension sysroot"),
+            "{out}"
         );
     }
 
