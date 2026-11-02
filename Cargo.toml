@@ -7,7 +7,7 @@ authors = ["Avocado"]
 license = "Apache-2.0"
 repository = "https://github.com/avocado-linux/avocado-cli"
 homepage = "https://avocadolinux.org"
-keywords = ["cli", "embedded-linux", "operating-system", "edge", "physical-ai"]
+keywords = ["embedded-linux", "operating-system", "physical-ai", "build", "provisioning"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
