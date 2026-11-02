@@ -7,7 +7,6 @@
 //! in the guest's /var (var.btrfs), so `vm reset` means connecting again.
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
 
 use crate::commands::connect::client::{
     self, ConnectClient, CreateClaimTokenParams, CreateClaimTokenRequest,
@@ -119,7 +118,8 @@ impl VmConnectCommand {
                     .context("Connect did not return the claim token value")?;
 
                 let cfg = hub::conn_config(&api_url, &raw);
-                let b64 = base64::engine::general_purpose::STANDARD.encode(cfg);
+                // Quoted, not base64: the VM image has no `base64`.
+                let cfg = crate::utils::shell::shell_escape(&cfg);
                 // A UUID: safe in the command line as is.
                 let id = crate::utils::vm::state::instance_id(
                     &crate::utils::vm::state::VmPaths::resolve()?,
@@ -128,7 +128,7 @@ impl VmConnectCommand {
                     .exec(&format!(
                         "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
                          for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
-                         echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && \
+                         printf '%s' {cfg} > {d}/config.toml && chmod 0600 {d}/config.toml && \
                          printf '%s\\n' {id} > {idf} && sync && \
                          systemctl restart avocado-conn",
                         d = hub::CONN_DIR,
