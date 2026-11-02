@@ -86,6 +86,13 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(raw.trim())))
 }
 
+/// `AVOCADO_VM_NO_WORKSPACE=1`: no 9p share at all. For a VM nothing routes
+/// host paths into (a Linux hub VM), and for a qemu built without virtfs,
+/// which refuses `virtio-9p-pci` and exits before the guest boots.
+fn disabled() -> bool {
+    std::env::var("AVOCADO_VM_NO_WORKSPACE").is_ok_and(|v| v == "1")
+}
+
 /// QEMU arg fragments declaring the workspace 9p export.
 /// Append these to the rest of the `-fsdev` / `-device` lines.
 ///
@@ -93,6 +100,9 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
 /// guest's owner in an xattr. The plain `/opt/src` mount under the VM
 /// (`container::src_mount_uid_gid`) depends on that; change both together.
 pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
+    if disabled() {
+        return Vec::new();
+    }
     vec![
         "-fsdev".to_string(),
         format!(
@@ -107,6 +117,9 @@ pub fn qemu_args_for(workspace: &Path) -> Vec<String> {
 /// Mount `/mnt/workspace` inside the guest if not already mounted.
 /// Idempotent: re-running is cheap and safe.
 pub async fn ensure_mounted_in_guest(target: &SshTarget) -> Result<()> {
+    if disabled() {
+        return Ok(());
+    }
     let check = target
         .exec(&format!(
             "if mountpoint -q {VM_MOUNT_POINT}; then echo MOUNTED; else echo MISSING; fi"
