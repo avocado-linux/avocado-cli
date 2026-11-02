@@ -2,11 +2,12 @@
 name = "avocado-cli"
 version = "1.1.0-dev"
 edition = "2021"
-description = "Command line interface for Avocado."
+description = "CLI for Avocado OS"
 authors = ["Avocado"]
 license = "Apache-2.0"
 repository = "https://github.com/avocado-linux/avocado-cli"
-keywords = ["cli", "build", "provisioning", "containers", "extensions"]
+homepage = "https://avocadolinux.org"
+keywords = ["cli", "embedded-linux", "operating-system", "edge", "physical-ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
