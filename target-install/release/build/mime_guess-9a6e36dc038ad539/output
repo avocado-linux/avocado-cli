@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/mnt/src/jschneck/avocado-linux/avocado-cli-rubicon-trial/target-install/release/build/mime_guess-9a6e36dc038ad539/out/mime_types_generated.rs

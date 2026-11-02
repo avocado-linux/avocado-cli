@@ -18,7 +18,6 @@
 //! this command's exit code.
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
 use reqwest::Method;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -448,11 +447,12 @@ fn queued_line(v: &Value) -> String {
 /// own process group: Ctrl-C at the terminal is ours to handle, not ssh's.
 fn agent_ctl(req: &Value) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
+    // Quoted, not base64: the VM image has no `base64`.
+    let req = crate::utils::shell::shell_escape(&req.to_string());
     let target = lifecycle::ssh_target_for_running()?;
     Command::new("ssh")
         .args(target.base_args())
-        .arg(format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
+        .arg(format!("printf '%s' {req} | avocado-vm-agent ctl"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .process_group(0)

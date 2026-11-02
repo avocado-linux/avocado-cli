@@ -7,7 +7,6 @@
 //! restart never loses it.
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -72,9 +71,10 @@ pub fn host_facts(paths: &VmPaths) -> Value {
 
 /// Send one request line to the agent and return its reply.
 pub async fn agent_request(target: &SshTarget, req: &Value) -> Result<Value> {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(req.to_string());
+    // Quoted, not base64: the VM image has no `base64`.
+    let req = crate::utils::shell::shell_escape(&req.to_string());
     let (out, _) = target
-        .exec(&format!("echo {b64} | base64 -d | avocado-vm-agent ctl"))
+        .exec(&format!("printf '%s' {req} | avocado-vm-agent ctl"))
         .await
         .context("the VM agent did not answer (is it running a hub-capable build?)")?;
     let reply: Value = serde_json::from_str(out.trim())

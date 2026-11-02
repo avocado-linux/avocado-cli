@@ -1,0 +1,6 @@
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-changed=/mnt/src/jschneck/avocado-linux/avocado-cli/.git/refs/heads/jschneck/rubicon-on-1.0.0
+cargo:rerun-if-changed=/mnt/src/jschneck/avocado-linux/avocado-cli/.git/worktrees/avocado-cli-rubicon-trial/HEAD
+cargo:rerun-if-changed=/mnt/src/jschneck/avocado-linux/avocado-cli/.git/worktrees/avocado-cli-rubicon-trial/logs/HEAD
+cargo:rustc-env=AVOCADO_CLI_VERSION=1.1.0-dev (11707e9f 2026-11-01)
+cargo:rustc-env=TARGET=x86_64-unknown-linux-gnu
