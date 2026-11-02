@@ -19,7 +19,7 @@ impl ConnectRuntimesListCommand {
         let (_, profile) = config.resolve_profile(self.profile.as_deref(), Some(&self.org))?;
         let client = ConnectClient::from_profile(profile)?;
 
-        let runtimes = client.list_runtimes(&self.org, &self.project).await?;
+        let runtimes = client.list_runtimes(&self.org, &self.project, None).await?;
 
         if self.output.is_json() {
             emit_json_object(&json!({

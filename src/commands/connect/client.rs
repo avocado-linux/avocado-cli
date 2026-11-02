@@ -1900,12 +1900,14 @@ impl ConnectClient {
     // Deployments
     // -----------------------------------------------------------------------
 
-    /// List runtimes for a project (for interactive picker).
-    pub async fn list_runtimes(&self, org: &str, project: &str) -> Result<Vec<RuntimeListItem>> {
-        let url = format!(
-            "{}/api/orgs/{}/projects/{}/runtimes?status=published",
-            self.api_url, org, project
-        );
+    /// List runtimes for a project, optionally filtered by status.
+    pub async fn list_runtimes(
+        &self,
+        org: &str,
+        project: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<RuntimeListItem>> {
+        let url = list_runtimes_url(&self.api_url, org, project, status);
 
         let res = self
             .http
@@ -2047,10 +2049,47 @@ fn format_reclaim_error(http_status: reqwest::StatusCode, body: &str) -> String 
     }
 }
 
+fn list_runtimes_url(api_url: &str, org: &str, project: &str, status: Option<&str>) -> String {
+    let mut url = format!("{api_url}/api/orgs/{org}/projects/{project}/runtimes");
+    if let Some(status) = status {
+        url.push_str(&format!("?status={status}"));
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn list_runtimes_url_without_filter_includes_drafts() {
+        assert_eq!(
+            list_runtimes_url("https://connect.example", "org", "project", None),
+            "https://connect.example/api/orgs/org/projects/project/runtimes"
+        );
+    }
+
+    #[test]
+    fn list_runtimes_url_published_filter_for_deploy_picker() {
+        assert_eq!(
+            list_runtimes_url(
+                "https://connect.example",
+                "org",
+                "project",
+                Some("published")
+            ),
+            "https://connect.example/api/orgs/org/projects/project/runtimes?status=published"
+        );
+    }
+
+    #[test]
+    fn list_runtimes_url_draft_filter() {
+        assert_eq!(
+            list_runtimes_url("https://connect.example", "org", "project", Some("draft")),
+            "https://connect.example/api/orgs/org/projects/project/runtimes?status=draft"
+        );
+    }
 
     #[test]
     fn format_reclaim_error_maps_known_422_codes() {
