@@ -121,6 +121,12 @@ pub fn interpolate_config(
     cli_target: Option<&str>,
     cli_target_board: Option<&str>,
 ) -> Result<()> {
+    // Fold `distro.target-<name>:` first, so `{{ config.distro.* }}` and the
+    // deserialized config follow the target's release/channel too.
+    let target = AvocadoContext::resolve_target_value(yaml_value, cli_target);
+    if let Some(distro) = yaml_value.get_mut("distro") {
+        *distro = avocado::distro_for_target(distro, target.as_deref());
+    }
     let context = AvocadoContext::from_main_config(yaml_value, cli_target, cli_target_board);
     interpolate_config_with_context(yaml_value, &context)
 }

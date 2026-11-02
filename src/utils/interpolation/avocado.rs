@@ -121,6 +121,24 @@ pub struct AvocadoContext {
     pub kernel_version: Option<String>,
 }
 
+/// `distro` as `target` sees it: its `target-<target>:` block laid over the
+/// base keys (a key it sets replaces the base key whole), with every
+/// `target-*` block stripped. One project can then keep a few boards on
+/// another release or channel.
+pub(crate) fn distro_for_target(distro: &Value, target: Option<&str>) -> Value {
+    let Value::Mapping(map) = distro else {
+        return distro.clone();
+    };
+    let mut base = map.clone();
+    base.retain(|k, _| !k.as_str().is_some_and(|k| k.starts_with("target-")));
+    if let Some(Value::Mapping(over)) = target.and_then(|t| map.get(format!("target-{t}"))) {
+        for (k, v) in over {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Mapping(base)
+}
+
 impl AvocadoContext {
     /// Create a new empty context.
     #[allow(dead_code)]
@@ -171,8 +189,8 @@ impl AvocadoContext {
         let target_board =
             Self::resolve_target_board_value(root, cli_target_board, runtime.as_deref());
 
-        // Extract distro values from the main config
-        let (distro_release, distro_channel) = Self::extract_distro_values(root);
+        // Extract distro values from the main config, as seen by this target
+        let (distro_release, distro_channel) = Self::extract_distro_values(root, target.as_deref());
 
         Self {
             target,
@@ -185,7 +203,7 @@ impl AvocadoContext {
     }
 
     /// Resolve the target value with standard precedence.
-    fn resolve_target_value(root: &Value, cli_target: Option<&str>) -> Option<String> {
+    pub(crate) fn resolve_target_value(root: &Value, cli_target: Option<&str>) -> Option<String> {
         // 1. CLI target (highest priority)
         if let Some(target) = cli_target {
             return Some(target.to_string());
@@ -289,9 +307,12 @@ impl AvocadoContext {
 
     /// Extract distro release and channel from the config.
     /// Reads `distro.release` with fallback to `distro.version` for backward compat.
-    fn extract_distro_values(root: &Value) -> (Option<String>, Option<String>) {
+    fn extract_distro_values(
+        root: &Value,
+        target: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
         let distro = match root.get("distro") {
-            Some(d) => d,
+            Some(d) => distro_for_target(d, target),
             None => return (None, None),
         };
 

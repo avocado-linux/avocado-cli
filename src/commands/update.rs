@@ -36,8 +36,11 @@ impl UpdateCommand {
     }
 
     pub async fn execute(&self) -> Result<()> {
-        let config = Config::load(&self.config_path)
-            .with_context(|| format!("Failed to load config from {}", self.config_path))?;
+        // Loaded for this target, so a `distro.target-<name>:` release/channel
+        // picks the feed the snapshot is resolved from.
+        let config = Config::load_composed(&self.config_path, self.target.as_deref())
+            .with_context(|| format!("Failed to load config from {}", self.config_path))?
+            .config;
         let target = resolve_target_required(self.target.as_deref(), &config)?;
 
         let src_dir = config

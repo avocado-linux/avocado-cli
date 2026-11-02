@@ -15027,6 +15027,51 @@ sdk:
         );
     }
 
+    /// A `distro.target-<name>:` block keeps one board on another release:
+    /// that target's distro, SDK image tag and feed follow it, every other
+    /// target (and no target) keeps the base, and no `target-*` key is left.
+    #[test]
+    #[serial]
+    fn a_target_block_overrides_the_distro_for_that_target_only() {
+        clear_env();
+        let yaml = "\
+distro:
+  release: 2026
+  channel: edge
+  target-raspberrypi0-2w:
+    release: 2024
+supported_targets: [raspberrypi0-2w, raspberrypi4]
+sdk:
+  image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}\"
+";
+        let (_dir, path) = project(yaml, None);
+        let feed = |target: Option<&str>| {
+            let c = Config::load_composed(&path, target).unwrap();
+            let distro = c.merged_value.get("distro").unwrap().as_mapping().unwrap();
+            assert!(
+                distro
+                    .keys()
+                    .all(|k| !k.as_str().unwrap().starts_with("target-")),
+                "{distro:?}"
+            );
+            (
+                c.config.get_sdk_image().cloned().unwrap(),
+                c.config.get_releasever().unwrap(),
+            )
+        };
+
+        assert_eq!(
+            feed(Some("raspberrypi0-2w")),
+            ("docker.io/avocadolinux/sdk:2024".into(), "2024/edge".into())
+        );
+        for target in [Some("raspberrypi4"), None] {
+            assert_eq!(
+                feed(target),
+                ("docker.io/avocadolinux/sdk:2026".into(), "2026/edge".into())
+            );
+        }
+    }
+
     /// The distro feed's baseurl in a named feed set takes the same value, so
     /// `sdk dnf` and `sdk run` fetch custom feeds from the pinned snapshot too.
     #[test]
