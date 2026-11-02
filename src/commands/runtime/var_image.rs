@@ -51,6 +51,23 @@ struct Rendered {
     post_creation_section: String,
     device_tree_overlay_section: String,
     var_luks_room: &'static str,
+    keep_initial_os_rollback: &'static str,
+}
+
+/// `runtimes.<r>.var.initial_os_rollback`: whether the provisioned var image carries
+/// the OS bundle (default true). Anything but a boolean is an error, not a
+/// silent default.
+fn keep_initial_os_rollback(merged_runtime: &serde_yaml::Value) -> Result<bool> {
+    match merged_runtime
+        .get("var")
+        .and_then(|v| v.get("initial_os_rollback"))
+    {
+        None => Ok(true),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => {
+            anyhow::bail!("var.initial_os_rollback must be true or false, got {other:?}")
+        }
+    }
 }
 
 fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
@@ -318,6 +335,11 @@ echo "Docker image priming complete.""#,
         post_creation_section,
         device_tree_overlay_section,
         var_luks_room: if var_encrypt(target_arch) { "1" } else { "0" },
+        keep_initial_os_rollback: if keep_initial_os_rollback(merged_runtime)? {
+            "1"
+        } else {
+            "0"
+        },
     })
 }
 
@@ -618,7 +640,40 @@ fi
 export AVOCADO_MANIFEST_PATH="$MANIFEST_FILE"
 {docker_section}
 
+# The build linked the OS bundle into var-staging for Connect upload. In the
+# var image it is what `runtime activate` uses to roll the device back to
+# this OS after an OS update. `var.initial_os_rollback: false` leaves it out (it is the
+# size of the rootfs, initramfs and kernel again); the signed manifest still
+# names it, so that rollback then fails with the bundle not found.
+OS_BUNDLE_ID=$(python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("os_bundle") or {{}}).get("image_id", ""))' "$MANIFEST_FILE")
+# A provision stopped before it put the bundle back left it beside the var
+# image, named by its image id: put it back. Any other is from an older bundle.
+if [ -n "$OS_BUNDLE_ID" ] && [ -f "$OUTPUT_DIR/$OS_BUNDLE_ID.aside.raw" ] && [ ! -f "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" ]; then
+    mv "$OUTPUT_DIR/$OS_BUNDLE_ID.aside.raw" "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" || exit 1
+fi
+rm -f "$OUTPUT_DIR"/*.aside.raw
+OS_BUNDLE_ASIDE=""
+_PROGRESS_PID=""
+# However the var image step ends (a failed mkfs.btrfs, Ctrl-C): stop the
+# progress reporter, which would otherwise wait forever for an image that was
+# never written, and put the bundle back. The docker section's EXIT trap is
+# cleared before this point.
+_avocado_var_cleanup() {{
+    [ -n "$_PROGRESS_PID" ] && kill "$_PROGRESS_PID" 2>/dev/null
+    if [ -n "$OS_BUNDLE_ASIDE" ] && [ -f "$OS_BUNDLE_ASIDE" ]; then
+        mv "$OS_BUNDLE_ASIDE" "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw"
+    fi
+}}
+trap _avocado_var_cleanup EXIT
+if [ "{keep_initial_os_rollback}" = "0" ] && [ -n "$OS_BUNDLE_ID" ] && [ -f "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" ]; then
+    OS_BUNDLE_ASIDE="$OUTPUT_DIR/$OS_BUNDLE_ID.aside.raw"
+    mv "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" "$OS_BUNDLE_ASIDE" || exit 1
+fi
+
 VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
+# mkfs.btrfs writes into an existing file without shrinking it, so a var
+# image left by an earlier, larger provision would keep that size.
+rm -f "$VAR_IMAGE"
 VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
 VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
 echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
@@ -659,6 +714,10 @@ if [ "{var_luks_room}" = "1" ]; then
 fi
 
 kill $_PROGRESS_PID 2>/dev/null; wait $_PROGRESS_PID 2>/dev/null || true
+if [ -n "$OS_BUNDLE_ASIDE" ]; then
+    mv "$OS_BUNDLE_ASIDE" "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" || exit 1
+fi
+trap - EXIT
 
 {post_creation_section}
 FINAL_SIZE=$(stat -c%s "$VAR_IMAGE" 2>/dev/null || echo 0)
@@ -674,6 +733,7 @@ echo "Built var image: ${{FINAL_MB}}MB"
         global_compress_flag = r.global_compress_flag,
         post_creation_section = r.post_creation_section,
         var_luks_room = r.var_luks_room,
+        keep_initial_os_rollback = r.keep_initial_os_rollback,
     ))
 }
 
@@ -748,7 +808,8 @@ runtimes:
         for needle in [
             "$AVOCADO_SDK_PREFIX/usr/bin/avocado-build-$TARGET_ARCH",
             "stone bundle",
-            "os_bundle",
+            // The patch; the var half only reads the key to leave the bundle out.
+            "os_bundle = dict(",
             "sign_amf \"$AVOCADO_MANIFEST_PATH\"",
         ] {
             assert!(ota.contains(needle), "OTA half must contain {needle}");
@@ -1098,6 +1159,131 @@ stone() {
         let (code, out, err, _) = run(Some("ID=avocado\n"), None, None);
         assert_eq!(code, Some(0), "{err}");
         assert!(out.contains("TAIL-DONE"));
+    }
+
+    /// The var image carries the OS bundle (the factory rollback) unless the
+    /// runtime sets `var.initial_os_rollback: false`; either way var-staging still has
+    /// it afterwards for Connect upload, and a stale image is not reused.
+    #[cfg(unix)]
+    #[test]
+    fn the_var_image_carries_the_initial_os_rollback_unless_the_runtime_opts_out() {
+        assert_eq!(packed_images(BASE), "aos1.raw\next1.raw");
+        assert_eq!(packed_images(&opted_out()), "ext1.raw");
+    }
+
+    /// A failed mkfs.btrfs (or Ctrl-C) still puts the bundle back, and a bundle a
+    /// killed provision left aside is put back by the next one.
+    #[cfg(unix)]
+    #[test]
+    fn the_os_bundle_is_never_left_aside() {
+        assert_eq!(run_var_half(&opted_out(), true, false), None);
+        assert_eq!(
+            run_var_half(BASE, false, true).as_deref(),
+            Some("aos1.raw\next1.raw")
+        );
+    }
+
+    #[cfg(unix)]
+    fn opted_out() -> String {
+        format!("{BASE}    var:\n      initial_os_rollback: false\n")
+    }
+
+    #[test]
+    fn var_initial_os_rollback_must_be_a_boolean() {
+        let v: serde_yaml::Value =
+            serde_yaml::from_str("var:\n  initial_os_rollback: \"no\"\n").unwrap();
+        assert!(keep_initial_os_rollback(&v).is_err());
+    }
+
+    #[cfg(unix)]
+    fn packed_images(config: &str) -> String {
+        run_var_half(config, false, false).expect("mkfs ran")
+    }
+
+    /// Runs the var half under `set -e` (as provision does) against a stand-in
+    /// mkfs.btrfs, which fails when `mkfs_fails`; returns the images it packed.
+    /// `left_aside`: a killed provision left the bundle beside the image.
+    #[cfg(unix)]
+    fn run_var_half(config: &str, mkfs_fails: bool, left_aside: bool) -> Option<String> {
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path();
+        let lib = prefix.join("runtimes/test-runtime/var-staging/lib/avocado");
+        std::fs::create_dir_all(lib.join("images")).unwrap();
+        std::fs::create_dir_all(lib.join("runtimes/b1")).unwrap();
+        std::os::unix::fs::symlink("runtimes/b1", lib.join("active")).unwrap();
+        std::fs::write(
+            lib.join("runtimes/b1/manifest.json"),
+            r#"{"os_bundle": {"image_id": "aos1", "sha256": "x"}}"#,
+        )
+        .unwrap();
+        let out_dir = prefix.join("runtimes/test-runtime");
+        if left_aside {
+            std::fs::write(out_dir.join("aos1.aside.raw"), "bundle").unwrap();
+            std::fs::write(out_dir.join("aos0.aside.raw"), "older bundle").unwrap();
+        } else {
+            std::fs::write(lib.join("images/aos1.raw"), "bundle").unwrap();
+        }
+        std::fs::write(lib.join("images/ext1.raw"), "ext").unwrap();
+        // mkfs.btrfs stand-in: record what it would pack, write the image.
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mkfs = bin.join("mkfs.btrfs");
+        std::fs::write(
+            &mkfs,
+            "#!/bin/sh\nls \"$AVOCADO_IMAGES_DIR\" > \"$OUTPUT_DIR/packed\"\n\
+             while [ $# -gt 1 ]; do shift; done; echo img >> \"$1\"\n",
+        )
+        .unwrap();
+        if mkfs_fails {
+            std::fs::write(&mkfs, "#!/bin/sh\nexit 1\n").unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mkfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A larger image from an earlier provision must not keep its size.
+        let image = prefix.join("runtimes/test-runtime/avocado-image-var-x86_64.btrfs");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let script = prefix.join("var.sh");
+        std::fs::write(&script, var_half(config)).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script)
+            .env("AVOCADO_PREFIX", prefix)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.success(),
+            !mkfs_fails,
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(lib.join("images/aos1.raw"))
+                .ok()
+                .as_deref(),
+            Some("bundle"),
+            "bundle not put back"
+        );
+        let aside: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".aside.raw"))
+            .collect();
+        assert!(aside.is_empty(), "left aside: {aside:?}");
+        if mkfs_fails {
+            return None;
+        }
+        let packed = std::fs::read_to_string(out_dir.join("packed")).unwrap();
+        // Like mkfs.btrfs, the stand-in writes into whatever file is there.
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().len(),
+            4,
+            "stale image reused"
+        );
+        Some(packed.trim().to_string())
     }
 
     #[test]
