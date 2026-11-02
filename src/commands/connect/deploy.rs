@@ -184,7 +184,9 @@ impl ConnectDeployCommand {
     }
 
     async fn resolve_runtime(&self, client: &ConnectClient) -> Result<RuntimeListItem> {
-        let runtimes = client.list_runtimes(&self.org, &self.project).await?;
+        let runtimes = client
+            .list_runtimes(&self.org, &self.project, Some("published"))
+            .await?;
 
         if let Some(ref runtime_flag) = self.runtime {
             return runtimes
