@@ -57,12 +57,3 @@ By submitting a contribution (a pull request, patch, code, documentation, or any
 - **Nothing unlawful.** Your contribution is not defamatory, misleading, infringing, or otherwise unlawful.
 
 Please do not submit anything you do not have the right to license this way.
-
-## Maintainers
-
-- Justin Schneck
-- Lee Reinhardt
-- Javier Tia
-- Nick Sinas
-- Beniamin Sandu
-- Jason T. Wong
