@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A release's `SHA256SUMS` verifies every archive.** The Windows checksum
+  had no trailing newline, so it ran into the next line and
+  `sha256sum -c SHA256SUMS` failed for the Windows and Linux (gnu) archives.
+- **Releases open the Homebrew tap bump as a pull request.** The tap only
+  accepts reviewed changes, so the release's direct push failed and the
+  formula fell behind.
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

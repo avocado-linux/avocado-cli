@@ -193,8 +193,10 @@ jobs:
             --pattern '*.sha256'
 
       - name: Concatenate into SHA256SUMS
+        # `awk 1`, not `cat`: the Windows leg writes its .sha256 without a trailing newline,
+        # and `cat` ran that line into the next one, so `sha256sum -c` failed for both.
         run: |
-          cat sums/*.sha256 > SHA256SUMS
+          awk 1 sums/*.sha256 > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload SHA256SUMS to release
@@ -256,7 +258,8 @@ jobs:
           with open(path) as f:
               src = f.read()
           tag = os.environ["TAG"]
-          src = re.sub(r'version "[^"]+"', f'version "{tag}"', src, count=1)
+          # No `version` line (brew audit flags it as redundant): the version lives in each url.
+          src = re.sub(r'(releases/download/)[^/]+/avocado-[^_]+_', rf'\g<1>{tag}/avocado-{tag}_', src)
           mapping = [
               ("aarch64-apple-darwin",         os.environ["SHA_MACOS_ARM64"]),
               ("x86_64-apple-darwin",          os.environ["SHA_MACOS_X86_64"]),
@@ -278,10 +281,13 @@ jobs:
           PY
           cat Formula/avocado-cli.rb
 
-      - name: Commit and push
+      # The tap's main only takes changes through a reviewed pull request, so the bump goes
+      # up as a branch and a PR rather than a push to main.
+      - name: Open a pull request with the bump
         working-directory: homebrew-tap
         env:
           TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           git config user.name "avocado-release-bot"
           git config user.email "release-bot@avocadolinux.org"
@@ -289,6 +295,19 @@ jobs:
             echo "Formula already up to date for ${TAG}; nothing to commit."
             exit 0
           fi
+          branch="avocado-cli-${TAG}"
+          git checkout -b "$branch"
           git add Formula/avocado-cli.rb
           git commit -m "avocado-cli ${TAG}"
-          git push
+          git push --force origin "$branch"
+          # Only an open PR counts: `gh pr view` also succeeds for a closed one, which would leave
+          # the tap unbumped on a rerun.
+          open=$(gh pr list --repo avocado-linux/homebrew-tap --head "$branch" --base main \
+            --state open --json number --jq length)
+          if [ "$open" -gt 0 ]; then
+            echo "Pull request for ${branch} already open; branch updated."
+          else
+            gh pr create --repo avocado-linux/homebrew-tap --base main --head "$branch" \
+              --title "avocado-cli ${TAG}" \
+              --body "Formula bump for avocado-cli ${TAG}: version and the four sha256 values from the release's per-archive .sha256 assets."
+          fi
