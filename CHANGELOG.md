@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Stacks: SDK installs shared across projects, on by default.**
+  `sdk install` builds a project's
+  `/opt/_avocado/<target>` as content-addressed layers: the SDK bootstrap,
+  the target base (rootfs, initramfs and the platform SDK packages) and the
+  project's own additions. Another project whose inputs match reuses them
+  instead of installing, and gets the lock pins of what it reused. Layers are
+  shared only when the feed is pinned to a snapshot and the project has no
+  `repos:` of its own. Files are stored once by content; each project keeps
+  its private paths (extension and runtime outputs, build stamps) out of
+  shared layers. Needs rootful docker that can run `--privileged` and Linux
+  6.5+ (layers mount file-backed on 6.12+, through loop devices below); a
+  host that cannot run stacks uses plain volumes, with a note. Stacks live
+  in `/var/lib/avocado/stacks` on the docker host unless `root:` in
+  `<config dir>/avocado/stacks.yaml` (or `AVOCADO_STACKS`) says otherwise,
+  and keep 20 GiB free there unless `gc:` sets a limit. `enabled: false` or
+  `AVOCADO_STACKS=off` turns them off. `commit: false` (or
+  `AVOCADO_STACKS_COMMIT=0`) reuses layers but never commits one, for jobs
+  whose inputs are not trusted, such as CI building pull requests next to
+  release builds on one host. A project installed on a plain volume moves
+  over on its next install: its outputs move into its view, and the old
+  SDK tree is deleted rather than left hidden under it.
+- **`avocado stack`: see and reclaim the space stacks use.** `status`
+  shows totals, what is reclaimable now, every project's view and every
+  layer with what evicting it alone would free and what holds it. `gc`
+  evicts layers no project uses (all of them, or down to `--max-size` /
+  `--min-free`; leaves first, so shared base layers go last), `prune` drops
+  views whose project or volume is gone, `drop` releases one project's
+  views, `destroy --yes` deletes all stacks (their files are root-owned),
+  and `config` shows the effective settings and whether stacks work on
+  this host. The ones that change something take `--dry-run`. `gc:` limits in
+  the config file run the same cleanup after each `sdk install`. The helper
+  image is `ghcr.io/avocado-linux/avocado-stacks:<CLI version>` (`:edge` for
+  development builds).
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

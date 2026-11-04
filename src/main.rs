@@ -645,6 +645,63 @@ enum Commands {
         #[command(subcommand)]
         command: ConnectCommands,
     },
+    /// Stacks: where the space goes, and reclaiming it
+    Stack {
+        /// Container tool to use (docker/podman)
+        #[arg(long, default_value = "docker", global = true)]
+        container_tool: String,
+        #[command(subcommand)]
+        command: StackCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum StackCommands {
+    /// Space used: totals, what is reclaimable, per project and per layer
+    Status {
+        /// Print the full report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evict layers no project uses (leaves first, then least recently used); with no
+    /// limit, all of them
+    Gc {
+        /// Evict until stacks are at or under this size (e.g. 100G)
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Evict until the stacks filesystem has at least this much free (e.g. 20G)
+        #[arg(long)]
+        min_free: Option<String>,
+        /// Show what would be evicted and freed, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drop views whose project or volume is gone
+    Prune {
+        /// Show what would be dropped, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drop a project's views (its private files and its hold on layers)
+    Drop {
+        /// Project directory (default: the current directory)
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+        /// Only this target's view
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Show what would be dropped, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the effective settings, where they come from, and whether stacks work here
+    Config,
+    /// Delete all stacks (every view and layer)
+    Destroy {
+        /// Confirm: every project reinstalls its SDK afterwards
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2175,6 +2232,8 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
             | Commands::Hitl { .. }
             | Commands::Prune { .. }
             | Commands::Clean { .. }
+            // The stacks helper runs on the docker daemon that holds the views.
+            | Commands::Stack { .. }
             | Commands::Sign { .. }
             | Commands::Deploy { .. }
             // `connect upload` runs a prerequisite stamp check + in-container
@@ -3825,6 +3884,28 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Login(args) => args.run().await,
+        Commands::Stack {
+            container_tool,
+            command,
+        } => {
+            let stack = commands::stack::StackCommand::new(container_tool);
+            match command {
+                StackCommands::Status { json } => stack.status(json).await,
+                StackCommands::Gc {
+                    max_size,
+                    min_free,
+                    dry_run,
+                } => stack.gc(max_size, min_free, dry_run).await,
+                StackCommands::Prune { dry_run } => stack.prune(dry_run).await,
+                StackCommands::Drop {
+                    path,
+                    target,
+                    dry_run,
+                } => stack.drop_project(&path, target.as_deref(), dry_run).await,
+                StackCommands::Config => stack.config().await,
+                StackCommands::Destroy { yes } => stack.destroy(yes).await,
+            }
+        }
         Commands::Connect { command } => match command {
             ConnectCommands::Auth { command } => match command {
                 ConnectAuthCommands::Login(args) => args.run().await,
