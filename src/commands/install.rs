@@ -659,6 +659,15 @@ impl InstallCommand {
 use crate::utils::config_edit::PackageScope;
 use crate::utils::output::OutputLevel as OL;
 
+/// The runtime a scoped extension install targets: the one `ext build` would
+/// resolve (sole or default runtime), so the packages land in the runtime's
+/// extension sysroot, where `ext build` looks for the package database. `None`
+/// when the project has no resolvable runtime, which keeps the per-target install.
+fn ext_install_runtime(config_path: &str) -> Option<String> {
+    let config = crate::utils::config::Config::load(config_path).ok()?;
+    crate::utils::runtime::validate_and_log_runtime(None, &config).ok()
+}
+
 /// `avocado install <packages> -e <ext>` -- add packages to config + install
 pub struct PackageAddCommand {
     pub packages: Vec<String>,
@@ -737,7 +746,8 @@ impl PackageAddCommand {
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone());
+                .with_sdk_arch(self.sdk_arch.clone())
+                .with_runtime(ext_install_runtime(&self.config_path));
                 cmd.execute().await
             }
             PackageScope::Runtime(name) => {
@@ -854,7 +864,8 @@ impl PackageRemoveCommand {
                 )
                 .with_no_stamps(self.no_stamps)
                 .with_runs_on(self.runs_on.clone(), self.nfs_port)
-                .with_sdk_arch(self.sdk_arch.clone());
+                .with_sdk_arch(self.sdk_arch.clone())
+                .with_runtime(ext_install_runtime(&self.config_path));
                 cmd.execute().await
             }
             PackageScope::Runtime(name) => {
@@ -899,6 +910,40 @@ fn scope_label(scope: &PackageScope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_for(yaml: &str) -> Option<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        std::env::remove_var("AVOCADO_RUNTIME");
+        ext_install_runtime(path.to_str().unwrap())
+    }
+
+    /// `avocado install <pkgs> -e <ext>` must target the runtime `ext build`
+    /// resolves, otherwise the packages land in the per-target sysroot and
+    /// `ext build` fails its package-database probe.
+    #[test]
+    #[serial_test::serial]
+    fn ext_install_runtime_is_the_sole_runtime() {
+        let yaml = "default_target: qemux86-64\nruntimes:\n  only:\n    target-qemux86-64:\n      extensions: [app]\nextensions:\n  app:\n    version: \"1.0.0\"\n";
+        assert_eq!(runtime_for(yaml).as_deref(), Some("only"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ext_install_runtime_honours_default_runtime() {
+        let yaml = "default_target: qemux86-64\ndefault_runtime: beta\nruntimes:\n  alpha:\n    target-qemux86-64:\n      extensions: [app]\n  beta:\n    target-qemux86-64:\n      extensions: [app]\nextensions:\n  app:\n    version: \"1.0.0\"\n";
+        assert_eq!(runtime_for(yaml).as_deref(), Some("beta"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ext_install_runtime_is_none_when_ambiguous_or_absent() {
+        let ambiguous = "default_target: qemux86-64\nruntimes:\n  alpha:\n    target-qemux86-64:\n      extensions: [app]\n  beta:\n    target-qemux86-64:\n      extensions: [app]\nextensions:\n  app:\n    version: \"1.0.0\"\n";
+        assert_eq!(runtime_for(ambiguous), None);
+        let none = "default_target: qemux86-64\nextensions:\n  app:\n    version: \"1.0.0\"\n";
+        assert_eq!(runtime_for(none), None);
+    }
 
     /// The multi-runtime install must hand each extension the runtimes whose
     /// per-runtime sysroot it has to seed, including extensions reached only
