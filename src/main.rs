@@ -3000,9 +3000,17 @@ async fn main() -> Result<()> {
                 force,
                 extension,
                 target,
+                runtime,
                 container_args,
                 dnf_args,
             } => {
+                // Resolve the runtime the way `ext build` does: `ext build`
+                // looks for the extension's package database in the runtime's
+                // sysroot, so an install that ignored the runtime left it empty
+                // for any project with a sole runtime, including the implicit
+                // one. None for projects without runtimes keeps the per-target
+                // install.
+                let resolved_runtime = resolve_runtime_at_path(&config, runtime.as_deref()).ok();
                 let install_cmd = ExtInstallCommand::new(
                     name.or(extension),
                     config,
@@ -3013,7 +3021,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_no_stamps(cli.no_stamps)
-                .with_sdk_arch(cli.sdk_arch.clone());
+                .with_sdk_arch(cli.sdk_arch.clone())
+                .with_runtime(resolved_runtime);
                 install_cmd.execute().await?;
                 Ok(())
             }
@@ -4595,6 +4604,11 @@ enum ExtCommands {
         /// Target architecture
         #[arg(short, long)]
         target: Option<String>,
+        /// Runtime whose extension sysroot to install into. Defaults to the
+        /// runtime `ext build` resolves (the sole or default runtime), so an
+        /// `ext install` followed by `ext build` fill the same sysroot.
+        #[arg(short = 'r', long = "runtime")]
+        runtime: Option<String>,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
