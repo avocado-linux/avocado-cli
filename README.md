@@ -39,7 +39,7 @@ Because everything is prebuilt, you get:
 - **Hardware portability.** To move to different hardware, simply change the target in `avocado.yaml`.
 - **One-line packages.** To add a package, search our feeds and add it to your `avocado.yaml`.
 - **Fast iteration.** Push an updated extension to a running device on your network with `avocado deploy`.
-- **Fully reproducible.** Versioned package feeds and a lockfile pin every package, so the same `avocado.yaml` builds the same image every time, so every device runs the image that you tested.
+- **Reproducible.** Versioned package feeds and `avocado.lock` pin every package, so the same `avocado.yaml` and lockfile install the same package versions every time, and every device runs what you tested.
 
 Your application goes in extensions, so you can update it without a rebuild of the OS or a reboot. OS updates use A/B partitions with automatic rollback. Avocado OS also supports [secure boot](https://docs.peridio.com/avocado-os/security/secure-boot) and [encrypted storage](https://docs.peridio.com/avocado-os/security/encryption).
 
