@@ -1415,7 +1415,7 @@ modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
 mkdir -p "$release_dir"
 # The sysroot outlives a version bump: drop every earlier version's file,
 # or the image ships them all and each one's hooks run on merge.
-rm -f "$release_dir"/extension-release.{3}-* "$release_dir"/extension-release.{3}
+rm -f "$release_dir/extension-release.{3}"-* "$release_dir/extension-release.{3}"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "SYSEXT_SCOPE={}" >> "$release_file"
@@ -1639,7 +1639,7 @@ release_file="$release_dir/extension-release.{}-{}"
 mkdir -p "$release_dir"
 # The sysroot outlives a version bump: drop every earlier version's file,
 # or the image ships them all and each one's hooks run on merge.
-rm -f "$release_dir"/extension-release.{3}-* "$release_dir"/extension-release.{3}
+rm -f "$release_dir/extension-release.{3}"-* "$release_dir/extension-release.{3}"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
