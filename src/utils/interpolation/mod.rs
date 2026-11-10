@@ -123,7 +123,20 @@ pub fn interpolate_config(
 ) -> Result<()> {
     // Fold `distro.target-<name>:` first, so `{{ config.distro.* }}` and the
     // deserialized config follow the target's release/channel too.
-    let target = AvocadoContext::resolve_target_value(yaml_value, cli_target);
+    let mut target = AvocadoContext::resolve_target_value(yaml_value, cli_target);
+    // A templated `default_target` (e.g. `{{ env.BOARD }}`) names its target
+    // only once resolved. Resolve just that string: nothing else is expanded
+    // yet, so no field sees the base distro before the fold.
+    for _ in 0..MAX_ITERATIONS {
+        let Some(t) = target.as_deref().filter(|t| t.contains("{{")) else {
+            break;
+        };
+        let resolved = preprocess_text(t, yaml_value, &AvocadoContext::new())?;
+        if resolved == t {
+            break;
+        }
+        target = Some(resolved);
+    }
     if let Some(distro) = yaml_value.get_mut("distro") {
         *distro = avocado::distro_for_target(distro, target.as_deref());
     }

@@ -132,6 +132,12 @@ pub(crate) fn distro_for_target(distro: &Value, target: Option<&str>) -> Value {
     let mut base = map.clone();
     base.retain(|k, _| !k.as_str().is_some_and(|k| k.starts_with("target-")));
     if let Some(Value::Mapping(over)) = target.and_then(|t| map.get(format!("target-{t}"))) {
+        // `version` is an alias of `release`: an override setting either one
+        // replaces both, or the base spelling survives beside it.
+        if over.contains_key("release") || over.contains_key("version") {
+            base.remove("release");
+            base.remove("version");
+        }
         for (k, v) in over {
             base.insert(k.clone(), v.clone());
         }

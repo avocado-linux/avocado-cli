@@ -15066,6 +15066,51 @@ sdk:
         }
     }
 
+    /// `version` is an alias of `release`, so an override in one spelling
+    /// replaces a base in the other instead of leaving both to collide.
+    #[test]
+    #[serial]
+    fn a_target_block_release_replaces_either_spelling() {
+        clear_env();
+        for (base, over) in [("version", "release"), ("release", "version")] {
+            let yaml = format!(
+                "distro:\n  {base}: 2026\n  channel: edge\n  target-raspberrypi0-2w:\n    {over}: 2024\n\
+                 supported_targets: [raspberrypi0-2w]\n"
+            );
+            let (_dir, path) = project(&yaml, None);
+            let c = Config::load_composed(&path, Some("raspberrypi0-2w")).unwrap();
+            assert_eq!(
+                c.config.get_releasever().unwrap(),
+                "2024/edge",
+                "{base} -> {over}"
+            );
+        }
+    }
+
+    /// A templated `default_target` picks its override once resolved.
+    #[test]
+    #[serial]
+    fn a_templated_default_target_picks_its_override() {
+        clear_env();
+        std::env::set_var("PROJECT_TARGET", "raspberrypi0-2w");
+        let yaml = "\
+default_target: \"{{ env.PROJECT_TARGET }}\"
+distro:
+  release: 2026
+  channel: edge
+  target-raspberrypi0-2w:
+    release: 2024
+supported_targets: [raspberrypi0-2w, raspberrypi4]
+";
+        let (_dir, path) = project(yaml, None);
+        let releasever = Config::load_composed(&path, None)
+            .unwrap()
+            .config
+            .get_releasever();
+        std::env::remove_var("PROJECT_TARGET");
+        assert_eq!(releasever.unwrap(), "2024/edge");
+    }
+
     /// The distro feed's baseurl in a named feed set takes the same value, so
     /// `sdk dnf` and `sdk run` fetch custom feeds from the pinned snapshot too.
     #[test]
