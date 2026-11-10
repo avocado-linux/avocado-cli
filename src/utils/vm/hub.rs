@@ -18,6 +18,12 @@ use super::state::VmPaths;
 /// Where avocado-conn keeps its config and claim state in the guest. Must be
 /// under /var: the guest's /etc is a /run-backed overlay.
 pub const CONN_DIR: &str = "/var/lib/avocado-conn";
+/// The VM's identity for avocado-conn (`device_id_source = "file:..."`): its
+/// instance id, written by `avocado vm connect`. Not DMI: an arm64 VM boots
+/// `-machine virt` with no firmware, so it has no SMBIOS and no
+/// /sys/class/dmi. On x86 the instance id is also the DMI product_uuid
+/// (`-uuid`), so a VM claimed before keeps its device id.
+pub const DEVICE_ID_FILE: &str = "/var/lib/avocado-conn/device-id";
 /// The agent's API socket, avocado-conn's `[local_handler]`.
 pub const AGENT_API_SOCK: &str = "/run/avocado-vm-agent/api.sock";
 
@@ -119,7 +125,7 @@ pub fn conn_config(api_url: &str, claim_token: &str) -> String {
         "# Written by `avocado vm connect`.\n\
          api_url = \"{api}\"\n\
          claim_token = \"{claim_token}\"\n\
-         device_id_source = \"dmi\"\n\
+         device_id_source = \"file:{DEVICE_ID_FILE}\"\n\
          data_dir = \"{CONN_DIR}\"\n\
          \n\
          [local_handler]\n\
@@ -176,7 +182,10 @@ mod tests {
         let v: toml::Value = toml::from_str(&c).unwrap();
         assert_eq!(v["api_url"].as_str(), Some("http://10.0.2.2:3001"));
         assert_eq!(v["claim_token"].as_str(), Some("tok"));
-        assert_eq!(v["device_id_source"].as_str(), Some("dmi"));
+        assert_eq!(
+            v["device_id_source"].as_str(),
+            Some("file:/var/lib/avocado-conn/device-id")
+        );
         assert_eq!(v["data_dir"].as_str(), Some(CONN_DIR));
         assert_eq!(v["local_handler"]["socket"].as_str(), Some(AGENT_API_SOCK));
     }

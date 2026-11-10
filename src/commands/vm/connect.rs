@@ -2,7 +2,8 @@
 //!
 //! Mints a single-use, short-lived claim token (kind `vm`) with the user's
 //! Connect login, writes avocado-conn's config into the guest over SSH and
-//! starts it; avocado-conn claims with the VM's DMI UUID. Credentials stay
+//! starts it; avocado-conn claims with the VM's instance id (the DMI UUID on
+//! x86, and arm64 has no DMI), written to a file. Credentials stay
 //! in the guest's /var (var.btrfs), so `vm reset` means connecting again.
 
 use anyhow::{bail, Context, Result};
@@ -119,13 +120,19 @@ impl VmConnectCommand {
 
                 let cfg = hub::conn_config(&api_url, &raw);
                 let b64 = base64::engine::general_purpose::STANDARD.encode(cfg);
+                // A UUID: safe in the command line as is.
+                let id = crate::utils::vm::state::instance_id(
+                    &crate::utils::vm::state::VmPaths::resolve()?,
+                )?;
                 target
                     .exec(&format!(
                         "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
                          for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
-                         echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && sync && \
+                         echo {b64} | base64 -d > {d}/config.toml && chmod 0600 {d}/config.toml && \
+                         printf '%s\\n' {id} > {idf} && sync && \
                          systemctl restart avocado-conn",
-                        d = hub::CONN_DIR
+                        d = hub::CONN_DIR,
+                        idf = hub::DEVICE_ID_FILE,
                     ))
                     .await
                     .context("could not start avocado-conn in the VM")?;
