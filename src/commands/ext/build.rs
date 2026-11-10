@@ -6,7 +6,9 @@ use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::LockFile;
-use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output::{
+    print_error, print_info, print_success, print_warning, print_warning_above, OutputLevel,
+};
 use crate::utils::permissions::render_users_groups_script;
 use crate::utils::stamps::{
     compute_ext_build_input_hash, generate_batch_read_stamps_script,
@@ -639,7 +641,11 @@ impl ExtBuildCommand {
         if let Some(message) =
             enable_services_confext_warning(&self.extension, &enable_services, &ext_types)
         {
-            print_warning(&message, OutputLevel::Normal);
+            // `print_warning_above` rather than `print_warning`: the plain one
+            // returns early while a renderer or `--json` is active, which covers
+            // the interactive `avocado build`, so the services would silently
+            // never be enabled on a run that looks clean.
+            print_warning_above(&message);
         }
 
         let ext_scopes = ext_config
