@@ -6,7 +6,9 @@ use crate::commands::sdk::SdkCompileCommand;
 use crate::utils::config::{ComposedConfig, Config, ExtensionLocation};
 use crate::utils::container::{RunConfig, SdkContainer, TuiContext};
 use crate::utils::lockfile::LockFile;
-use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
+use crate::utils::output::{
+    print_error, print_info, print_success, print_warning, print_warning_above, OutputLevel,
+};
 use crate::utils::permissions::render_users_groups_script;
 use crate::utils::stamps::{
     compute_ext_build_input_hash, generate_batch_read_stamps_script,
@@ -636,15 +638,14 @@ impl ExtBuildCommand {
         }
 
         // Validate that confext is present if enable_services is used
-        if !enable_services.is_empty() && !ext_types.contains(&"confext") {
-            print_error(
-                &format!(
-                    "Warning: Extension '{}' has enable_services configured but 'confext' is not in types. \
-                    Service linking requires a confext. Please add 'confext' to the types array.",
-                    self.extension
-                ),
-                OutputLevel::Normal,
-            );
+        if let Some(message) =
+            enable_services_confext_warning(&self.extension, &enable_services, &ext_types)
+        {
+            // `print_warning_above` rather than `print_warning`: the plain one
+            // returns early while a renderer or `--json` is active, which covers
+            // the interactive `avocado build`, so the services would silently
+            // never be enabled on a run that looks clean.
+            print_warning_above(&message);
         }
 
         let ext_scopes = ext_config
@@ -1970,9 +1971,68 @@ fi
     }
 }
 
+/// The text to warn with when an extension lists `enable_services` but does not
+/// build a confext, which is what links the units. `None` when nothing is wrong.
+///
+/// The message carries no severity word: the printer that shows it adds the label.
+fn enable_services_confext_warning(
+    extension: &str,
+    enable_services: &[String],
+    ext_types: &[&str],
+) -> Option<String> {
+    if enable_services.is_empty() || ext_types.contains(&"confext") {
+        return None;
+    }
+    Some(format!(
+        "Extension '{extension}' has enable_services configured but 'confext' is not in types. \
+         Service linking requires a confext. Please add 'confext' to the types array."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `enable_services` links its units through a confext, so listing services on
+    /// an extension that builds only a sysext is a setup the build should flag.
+    #[test]
+    fn enable_services_without_a_confext_is_flagged() {
+        let services = vec!["peridiod.service".to_string()];
+        let message = enable_services_confext_warning("my-ext", &services, &["sysext"])
+            .expect("services without a confext must be flagged");
+        assert!(message.contains("my-ext"));
+        assert!(message.contains("'confext' is not in types"));
+    }
+
+    /// The printer adds the severity label, so the text must not carry its own
+    /// "Warning:" prefix on top of it.
+    #[test]
+    fn the_flag_text_has_no_severity_prefix() {
+        let services = vec!["peridiod.service".to_string()];
+        let message = enable_services_confext_warning("my-ext", &services, &["sysext"]).unwrap();
+        assert!(!message.starts_with("Warning"));
+    }
+
+    #[test]
+    fn enable_services_with_a_confext_is_not_flagged() {
+        let services = vec!["peridiod.service".to_string()];
+        assert_eq!(
+            enable_services_confext_warning("my-ext", &services, &["sysext", "confext"]),
+            None
+        );
+        assert_eq!(
+            enable_services_confext_warning("my-ext", &services, &["confext"]),
+            None
+        );
+    }
+
+    #[test]
+    fn no_enable_services_is_never_flagged() {
+        assert_eq!(
+            enable_services_confext_warning("my-ext", &[], &["sysext"]),
+            None
+        );
+    }
 
     /// Only an extension with packages needs an installed sysroot before it
     /// builds. Overlay-only, empty, and missing `packages:` all read as none.
