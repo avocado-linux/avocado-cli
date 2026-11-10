@@ -1505,10 +1505,12 @@ service="{}"
 #
 # An instance (foo@bar.service) is never a file: systemd loads it from its
 # template (foo@.service), and `systemctl enable` links the instance name to the
-# template. An exact instance file still wins, as it does in systemd.
+# template. An exact instance file still wins, as it does in systemd. The
+# instance must be nonempty: foo@.service is the template itself, not an
+# instance, and gets no fallback.
 template=""
 case "$service" in
-    *@*.*) template="${{service%%@*}}@.${{service##*.}}" ;;
+    *@?*.*) template="${{service%%@*}}@.${{service##*.}}" ;;
 esac
 unit_file=""
 unit_target=""
@@ -1545,11 +1547,20 @@ if [ -n "$unit_file" ]; then
     wanted_by=""
     required_by=""
     _avocado_collect_install "$unit_file"
-    # An instance also reads its template's drop-ins, as systemd does.
+    # An instance also reads its template's drop-ins, as systemd does. Only
+    # the effective file for each name counts: systemd takes the first one in
+    # /etc before /usr/lib and, within one directory, the instance's before
+    # the template's, so an override can drop the template's WantedBy=.
+    seen_dropins="/"
     for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
-        for name in $template "$service"; do
+        for name in "$service" $template; do
             for dropin in "$sysroot$dropin_dir/$name.d/"*.conf; do
-                [ -f "$dropin" ] && _avocado_collect_install "$dropin"
+                [ -f "$dropin" ] || continue
+                case "$seen_dropins" in
+                    */"${{dropin##*/}}"/*) continue ;;
+                esac
+                seen_dropins="$seen_dropins${{dropin##*/}}/"
+                _avocado_collect_install "$dropin"
             done
         done
     done
@@ -2976,6 +2987,68 @@ extensions:
             out.contains("Warning: enable_services lists serial-getty@ttyGS0.service, but its template serial-getty@.service is not in the extension sysroot"),
             "{out}"
         );
+    }
+
+    /// `foo@.service` is the template, not an instance: when it is missing the
+    /// build fails as for any missing unit, rather than warning.
+    #[test]
+    #[cfg(unix)]
+    fn a_missing_bare_template_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        std::fs::create_dir_all(root.join("sysroots/app")).unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains(
+                "Error: enable_services lists wpa_supplicant@.service, but no such unit exists"
+            ),
+            "{stdout}"
+        );
+    }
+
+    /// An instance's drop-in replaces the template's drop-in of the same name,
+    /// as in systemd, so a WantedBy= the override dropped links nothing.
+    #[test]
+    #[cfg(unix)]
+    fn an_instance_dropin_replaces_the_templates_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        for (dir, target) in [
+            ("wpa_supplicant@.service.d", "multi-user.target"),
+            ("wpa_supplicant@wlan0.service.d", "rescue.target"),
+        ] {
+            std::fs::create_dir_all(unit_dir.join(dir)).unwrap();
+            std::fs::write(
+                unit_dir.join(dir).join("10-install.conf"),
+                format!("[Install]\nWantedBy={target}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            unit_dir.join("wpa_supplicant@.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@wlan0.service"]),
+            root,
+            None,
+        );
+        let etc = root.join("sysroots/app/etc/systemd/system");
+        assert!(etc
+            .join("rescue.target.wants/wpa_supplicant@wlan0.service")
+            .is_symlink());
+        assert!(!etc.join("multi-user.target.wants").exists());
     }
 
     #[test]
