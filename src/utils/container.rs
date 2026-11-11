@@ -1622,7 +1622,7 @@ pub(crate) fn scan_env_args(args: &[String]) -> (Vec<(String, Option<String>)>, 
 /// Not handled: `--env-file`, which docker reads itself (an explicit `-e`
 /// wins over it, so the generated git settings still apply). Short flags
 /// packed with `-e` (`-ie K=V`) must be unpacked first by [`split_env_tokens`].
-fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
+pub(crate) fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
     let a = args.get(i)?.as_str();
     if a == "-e" || a == "--env" {
         return args.get(i + 1).map(|v| (2, v.as_str()));

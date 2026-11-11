@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
-    container::{RunConfig, SdkContainer, TuiContext},
+    container::{docker_env_flag, RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
     stamps::{
         compute_sdk_compile_input_hash, generate_batch_read_stamps_script,
         generate_output_listing_probe, generate_write_stamp_script, get_local_arch,
-        locked_packages_hash, output_listing_from_batch, own_stamp_is_current,
-        remove_own_stamp_line, sdk_compile_inputs_are_complete, stamp_identity_from_batch,
-        validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
+        hash_root_is_mounted, locked_packages_hash, output_listing_from_batch,
+        own_stamp_is_current, remove_own_stamp_line, sdk_compile_inputs_are_complete,
+        stamp_identity_from_batch, validate_stamps_batch, Stamp, StampInputs, StampOutputs,
+        StampRequirement,
     },
     target::resolve_target_required,
 };
@@ -31,6 +32,50 @@ enum SectionPlan {
     Skip,
     /// Run the script. With inputs, write the section stamp when it succeeds.
     Run(Option<StampInputs>),
+}
+
+/// What a section skip is decided from, besides the section and its stamp.
+/// Set only under `ext build` with stamps on and a lock file.
+struct SkipContext<'a> {
+    merged: &'a serde_yaml::Value,
+    project_root: &'a std::path::Path,
+    /// The batch stamp read: SDK, compile-deps and section stamps, and the
+    /// section build directories that exist.
+    batch: &'a str,
+    lock_pins: &'a std::collections::BTreeMap<String, String>,
+    container_args: Option<&'a [String]>,
+    /// The repo values the container gets, after env and `distro` overrides.
+    repo_url: Option<&'a str>,
+    repo_release: Option<&'a str>,
+    /// Whether the container mounts the tree the hash reads.
+    hash_root_mounted: bool,
+}
+
+/// Whether a container arg passes host state into the build that its text
+/// does not show: an env flag with a bare name (`-e CFLAGS`, docker then
+/// passes the host's current value), or `--env-file` (docker reads the file
+/// when the container starts). Hashing the text would miss a change to either.
+/// A config arg can hold several words (`-e CFLAGS`), so each is split first.
+fn passes_host_state(container_args: &[String]) -> bool {
+    let words: Vec<String> = container_args
+        .iter()
+        .flat_map(|a| a.split_whitespace().map(str::to_string))
+        .collect();
+    let mut i = 0;
+    while i < words.len() {
+        if words[i].starts_with("--env-file") {
+            return true;
+        }
+        if let Some((taken, operand)) = docker_env_flag(&words, i) {
+            if !operand.contains('=') {
+                return true;
+            }
+            i += taken;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Implementation of the 'sdk compile' command.
@@ -55,11 +100,11 @@ pub struct SdkCompileCommand {
     /// If set, scripts are executed from this directory instead of /opt/src.
     /// Used for remote extensions where scripts are in $AVOCADO_PREFIX/includes/<ext>/
     pub workdir: Option<String>,
-    /// The extension whose `ext build` runs these sections, with its node
-    /// resolved for the target as `ext build` uses it. Only then may a section
-    /// be skipped: its stamp folds that extension's `package_files`. A direct
-    /// `sdk compile` always runs.
-    pub extension: Option<(String, serde_yaml::Value)>,
+    /// Under `ext build`: every extension that names the section, the
+    /// calling extension first, each node resolved for the target as `ext
+    /// build` resolves it. Only then may a section be skipped: its stamp folds
+    /// their `package_files`. A direct `sdk compile` always runs.
+    pub extensions: Option<Vec<(String, serde_yaml::Value)>>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     /// TUI context for output capture when running under a parent orchestrator
@@ -86,7 +131,7 @@ impl SdkCompileCommand {
             no_stamps: false,
             sdk_arch: None,
             workdir: None,
-            extension: None,
+            extensions: None,
             composed_config: None,
             tui_context: None,
         }
@@ -98,10 +143,10 @@ impl SdkCompileCommand {
         self
     }
 
-    /// Set the extension whose build runs these sections and its resolved
-    /// config node (see [`Self::extension`])
-    pub fn with_extension(mut self, name: String, config: serde_yaml::Value) -> Self {
-        self.extension = Some((name, config));
+    /// Set the extensions that name the section, the caller first, with their
+    /// resolved config nodes (see [`Self::extensions`])
+    pub fn with_extensions(mut self, extensions: Vec<(String, serde_yaml::Value)>) -> Self {
+        self.extensions = Some(extensions);
         self
     }
 
@@ -152,6 +197,7 @@ impl SdkCompileCommand {
         // Validate stamps before proceeding (unless --no-stamps)
         // SDK compile requires SDK to be installed
         let mut stamp_batch: Option<String> = None;
+        let mut mounted_src_dir: Option<std::path::PathBuf> = None;
         if !self.no_stamps {
             let container_image = config
                 .get_sdk_image()
@@ -166,7 +212,7 @@ impl SdkCompileCommand {
             // needs: the section stamps, the compile-deps stamp, and which
             // section build directories exist.
             let mut batch_script = generate_batch_read_stamps_script(&requirements);
-            if self.extension.is_some() {
+            if self.extensions.is_some() {
                 let mut own: Vec<StampRequirement> = self
                     .sections
                     .iter()
@@ -211,6 +257,7 @@ impl SdkCompileCommand {
                     .print_and_exit();
             }
             stamp_batch = output;
+            mounted_src_dir = Some(container_helper.mounted_src_dir().to_path_buf());
         }
 
         // Debug: Check if sdk.compile was parsed
@@ -316,20 +363,26 @@ impl SdkCompileCommand {
 
         let mut overall_success = true;
         let project_root = config.project_root(&self.config_path);
-        let lock_pins = match (&self.extension, &stamp_batch) {
+        let lock_pins = match (&self.extensions, &stamp_batch) {
             (Some(_), Some(_)) => self.lock_pins(config, &target),
+            _ => None,
+        };
+        let skip_context = match (&stamp_batch, &lock_pins, &mounted_src_dir) {
+            (Some(batch), Some(lock_pins), Some(mounted)) => Some(SkipContext {
+                merged: &composed.merged_value,
+                project_root: &project_root,
+                batch,
+                lock_pins,
+                container_args: merged_container_args.as_deref(),
+                repo_url: repo_url.as_deref(),
+                repo_release: repo_release.as_deref(),
+                hash_root_mounted: hash_root_is_mounted(&project_root, mounted),
+            }),
             _ => None,
         };
 
         for section in &filtered_sections {
-            let plan = self.plan_section(
-                &composed.merged_value,
-                &project_root,
-                section,
-                stamp_batch.as_deref(),
-                merged_container_args.as_deref(),
-                lock_pins.as_ref(),
-            );
+            let plan = self.plan_section(section, skip_context.as_ref());
             if plan == SectionPlan::Skip {
                 print_success(
                     &format!("Compile section '{}' is up to date.", section.name),
@@ -472,51 +525,57 @@ impl SdkCompileCommand {
 
     /// Decide whether one section runs, and whether its run writes a stamp.
     ///
-    /// A section is skipped only under `ext build` with stamps on, when its
-    /// inputs are complete (`sdk_compile_inputs_are_complete`), its stamp is
-    /// current, and its build directory exists. Everything else runs, as every
-    /// section did before there was a stamp.
-    fn plan_section(
-        &self,
-        merged: &serde_yaml::Value,
-        project_root: &std::path::Path,
-        section: &CompileSection,
-        batch: Option<&str>,
-        container_args: Option<&[String]>,
-        lock_pins: Option<&std::collections::BTreeMap<String, String>>,
-    ) -> SectionPlan {
-        let (Some((extension, ext)), Some(batch), Some(lock_pins)) =
-            (self.extension.as_ref(), batch, lock_pins)
-        else {
+    /// A section is skipped only under `ext build` with stamps on and a lock
+    /// file (`ctx` is then set), when its inputs are complete
+    /// (`sdk_compile_inputs_are_complete`), the build reads the tree the hash
+    /// reads, no container arg passes in host state the hash cannot see, its
+    /// stamp is current, and its build directory exists. Everything else runs,
+    /// as every section did before there was a stamp.
+    fn plan_section(&self, section: &CompileSection, ctx: Option<&SkipContext<'_>>) -> SectionPlan {
+        let (Some(extensions), Some(ctx)) = (self.extensions.as_deref(), ctx) else {
             return SectionPlan::Run(None);
         };
         let name = section.name.as_str();
-        if !sdk_compile_inputs_are_complete(ext, &section.script, project_root) {
-            if ext.get("package_files").is_none() {
+        if !sdk_compile_inputs_are_complete(extensions, &section.script, ctx.project_root) {
+            if let Some((undeclared, _)) = extensions
+                .iter()
+                .find(|(_, ext)| ext.get("package_files").is_none())
+            {
                 print_info(
                     &format!(
-                        "Compile section '{name}' runs on every build of extension \
-                         '{extension}'. Add package_files to the extension to skip the \
-                         section when its sources do not change."
+                        "Compile section '{name}' runs on every build. Add package_files to \
+                         extension '{undeclared}' to skip the section when its sources do \
+                         not change."
                     ),
                     OutputLevel::Normal,
                 );
             }
             return SectionPlan::Run(None);
         }
+        if !ctx.hash_root_mounted || passes_host_state(ctx.container_args.unwrap_or_default()) {
+            return SectionPlan::Run(None);
+        }
 
-        let mut environment = lock_pins.clone();
+        let mut environment = ctx.lock_pins.clone();
         environment.insert(
             "sdk_install".to_string(),
-            stamp_identity_from_batch(batch, &StampRequirement::sdk_install()),
+            stamp_identity_from_batch(ctx.batch, &StampRequirement::sdk_install()),
         );
         environment.insert(
             "compile_deps".to_string(),
-            stamp_identity_from_batch(batch, &StampRequirement::compile_deps_install()),
+            stamp_identity_from_batch(ctx.batch, &StampRequirement::compile_deps_install()),
         );
         environment.insert(
             "container_args".to_string(),
-            container_args.unwrap_or_default().join("\n"),
+            ctx.container_args.unwrap_or_default().join("\n"),
+        );
+        environment.insert(
+            "repo_url".to_string(),
+            ctx.repo_url.unwrap_or_default().to_string(),
+        );
+        environment.insert(
+            "repo_release".to_string(),
+            ctx.repo_release.unwrap_or_default().to_string(),
         );
         environment.insert(
             "sdk_arch".to_string(),
@@ -530,20 +589,21 @@ impl SdkCompileCommand {
         // section ran without a stamp before, and the build reports the same
         // file error from its own input hash.
         let Ok(inputs) = compute_sdk_compile_input_hash(
-            merged,
+            ctx.merged,
             name,
             &section.script,
-            extension,
-            ext,
-            project_root,
+            extensions,
+            ctx.project_root,
             &environment,
         ) else {
             return SectionPlan::Run(None);
         };
 
-        let build_dir_present = output_listing_from_batch(batch).iter().any(|d| d == name);
+        let build_dir_present = output_listing_from_batch(ctx.batch)
+            .iter()
+            .any(|d| d == name);
         if build_dir_present
-            && own_stamp_is_current(batch, &StampRequirement::sdk_compile(name), &inputs)
+            && own_stamp_is_current(ctx.batch, &StampRequirement::sdk_compile(name), &inputs)
         {
             return SectionPlan::Skip;
         }
@@ -907,7 +967,9 @@ extensions:
         dir
     }
 
-    fn ext_build_compile(merged: &serde_yaml::Value) -> SdkCompileCommand {
+    /// The compile step as `ext build` sets it up: the extensions that name
+    /// the section, the caller first, each taken from `merged`.
+    fn ext_build_compile(merged: &serde_yaml::Value, names: &[&str]) -> SdkCompileCommand {
         SdkCompileCommand::new(
             "avocado.yaml".to_string(),
             false,
@@ -916,7 +978,12 @@ extensions:
             None,
             None,
         )
-        .with_extension("my-ext".to_string(), merged["extensions"]["my-ext"].clone())
+        .with_extensions(
+            names
+                .iter()
+                .map(|n| (n.to_string(), merged["extensions"][*n].clone()))
+                .collect(),
+        )
     }
 
     fn app_section() -> CompileSection {
@@ -956,6 +1023,26 @@ extensions:
         )
     }
 
+    /// A skip context with defaults: no container args, the default repo, and
+    /// the hash root mounted.
+    fn ctx<'a>(
+        merged: &'a serde_yaml::Value,
+        root: &'a std::path::Path,
+        batch: &'a str,
+        lock_pins: &'a std::collections::BTreeMap<String, String>,
+    ) -> SkipContext<'a> {
+        SkipContext {
+            merged,
+            project_root: root,
+            batch,
+            lock_pins,
+            container_args: None,
+            repo_url: None,
+            repo_release: None,
+            hash_root_mounted: true,
+        }
+    }
+
     /// The stamp a successful run writes, so the next run can be compared.
     fn stamp_written_by(plan: SectionPlan) -> Stamp {
         let SectionPlan::Run(Some(inputs)) = plan else {
@@ -969,50 +1056,41 @@ extensions:
         )
     }
 
+    /// Runs the section once with no stamp and returns the batch the next
+    /// build reads: that stamp, and the build directory present.
+    fn after_first_build(
+        cmd: &SdkCompileCommand,
+        merged: &serde_yaml::Value,
+        root: &std::path::Path,
+    ) -> String {
+        let empty = batch_with(None, "");
+        let p = pins("s");
+        let stamp = stamp_written_by(
+            cmd.plan_section(&app_section(), Some(&ctx(merged, root, &empty, &p))),
+        );
+        batch_with(Some(&stamp), "app-compile")
+    }
+
     #[test]
     fn unchanged_section_is_skipped_after_an_install_script_edit() {
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile(&merged);
-
-        // First build: no stamp, so the section runs and writes one.
-        let first = cmd.plan_section(
-            &merged,
-            root,
-            &app_section(),
-            Some(&batch_with(None, "")),
-            None,
-            Some(&pins("s")),
-        );
-        let stamp = stamp_written_by(first);
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        let p = pins("s");
 
         // The reported case: only install.sh changes. The section is skipped.
         std::fs::write(root.join("install.sh"), "install -m755 app $DEST\n").unwrap();
-        let batch = batch_with(Some(&stamp), "app-compile");
         assert_eq!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Skip
         );
 
         // A source edit under package_files runs it again.
         std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
         assert!(matches!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(Some(_))
         ));
     }
@@ -1022,101 +1100,198 @@ extensions:
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile(&merged);
-        let stamp = stamp_written_by(cmd.plan_section(
-            &merged,
-            root,
-            &app_section(),
-            Some(&batch_with(None, "")),
-            None,
-            Some(&pins("s")),
-        ));
-
-        let batch = batch_with(Some(&stamp), "other-section");
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root)
+            .replace(":::app-compile\n", ":::other-section\n");
+        let p = pins("s");
         assert!(matches!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(Some(_))
         ));
     }
 
+    /// Container args, the resolved repo and the lock pins are all inputs.
     #[test]
-    fn section_runs_when_the_container_args_change() {
+    fn section_runs_when_the_build_environment_changes() {
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile(&merged);
-        let stamp = stamp_written_by(cmd.plan_section(
-            &merged,
-            root,
-            &app_section(),
-            Some(&batch_with(None, "")),
-            None,
-            Some(&pins("s")),
-        ));
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        let p = pins("s");
+        let plan = |c: SkipContext<'_>| cmd.plan_section(&app_section(), Some(&c));
 
-        let batch = batch_with(Some(&stamp), "app-compile");
+        assert_eq!(plan(ctx(&merged, root, &batch, &p)), SectionPlan::Skip);
+
         let args = vec!["--env=OPT=1".to_string()];
-        assert!(matches!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                Some(&args),
-                Some(&pins("s"))
+        let mut c = ctx(&merged, root, &batch, &p);
+        c.container_args = Some(&args);
+        assert!(
+            matches!(plan(c), SectionPlan::Run(Some(_))),
+            "container args"
+        );
+
+        // The repo the container gets, after env and distro overrides.
+        let mut c = ctx(&merged, root, &batch, &p);
+        c.repo_url = Some("https://mirror.example.com");
+        assert!(matches!(plan(c), SectionPlan::Run(Some(_))), "repo url");
+        let mut c = ctx(&merged, root, &batch, &p);
+        c.repo_release = Some("2026");
+        assert!(matches!(plan(c), SectionPlan::Run(Some(_))), "repo release");
+
+        let repinned = pins("s2");
+        assert!(
+            matches!(
+                plan(ctx(&merged, root, &batch, &repinned)),
+                SectionPlan::Run(Some(_))
             ),
-            SectionPlan::Run(Some(_))
-        ));
+            "lock pins"
+        );
+
+        // No context (no lock file, or --no-stamps): always runs.
+        assert_eq!(
+            cmd.plan_section(&app_section(), None),
+            SectionPlan::Run(None)
+        );
     }
 
-    /// A re-pin of the SDK in the lock runs the section again.
+    /// Docker passes host state the arg text does not show: the host's value
+    /// for a bare env name, and the contents of an env file.
     #[test]
-    fn section_runs_when_the_lock_pins_change() {
+    fn section_never_skips_with_host_env_passthrough() {
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile(&merged);
-        let stamp = stamp_written_by(cmd.plan_section(
-            &merged,
-            root,
-            &app_section(),
-            Some(&batch_with(None, "")),
-            None,
-            Some(&pins("s")),
-        ));
-        let batch = batch_with(Some(&stamp), "app-compile");
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        let p = pins("s");
+
+        for args in [
+            vec!["--env=CFLAGS".to_string()],
+            vec!["-e".to_string(), "CFLAGS".to_string()],
+            vec!["-e CFLAGS".to_string()],
+            vec!["-eCFLAGS".to_string()],
+            vec!["--env-file=build.env".to_string()],
+            vec!["--env-file".to_string(), "build.env".to_string()],
+        ] {
+            let mut c = ctx(&merged, root, &batch, &p);
+            c.container_args = Some(&args);
+            assert_eq!(
+                cmd.plan_section(&app_section(), Some(&c)),
+                SectionPlan::Run(None),
+                "{args:?}"
+            );
+        }
+
+        // A value in the text is hashed, and the provision args every
+        // reference carries pass no host state.
+        for args in [
+            vec!["--env=CFLAGS=-O2".to_string()],
+            vec![
+                "--privileged".to_string(),
+                "--network=host".to_string(),
+                "-v /dev:/dev".to_string(),
+                "-v /sys:/sys".to_string(),
+            ],
+        ] {
+            assert!(!passes_host_state(&args), "{args:?}");
+        }
+    }
+
+    /// Without `src_dir`, the container mounts the working directory. When
+    /// that is not the tree the hash reads, nothing is skipped.
+    #[test]
+    fn section_never_skips_when_the_container_mounts_another_tree() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        let p = pins("s");
+        let mut c = ctx(&merged, root, &batch, &p);
+        c.hash_root_mounted = false;
         assert_eq!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
-            SectionPlan::Skip
+            cmd.plan_section(&app_section(), Some(&c)),
+            SectionPlan::Run(None)
         );
+    }
+
+    /// The stamp is keyed by the section, so it hashes the sources of every
+    /// extension that names it. B lists only its own files; A lists the
+    /// library source. A library edit followed by a build of B must compile.
+    #[test]
+    fn shared_section_hashes_every_naming_extension() {
+        let dir = skip_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("libfoo-src")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("libfoo-src/foo.c"), "int foo;\n").unwrap();
+        std::fs::write(root.join("b/install.sh"), "install b\n").unwrap();
+        let yaml = r#"
+sdk:
+  image: sdk:2024
+  compile:
+    app-compile:
+      compile: compile.sh
+extensions:
+  ext-a:
+    package_files: [libfoo-src, src]
+    packages:
+      libfoo:
+        compile: app-compile
+        install: install.sh
+  ext-b:
+    package_files: [b]
+    packages:
+      libfoo:
+        compile: app-compile
+        install: b/install.sh
+"#;
+        let merged: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cmd = ext_build_compile(&merged, &["ext-b", "ext-a"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        let p = pins("s");
+
+        std::fs::write(root.join("libfoo-src/foo.c"), "int foo = 1;\n").unwrap();
+        std::fs::write(root.join("b/install.sh"), "install -m755 b\n").unwrap();
         assert!(matches!(
-            cmd.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s2"))
-            ),
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(Some(_))
         ));
-        // No readable lock: nothing to compare the pins with, so it runs.
+
+        // One naming extension without a source list: no skip for anyone.
+        let undeclared = yaml.replace("    package_files: [libfoo-src, src]\n", "");
+        let merged: serde_yaml::Value = serde_yaml::from_str(&undeclared).unwrap();
+        let cmd = ext_build_compile(&merged, &["ext-b", "ext-a"]);
+        let batch = batch_with(None, "app-compile");
         assert_eq!(
-            cmd.plan_section(&merged, root, &app_section(), Some(&batch), None, None),
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Run(None)
+        );
+    }
+
+    /// A source edited through a symlinked `package_files` entry reruns the
+    /// section: the digest hashes the link, so the skip is refused.
+    #[cfg(unix)]
+    #[test]
+    fn source_edited_through_a_symlinked_package_files_entry_reruns() {
+        let dir = skip_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("actual-src")).unwrap();
+        std::fs::write(root.join("actual-src/main.c"), "int main() {}\n").unwrap();
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        std::os::unix::fs::symlink("actual-src", root.join("src")).unwrap();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let p = pins("s");
+        let batch = batch_with(None, "app-compile");
+        assert_eq!(
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Run(None)
+        );
+        std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
+        assert_eq!(
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(None)
         );
     }
@@ -1130,37 +1305,23 @@ extensions:
         let yaml = SKIP_YAML.replace("    package_files: [src]\n", "");
         let merged: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let batch = batch_with(None, "app-compile");
+        let p = pins("s");
         assert_eq!(
-            ext_build_compile(&merged).plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
+            ext_build_compile(&merged, &["my-ext"])
+                .plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(None)
         );
     }
 
-    /// A direct `sdk compile` and a run with `--no-stamps` (no batch read)
-    /// always run, and write no stamp.
+    /// A direct `sdk compile` names no extensions, so it always runs and
+    /// writes no stamp.
     #[test]
-    fn direct_compile_and_no_stamps_always_run() {
+    fn direct_compile_always_runs() {
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile(&merged);
-        let stamp = stamp_written_by(cmd.plan_section(
-            &merged,
-            root,
-            &app_section(),
-            Some(&batch_with(None, "")),
-            None,
-            Some(&pins("s")),
-        ));
-        let batch = batch_with(Some(&stamp), "app-compile");
-
+        let batch = after_first_build(&ext_build_compile(&merged, &["my-ext"]), &merged, root);
+        let p = pins("s");
         let direct = SdkCompileCommand::new(
             "avocado.yaml".to_string(),
             false,
@@ -1170,18 +1331,7 @@ extensions:
             None,
         );
         assert_eq!(
-            direct.plan_section(
-                &merged,
-                root,
-                &app_section(),
-                Some(&batch),
-                None,
-                Some(&pins("s"))
-            ),
-            SectionPlan::Run(None)
-        );
-        assert_eq!(
-            cmd.plan_section(&merged, root, &app_section(), None, None, Some(&pins("s"))),
+            direct.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(None)
         );
     }
