@@ -555,6 +555,10 @@ mod tests {
                 serde_fields::<RubiconConsole>(),
             ),
             (
+                "/definitions/rubiconStep/properties/with_usb",
+                serde_fields::<RubiconWithUsb>(),
+            ),
+            (
                 "/definitions/containerDevConfig",
                 serde_fields::<ContainerDevConfig>(),
             ),

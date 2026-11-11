@@ -2476,9 +2476,9 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^[0-9a-fA-F]{4}:([0-9a-fA-F]{4}|\\*)$"
+            "pattern": "^([0-9a-fA-F]{4}:([0-9a-fA-F]{4}|\\*)|\\*)$"
           },
-          "description": "Keep the board's USB devices with these ids (vvvv:pppp or vvvv:*) attached to the hub for the rest of the job."
+          "description": "Keep the board's USB devices with these ids (vvvv:pppp, vvvv:* for any product, or * for every device on the board's USB port) attached to the hub for the rest of the job."
         },
         "wait_usb": {
           "type": "object",
@@ -2539,6 +2539,33 @@
             "monitor"
           ],
           "description": "The Rubicon's mode: transfer (its whole USB/IP buffer pool, for flashing; provision jobs switch to it themselves) or monitor (part of the pool lent to on-board analysis while a DUT runs)."
+        },
+        "with_usb": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$"
+            },
+            "run": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            },
+            "timeout_s": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Seconds the command may take (the hub's default: 120)."
+            }
+          },
+          "required": [
+            "id",
+            "run"
+          ],
+          "additionalProperties": false,
+          "description": "Attach the board's USB device id to the hub, run run in the job's SDK container with it, then let it go (the console pauses meanwhile). Provision jobs only."
         }
       },
       "minProperties": 1,
