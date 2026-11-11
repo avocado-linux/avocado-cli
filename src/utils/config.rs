@@ -2280,6 +2280,8 @@ impl Config {
                 Self::find_compile_dependencies_in_ext(&external_config, ext_name);
 
             // Merge external config into main config
+            let mut external_config = external_config;
+            Self::resolve_rubicon_run_names(&mut external_config, &main_config, target)?;
             Self::merge_external_config(
                 &mut main_config,
                 &external_config,
@@ -2809,6 +2811,8 @@ impl Config {
             }
 
             // Merge the remote extension config with include patterns
+            let mut ext_config = ext_config;
+            Self::resolve_rubicon_run_names(&mut ext_config, main_config, Some(&resolved_target))?;
             Self::merge_external_config(
                 main_config,
                 &ext_config,
@@ -3028,6 +3032,38 @@ impl Config {
 
             main_ext_map.insert(dep_key, dep_value.clone());
         }
+    }
+
+    /// Resolve the templates in an extension's run profile names
+    /// (`enter-{{ avocado.target }}`) as the composed config's interpolation
+    /// will, before they merge: matched as written, the project's
+    /// `enter-jetson` and the extension's template both went in, and the
+    /// final interpolation let the extension's replace the project's.
+    fn resolve_rubicon_run_names(
+        ext_config: &mut serde_yaml::Value,
+        main_config: &serde_yaml::Value,
+        target: Option<&str>,
+    ) -> Result<()> {
+        use crate::utils::interpolation::{preprocess_text, AvocadoContext};
+        let Some(run) = ext_config
+            .get_mut("rubicon")
+            .and_then(|r| r.get_mut("run"))
+            .and_then(|r| r.as_mapping_mut())
+        else {
+            return Ok(());
+        };
+        let context = AvocadoContext::from_main_config(main_config, target, None);
+        *run = std::mem::take(run)
+            .into_iter()
+            .map(|(name, steps)| {
+                let name = match name.as_str() {
+                    Some(n) => preprocess_text(n, main_config, &context)?.into(),
+                    None => name,
+                };
+                Ok((name, steps))
+            })
+            .collect::<Result<_>>()?;
+        Ok(())
     }
 
     /// Merge an external config into the main config.
@@ -15815,6 +15851,32 @@ provision:
             .unwrap();
             assert!(c.validate_rubicon().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_project_wins_over_an_extension_run_profile_named_by_template() {
+        // As `load_composed` does it: the project is interpolated, the
+        // extension raw, and the composition interpolated once merged.
+        let mut main: serde_yaml::Value = serde_yaml::from_str(
+            "default_target: jetson
+rubicon:
+  run:
+    enter-jetson: [ { wait_ms: 1 } ]
+",
+        )
+        .unwrap();
+        let mut ext: serde_yaml::Value = serde_yaml::from_str(
+            "rubicon:
+  run:
+    \"enter-{{ avocado.target }}\": [ { out: { power: \"on\" } } ]
+",
+        )
+        .unwrap();
+        Config::resolve_rubicon_run_names(&mut ext, &main, None).unwrap();
+        Config::merge_external_config(&mut main, &ext, "bsp", &[], &[]);
+        crate::utils::interpolation::interpolate_config(&mut main, None, None).unwrap();
+        let c: Config = serde_yaml::from_value(main).unwrap();
+        assert_eq!(steps(&c, "enter-jetson"), vec![RubiconStep::WaitMs(1)]);
     }
 
     #[test]
