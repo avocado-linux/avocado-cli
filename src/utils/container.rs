@@ -883,7 +883,18 @@ pub fn inject_kernel_cmdline(
 /// Host networking as the container will actually see it, from the container
 /// args the run carries (`sdk.container_args` and anything layered on it).
 fn run_config_has_host_network(config: &RunConfig) -> bool {
-    crate::utils::feeds::args_have_host_network(config.container_args.as_deref().unwrap_or(&[]))
+    run_config_has_host_network_with(
+        config,
+        crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+    )
+}
+
+/// [`run_config_has_host_network`] with the environment probe injected.
+fn run_config_has_host_network_with(config: &RunConfig, loopback_isolated: bool) -> bool {
+    crate::utils::feeds::host_network_shares_loopback(
+        config.container_args.as_deref().unwrap_or(&[]),
+        loopback_isolated,
+    )
 }
 
 /// The distro repository URL the container's `AVOCADO_SDK_REPO_URL` carries.
@@ -7215,6 +7226,14 @@ extensions:
                 run_config_has_host_network(&cfg),
             )
         };
+        // Host networking is only honoured where it shares loopback; the
+        // injected probe stands in for Docker Desktop / VM routing.
+        let hn_args = RunConfig {
+            container_args: Some(vec!["--network=host".to_string()]),
+            ..Default::default()
+        };
+        assert!(run_config_has_host_network_with(&hn_args, false));
+        assert!(!run_config_has_host_network_with(&hn_args, true));
         let (rewritten, hn) = url(None);
         assert!(rewritten.contains("host.docker.internal") && !hn);
         let (kept, hn) = url(Some(vec!["--network=host".to_string()]));

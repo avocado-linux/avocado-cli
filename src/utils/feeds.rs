@@ -72,6 +72,21 @@ pub fn args_have_host_network(args: &[String]) -> bool {
     })
 }
 
+/// True when host networking cannot share the developer machine's loopback:
+/// on Docker Desktop and under the avocado VM the container's "host" is a VM,
+/// and the deploy path strips `--network=host` there.
+pub fn host_network_is_isolated_from_developer_loopback() -> bool {
+    crate::utils::container::is_docker_desktop() || crate::utils::container::is_vm_routing_active()
+}
+
+/// True iff `args` request host networking AND it is in effect, so a
+/// `localhost` URL on the host is reachable from the container unchanged.
+/// `loopback_isolated` comes from
+/// [`host_network_is_isolated_from_developer_loopback`].
+pub fn host_network_shares_loopback(args: &[String], loopback_isolated: bool) -> bool {
+    !loopback_isolated && args_have_host_network(args)
+}
+
 /// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
 /// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
 /// user-net address for this machine instead.
@@ -454,6 +469,25 @@ impl ResolvedFeedSet {
         config_dir: &Path,
         releasever: Option<&str>,
     ) -> Result<Option<Self>> {
+        Self::resolve_with_loopback_isolated(
+            config,
+            target,
+            config_dir,
+            releasever,
+            host_network_is_isolated_from_developer_loopback(),
+        )
+    }
+
+    /// [`Self::resolve`] with the environment probe supplied by the caller:
+    /// `loopback_isolated` is true when host networking would not share the
+    /// developer machine's loopback (Docker Desktop, the avocado VM).
+    fn resolve_with_loopback_isolated(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        loopback_isolated: bool,
+    ) -> Result<Option<Self>> {
         let repos = config.repos.as_ref();
         let distro = config.distro.as_ref();
         let feeds_list = distro.and_then(|d| d.feeds.as_ref());
@@ -491,8 +525,10 @@ impl ResolvedFeedSet {
         }
         let empty = HashMap::new();
         let repos = repos.unwrap_or(&empty);
-        let host_network =
-            args_have_host_network(config.get_sdk_container_args().map_or(&[], |a| a));
+        let host_network = host_network_shares_loopback(
+            config.get_sdk_container_args().map_or(&[], |a| a),
+            loopback_isolated,
+        );
 
         // Validate definitions once, independent of enablement — in name order so
         // the first error reported is the same every run.
@@ -2964,7 +3000,7 @@ distro:
         let c = load(&format!(
             "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n{extra_key}{sdk}"
         ));
-        ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+        ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
             .unwrap()
             .unwrap()
     }
@@ -2978,33 +3014,84 @@ distro:
             .clone()
     }
 
+    fn local_feed_set_probed(container_args: Option<&str>, isolated: bool) -> ResolvedFeedSet {
+        let sdk = container_args
+            .map(|a| format!("sdk:\n  container_args: [{a}]\n"))
+            .unwrap_or_default();
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n{sdk}"
+        ));
+        ResolvedFeedSet::resolve_with_loopback_isolated(
+            &c,
+            "t",
+            Path::new("."),
+            Some("2026/next"),
+            isolated,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
     /// Install hashes the projection with its command-line container args in
-    /// hand and build does not. The decision reads project configuration alone,
-    /// so the stamp cannot depend on them.
+    /// hand and build does not. The decision reads `sdk.container_args` from
+    /// project configuration alone and its outcome reaches the stamp only as the
+    /// baseurl, so neither the probe nor the decision flag is a stamp field.
     #[test]
     fn stage_projection_equal_with_and_without_cli_args() {
-        let c = load(&format!(
-            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\nsdk:\n  container_args: [--privileged]\n"
-        ));
-        let cli = sv(&["--network=host"]);
-        // The merged view a container run would see differs ...
-        let merged = c.merge_sdk_container_args(Some(&cli)).unwrap();
-        assert!(args_have_host_network(&merged));
-        assert!(!args_have_host_network(c.get_sdk_container_args().unwrap()));
-        // ... but resolve takes no command-line args, so both stages agree.
-        let install = ResolvedFeedSet::resolve(&c, "t", Path::new("."), Some("2026/next"))
-            .unwrap()
-            .unwrap();
-        let build = ResolvedFeedSet::resolve(&c, "t", Path::new("."), Some("2026/next"))
-            .unwrap()
-            .unwrap();
         for stage in [FeedStage::Ext, FeedStage::Rootfs] {
+            // Where host networking is not in effect, the flag changes nothing.
+            let with = local_feed_set_probed(Some("--network=host"), true);
+            let without = local_feed_set_probed(None, true);
             assert_eq!(
-                install.stage_projection_json(stage).unwrap(),
-                build.stage_projection_json(stage).unwrap()
+                with.stage_projection_json(stage).unwrap(),
+                without.stage_projection_json(stage).unwrap()
+            );
+            assert_eq!(
+                with.canonical_json().unwrap(),
+                without.canonical_json().unwrap()
+            );
+            // Container args other than host networking never reach the stamp.
+            for isolated in [true, false] {
+                assert_eq!(
+                    local_feed_set_probed(Some("--privileged"), isolated)
+                        .stage_projection_json(stage)
+                        .unwrap(),
+                    local_feed_set_probed(None, isolated)
+                        .stage_projection_json(stage)
+                        .unwrap()
+                );
+            }
+            // Where it is in effect, the only difference is the baseurl: the
+            // decision and the probe are not serialized.
+            let shared = local_feed_set_probed(Some("--network=host"), false);
+            let doc = shared.canonical_json().unwrap();
+            assert!(
+                !doc.contains("rewrite_loopback") && !doc.contains("isolated"),
+                "{doc}"
+            );
+            assert_eq!(
+                doc.replace("http://localhost:8080", HOST_GATEWAY_ALIAS_URL),
+                without.canonical_json().unwrap()
             );
         }
-        assert!(local_baseurl(&install).contains(HOST_GATEWAY_ALIAS));
+    }
+
+    const HOST_GATEWAY_ALIAS_URL: &str = "http://host.docker.internal:8080";
+
+    #[test]
+    fn host_network_only_shares_loopback_when_in_effect() {
+        let hn = sv(&["--network=host"]);
+        assert!(host_network_shares_loopback(&hn, false));
+        assert!(!host_network_shares_loopback(&hn, true));
+        assert!(!host_network_shares_loopback(&sv(&[]), false));
+    }
+
+    #[test]
+    fn loopback_is_rewritten_when_host_network_is_not_in_effect() {
+        let isolated = local_feed_set_probed(Some("--network=host"), true);
+        assert!(local_baseurl(&isolated).contains(HOST_GATEWAY_ALIAS));
+        let shared = local_feed_set_probed(Some("--network=host"), false);
+        assert_eq!(local_baseurl(&shared), "http://localhost:8080");
     }
 
     #[test]
@@ -3045,13 +3132,32 @@ distro:
         );
     }
 
-    #[test]
-    fn connect_feed_stores_the_rewrite_decision() {
+    /// One canned feed-token response on an ephemeral loopback port.
+    async fn serve_mint_once(feed_url: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = format!(r#"{{"token":"t","tier":1,"feed_url":"{feed_url}"}}"#);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn connect_feed_stores_the_rewrite_decision() {
         let mk = |extra: &str| {
             let c = load(&format!(
                 "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: acme\n{extra}"
             ));
-            ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
                 .unwrap()
                 .unwrap()
         };
@@ -3065,6 +3171,26 @@ distro:
         assert!(flag(&mk("")));
         assert!(!flag(&mk("    rewrite_loopback: false\n")));
         assert!(!flag(&mk("sdk:\n  container_args: [--net=host]\n")));
+
+        // The stored decision drives the minted base URL.
+        for (extra, want_rewritten) in [("", true), ("    rewrite_loopback: false\n", false)] {
+            let mut set = mk(extra);
+            let api = serve_mint_once("http://localhost:9999/feeds").await;
+            std::env::set_var("AVOCADO_CONNECT_TOKEN", "tok");
+            std::env::set_var("AVOCADO_CONNECT_URL", &api);
+            let res = set.resolve_connect_credentials(FeedStage::Ext).await;
+            std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+            std::env::remove_var("AVOCADO_CONNECT_URL");
+            res.unwrap();
+            let feed = set.feeds.iter().find(|f| f.name == "acme").unwrap();
+            assert_eq!(feed.loopback_rewritten, want_rewritten);
+            assert_eq!(
+                feed.baseurl.contains(HOST_GATEWAY_ALIAS),
+                want_rewritten,
+                "{}",
+                feed.baseurl
+            );
+        }
     }
 
     #[test]
