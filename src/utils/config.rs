@@ -15212,3 +15212,51 @@ supported_targets: [raspberrypi0-2w, raspberrypi4]
         assert_eq!(got.as_deref(), Some("env/rv"));
     }
 }
+
+#[cfg(test)]
+mod enabled_flag_ruling_tests {
+    use super::*;
+
+    const YAML: &str = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - on-ext
+        - shipped-off:
+            enabled: false
+extensions:
+  on-ext:
+    version: "1.0.0"
+  shipped-off:
+    version: "1.0.0"
+"#;
+
+    /// Ruling 1.4: `enabled: false` keeps current semantics. The flag only
+    /// controls whether an extension ships in the runtime image; the extension
+    /// is still fetched at SDK install, so the active set includes it.
+    #[test]
+    fn test_find_active_extensions_follows_ruling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, YAML).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let active = find_active_extensions(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            config_path,
+            None,
+        )
+        .expect("active extensions");
+
+        let mut names: Vec<_> = active.into_iter().collect();
+        names.sort();
+        assert_eq!(names, vec!["on-ext", "shipped-off"]);
+    }
+}

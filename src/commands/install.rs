@@ -1042,6 +1042,51 @@ extensions:
         );
     }
 
+    /// Ruling 1.4: a shipped-but-off (`enabled: false`) extension is still in
+    /// the install command's own extension list, so it is still fetched.
+    #[test]
+    fn test_install_required_extensions_follow_ruling() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - on-ext
+        - shipped-off:
+            enabled: false
+extensions:
+  on-ext:
+    version: "1.0.0"
+  shipped-off:
+    version: "1.0.0"
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let cmd = InstallCommand::new(
+            config_path.to_string(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let names: Vec<String> = cmd
+            .find_required_extensions(&composed, "qemux86-64")
+            .expect("required extensions")
+            .into_iter()
+            .map(|ExtensionDependency::Local(n)| n)
+            .collect();
+        assert_eq!(names, vec!["on-ext", "shipped-off"]);
+    }
+
     #[test]
     fn ext_install_waits_on_the_base_it_seeds_from() {
         let base = TaskId::ExtInstall("weston-base".to_string());
