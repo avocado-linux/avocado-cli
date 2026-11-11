@@ -90,8 +90,30 @@ pub(crate) fn resolve_remote_ext_config(
     ))
 }
 
+/// An extension config's `version` as a string: a number is printed whole.
+/// An empty one is no version: an unset `{{ env.X }}` renders empty.
+pub(crate) fn ext_config_version(ext_config: &serde_yaml::Value) -> Option<String> {
+    let v = ext_config.get("version")?;
+    let version = v.as_str().map(str::to_string).unwrap_or_else(|| {
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .unwrap_or(0)
+            .to_string()
+    });
+    (!version.is_empty()).then_some(version)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_version_is_no_version() {
+        let version = |y: &str| super::ext_config_version(&serde_yaml::from_str(y).unwrap());
+        assert_eq!(version("version: '1.2.0'"), Some("1.2.0".to_string()));
+        assert_eq!(version("version: 3"), Some("3".to_string()));
+        assert_eq!(version("version: ''"), None);
+        assert_eq!(version("name: x"), None);
+    }
+
     use super::*;
 
     fn make_config(yaml: &str) -> serde_yaml::Value {

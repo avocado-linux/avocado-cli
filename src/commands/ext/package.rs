@@ -540,9 +540,10 @@ fi
         let version = ext_config
             .get("version")
             .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Extension '{}' is missing required 'version' field for RPM packaging",
+                    "Extension '{}' has a missing or empty 'version' field for RPM packaging",
                     self.extension
                 )
             })?
@@ -1690,7 +1691,7 @@ extensions:
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("missing required 'version' field"));
+            .contains("missing or empty 'version' field"));
     }
 
     #[test]

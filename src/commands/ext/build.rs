@@ -710,26 +710,14 @@ impl ExtBuildCommand {
 
         // Get extension version from the composed config (source of truth).
         // For remote extensions, the version comes from the merged remote extension avocado.yaml.
-        let config_version = ext_config
-            .get("version")
-            .map(|v| {
-                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                    format!(
-                        "{}",
-                        v.as_i64()
-                            .or_else(|| v.as_f64().map(|f| f as i64))
-                            .unwrap_or(0)
-                    )
-                })
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Extension '{}' is missing a 'version' field. \
-                 Remote extensions must define 'version' in their avocado.yaml. \
-                 Check that the extension config was parsed and merged correctly.",
-                    self.extension
-                )
-            })?;
+        let config_version = super::ext_config_version(&ext_config).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' has a missing or empty 'version' field. \
+                 Remote extensions must define 'version' in their avocado.yaml; \
+                 a templated one like '{{{{ env.X }}}}' is empty when X is unset.",
+                self.extension
+            )
+        })?;
 
         // Get overlay configuration
         let mut overlay_config = ext_config.get("overlay").map(|v| {

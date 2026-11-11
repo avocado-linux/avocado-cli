@@ -1641,22 +1641,11 @@ echo -n '}}'
             for (ext_name_val, ext_data) in ext_config {
                 if let Some(ext_name) = ext_name_val.as_str() {
                     if all_required_extensions.contains(ext_name) {
-                        let ext_version = ext_data
-                            .get("version")
-                            .map(|v| {
-                                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                                    format!(
-                                        "{}",
-                                        v.as_i64()
-                                            .or_else(|| v.as_f64().map(|f| f as i64))
-                                            .unwrap_or(0)
-                                    )
-                                })
-                            })
+                        let ext_version = crate::commands::ext::ext_config_version(ext_data)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "Extension '{ext_name}' is missing a 'version' field. \
-                                 Check that the extension config was parsed and merged correctly."
+                                    "Extension '{ext_name}' has a missing or empty 'version' field. \
+                                 A templated one like '{{{{ env.X }}}}' is empty when X is unset."
                                 )
                             })?;
 

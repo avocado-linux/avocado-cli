@@ -529,9 +529,10 @@ impl ExtImageCommand {
         let config_version = ext_config
             .get("version")
             .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Extension '{}' is missing required 'version' field",
+                    "Extension '{}' has a missing or empty 'version' field",
                     self.extension
                 )
             })?;
