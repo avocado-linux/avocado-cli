@@ -562,6 +562,12 @@ impl SdkInstallCommand {
             None,
         )?;
 
+        // Before the first download. `active_extensions` ignores `enabled`, so an
+        // `enabled: false` extension still needs the extension repository.
+        config
+            .preflight_feeds_once(&target, &self.config_path, !active_extensions.is_empty())
+            .await?;
+
         print_info("Installing SDK dependencies.", OutputLevel::Normal);
 
         // Get SDK dependencies from the composed config (already has external deps merged)

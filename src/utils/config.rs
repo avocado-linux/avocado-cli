@@ -4524,7 +4524,38 @@ async fn invocation_feeds(
     .cloned()
 }
 
+/// Targets whose feed repositories this process has already probed.
+static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
 impl Config {
+    /// Fail before the first download when a feed repository is unreachable.
+    ///
+    /// `install` and `sdk install` both call this on the way in, and `install`
+    /// runs the SDK install, so the probes are keyed by target and run once per
+    /// invocation. The lock is held across the probes so two concurrent callers
+    /// do not both run them. Only a pass is recorded; a failure ends the command.
+    /// Resolution is repeated here rather than shared with `materialize_feeds`,
+    /// which runs later and needs the mint this check must precede.
+    pub async fn preflight_feeds_once(
+        &self,
+        target: &str,
+        config_path: &str,
+        needs_extension_repo: bool,
+    ) -> Result<()> {
+        let probed = FEEDS_PROBED.get_or_init(Default::default);
+        let mut done = probed.lock().await;
+        if done.contains(target) {
+            return Ok(());
+        }
+        let project_root = self.project_root(config_path);
+        let set = crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?;
+        crate::utils::feeds::preflight_feeds(self, set.as_ref(), target, needs_extension_repo)
+            .await?;
+        done.insert(target.to_string());
+        Ok(())
+    }
+
     /// Resolve, record, and materialize the named feeds for one container run.
     /// `None` when the project declares no feeds — the zero-cost path. The first
     /// call for a target writes the canonical document to
@@ -14946,6 +14977,45 @@ mod invocation_feeds_tests {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(&format!("avocado-feeds-{}-", std::process::id())));
         assert!(FEED_DIRS.lock().unwrap().iter().any(|d| d == path));
+    }
+
+    /// `install` and `sdk install` both call the hook on the way to the first
+    /// download; the feeds must be asked about once between them.
+    #[tokio::test]
+    async fn probe_runs_once_per_invocation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\nrepos:\n  local:\n    url: http://{addr}/feed\n"
+        ))
+        .unwrap();
+        let cfg = cfg.to_str().unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, false)
+            .await
+            .unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }
 

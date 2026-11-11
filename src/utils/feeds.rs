@@ -1650,8 +1650,6 @@ impl Probe<'_> {
 /// Unlike [`ResolvedFeedSet::check_addons`], which tolerates an unreadable
 /// index with a warning, an unreachable feed here is an error: dnf would
 /// otherwise fail the same way later with less to say about which feed.
-// Called by the install and SDK install commands once they wire it in.
-#[allow(dead_code)]
 pub async fn preflight_feeds(
     config: &Config,
     feeds: Option<&ResolvedFeedSet>,

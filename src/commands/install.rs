@@ -204,6 +204,16 @@ impl InstallCommand {
         // channel snapshot — auto-pinning on first fetch, reusing the pin after.
         crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &_target).await?;
 
+        // Probe the feeds before the first download. The SDK install step runs
+        // the same hook, which is a no-op once this has passed. `enabled: false`
+        // extensions count: they are fetched regardless of the flag.
+        let needs_extension_repo = !self
+            .find_required_extensions(&composed, &_target)?
+            .is_empty();
+        config
+            .preflight_feeds_once(&_target, &self.config_path, needs_extension_repo)
+            .await?;
+
         // Compute target runtimes early so we can show a useful start message.
         let initial_runtimes = self.find_target_relevant_runtimes(config, _parsed, &_target)?;
         if initial_runtimes.len() == 1 {
