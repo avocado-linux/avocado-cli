@@ -2244,6 +2244,18 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
                         | ContainerDevCommands::Prune
                 }
             }
+    ) || matches!(
+        cmd,
+        // These compose the project, reading installed BSPs' run profiles,
+        // wiring and console out of the SDK volume. The rest only talk to
+        // hubs, and routing may auto-start the VM.
+        Commands::Rubicon(args) if matches!(
+            args.command,
+            RubiconCommands::Run { .. }
+                | RubiconCommands::Show { .. }
+                | RubiconCommands::Console { .. }
+                | RubiconCommands::Logs { .. }
+        )
     )
 }
 
@@ -6056,6 +6068,35 @@ mod tests {
     /// Docker socket and fails. The pin advance still succeeds and the failure
     /// only prints at INFO, so the user sees success while the stamps still
     /// read current and the next install skips dnf.
+    #[test]
+    fn needs_vm_routing_gates_rubicon_commands_that_compose_the_project() {
+        let routed = |args: &[&str]| {
+            needs_vm_routing(
+                &Cli::try_parse_from(args)
+                    .expect("args should parse")
+                    .command,
+            )
+        };
+        for c in [
+            &["run", "enter-recovery"][..],
+            &["show"],
+            &["console"],
+            &["logs"],
+        ] {
+            let args = [&["avocado", "rubicon"][..], c].concat();
+            assert!(routed(&args), "{args:?} reads BSPs from the SDK volume");
+        }
+        for c in [
+            &["list"][..],
+            &["add", "10.0.0.1"],
+            &["claim"],
+            &["cancel", "j"],
+        ] {
+            let args = [&["avocado", "rubicon"][..], c].concat();
+            assert!(!routed(&args), "{args:?} only talks to hubs");
+        }
+    }
+
     #[test]
     fn needs_vm_routing_gates_update() {
         let cmd = |args: &[&str]| {
