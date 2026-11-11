@@ -672,8 +672,10 @@ fi
 
 VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 # mkfs.btrfs writes into an existing file without shrinking it, so a var
-# image left by an earlier, larger provision would keep that size.
-rm -f "$VAR_IMAGE"
+# image left by an earlier, larger provision would keep that size. Truncate
+# rather than remove: mkfs.btrfs stats the target for zoned support first and
+# prints "ERROR: zoned: unable to stat" when it does not exist yet.
+: > "$VAR_IMAGE"
 VAR_INPUT_SIZE=$(du -sb "$VAR_DIR" 2>/dev/null | awk '{{print $1}}')
 VAR_INPUT_MB=$(( VAR_INPUT_SIZE / 1048576 ))
 echo "Building var image (${{VAR_INPUT_MB}}MB source)..."
@@ -1231,7 +1233,9 @@ stone() {
         std::fs::write(
             &mkfs,
             "#!/bin/sh\nls \"$AVOCADO_IMAGES_DIR\" > \"$OUTPUT_DIR/packed\"\n\
-             while [ $# -gt 1 ]; do shift; done; echo img >> \"$1\"\n",
+             while [ $# -gt 1 ]; do shift; done\n\
+             [ -e \"$1\" ] || { echo 'ERROR: zoned: unable to stat' >&2; exit 1; }\n\
+             echo img >> \"$1\"\n",
         )
         .unwrap();
         if mkfs_fails {
