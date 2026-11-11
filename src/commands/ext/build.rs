@@ -1414,6 +1414,9 @@ release_file="$release_dir/extension-release.{}-{}"
 modules_dir="$AVOCADO_EXT_SYSROOTS/{}/usr/lib/modules"
 
 mkdir -p "$release_dir"
+# The sysroot outlives a version bump: drop every earlier version's file,
+# or the image ships them all and each one's hooks run on merge.
+rm -f "$release_dir/extension-release.{3}"-* "$release_dir/extension-release.{3}"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "SYSEXT_SCOPE={}" >> "$release_file"
@@ -1635,6 +1638,9 @@ release_dir="$AVOCADO_EXT_SYSROOTS/{}/etc/extension-release.d"
 release_file="$release_dir/extension-release.{}-{}"
 
 mkdir -p "$release_dir"
+# The sysroot outlives a version bump: drop every earlier version's file,
+# or the image ships them all and each one's hooks run on merge.
+rm -f "$release_dir/extension-release.{3}"-* "$release_dir/extension-release.{3}"
 echo "ID=_any" > "$release_file"
 echo "EXTENSION_RELOAD_MANAGER={}" >> "$release_file"
 echo "CONFEXT_SCOPE={}" >> "$release_file"
@@ -3386,6 +3392,73 @@ extensions:
             sysroot.join("usr/lib/extension-release.d/extension-release.kmod-ext-1.0"),
         )
         .unwrap()
+    }
+
+    /// A version bump rebuilds into the same sysroot. Each build must leave
+    /// exactly its own release file per type: an old one ships in the image
+    /// and its AVOCADO_ON_MERGE hooks run on the device next to the new ones.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_bump_leaves_only_the_current_release_file() {
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sysroot = tmp.path().join("sysroots/app");
+        std::fs::create_dir_all(&sysroot).unwrap();
+        let scopes = ["system".to_string()];
+        let run = |script: String| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("AVOCADO_EXT_SYSROOTS", tmp.path().join("sysroots"))
+                .env("AVOCADO_PREFIX", tmp.path().join("prefix"))
+                .output()
+                .expect("run script");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        for version in ["0.1.0", "0.1.1"] {
+            let hook = [format!("echo {version}")];
+            run(cmd.create_sysext_build_script(
+                version,
+                &scopes,
+                None,
+                &[],
+                &hook,
+                &[],
+                None,
+                None,
+                false,
+                "/opt/src",
+            ));
+            run(cmd.create_confext_build_script(
+                version,
+                &scopes,
+                None,
+                &[],
+                &hook,
+                &[],
+                None,
+                None,
+                false,
+                "/opt/src",
+            ));
+        }
+        for dir in ["usr/lib", "etc"] {
+            let d = sysroot.join(dir).join("extension-release.d");
+            let mut names: Vec<String> = std::fs::read_dir(&d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["extension-release.app-0.1.1"], "{dir}");
+        }
     }
 
     /// The on_merge lines of a release file, in order.
