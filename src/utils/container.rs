@@ -902,12 +902,20 @@ fn run_config_has_host_network_with(config: &RunConfig, loopback_isolated: bool)
 /// host-networking decision alone; `repos.*.rewrite_loopback` does not apply to
 /// the distro feed.
 fn distro_repo_url_for_container(config: &RunConfig) -> String {
+    distro_repo_url_for_container_with(
+        config,
+        crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+    )
+}
+
+/// [`distro_repo_url_for_container`] with the environment probe injected.
+fn distro_repo_url_for_container_with(config: &RunConfig, loopback_isolated: bool) -> String {
     crate::utils::feeds::rewrite_loopback_reported(
         &config
             .repo_url
             .clone()
             .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-        run_config_has_host_network(config),
+        run_config_has_host_network_with(config, loopback_isolated),
     )
 }
 
@@ -7215,29 +7223,25 @@ extensions:
 
     #[test]
     fn distro_repo_url_follows_host_networking_of_the_run() {
-        let url = |args: Option<Vec<String>>| {
+        let url = |args: Option<Vec<String>>, isolated: bool| {
             let cfg = RunConfig {
                 repo_url: Some("http://localhost:9000".to_string()),
                 container_args: args,
                 ..Default::default()
             };
             (
-                distro_repo_url_for_container(&cfg),
-                run_config_has_host_network(&cfg),
+                distro_repo_url_for_container_with(&cfg, isolated),
+                run_config_has_host_network_with(&cfg, isolated),
             )
         };
-        // Host networking is only honoured where it shares loopback; the
-        // injected probe stands in for Docker Desktop / VM routing.
-        let hn_args = RunConfig {
-            container_args: Some(vec!["--network=host".to_string()]),
-            ..Default::default()
-        };
-        assert!(run_config_has_host_network_with(&hn_args, false));
-        assert!(!run_config_has_host_network_with(&hn_args, true));
-        let (rewritten, hn) = url(None);
+        let host = Some(vec!["--network=host".to_string()]);
+        let (rewritten, hn) = url(None, false);
         assert!(rewritten.contains("host.docker.internal") && !hn);
-        let (kept, hn) = url(Some(vec!["--network=host".to_string()]));
+        let (kept, hn) = url(host.clone(), false);
         assert_eq!(kept, "http://localhost:9000");
         assert!(hn);
+        // Docker Desktop / VM routing: host networking is not in effect.
+        let (rewritten, hn) = url(host, true);
+        assert!(rewritten.contains("host.docker.internal") && !hn);
     }
 }
