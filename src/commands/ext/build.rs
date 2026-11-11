@@ -2023,6 +2023,8 @@ fi
 ///
 /// Each command is escaped, so it reaches the release file as written and
 /// never runs in the build container. avocadoctl splits it on the device.
+/// `printf '%s\n'` rather than `echo`: some shells' `echo` expands `\n`,
+/// `\c` and `\\` in its argument.
 fn release_hook_section(key: &str, commands: &[String], log: impl Fn(&str) -> String) -> String {
     commands
         .iter()
@@ -2030,8 +2032,8 @@ fn release_hook_section(key: &str, commands: &[String], log: impl Fn(&str) -> St
             let command = shell_escape_double_quoted(command);
             let log = log(&command);
             format!(
-                r#"echo "{key}=\"{command}\"" >> "$release_file"
-echo "{log}""#
+                r#"printf '%s\n' "{key}=\"{command}\"" >> "$release_file"
+printf '%s\n' "{log}""#
             )
         })
         .collect::<Vec<_>>()
@@ -3775,15 +3777,15 @@ extensions:
         assert!(script.contains("[INFO] Found kernel modules in extension 'test-ext', added AVOCADO_ON_MERGE=\\\"depmod\\\" to release file"));
 
         // Verify separate modprobe commands are added
-        assert!(
-            script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe nfs\\\"\" >> \"$release_file\"")
-        );
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe nfs\\\"\" >> \"$release_file\""
+        ));
         assert!(
             script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe nfs\\\" to release file")
         );
-        assert!(
-            script.contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe ext4\\\"\" >> \"$release_file\"")
-        );
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe ext4\\\"\" >> \"$release_file\""
+        ));
         assert!(
             script.contains("[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe ext4\\\" to release file")
         );
@@ -3958,6 +3960,7 @@ extensions:
             format!("echo $(touch {})", marker.display()),
             format!("echo `touch {}`", marker.display()),
             r"echo back\slash $HOME".to_string(),
+            r"printf a\nb stop\c here two\\back".to_string(),
         ];
         let on_unmerge = vec![r#"echo "bye""#.to_string()];
         let scopes = ["system".to_string()];
@@ -4202,12 +4205,14 @@ extensions:
 
         // Verify custom on_merge commands are added as separate entries
         assert!(script.contains(
-            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added custom on_merge command to release file: systemctl restart sshd.socket"
         ));
-        assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo test\\\"\" >> \"$release_file\""));
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"echo test\\\"\" >> \"$release_file\""
+        ));
         assert!(script.contains("[INFO] Added custom on_merge command to release file: echo test"));
     }
 
@@ -4243,13 +4248,14 @@ extensions:
 
         // Verify custom on_unmerge commands are added as separate entries
         assert!(script.contains(
-            "echo \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added custom on_unmerge command to release file: systemctl stop myservice.service"
         ));
-        assert!(script
-            .contains("echo \"AVOCADO_ON_UNMERGE=\\\"echo cleanup\\\"\" >> \"$release_file\""));
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_UNMERGE=\\\"echo cleanup\\\"\" >> \"$release_file\""
+        ));
         assert!(
             script.contains("[INFO] Added custom on_unmerge command to release file: echo cleanup")
         );
@@ -4284,7 +4290,7 @@ extensions:
 
         // Verify custom on_unmerge commands are added as separate entries
         assert!(script.contains(
-            "echo \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_UNMERGE=\\\"systemctl stop myservice.service\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added custom on_unmerge command to release file: systemctl stop myservice.service"
@@ -4320,7 +4326,7 @@ extensions:
 
         // Verify custom on_merge commands are added as separate entries
         assert!(script.contains(
-            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"systemctl restart sshd.socket\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added custom on_merge command to release file: systemctl restart sshd.socket"
@@ -4427,13 +4433,13 @@ extensions:
 
         // Verify separate modprobe commands are added
         assert!(script.contains(
-            "echo \"AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe gpio-pca953x\\\" to release file"
         ));
         assert!(script.contains(
-            "echo \"AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\"\" >> \"$release_file\""
         ));
         assert!(script.contains(
             "[INFO] Added AVOCADO_ON_MERGE=\\\"modprobe rtc-pcf8563w\\\" to release file"
@@ -4478,18 +4484,20 @@ extensions:
         // Verify that each command gets its own separate AVOCADO_ON_MERGE entry
         // Kernel modules section
         assert!(script.contains("echo \"AVOCADO_ON_MERGE=\\\"depmod\\\"\" >> \"$release_file\""));
-        assert!(script
-            .contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module1\\\"\" >> \"$release_file\""));
-        assert!(script
-            .contains("echo \"AVOCADO_ON_MERGE=\\\"modprobe module2\\\"\" >> \"$release_file\""));
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe module1\\\"\" >> \"$release_file\""
+        ));
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"modprobe module2\\\"\" >> \"$release_file\""
+        ));
 
         // Custom commands section
         assert!(script.contains(
-            "echo \"AVOCADO_ON_MERGE=\\\"systemctl restart service1\\\"\" >> \"$release_file\""
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"systemctl restart service1\\\"\" >> \"$release_file\""
         ));
-        assert!(
-            script.contains("echo \"AVOCADO_ON_MERGE=\\\"echo 'test'\\\"\" >> \"$release_file\"")
-        );
+        assert!(script.contains(
+            "printf '%s\\n' \"AVOCADO_ON_MERGE=\\\"echo 'test'\\\"\" >> \"$release_file\""
+        ));
 
         // Verify no semicolon-separated commands
         assert!(!script.contains("depmod; modprobe"));

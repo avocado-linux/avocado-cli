@@ -2163,6 +2163,7 @@ fn ext_build_hash_data(
             "image",
             "version",
             "enable_services",
+            "modprobe",
             "on_merge",
             "on_unmerge",
             "sysusers",
@@ -7235,6 +7236,16 @@ find() {
             "    var_files:\n      - \"var/lib/docker/**\"\n    subvolumes:\n      lib/x:\n        nodatacow: true",
         );
         assert_eq!(ext_build_hash(&base), ext_build_hash(&with));
+    }
+
+    /// `ext build` writes each `modprobe` entry to the release file, so a
+    /// change to the list alone must rebuild, not report "up to date".
+    #[test]
+    fn ext_build_hash_includes_modprobe() {
+        let base = ext_with_extras("    modprobe: [uvcvideo]");
+        let changed = ext_with_extras("    modprobe: [uvcvideo, br_netfilter]");
+        assert_ne!(ext_build_hash(&base), ext_build_hash(&changed));
+        assert_ne!(ext_build_hash(&ext_with_extras("")), ext_build_hash(&base));
     }
 
     #[test]
