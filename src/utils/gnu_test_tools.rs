@@ -12,10 +12,13 @@ use std::path::{Path, PathBuf};
 /// (name the script calls, GNU program on a macOS host)
 const TOOLS: [(&str, &str); 2] = [("tar", "gtar"), ("sed", "gsed")];
 
+/// Absolute path of `program` on `PATH`. A relative `PATH` entry would give a
+/// link in the stub `bin` dir that points nowhere, so the result is resolved.
 fn find_on_path(program: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(program))
         .find(|p| p.is_file())
+        .and_then(|p| std::fs::canonicalize(p).ok())
 }
 
 /// True on a macOS host without `gtar` or `gsed`, after printing how to
