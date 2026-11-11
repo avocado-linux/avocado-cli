@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn bad_modprobe_and_hook_entries_are_errors() {
         let errs = errors(
-            "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: [app]\nextensions:\n  app:\n    modprobe: [uvcvideo, \"nvidia $(reboot)\"]\n    on_merge: [\"echo one\\necho two\"]\n",
+            "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: [app]\nextensions:\n  app:\n    modprobe: [uvcvideo, \"nvidia -r\", \"i915 force_probe=*\"]\n    on_merge: [\"echo one\\necho two\", \"echo \\\"hi\\\"\", \"sh -c 'echo hi'\"]\n",
         );
         assert!(
             errs.iter()
@@ -1129,8 +1129,25 @@ mod tests {
             "{errs:?}"
         );
         assert!(
+            !errs
+                .iter()
+                .any(|e| e.starts_with("/extensions/app/modprobe/2 ")),
+            "{errs:?}"
+        );
+        assert!(
             errs.iter()
                 .any(|e| e.starts_with("/extensions/app/on_merge/0 ")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/extensions/app/on_merge/1 ")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.starts_with("/extensions/app/on_merge/2 ")),
             "{errs:?}"
         );
     }

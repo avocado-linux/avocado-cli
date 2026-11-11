@@ -2043,8 +2043,10 @@ printf '%s\n' "{log}""#
 /// Check the `modprobe`, `on_merge` and `on_unmerge` entries of an extension.
 ///
 /// Each entry becomes one line of the release file, which avocadoctl reads
-/// line by line, so an entry must not hold a line break. A `modprobe` entry
-/// is a module name, then optional parameters such as `param=value`.
+/// line by line, so an entry must not hold a line break. avocadoctl then
+/// splits the line on whitespace and runs it with no shell, so a double quote
+/// would reach the command as a literal character. A `modprobe` entry is a
+/// module name, then optional parameters such as `param=value`.
 fn check_hook_entries(
     extension: &str,
     modprobe_modules: &[String],
@@ -2070,26 +2072,33 @@ fn check_hook_entries(
                  Put each command in its own list item."
             ));
         }
+        if let Some(entry) = commands.iter().find(|c| c.contains('"')) {
+            return Err(anyhow::anyhow!(
+                "Extension '{extension}' has an {key} entry with a double quote: {entry:?}. \
+                 avocadoctl runs {key} commands without a shell, so the quotes would be \
+                 passed to the command. Remove them. For an argument with spaces, call a \
+                 script shipped in the extension."
+            ));
+        }
     }
     Ok(())
 }
 
 /// A module name, then zero or more parameters, separated by spaces.
-/// Parameters are unquoted, because avocadoctl splits the line on whitespace.
+/// avocadoctl splits the line on whitespace and runs modprobe with no shell,
+/// so a parameter may hold any character except whitespace and `"`. No word
+/// may start with `-`, or modprobe would read it as an option such as `-r`.
 /// The schema's `modprobe` item pattern accepts the same entries.
 fn is_valid_modprobe_entry(entry: &str) -> bool {
     let is_module_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
-    let is_param_char = |c: char| {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ',' | ':' | '/' | '=' | '+')
-    };
+    let is_param_char = |c: char| !c.is_whitespace() && c != '"';
     let mut words = entry.split(' ').filter(|w| !w.is_empty());
     let Some(module) = words.next() else {
         return false;
     };
-    // A leading '-' would make modprobe read the module name as an option.
     !module.starts_with('-')
         && module.chars().all(is_module_char)
-        && words.all(|w| w.chars().all(is_param_char))
+        && words.all(|w| !w.starts_with('-') && w.chars().all(is_param_char))
 }
 
 /// The text to warn with when an extension lists `modprobe` but does not build
@@ -2206,19 +2215,25 @@ mod tests {
         "usbcore quirks=0bda:8153:k autosuspend=-1",
         "snd-hda-intel model=auto,generic power_save=1",
         "brcmfmac firmware_path=/lib/firmware/brcm",
+        "i915 force_probe=*",
+        "i915 force_probe=!4571",
+        "netconsole netconsole=6665@10.0.0.1/eth0,6666@10.0.0.2/00:11:22:33:44:55",
+        "dummy numdummies=2 ",
     ];
 
     const INVALID_MODPROBE_ENTRIES: &[&str] = &[
         "",
         " ",
         r#"nvidia "x""#,
-        "nvidia $(reboot)",
-        "nvidia `reboot`",
-        "nvidia; reboot",
+        r#"nvidia NVreg_EnableGpuFirmware="0""#,
         "nvidia\nreboot",
         "nvidia\treboot",
+        "nvidia param=a\u{a0}b",
         "-v nvidia",
-        "nvidia param='a'",
+        "nvidia -r",
+        "uvcvideo --remove",
+        "nvidia -q",
+        "nvidia; reboot",
     ];
 
     #[test]
@@ -2262,13 +2277,55 @@ mod tests {
         }
     }
 
+    /// The schema's `on_merge` and `on_unmerge` item patterns must agree with
+    /// the build check.
+    #[test]
+    fn the_schema_hook_patterns_match_the_build_check() {
+        let entries = [
+            "systemctl restart --no-block app.service",
+            "sh -c 'echo hi'",
+            "echo $(date)",
+            "",
+            r#"echo "hi""#,
+            r#"FOO="bar""#,
+            "echo one\necho two",
+            "echo one\r",
+        ];
+        for key in ["on_merge", "on_unmerge"] {
+            let pattern = crate::utils::config_lint::schema()["definitions"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find_map(|d| d.pointer(&format!("/properties/{key}/items/pattern")))
+                .and_then(|p| p.as_str())
+                .expect("schema has a hook item pattern");
+            let re = regex::Regex::new(pattern).unwrap();
+            for entry in entries {
+                let hooks = [entry.to_string()];
+                assert_eq!(
+                    re.is_match(entry),
+                    check_hook_entries("my-ext", &[], &hooks, &hooks).is_ok(),
+                    "schema and build check disagree on {key} {entry:?}"
+                );
+            }
+        }
+    }
+
     /// A bad entry fails the build with a config error that shows the entry,
     /// not with a shell error from the build script.
     #[test]
     fn hook_entry_check_reports_the_bad_entry() {
         let ok = vec!["uvcvideo".to_string()];
-        let hooks = vec![r#"sh -c "echo $(date)""#.to_string()];
+        let hooks = vec![r"echo $(date) `id` back\slash 'single'".to_string()];
         assert!(check_hook_entries("my-ext", &ok, &hooks, &hooks).is_ok());
+
+        let quoted = vec![r#"systemctl set-environment FOO="bar""#.to_string()];
+        let err = check_hook_entries("my-ext", &ok, &quoted, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("on_merge"), "{err}");
+        assert!(err.contains("double quote"), "{err}");
+        assert!(err.contains(r#"FOO=\"bar\""#), "{err}");
 
         let bad = vec!["uvcvideo".to_string(), r#"nvidia "x""#.to_string()];
         let err = check_hook_entries("my-ext", &bad, &[], &[])
@@ -3943,7 +4000,9 @@ extensions:
     // An on_merge or on_unmerge entry reaches the release file exactly as
     // written. A quote must not break the build script, and `$(...)` or a
     // backtick must not run in the build container: avocadoctl splits the
-    // value itself on the device, with no shell.
+    // value itself on the device, with no shell. `check_hook_entries` rejects
+    // double quotes before the scripts are made; the script must still be
+    // safe without that check.
     #[cfg(unix)]
     #[test]
     fn hook_entries_reach_the_release_file_verbatim() {
@@ -4030,6 +4089,114 @@ extensions:
                 "{dir} release file:\n{release}"
             );
         }
+    }
+
+    /// The commands avocadoctl runs for `key` lines of a release file. This
+    /// mirrors `parse_avocado_on_merge_commands` and `execute_single_command`
+    /// in avocadoctl's `src/commands/ext.rs`: trim the value's outer quotes,
+    /// then split on whitespace and run it with no shell.
+    fn avocadoctl_commands(release: &str, key: &str) -> Vec<Vec<String>> {
+        release
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(&format!("{key}=")))
+            .map(|l| l.split_once('=').unwrap().1.trim_matches('"').trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.split_whitespace().map(String::from).collect())
+            .collect()
+    }
+
+    // Every entry the build accepts must run on the device as written: the
+    // words avocadoctl passes to the command are the words of the entry.
+    #[cfg(unix)]
+    #[test]
+    fn accepted_hook_entries_run_on_the_device_as_written() {
+        let hook_candidates = [
+            "systemctl restart --no-block app.service",
+            "sh -c 'echo hi'",
+            "echo $(date) `id` $HOME",
+            r"printf a\nb two\\back",
+            "  padded   words  ",
+            "",
+            r#"systemctl set-environment FOO="bar""#,
+            r#"echo "hi""#,
+        ];
+        let hooks: Vec<String> = hook_candidates
+            .iter()
+            .map(|h| h.to_string())
+            .filter(|h| {
+                let h = std::slice::from_ref(h);
+                check_hook_entries("app", &[], h, h).is_ok()
+            })
+            .collect();
+        let modprobe: Vec<String> = VALID_MODPROBE_ENTRIES
+            .iter()
+            .chain(INVALID_MODPROBE_ENTRIES)
+            .chain(&["nvidia $(touch x)", r"nvidia p=a\b"])
+            .map(|m| m.to_string())
+            .filter(|m| check_hook_entries("app", std::slice::from_ref(m), &[], &[]).is_ok())
+            .collect();
+        assert!(hooks.len() >= 5 && modprobe.len() >= 10);
+
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let script = cmd.create_sysext_build_script(
+            "1.0",
+            &["system".to_string()],
+            None,
+            &modprobe,
+            &hooks,
+            &hooks,
+            None,
+            None,
+            false,
+            "/opt/src",
+        );
+        std::fs::create_dir_all(tmp.path().join("sysroots/app")).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(tmp.path())
+            .env("AVOCADO_EXT_SYSROOTS", tmp.path().join("sysroots"))
+            .env("AVOCADO_PREFIX", tmp.path().join("prefix"))
+            .output()
+            .expect("run script");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let release = std::fs::read_to_string(
+            tmp.path()
+                .join("sysroots/app/usr/lib/extension-release.d/extension-release.app-1.0"),
+        )
+        .unwrap();
+
+        let words = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+        let hook_runs: Vec<Vec<String>> = hooks
+            .iter()
+            .map(|h| words(h))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let mut merge_runs: Vec<Vec<String>> = modprobe
+            .iter()
+            .map(|m| words(&format!("modprobe {m}")))
+            .collect();
+        merge_runs.extend(hook_runs.clone());
+        assert_eq!(
+            avocadoctl_commands(&release, "AVOCADO_ON_MERGE"),
+            merge_runs,
+            "release file:\n{release}"
+        );
+        assert_eq!(
+            avocadoctl_commands(&release, "AVOCADO_ON_UNMERGE"),
+            hook_runs,
+            "release file:\n{release}"
+        );
     }
 
     // With a .ko in the extension, depmod comes first, then each modprobe.
