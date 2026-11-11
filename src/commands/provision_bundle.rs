@@ -123,8 +123,8 @@ pub struct BundleMeta {
     pub small_files: Vec<SmallArchive>,
     pub created_at: String,
     pub cli_version: String,
-    /// What a hub runs on the Rubicon around this provision; absent when no
-    /// provision profile names a Rubicon run profile.
+    /// What a hub runs on the Rubicon around this provision, and how it reads
+    /// the console; absent when the config has no hooks, wiring or console.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rubicon: Option<BundleRubicon>,
     /// Path-sourced extensions, each a tar.gz of its directory; the bundled
@@ -162,7 +162,15 @@ pub fn bundle_rubicon(
         .flatten()
         .filter_map(|(name, p)| Some((name.clone(), p.rubicon.clone()?)))
         .collect();
-    if profiles.is_empty() {
+    let wiring = config
+        .rubicon
+        .as_ref()
+        .map(|r| r.wiring.clone())
+        .unwrap_or_default();
+    let console = config.rubicon.as_ref().and_then(|r| r.console.clone());
+    // Console settings and wiring are for the hub whether or not a profile
+    // has hooks (none: nothing runs around the provision).
+    if profiles.is_empty() && wiring.is_empty() && console.is_none() {
         return Ok(None);
     }
     // Flattened (`run:` steps expanded): the hub runs plain steps.
@@ -176,12 +184,8 @@ pub fn bundle_rubicon(
         default_profile,
         profiles,
         run,
-        wiring: config
-            .rubicon
-            .as_ref()
-            .map(|r| r.wiring.clone())
-            .unwrap_or_default(),
-        console: config.rubicon.as_ref().and_then(|r| r.console.clone()),
+        wiring,
+        console,
     }))
 }
 
@@ -1306,6 +1310,16 @@ provision:
 
         let none: Config = serde_yaml::from_str("provision:\n  usb: {}\n").unwrap();
         assert!(bundle_rubicon(&none, None).unwrap().is_none());
+
+        // No hooks, but the hub still needs the console rate and the wiring.
+        let console: Config = serde_yaml::from_str(
+            "rubicon:\n  console: { baud: 921600 }\n  wiring: { ssr1: REC }\nprovision:\n  usb: {}\n",
+        )
+        .unwrap();
+        let r = bundle_rubicon(&console, None).unwrap().unwrap();
+        assert!(r.profiles.is_empty() && r.run.is_empty());
+        assert_eq!(r.console.and_then(|c| c.baud), Some(921600));
+        assert_eq!(r.wiring["ssr1"], "REC");
     }
 
     #[test]
