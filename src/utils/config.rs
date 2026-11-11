@@ -2405,7 +2405,7 @@ impl Config {
     ///
     /// Runs BEFORE deserialization so the typed structs never see the
     /// `source:` block (which isn't in their schema).
-    fn merge_path_based_image_sections(
+    pub(crate) fn merge_path_based_image_sections(
         main_config: &mut serde_yaml::Value,
         config_path: &Path,
     ) -> Result<()> {

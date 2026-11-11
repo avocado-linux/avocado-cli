@@ -453,7 +453,8 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
 
 /// Archive each path-sourced extension's directory into `blobs` and return
 /// them with the config text the bundle carries, its path sources pointing
-/// at the copies a hub unpacks (`.avocado-bundle/ext/<name>`).
+/// at the copies a hub unpacks (`.avocado-bundle/ext/<name>`) and its
+/// path-sourced image sections inlined.
 pub fn pack_ext_sources(
     config_path: &Path,
     target: &str,
@@ -529,6 +530,23 @@ pub fn pack_ext_sources(
             if let Some(to) = moved.get(&preprocess_text(written, &resolved, &ctx)?) {
                 src.insert("path".into(), to.clone().into());
             }
+        }
+    }
+    // `rootfs`/`initramfs`/`kernel` from a path fragment: its section goes
+    // in over the declaration, as the build composed it (the fragment is not
+    // on the hub).
+    let mut merged = resolved.clone();
+    Config::merge_path_based_image_sections(&mut merged, config_path)?;
+    for key in ["rootfs", "initramfs", "kernel"] {
+        let from_path = doc
+            .get(key)
+            .and_then(|s| s.get("source"))
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("path");
+        if let (true, Some(section), Some(map)) = (from_path, merged.get(key), doc.as_mapping_mut())
+        {
+            map.insert(key.into(), section.clone());
         }
     }
     // The replay's directory is the project root: the carried copies above
@@ -1047,6 +1065,40 @@ mod tests {
             doc["extensions"]["bsp"]["source"]["path"].as_str(),
             Some(".avocado-bundle/ext/bsp")
         );
+    }
+
+    #[test]
+    fn path_sourced_image_sections_travel_inline() {
+        // The rootfs comes from a fragment beside the project; the hub has
+        // no such directory, so the bundled config carries the section.
+        let tmp = tempfile::tempdir().unwrap();
+        let frag = tmp.path().join("os/rootfs");
+        std::fs::create_dir_all(&frag).unwrap();
+        std::fs::write(
+            frag.join("avocado.yaml"),
+            "rootfs:\n  filesystem: erofs-lz4\n  packages:\n    pkg-rootfs: '*'\n",
+        )
+        .unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = project.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "default_target: t\nrootfs:\n  source:\n    type: path\n    path: ../os/rootfs\n",
+        )
+        .unwrap();
+        let (_, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(doc["rootfs"].get("source").is_none(), "{yaml}");
+        assert_eq!(doc["rootfs"]["filesystem"].as_str(), Some("erofs-lz4"));
+
+        // And the replay composes it with the fragment gone.
+        std::fs::remove_dir_all(&frag).unwrap();
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(hub.join("avocado.yaml"), &yaml).unwrap();
+        let composed = Config::load_composed(hub.join("avocado.yaml"), Some("t")).unwrap();
+        assert_eq!(composed.config.get_rootfs_filesystem(), "erofs-lz4");
     }
 
     #[test]
