@@ -192,13 +192,14 @@ impl<'a> Walker<'a> {
         for (key, value) in map {
             let Some(key) = key_string(key) else { continue };
             path.push(key.clone());
-            if let Some(spec) = props.and_then(|p| p.get(&key)) {
+            let spec = props
+                .and_then(|p| p.get(&key))
+                .or_else(|| patterns.and_then(|p| matching_pattern(p, &key)));
+            if let Some(spec) = spec {
                 match spec.get("x-avocado-warning").and_then(Json::as_str) {
                     Some(message) => self.warn(format!("'{}' {message}", path.join("."))),
                     None => self.walk(spec, value, path),
                 }
-            } else if let Some(spec) = patterns.and_then(|p| matching_pattern(p, &key)) {
-                self.walk(spec, value, path);
             } else if target_overrides
                 && (self.targets.contains(&key) || sets_a_field(value, props))
             {
@@ -514,6 +515,7 @@ mod tests {
                 serde_fields::<SplitPackageConfig>(),
             ),
             ("/definitions/imageConfig", serde_fields::<ImageConfig>()),
+            ("/definitions/rootfsConfig", serde_fields::<ImageConfig>()),
             ("/definitions/kernelConfig", serde_fields::<KernelConfig>()),
             (
                 "/definitions/permissionsConfig",
@@ -757,14 +759,48 @@ sdk:
 
     #[test]
     fn flags_fields_read_only_on_the_top_level_block() {
-        let yaml = "kernel:\n  lts: { package: k, source: { type: path, path: k } }\nrootfs:\n  default: { packages: {}, overlay: o }\nruntimes:\n  dev:\n    rootfs: { permissions: dev, packages: {} }\n";
+        let yaml = "kernel:\n  lts: { package: k, source: { type: path, path: k } }\ninitramfs:\n  default: { packages: {}, overlay: o }\nrootfs:\n  default: { packages: {}, source: { type: path, path: r } }\nruntimes:\n  dev:\n    rootfs: { permissions: dev, packages: {} }\n";
         assert_eq!(
             warnings(yaml),
             vec![
                 "unknown key 'kernel.lts.source' is ignored",
-                "unknown key 'rootfs.default.overlay' is ignored",
+                "unknown key 'initramfs.default.overlay' is ignored",
+                "unknown key 'rootfs.default.source' is ignored",
                 "unknown key 'runtimes.dev.rootfs.packages' is ignored",
             ]
+        );
+    }
+
+    /// Rootfs install and the image step read these from the selected entry
+    /// and from `target-<name>:` blocks at either level.
+    #[test]
+    fn rootfs_named_entries_and_target_overrides_are_read() {
+        let named = "rootfs:\n  default:\n    packages: {}\n    overlay: o\n    post_install: a.sh\n    target-qemux86-64: { packages: {}, overlay: o, post_install: b.sh }\n  target-qemux86-64: { packages: {}, overlay: o, post_install: c.sh, image: { type: kab } }\n";
+        assert_eq!(warnings(named), Vec::<String>::new());
+        let flat = "rootfs:\n  packages: {}\n  target-qemux86-64: { packages: {}, overlay: o, post_install: a.sh }\n";
+        assert_eq!(warnings(flat), Vec::<String>::new());
+        let entry_image = "rootfs:\n  default:\n    image: { type: kab }\n    target-qemux86-64: { image: { type: kab }, filesystem: erofs-zst, permissions: p }\n";
+        assert_eq!(warnings(entry_image), Vec::<String>::new());
+    }
+
+    /// The rootfs resolver applies no `kernel-<spec>:` block, beside the named
+    /// entries or anywhere else.
+    #[test]
+    fn rootfs_kernel_overrides_are_flagged_as_ignored() {
+        let message =
+            "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'";
+        let named = "rootfs:\n  default: { packages: {}, kernel-6.6: { packages: {} } }\n  kernel-6.6: { packages: {} }\n";
+        assert_eq!(
+            warnings(named),
+            vec![
+                format!("'rootfs.default.kernel-6.6' {message}"),
+                format!("'rootfs.kernel-6.6' {message}"),
+            ]
+        );
+        let flat = "rootfs:\n  packages: {}\n  kernel-6.6: { packages: {} }\n";
+        assert_eq!(
+            warnings(flat),
+            vec![format!("'rootfs.kernel-6.6' {message}")]
         );
     }
 
@@ -796,10 +832,10 @@ sdk:
 
     #[test]
     fn flags_image_fields_a_target_override_does_not_carry() {
-        let yaml = "rootfs:\n  packages: {}\n  target-qemux86-64:\n    post_install: a.sh\n    packages: { curl: \"*\" }\n";
+        let yaml = "initramfs:\n  packages: {}\n  target-qemux86-64:\n    post_install: a.sh\n    packages: { curl: \"*\" }\n";
         assert_eq!(
             warnings(yaml),
-            vec!["unknown key 'rootfs.target-qemux86-64.packages' is ignored"]
+            vec!["unknown key 'initramfs.target-qemux86-64.packages' is ignored"]
         );
     }
 
