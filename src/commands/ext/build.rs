@@ -1506,14 +1506,26 @@ service="{}"
 # systemd resolves and prefers, but looking only in /usr/lib skipped it: the
 # extension merged, presented the unit, and left it disabled with nothing at
 # runtime to say why.
+#
+# An instance (foo@bar.service) is never a file: systemd loads it from its
+# template (foo@.service), and `systemctl enable` links the instance name to the
+# template. An exact instance file still wins, as it does in systemd. The
+# instance must be nonempty: foo@.service is the template itself, not an
+# instance, and gets no fallback.
+template=""
+case "$service" in
+    *@?*.*) template="${{service%%@*}}@.${{service##*.}}" ;;
+esac
 unit_file=""
 unit_target=""
-for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do
-    if [ -f "$sysroot$unit_dir/$service" ]; then
-        unit_file="$sysroot$unit_dir/$service"
-        unit_target="$unit_dir/$service"
-        break
-    fi
+for name in "$service" $template; do
+    for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$sysroot$unit_dir/$name" ]; then
+            unit_file="$sysroot$unit_dir/$name"
+            unit_target="$unit_dir/$name"
+            break 2
+        fi
+    done
 done
 
 if [ -n "$unit_file" ]; then
@@ -1536,12 +1548,48 @@ if [ -n "$unit_file" ]; then
         wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p;}}' "$1" | tr ',' ' ')"
         required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p;}}' "$1" | tr ',' ' ')"
     }}
+    # Targets can name the instance through specifiers, as templates do
+    # (WantedBy=sys-subsystem-net-devices-%i.device); `systemctl enable`
+    # expands them, so link under the expanded name or systemd never reads
+    # the .wants directory. %i is the instance as written, %I unescaped
+    # ("-" is "/"), %% a literal %. Any other specifier fails the build
+    # rather than linking a name systemd will not read.
+    instance=""
+    if [ -n "$template" ]; then instance="${{service#*@}}"; instance="${{instance%.*}}"; fi
+    _avocado_expand() {{
+        printf '%s\n' "$1" | AVOCADO_INSTANCE="$instance" awk '{{
+            i = ENVIRON["AVOCADO_INSTANCE"]; s = $0; out = ""
+            while ((p = index(s, "%")) > 0) {{
+                c = substr(s, p + 1, 1); out = out substr(s, 1, p - 1)
+                if (c == "%") out = out "%"
+                else if (c == "i") out = out i
+                else if (c == "I" && index(i, "\\") == 0) {{ u = i; gsub("-", "/", u); out = out u }}
+                else exit 1
+                s = substr(s, p + 2)
+            }}
+            print out s
+        }}' && return
+        echo "Error: enable_services lists $service, whose [Install] names $1, with a specifier this build cannot expand. Only %i, %I and %% are supported."
+        return 1
+    }}
     wanted_by=""
     required_by=""
     _avocado_collect_install "$unit_file"
+    # An instance also reads its template's drop-ins, as systemd does. Only
+    # the effective file for each name counts: systemd takes the first one in
+    # /etc before /usr/lib and, within one directory, the instance's before
+    # the template's, so an override can drop the template's WantedBy=.
+    seen_dropins="/"
     for dropin_dir in /etc/systemd/system /usr/lib/systemd/system; do
-        for dropin in "$sysroot$dropin_dir/$service.d/"*.conf; do
-            [ -f "$dropin" ] && _avocado_collect_install "$dropin"
+        for name in "$service" $template; do
+            for dropin in "$sysroot$dropin_dir/$name.d/"*.conf; do
+                [ -f "$dropin" ] || continue
+                case "$seen_dropins" in
+                    */"${{dropin##*/}}"/*) continue ;;
+                esac
+                seen_dropins="$seen_dropins${{dropin##*/}}/"
+                _avocado_collect_install "$dropin"
+            done
         done
     done
     # Unquoted: collapses the separators left by accumulation so the
@@ -1550,6 +1598,7 @@ if [ -n "$unit_file" ]; then
     required_by=$(echo $required_by)
 
     for target in $wanted_by; do
+        target=$(_avocado_expand "$target") || {{ echo "$target"; exit 1; }}
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
@@ -1558,6 +1607,7 @@ if [ -n "$unit_file" ]; then
     done
 
     for target in $required_by; do
+        target=$(_avocado_expand "$target") || {{ echo "$target"; exit 1; }}
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
@@ -1572,6 +1622,12 @@ if [ -n "$unit_file" ]; then
         exit 1
     fi
     echo "Successfully enabled $service"
+elif [ -n "$template" ]; then
+    # A template from the rootfs (serial-getty@.service ships with systemd) is
+    # out of this build's sight, and nothing on the device enables the
+    # instance at merge time, so it fails like any missing unit.
+    echo "Error: enable_services lists $service, but its template $template is not in the extension sysroot ($sysroot). If the template comes from the rootfs, drop $service from enable_services and ship the link in the overlay instead: overlay/etc/systemd/system/<target>.wants/$service -> /usr/lib/systemd/system/$template."
+    exit 1
 else
     echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
     exit 1
@@ -2413,14 +2469,14 @@ extensions:
         // The unit is searched for in systemd's own directories, in its
         // precedence order - not /usr/lib alone.
         assert!(script.contains("for unit_dir in /etc/systemd/system /usr/lib/systemd/system; do"));
-        assert!(script.contains("if [ -f \"$sysroot$unit_dir/$service\" ]; then"));
+        assert!(script.contains("if [ -f \"$sysroot$unit_dir/$name\" ]; then"));
         // Check for WantedBy= parsing
         assert!(script.contains("/^WantedBy=/"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.wants"));
         // Check for RequiredBy= parsing
         assert!(script.contains("/^RequiredBy=/"));
         // [Install] is collected from drop-ins too, matching systemd.
-        assert!(script.contains("$service.d/\"*.conf"));
+        assert!(script.contains("$name.d/\"*.conf"));
         assert!(script.contains("$sysroot/etc/systemd/system/$target.requires"));
         // The symlink points at wherever the unit was actually found, so a unit
         // under /etc is not linked to a /usr/lib path that holds nothing.
@@ -2483,13 +2539,15 @@ extensions:
         // An [Install] section carrying neither key enables nothing either.
         assert!(script.contains("has no WantedBy= or RequiredBy="));
 
-        // Each failure path exits non-zero rather than falling through. Two
-        // guards, so two exits, and the build script must not continue past
-        // either - the whole point is that a silent pass is what shipped the bug.
+        // Each failure path exits non-zero rather than falling through: the
+        // missing unit, the missing template, no install target, a specifier
+        // in each of WantedBy= and RequiredBy=, and awk's own exit on one. The
+        // build script must not continue past any - the whole point is that a
+        // silent pass is what shipped the bug.
         assert_eq!(
             script.matches("exit 1").count(),
-            2,
-            "both the missing-unit and no-install-target guards must exit non-zero"
+            6,
+            "every enable_services guard must exit non-zero"
         );
     }
 
@@ -2983,6 +3041,161 @@ extensions:
                 "usr/local/bin/hello.sh"
             ]
         );
+    }
+
+    /// An instance is enabled through its template, linked under the instance
+    /// name as `systemctl enable` does, with the instance expanded into
+    /// targets that name it.
+    #[test]
+    #[cfg(unix)]
+    fn a_template_instance_is_enabled_through_its_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("wpa_supplicant@.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target sys-subsystem-net-devices-%i.device\n",
+        )
+        .unwrap();
+
+        run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@wlan0.service"]),
+            root,
+            None,
+        );
+        let etc = root.join("sysroots/app/etc/systemd/system");
+        for wants in [
+            "multi-user.target.wants",
+            "sys-subsystem-net-devices-wlan0.device.wants",
+        ] {
+            assert_eq!(
+                std::fs::read_link(etc.join(wants).join("wpa_supplicant@wlan0.service")).unwrap(),
+                std::path::Path::new("/usr/lib/systemd/system/wpa_supplicant@.service")
+            );
+        }
+        assert!(!etc
+            .join("sys-subsystem-net-devices-%i.device.wants")
+            .exists());
+    }
+
+    /// An instance whose template comes from the rootfs (serial-getty@.service)
+    /// cannot be linked here and nothing enables it on the device, so the build
+    /// fails and says how to ship the link instead.
+    #[test]
+    #[cfg(unix)]
+    fn a_rootfs_template_instance_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        std::fs::create_dir_all(root.join("sysroots/app")).unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["serial-getty@ttyGS0.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("its template serial-getty@.service is not in the extension sysroot"),
+            "{stdout}"
+        );
+        assert!(
+            stdout
+                .contains("overlay/etc/systemd/system/<target>.wants/serial-getty@ttyGS0.service"),
+            "{stdout}"
+        );
+    }
+
+    /// A specifier the build cannot expand fails rather than linking a target
+    /// name systemd never reads.
+    #[test]
+    #[cfg(unix)]
+    fn an_unsupported_target_specifier_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("foo@.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=%p.target\n",
+        )
+        .unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["foo@bar.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("names %p.target, with a specifier"),
+            "{stdout}"
+        );
+    }
+
+    /// `foo@.service` is the template, not an instance: when it is missing the
+    /// build fails as for any missing unit, rather than warning.
+    #[test]
+    #[cfg(unix)]
+    fn a_missing_bare_template_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        std::fs::create_dir_all(root.join("sysroots/app")).unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains(
+                "Error: enable_services lists wpa_supplicant@.service, but no such unit exists"
+            ),
+            "{stdout}"
+        );
+    }
+
+    /// An instance's drop-in replaces the template's drop-in of the same name,
+    /// as in systemd, so a WantedBy= the override dropped links nothing.
+    #[test]
+    #[cfg(unix)]
+    fn an_instance_dropin_replaces_the_templates_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        for (dir, target) in [
+            ("wpa_supplicant@.service.d", "multi-user.target"),
+            ("wpa_supplicant@wlan0.service.d", "rescue.target"),
+        ] {
+            std::fs::create_dir_all(unit_dir.join(dir)).unwrap();
+            std::fs::write(
+                unit_dir.join(dir).join("10-install.conf"),
+                format!("[Install]\nWantedBy={target}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            unit_dir.join("wpa_supplicant@.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@wlan0.service"]),
+            root,
+            None,
+        );
+        let etc = root.join("sysroots/app/etc/systemd/system");
+        assert!(etc
+            .join("rescue.target.wants/wpa_supplicant@wlan0.service")
+            .is_symlink());
+        assert!(!etc.join("multi-user.target.wants").exists());
     }
 
     #[test]
