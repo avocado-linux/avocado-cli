@@ -30,6 +30,17 @@ pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
     (out, reads.unwrap_or_default())
 }
 
+static FLAG_OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Make a command's `--env KEY=VALUE` values visible to `{{ env.KEY }}`,
+/// ahead of the caller's environment. `--env` otherwise reaches only the
+/// container, so a run whose shell does not also export the variable (a
+/// Rubicon hub replaying a provision with the caller's `--env`) rendered it
+/// empty.
+pub fn set_flag_overrides(vars: HashMap<String, String>) {
+    *FLAG_OVERRIDES.get_or_init(Default::default).lock().unwrap() = vars;
+}
+
 /// Resolve an environment variable template.
 ///
 /// # Arguments
@@ -46,17 +57,6 @@ pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
 /// assert_eq!(result, Some("test_value".to_string()));
 /// std::env::remove_var("TEST_VAR");
 /// ```
-static FLAG_OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-/// Make a command's `--env KEY=VALUE` values visible to `{{ env.KEY }}`,
-/// ahead of the caller's environment. `--env` otherwise reaches only the
-/// container, so a run whose shell does not also export the variable (a
-/// Rubicon hub replaying a provision with the caller's `--env`) rendered it
-/// empty.
-pub fn set_flag_overrides(vars: HashMap<String, String>) {
-    *FLAG_OVERRIDES.get_or_init(Default::default).lock().unwrap() = vars;
-}
-
 pub fn resolve(var_name: &str) -> Result<Option<String>> {
     let flagged = FLAG_OVERRIDES
         .get()
