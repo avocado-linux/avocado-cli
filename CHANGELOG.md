@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check mark; steps before it keep `(up to date)`. Steps that had started
   but not finished when a step failed, which printed no line at all, now
   print `(not finished: a step failed)`.
+- **Named rootfs entries and `target-<name>:` overrides apply everywhere the
+  rootfs is read.** A rootfs written as named entries
+  (`rootfs: { default: { overlay: ... } }`) had its `overlay` ignored at
+  install, its `post_install` hook and `image:` settings ignored at the image
+  step, and a lone entry not named `default` lost its `filesystem` and
+  `permissions` when a `target-<name>:` block sat beside it.
+  `target-<name>:` blocks under `rootfs:` changed the image but not the
+  installed packages or overlay. Every rootfs reader (install packages and
+  overlay, the image step's filesystem, hook, permissions and `image:`
+  settings, and the install, image and runtime build stamps) now reads one
+  resolved node: install takes the default (or only) entry, and a runtime's
+  image step takes the entry its `rootfs: <name>` names. A `target-<name>:`
+  block beside the named entries applies over the selected entry, and the
+  entry's own `target-<name>:` block applies over both; package maps and
+  `image:` merge key by key, while `overlay` and `permissions` replace the
+  base's whole, so a target's long-form overlay no longer inherits the base's
+  `mode`. Package maps merge whether they are spelled `packages` or
+  `dependencies`. A `target-*` or `kernel-*` key beside named entries is never
+  an entry, so a runtime referencing one is rejected; `kernel-<spec>:` blocks
+  under `rootfs:` are flagged as ignored. The config schema and
+  `avocado config validate` accept these rootfs shapes. A flat `rootfs:`
+  section without matching target overrides hashes exactly as before.
 
 ## [1.1.0] - 2026-11-11
 

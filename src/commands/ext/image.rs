@@ -253,7 +253,9 @@ impl ExtImageCommand {
 
         // Resolve the effective filesystem for this extension early — needed for stamp hashing.
         // If the extension explicitly sets `filesystem`, use that; otherwise inherit from rootfs.
-        let rootfs_fs = config.get_rootfs_filesystem();
+        let rootfs_fs = crate::utils::config::rootfs_filesystem(
+            config.resolve_rootfs(parsed, &target, None)?.as_ref(),
+        );
         let effective_fs = parsed
             .get("extensions")
             .and_then(|e| e.get(&self.extension))

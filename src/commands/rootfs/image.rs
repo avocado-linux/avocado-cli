@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use crate::utils::{
     config::{
-        get_ext_image_args, get_ext_image_type, get_ext_image_verity, get_post_install, Config,
+        get_ext_image_args, get_ext_image_type, get_ext_image_verity, get_post_install,
+        rootfs_filesystem, Config,
     },
     container::{RunConfig, SdkContainer},
     host_copy::copy_volume_path_to_host,
@@ -614,6 +615,53 @@ fi"#,
     )
 }
 
+/// What `rootfs image` builds, all read from one resolved rootfs.
+struct RootfsImagePlan {
+    filesystem: String,
+    build_section: String,
+    image_type: String,
+    image_args: Option<String>,
+}
+
+/// Resolved on the composed value so path-based rootfs sources
+/// (merge_path_based_image_sections) are preserved.
+fn plan_rootfs_image(
+    config: &Config,
+    composed: &serde_yaml::Value,
+    target: &str,
+) -> Result<RootfsImagePlan> {
+    let rootfs = config.resolve_rootfs(composed, target, None)?;
+    let node = rootfs.as_ref().map(|r| &r.node);
+    let filesystem = rootfs_filesystem(rootfs.as_ref());
+    let permissions_section = rootfs
+        .as_ref()
+        .and_then(|r| config.resolve_image_permissions(&r.config))
+        .map(|p| {
+            let users = mapping_from_map(p.users.as_ref());
+            let groups = mapping_from_map(p.groups.as_ref());
+            render_users_groups_script(users.as_ref(), groups.as_ref(), "$ROOTFS_WORK/etc", None)
+        })
+        .unwrap_or_default();
+    let build_section = generate_rootfs_build_script(
+        NAMESPACE_UUID,
+        &filesystem,
+        get_post_install(node).as_deref(),
+        &permissions_section,
+        node.map(get_ext_image_verity)
+            .transpose()
+            .context("rootfs")?
+            .unwrap_or(false),
+    );
+    Ok(RootfsImagePlan {
+        filesystem,
+        build_section,
+        image_type: node
+            .and_then(get_ext_image_type)
+            .unwrap_or_else(|| "raw".to_string()),
+        image_args: node.and_then(get_ext_image_args),
+    })
+}
+
 /// Implementation of the 'rootfs image' command.
 pub struct RootfsImageCommand {
     config_path: String,
@@ -694,49 +742,17 @@ impl RootfsImageCommand {
 
         print_info("Building rootfs image.", OutputLevel::Normal);
 
-        let rootfs_filesystem = config.get_rootfs_filesystem();
-        // Honor per-target `target-<name>:` overrides inside the `rootfs:`
-        // section (e.g. a custom `--tag`). Resolved on the already-composed
-        // value so path-based rootfs sources (merge_path_based_image_sections)
-        // are preserved.
-        let rootfs_merged =
-            config.resolve_image_section(&composed.merged_value, "rootfs", &target_arch);
-        let rootfs_node = rootfs_merged.as_ref();
-        let post_install = get_post_install(rootfs_node);
-        let permissions_section = config
-            .rootfs_default()
-            .and_then(|img| config.resolve_image_permissions(img))
-            .map(|p| {
-                let users = mapping_from_map(p.users.as_ref());
-                let groups = mapping_from_map(p.groups.as_ref());
-                render_users_groups_script(
-                    users.as_ref(),
-                    groups.as_ref(),
-                    "$ROOTFS_WORK/etc",
-                    None,
-                )
-            })
-            .unwrap_or_default();
-        let build_section = generate_rootfs_build_script(
-            NAMESPACE_UUID,
-            &rootfs_filesystem,
-            post_install.as_deref(),
-            &permissions_section,
-            rootfs_node
-                .map(get_ext_image_verity)
-                .transpose()
-                .context("rootfs")?
-                .unwrap_or(false),
-        );
+        let RootfsImagePlan {
+            filesystem: rootfs_filesystem,
+            build_section,
+            image_type,
+            image_args,
+        } = plan_rootfs_image(config, &composed.merged_value, &target_arch)?;
 
         // If the avocado.yaml asks for a kab-wrapped rootfs, validate the
         // keyset on the host, append the wrap step to the script, and
         // bind-mount the keyset into the container at /tmp/kab.keyset.
         // Same plumbing as runtime/build.rs.
-        let image_type = rootfs_node
-            .and_then(get_ext_image_type)
-            .unwrap_or_else(|| "raw".to_string());
-        let image_args = rootfs_node.and_then(get_ext_image_args);
         let wrap_kab = image_type == "kab";
 
         let kab_keyset_host_path: Option<String> = if wrap_kab {
@@ -920,6 +936,26 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rootfs image` reads the filesystem, hook, permissions and `image:`
+    /// settings from one node: the selected entry with its overrides.
+    #[test]
+    fn rootfs_image_plan_reads_one_resolved_entry() {
+        let yaml = "rootfs:\n  custom:\n    filesystem: erofs-zst\n    post_install: entry.sh\n    permissions:\n      users:\n        appuser: {uid: 1000}\n    image: {type: kab, args: '-z entry'}\n    target-qemux86-64:\n      image: {args: '-z board'}\n  target-qemux86-64:\n    post_install: board.sh\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let plan = plan_rootfs_image(&config, &parsed, "qemux86-64").unwrap();
+        assert_eq!(plan.filesystem, "erofs-zst");
+        assert_eq!(plan.image_type, "kab");
+        assert_eq!(plan.image_args.as_deref(), Some("-z board"));
+        assert!(plan.build_section.contains("post_install script: board.sh"));
+        assert!(plan.build_section.contains("appuser"));
+        let other = plan_rootfs_image(&config, &parsed, "qemuarm64").unwrap();
+        assert_eq!(other.image_args.as_deref(), Some("-z entry"));
+        assert!(other
+            .build_section
+            .contains("post_install script: entry.sh"));
+    }
 
     /// `.exports` records exactly the variables that are set, as sourceable
     /// `export` lines, so a reused image replays what a full build exported
