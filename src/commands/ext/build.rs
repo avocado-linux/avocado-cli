@@ -2776,7 +2776,8 @@ extensions:
 
     /// Run a generated build script against a tempfile sysroot. `chown` is
     /// stubbed out, and `rpm -qf` either answers with `rpm_owner` or fails,
-    /// which is how the real one says no package owns the file.
+    /// which is how the real one says no package owns the file. On macOS,
+    /// `tar` and `sed` are GNU: see [`crate::utils::gnu_test_tools`].
     #[cfg(unix)]
     fn run_overlay_script(script: &str, root: &std::path::Path, rpm_owner: Option<&str>) -> String {
         let out = run_overlay_script_raw(script, root, rpm_owner);
@@ -2807,6 +2808,7 @@ extensions:
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        crate::utils::gnu_test_tools::link_into(&bin);
         std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
@@ -2895,6 +2897,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_file_dropped_from_the_overlay_is_removed_and_the_list_rewritten() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2925,6 +2930,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn the_first_build_without_a_list_removes_nothing_and_writes_one() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2946,6 +2954,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn unlisted_files_survive_and_an_already_absent_entry_is_skipped_silently() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2969,6 +2980,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_recorded_file_a_package_owns_is_kept_with_a_notice() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2994,6 +3008,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_service_dropped_from_enable_services_loses_its_wants_link() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3049,6 +3066,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_template_instance_is_enabled_through_its_template() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3086,6 +3106,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_rootfs_template_instance_fails() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3113,6 +3136,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn an_unsupported_target_specifier_fails() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3141,6 +3167,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_missing_bare_template_fails() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3165,6 +3194,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn an_instance_dropin_replaces_the_templates_of_the_same_name() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
@@ -3201,6 +3233,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn opaque_mode_removes_what_the_overlay_dropped_too() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -3238,6 +3273,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn the_sysext_script_leaves_recorded_service_links_alone() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -3281,6 +3319,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_dropped_service_link_is_removed_when_both_scripts_run_in_turn() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -3368,6 +3409,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_changed_wantedby_target_leaves_no_stale_link() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -3414,6 +3458,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn an_entry_that_points_outside_the_sysroot_is_left_alone() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -3436,6 +3483,9 @@ extensions:
     #[test]
     #[cfg(unix)]
     fn a_missing_overlay_directory_fails_before_anything_is_removed() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(

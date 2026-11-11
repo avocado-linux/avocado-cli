@@ -2249,7 +2249,8 @@ mod tests {
     /// Run a generated overlay script under bash, the shell the container
     /// uses. `chown` is stubbed out, and `rpm -qf` either answers with
     /// `rpm_owner` or fails, which is how the real one says no package owns
-    /// the file.
+    /// the file. On macOS, `tar` and `sed` are GNU: see
+    /// [`crate::utils::gnu_test_tools`].
     #[cfg(unix)]
     fn overlay_script_output(
         script: &str,
@@ -2268,6 +2269,7 @@ mod tests {
             std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        crate::utils::gnu_test_tools::link_into(&bin);
         std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
@@ -2330,6 +2332,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_file_dropped_from_the_overlay_is_removed_and_the_list_rewritten() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2357,6 +2362,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_first_install_without_a_list_removes_nothing_and_writes_one() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &["etc/motd.extra"], &["etc/hello.conf"], None);
@@ -2373,6 +2381,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn unlisted_files_survive_and_an_already_absent_entry_is_skipped_silently() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2394,6 +2405,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_recorded_file_a_package_owns_is_kept_with_a_notice() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2421,6 +2435,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn opaque_mode_removes_what_the_overlay_dropped_too() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2452,6 +2469,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_missing_overlay_directory_fails_before_anything_is_removed() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &["etc/motd.extra"], &[], Some(&["etc/motd.extra"]));
@@ -2473,6 +2493,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_list_entry_with_a_parent_component_is_left_alone() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &[], &["etc/hello.conf"], Some(&["../victim"]));
@@ -2492,6 +2515,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_absolute_list_entry_is_left_alone() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2512,6 +2538,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn with_no_overlay_configured_every_recorded_file_is_removed_and_an_empty_list_written() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2542,6 +2571,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_install_without_an_overlay_still_prunes_what_the_last_one_placed() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(root, &["etc/old.conf"], &[], Some(&["./etc/old.conf"]));
@@ -2607,6 +2639,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_symlinked_parent_cannot_lead_the_removal_outside_the_sysroot() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2637,6 +2672,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_parent_ending_in_a_newline_is_checked_as_itself() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2661,6 +2699,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_path_with_a_newline_is_recorded_and_removed_whole() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         overlay_fixture(
@@ -2791,6 +2832,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn depmod_output_survives_the_overlay_prune() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

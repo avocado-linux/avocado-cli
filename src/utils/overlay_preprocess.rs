@@ -814,13 +814,24 @@ mod tests {
     }
 
     /// Runs `overlay_copy_command` with bash against a sysroot that already
-    /// holds package paths. Returns (exit status, stderr).
+    /// holds package paths. Returns (exit status, stderr). On macOS, `tar` is
+    /// GNU: see [`crate::utils::gnu_test_tools`].
     #[cfg(unix)]
     fn run_overlay_copy(src: &Path, dst: &Path, preserve: bool) -> (bool, String) {
         let cmd = overlay_copy_command(src.to_str().unwrap(), dst.to_str().unwrap(), preserve);
+        let bin = tempfile::tempdir().unwrap();
+        crate::utils::gnu_test_tools::link_into(bin.path());
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(&cmd)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .output()
             .unwrap();
         (
@@ -844,6 +855,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn overlay_copy_sets_attributes_only_on_paths_it_creates() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let set = |p: &Path, m: u32| {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
@@ -876,8 +890,13 @@ mod tests {
             let (ok, err) = run_overlay_copy(&src, &dst, preserve);
             assert!(ok, "preserve={preserve}: {err}");
             assert_eq!(mode(&dst), 0o755, "the sysroot root keeps its mode");
-            assert_eq!(mode(&dst.join("var/log/journal")), 0o2755);
-            assert_eq!(mode(&dst.join("tmp")), 0o1777);
+            // GNU tar on macOS clears setgid and sticky on an existing
+            // directory unless `-p` is set. The SDK container is Linux, where
+            // it does not.
+            if preserve || !cfg!(target_os = "macos") {
+                assert_eq!(mode(&dst.join("var/log/journal")), 0o2755);
+                assert_eq!(mode(&dst.join("tmp")), 0o1777);
+            }
             assert_eq!(mode(&dst.join("usr/bin")), 0o755);
             assert_eq!(mode(&dst.join("usr/bin/nvidia-modprobe")), 0o4755);
             assert_eq!(
@@ -909,6 +928,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn overlay_copy_refuses_a_directory_over_a_symlink_or_file() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         for blocker in ["symlink", "file"] {
             let tmp = tempfile::tempdir().unwrap();
             let (src, dst) = (tmp.path().join("ov"), tmp.path().join("sysroot"));

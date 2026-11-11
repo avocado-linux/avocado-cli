@@ -3845,7 +3845,8 @@ mod tests {
 
     /// Runs the FIT assembly script against a two-configuration template with
     /// a stub `mkimage` that copies the .its to the output, so the result can
-    /// be read back. Returns (exit code, stderr, assembled .its or "").
+    /// be read back. Returns (exit code, stderr, assembled .its or ""). On
+    /// macOS, `sed` is GNU: see [`crate::utils::gnu_test_tools`].
     #[cfg(unix)]
     fn run_fit_script(env: &[(&str, &str)]) -> (i32, String, String) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3867,6 +3868,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&mkimage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::utils::gnu_test_tools::link_into(&bin);
         let path = format!(
             "{}:{}",
             bin.display(),
@@ -3894,6 +3896,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fit_carries_kernel_cmdline_extra_in_every_configuration() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let (rc, err, fit) = run_fit_script(&[
             ("AVOCADO_FIT_UNSIGNED", "1"),
             (
@@ -3913,6 +3918,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fit_without_cmdline_extra_carries_no_property() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let (rc, err, fit) = run_fit_script(&[("AVOCADO_FIT_UNSIGNED", "1")]);
         assert_eq!(rc, 0, "{err}");
         assert!(!fit.contains("avocado,cmdline-extra"), "{fit}");
@@ -3921,6 +3929,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fit_refuses_cmdline_extra_it_cannot_carry() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         for bad in ["a\"b", "a'b", "a\\b", "a#b", "a&b", "a\nb"] {
             let (rc, err, _) = run_fit_script(&[
                 ("AVOCADO_FIT_UNSIGNED", "1"),
@@ -3934,6 +3945,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cmdline_extra_without_a_fit_key_fails_instead_of_dropping_it() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let (rc, err, fit) =
             run_fit_script(&[("AVOCADO_KERNEL_CMDLINE_EXTRA", "avocado.board_tests=1")]);
         assert_eq!(rc, 1, "{err}");
@@ -3944,6 +3958,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cmdline_extra_without_an_initramfs_fails_instead_of_dropping_it() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
         let (rc, err, fit) = run_fit_script(&[
             ("AVOCADO_FIT_UNSIGNED", "1"),
             ("AVOCADO_INITRAMFS_IMAGE", ""),
