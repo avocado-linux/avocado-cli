@@ -91,6 +91,9 @@ impl RuntimeProvisionCommand {
         };
         let config = &composed.config;
         let parsed = &composed.merged_value;
+        if self.pack.is_some() {
+            crate::commands::provision_bundle::check_unsigned(config, &self.config.runtime_name)?;
+        }
 
         // Get SDK configuration from interpolated config
         let container_image = config

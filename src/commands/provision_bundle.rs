@@ -316,6 +316,19 @@ set +f
     )
 }
 
+/// A replay runs no signing service (the key stays on the packing host), so
+/// a hook calling `avocado-sign-request` would fail mid-provision: refuse a
+/// runtime that signs, at pack time and again at replay.
+pub fn check_unsigned(config: &Config, runtime: &str) -> Result<()> {
+    if let Some(key) = config.get_runtime_signing_key_name(runtime) {
+        bail!(
+            "runtime '{runtime}' signs with key '{key}', and a bundle replay has no \
+             signing service; provision it without --pack/--bundle"
+        );
+    }
+    Ok(())
+}
+
 /// The hook invocation `pack_tail` replaces (kept in one place so the two
 /// can't drift: provision.rs builds its script with this).
 pub fn hook_call(runtime: &str, target: &str) -> String {
@@ -968,6 +981,7 @@ impl BundleProvision {
         let composed =
             crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
         let config = &composed.config;
+        check_unsigned(config, &meta.runtime)?;
         let image = config
             .get_sdk_image()
             .context("No SDK container image specified in the bundled configuration")?;
@@ -1400,6 +1414,15 @@ provision:
         assert!(r.profiles.is_empty() && r.run.is_empty());
         assert_eq!(r.console.and_then(|c| c.baud), Some(921600));
         assert_eq!(r.wiring["ssr1"], "REC");
+    }
+
+    #[test]
+    fn a_signing_runtime_cannot_be_bundled() {
+        let signed: Config =
+            serde_yaml::from_str("runtimes:\n  dev:\n    signing:\n      key: my-key\n").unwrap();
+        let e = check_unsigned(&signed, "dev").unwrap_err().to_string();
+        assert!(e.contains("my-key"), "{e}");
+        check_unsigned(&signed, "other").expect("another runtime does not sign");
     }
 
     #[test]
