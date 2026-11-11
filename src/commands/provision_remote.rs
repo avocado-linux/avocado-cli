@@ -487,20 +487,29 @@ fn agent_ctl(req: &Value) -> Result<std::process::Child> {
     Ok(child)
 }
 
-/// Cancel a command on this machine's VM; the agent's answer.
-pub async fn cancel_local(id: &str) -> Result<Value> {
+/// A cancellation in flight: its ssh, and the agent's answer to come.
+type PendingCancel = (std::process::Child, tokio::task::JoinHandle<Option<Value>>);
+
+/// Ask this machine's VM to cancel a command; the answer arrives later.
+fn start_cancel(id: &str) -> Result<PendingCancel> {
     let req = json!({"type": "command", "id": uuid::Uuid::new_v4().to_string(),
                      "command": "cancel", "params": {"id": id}});
     let mut child = agent_ctl(&req)?;
     let stdout = child.stdout.take().unwrap();
-    let r = tokio::task::spawn_blocking(move || {
+    let answer = tokio::task::spawn_blocking(move || {
         BufReader::new(stdout)
             .lines()
             .map_while(|l| l.ok())
             .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
             .find(|v| v["type"] == "command_result")
-    })
-    .await?;
+    });
+    Ok((child, answer))
+}
+
+/// Cancel a command on this machine's VM; the agent's answer.
+pub async fn cancel_local(id: &str) -> Result<Value> {
+    let (mut child, answer) = start_cancel(id)?;
+    let r = answer.await?;
     let _ = child.wait();
     r.context("no answer from the hub")
 }
@@ -537,24 +546,45 @@ async fn follow_local(req: Value) -> Result<Value> {
     });
     tokio::pin!(result);
     let mut cancelled = false;
+    // Awaited alongside the job and Ctrl-C: an unresponsive hub must not
+    // swallow the second Ctrl-C (our ssh children don't get the SIGINT).
+    let mut cancel: Option<PendingCancel> = None;
+    let stop = |p: Option<PendingCancel>| {
+        if let Some((mut c, _)) = p {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    };
     let result = loop {
         tokio::select! {
             r = &mut result => break r?,
+            a = async { (&mut cancel.as_mut().unwrap().1).await }, if cancel.is_some() => {
+                stop(cancel.take());
+                match a {
+                    Ok(Some(r)) if r["status"] == "completed" => {}
+                    Ok(Some(r)) => eprintln!("cancel: {}", r["result"]["error"].as_str().unwrap_or("refused")),
+                    Ok(None) => eprintln!("cancel: no answer from the hub"),
+                    Err(e) => eprintln!("cancel: {e:#}"),
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 if cancelled {
+                    stop(cancel.take());
                     let _ = child.kill();
+                    let _ = child.wait();
                     bail!("stopped following job {id}; the hub decides when it ends");
                 }
                 cancelled = true;
                 eprintln!("cancelling job {id} (Ctrl-C again to stop following)");
-                match cancel_local(&id).await {
-                    Ok(r) if r["status"] == "completed" => {}
-                    Ok(r) => eprintln!("cancel: {}", r["result"]["error"].as_str().unwrap_or("refused")),
+                match start_cancel(&id) {
+                    Ok(p) => cancel = Some(p),
                     Err(e) => eprintln!("cancel: {e:#}"),
                 }
             }
         }
     };
+    // The job ended first: its cancellation's answer no longer matters.
+    stop(cancel.take());
     let _ = child.wait();
     result.context("the hub connection closed before the job finished (it keeps running in the VM)")
 }
