@@ -1581,6 +1581,142 @@ impl ResolvedFeedSet {
     }
 }
 
+/// One repository metadata index to probe before anything is downloaded.
+struct Probe<'a> {
+    /// Names the failing feed in the error, e.g. `feed 'local'`.
+    subject: String,
+    /// The `repodata/repomd.xml` URL, from the locator as configured so it is
+    /// reachable from the host, not the container's rewritten view.
+    url: String,
+    ca: Option<PathBuf>,
+    tls_verify: bool,
+    credential: Option<&'a (String, String)>,
+}
+
+impl Probe<'_> {
+    /// One client per probe: `ca`, `tls_verify` and the credential differ per feed.
+    async fn run(&self) -> Result<()> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent(user_agent());
+        if let Some(ca) = &self.ca {
+            let pem = fs::read(ca)
+                .with_context(|| format!("{}: reading ca {}", self.subject, ca.display()))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("{}: parsing ca {}", self.subject, ca.display()))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        if !self.tls_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder
+            .build()
+            .with_context(|| format!("{}: building the HTTP client", self.subject))?;
+        let mut req = client.get(&self.url);
+        if let Some((user, pass)) = self.credential {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => bail!("{}: cannot connect to {} ({e})", self.subject, self.url),
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            bail!(
+                "{}: not found at {} (the feed serves no repository metadata there)",
+                self.subject,
+                self.url
+            );
+        }
+        if !status.is_success() {
+            bail!("{}: {} answered {status}", self.subject, self.url);
+        }
+        Ok(())
+    }
+}
+
+/// Fail before the first download when a feed repository is unreachable,
+/// naming the feed.
+///
+/// Probes the metadata index of each URL feed in `feeds`, and the extension
+/// repository (`<repo url>/<releasever>/target/<target>-ext`, through the distro
+/// feed's TLS settings) only when `needs_extension_repo`. The caller decides
+/// that from the runtime extensions it will fetch, `enabled: false` ones
+/// included, since they are fetched regardless of the flag. A `path:` feed is
+/// checked on disk and never probed over the network. A project that needs no
+/// extension repository is not asked to serve one.
+///
+/// Unlike [`ResolvedFeedSet::check_addons`], which tolerates an unreadable
+/// index with a warning, an unreachable feed here is an error: dnf would
+/// otherwise fail the same way later with less to say about which feed.
+// Called by the install and SDK install commands once they wire it in.
+#[allow(dead_code)]
+pub async fn preflight_feeds(
+    config: &Config,
+    feeds: Option<&ResolvedFeedSet>,
+    target: &str,
+    needs_extension_repo: bool,
+) -> Result<()> {
+    for feed in feeds.into_iter().flat_map(|s| s.feeds.iter()) {
+        let subject = format!("feed '{}'", feed.name);
+        let locator = match feed.kind {
+            FeedKind::Path => {
+                let host = feed
+                    .mount
+                    .as_ref()
+                    .with_context(|| format!("{subject}: a path feed without a directory"))?;
+                if !host.join("repodata").join("repomd.xml").is_file() {
+                    bail!(
+                        "{subject}: {} has no repodata/repomd.xml; run `createrepo_c` on it first",
+                        host.display()
+                    );
+                }
+                continue;
+            }
+            FeedKind::Url => feed.configured_locator.as_str(),
+            // The mint's host is only known once minted, and a loopback one has
+            // been rewritten for the container, which the host cannot reach.
+            FeedKind::Connect
+                if !feed.baseurl.starts_with("connect://") && !feed.loopback_rewritten =>
+            {
+                feed.baseurl.as_str()
+            }
+            FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
+        };
+        Probe {
+            subject,
+            url: format!("{}/repodata/repomd.xml", locator.trim_end_matches('/')),
+            ca: feed.ca.clone(),
+            tls_verify: feed.tls_verify,
+            credential: feed.credential.as_ref(),
+        }
+        .run()
+        .await?;
+    }
+    if needs_extension_repo {
+        let repo_url = config.effective_repo_url();
+        let root = match config.get_releasever() {
+            Some(rv) => format!("{}/{rv}", repo_url.trim_end_matches('/')),
+            None => repo_url.trim_end_matches('/').to_string(),
+        };
+        let distro_feed = match config.distro.as_ref().and_then(|d| d.repo.as_ref()) {
+            Some(DistroRepoRef::Named(n)) => n.as_str(),
+            _ => DEFAULT_DISTRO_FEED_NAME,
+        };
+        Probe {
+            subject: format!("feed '{distro_feed}' extension repository"),
+            url: format!("{root}/target/{target}-ext/repodata/repomd.xml"),
+            ca: config.get_repo_ca().map(PathBuf::from),
+            tls_verify: !config.get_repo_insecure(),
+            credential: None,
+        }
+        .run()
+        .await?;
+    }
+    Ok(())
+}
+
 /// Under the avocado-vm, docker only sees the shared workspace. A `path:` feed
 /// outside it mounts empty and fails with a cryptic error, so fail here instead.
 fn check_in_vm_share(feed: &str, host: &Path, vm_workspace: Option<&Path>) -> Result<()> {
@@ -3237,5 +3373,172 @@ distro:
         assert!(
             rewrite_loopback_reported("http://localhost:1/x", false).contains(HOST_GATEWAY_ALIAS)
         );
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A loopback listener that answers every request with `status` and records
+    /// each request's head, so a test can say what was asked of it.
+    async fn serve_status(status: &'static str) -> (String, Seen) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An address nothing listens on.
+    async fn closed_port_url() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{addr}")
+    }
+
+    fn url_feed_set(url: &str, extra: &str) -> (Config, ResolvedFeedSet) {
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: {url}/feed\n{extra}"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        (c, set)
+    }
+
+    #[tokio::test]
+    async fn unreachable_feed_fails_naming_feed() {
+        let (c, set) = url_feed_set(&closed_port_url().await, "");
+        let e = preflight_feeds(&c, Some(&set), "t", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'"), "{e}");
+        assert!(e.contains("cannot connect"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn feed_without_metadata_fails_naming_feed_and_status() {
+        let (base, _) = serve_status("404 Not Found").await;
+        let (c, set) = url_feed_set(&base, "");
+        let e = preflight_feeds(&c, Some(&set), "t", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'"), "{e}");
+        assert!(e.contains("not found"), "{e}");
+        assert!(e.contains("/feed/repodata/repomd.xml"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn reachable_feed_passes_and_is_probed_at_the_configured_locator() {
+        let (base, seen) = serve_status("200 OK").await;
+        // Loopback is rewritten to the container's host alias in `baseurl`; the
+        // probe runs on the host, so it must use the locator as configured.
+        let (c, set) = url_feed_set(&base, "");
+        assert!(set
+            .feeds
+            .iter()
+            .any(|f| f.baseurl.contains(HOST_GATEWAY_ALIAS)));
+        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].starts_with("GET /feed/repodata/repomd.xml "),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_credential_reaches_the_probe() {
+        let (base, seen) = serve_status("200 OK").await;
+        let (c, set) = url_feed_set(&base, "    username: u\n    password: p\n");
+        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        let head = seen.lock().unwrap()[0].to_ascii_lowercase();
+        // base64("u:p")
+        assert!(head.contains("authorization: basic dtpw"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn directory_feed_is_checked_on_disk_and_never_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [here]\nrepos:\n  here:\n    path: feed\n"
+        ));
+        let resolve = || {
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", dir.path(), None, false)
+                .unwrap()
+                .unwrap()
+        };
+        std::fs::create_dir_all(dir.path().join("feed")).unwrap();
+        let e = preflight_feeds(&c, Some(&resolve()), "t", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'here'") && e.contains("repomd.xml"), "{e}");
+
+        std::fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
+        std::fs::write(dir.path().join("feed/repodata/repomd.xml"), "<repomd/>").unwrap();
+        preflight_feeds(&c, Some(&resolve()), "t", false)
+            .await
+            .unwrap();
+    }
+
+    fn config_with_repo(url: &str) -> Config {
+        load(&format!("{BASE}  repo:\n    url: {url}\n"))
+    }
+
+    #[tokio::test]
+    async fn missing_extension_repository_fails_naming_feed_and_repository() {
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = config_with_repo(&base);
+        let e = preflight_feeds(&c, None, "t", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'avocado' extension repository"), "{e}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[0].contains("/target/t-ext/repodata/repomd.xml "),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_repository_is_not_probed_when_no_extension_needs_it() {
+        // Nothing listens: a probe would fail. A minimal project against a feed
+        // with no extension repository must still succeed.
+        let c = config_with_repo(&closed_port_url().await);
+        preflight_feeds(&c, None, "t", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reachable_extension_repository_passes() {
+        let (base, _) = serve_status("200 OK").await;
+        let c = config_with_repo(&base);
+        preflight_feeds(&c, None, "t", true).await.unwrap();
     }
 }
