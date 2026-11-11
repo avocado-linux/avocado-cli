@@ -661,6 +661,20 @@ fn staging_name(address: &str) -> String {
     }
 }
 
+/// The caller's `--env` values for a job. `AVOCADO_PROVISION_PROFILE`, set
+/// for every provision from `--profile`, is not one: the profile travels as
+/// the job's own.
+fn caller_env(
+    env: Option<&HashMap<String, String>>,
+    profile: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = env.cloned().unwrap_or_default();
+    if profile.is_some() && env.get("AVOCADO_PROVISION_PROFILE").map(String::as_str) == profile {
+        env.remove("AVOCADO_PROVISION_PROFILE");
+    }
+    env
+}
+
 impl RemoteProvision {
     pub async fn execute(&self, provision: ProvisionCommand) -> Result<()> {
         let wanted = match self.rubicon.trim() {
@@ -694,7 +708,7 @@ impl RemoteProvision {
         // The caller's --env values (per-run choices such as a provisioning
         // profile's ERASE_* options) are not packed into the bundle, which
         // is stored and replayed; they ride with the job instead.
-        let job_env = provision.env_vars().cloned().unwrap_or_default();
+        let job_env = caller_env(provision.env_vars(), self.provision_profile.as_deref());
         print_info("Packing the provision for the hub...", OutputLevel::Normal);
         provision.with_pack(Some(out.clone())).execute().await?;
         let bundle = std::fs::read_dir(&out)?
@@ -890,6 +904,22 @@ mod tests {
         assert_eq!(issued_token(&Value::Null), None);
         assert_eq!(issued_token(&json!({"data": {"token": ""}})), None);
         assert_eq!(issued_token(&json!({"data": {"token": 7}})), None);
+    }
+
+    #[test]
+    fn a_profile_alone_is_no_env_for_the_job() {
+        // `--profile p` without `--env` must still provision through Connect.
+        let generated = HashMap::from([("AVOCADO_PROVISION_PROFILE".into(), "p".into())]);
+        assert!(caller_env(Some(&generated), Some("p")).is_empty());
+        assert!(caller_env(None, None).is_empty());
+        // What the caller asked for with --env stays.
+        let mut asked = generated.clone();
+        asked.insert("ERASE_ALL".into(), "1".into());
+        assert_eq!(
+            caller_env(Some(&asked), Some("p")),
+            HashMap::from([("ERASE_ALL".into(), "1".into())])
+        );
+        assert_eq!(caller_env(Some(&generated), None), generated);
     }
 
     #[test]
