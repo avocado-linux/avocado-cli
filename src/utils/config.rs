@@ -2281,7 +2281,12 @@ impl Config {
 
             // Merge external config into main config
             let mut external_config = external_config;
-            Self::resolve_rubicon_run_names(&mut external_config, &main_config, ext_name, target);
+            Self::resolve_extension_profile_names(
+                &mut external_config,
+                &main_config,
+                ext_name,
+                target,
+            );
             Self::merge_external_config(
                 &mut main_config,
                 &external_config,
@@ -2812,7 +2817,7 @@ impl Config {
 
             // Merge the remote extension config with include patterns
             let mut ext_config = ext_config;
-            Self::resolve_rubicon_run_names(
+            Self::resolve_extension_profile_names(
                 &mut ext_config,
                 main_config,
                 &ext_name,
@@ -3039,52 +3044,58 @@ impl Config {
         }
     }
 
-    /// Resolve the templates in an extension's run profile names
-    /// (`enter-{{ avocado.target }}`) as the composed config's interpolation
-    /// will, before they merge: matched as written, the project's
-    /// `enter-jetson` and the extension's template both went in, and the
-    /// final interpolation let the extension's replace the project's.
+    /// Resolve the templates in an extension's run and provision profile
+    /// names (`enter-{{ avocado.target }}`, `flash-{{ avocado.target }}`) as
+    /// the composed config's interpolation will, before they merge: matched
+    /// as written, the project's `enter-jetson` and the extension's template
+    /// both went in, and the final interpolation let the extension's replace
+    /// the project's.
     ///
     /// Names resolve against the project with the extension's own section
     /// merged in (project wins), so `boot-{{ config.extensions.bsp.version }}`
     /// sees a version the BSP supplies. A name still unresolvable here (a
     /// value only composition provides) stays raw for the final pass.
-    fn resolve_rubicon_run_names(
+    fn resolve_extension_profile_names(
         ext_config: &mut serde_yaml::Value,
         main_config: &serde_yaml::Value,
         ext_name: &str,
         target: Option<&str>,
     ) {
         use crate::utils::interpolation::{preprocess_text, AvocadoContext};
-        let has_run = ext_config
-            .get("rubicon")
-            .and_then(|r| r.get("run"))
-            .is_some_and(|r| r.is_mapping());
-        if !has_run {
+        // The name maps: `rubicon.run`, and the provision section under
+        // either of its keys.
+        fn maps(c: &mut serde_yaml::Value) -> Vec<&mut serde_yaml::Mapping> {
+            let Some(c) = c.as_mapping_mut() else {
+                return vec![];
+            };
+            c.iter_mut()
+                .filter_map(|(k, v)| match k.as_str() {
+                    Some("rubicon") => v.get_mut("run").and_then(|r| r.as_mapping_mut()),
+                    Some(k) if PROVISION_KEYS.contains(&k) => v.as_mapping_mut(),
+                    _ => None,
+                })
+                .collect()
+        }
+        if maps(ext_config).is_empty() {
             return;
         }
         let mut tree = main_config.clone();
         Self::merge_external_config(&mut tree, ext_config, ext_name, &[], &[]);
-        let Some(run) = ext_config
-            .get_mut("rubicon")
-            .and_then(|r| r.get_mut("run"))
-            .and_then(|r| r.as_mapping_mut())
-        else {
-            return;
-        };
         let context = AvocadoContext::from_main_config(&tree, target, None);
-        *run = std::mem::take(run)
-            .into_iter()
-            .map(|(name, steps)| {
-                let name = match name.as_str() {
-                    Some(n) => preprocess_text(n, &tree, &context)
-                        .map(Into::into)
-                        .unwrap_or(name),
-                    None => name,
-                };
-                (name, steps)
-            })
-            .collect();
+        for map in maps(ext_config) {
+            *map = std::mem::take(map)
+                .into_iter()
+                .map(|(name, body)| {
+                    let name = match name.as_str() {
+                        Some(n) => preprocess_text(n, &tree, &context)
+                            .map(Into::into)
+                            .unwrap_or(name),
+                        None => name,
+                    };
+                    (name, body)
+                })
+                .collect();
+        }
     }
 
     /// Merge an external config into the main config.
@@ -3448,9 +3459,14 @@ impl Config {
             .find(|k| config.get(k).is_some())
             .unwrap_or(PROVISION_KEYS[0]);
         if let Some(main_map) = config.as_mapping_mut() {
-            main_map
+            let section = main_map
                 .entry(serde_yaml::Value::String(key.to_string()))
                 .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            // An empty `provision:` is null in YAML: a section to merge into,
+            // not a reason to drop the extension's profiles.
+            if section.is_null() {
+                *section = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+            }
         }
         key
     }
@@ -15924,11 +15940,50 @@ rubicon:
 ",
         )
         .unwrap();
-        Config::resolve_rubicon_run_names(&mut ext, &main, "bsp", None);
+        Config::resolve_extension_profile_names(&mut ext, &main, "bsp", None);
         Config::merge_external_config(&mut main, &ext, "bsp", &[], &[]);
         crate::utils::interpolation::interpolate_config(&mut main, None, None).unwrap();
         let c: Config = serde_yaml::from_value(main).unwrap();
         assert_eq!(steps(&c, "enter-jetson"), vec![RubiconStep::WaitMs(1)]);
+    }
+
+    #[test]
+    fn the_project_wins_over_an_extension_provision_profile_named_by_template() {
+        let mut main: serde_yaml::Value = serde_yaml::from_str(
+            "default_target: jetson
+provision:
+  flash-jetson:
+    container_args: [\"--project\"]
+",
+        )
+        .unwrap();
+        let mut ext: serde_yaml::Value = serde_yaml::from_str(
+            "provision:
+  \"flash-{{ avocado.target }}\":
+    container_args: [\"--bsp\"]
+",
+        )
+        .unwrap();
+        let include = ["provision.*".to_string()];
+        Config::resolve_extension_profile_names(&mut ext, &main, "bsp", None);
+        Config::merge_external_config(&mut main, &ext, "bsp", &include, &[]);
+        let p = main["provision"].as_mapping().unwrap();
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(
+            main["provision"]["flash-jetson"]["container_args"][0],
+            "--project"
+        );
+    }
+
+    #[test]
+    fn an_empty_provision_section_still_takes_an_extensions_profiles() {
+        // `provision:` with nothing under it is null in YAML.
+        let mut main: serde_yaml::Value = serde_yaml::from_str("provision:\n").unwrap();
+        let ext: serde_yaml::Value =
+            serde_yaml::from_str("provision:\n  flash:\n    container_args: []\n").unwrap();
+        let include = ["provision.*".to_string()];
+        Config::merge_external_config(&mut main, &ext, "bsp", &include, &[]);
+        assert!(main["provision"]["flash"].is_mapping(), "{main:?}");
     }
 
     #[test]
@@ -15945,7 +16000,7 @@ rubicon:
 ",
         )
         .unwrap();
-        Config::resolve_rubicon_run_names(&mut ext, &main, "bsp", None);
+        Config::resolve_extension_profile_names(&mut ext, &main, "bsp", None);
         let run = ext["rubicon"]["run"].as_mapping().unwrap();
         assert!(run.contains_key("boot-1.2"));
         // Not available until composition: left for the final pass.
