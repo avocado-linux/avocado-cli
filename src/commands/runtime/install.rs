@@ -476,7 +476,7 @@ impl RuntimeInstallCommand {
         // reseed, and dnf installs against a dirty installroot, which is the exact
         // state needs_clean_reinstall exists to prevent (ENG-2352).
         let may_reinstall = clean_installroot_before_reinstall(needs_clean_reinstall, runtime, {
-            let clean_command = format!(r#"rm -rf "{installroot_path}""#);
+            let clean_command = runtime_installroot_clean_command(&installroot_path);
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target_arch.clone(),
@@ -944,6 +944,23 @@ where
     Ok(true)
 }
 
+/// The shell that empties a runtime installroot before a clean reinstall.
+///
+/// It removes every entry of the installroot except `extensions/`. That
+/// directory holds the extension sysroots (`runtimes/<rt>/extensions/<ext>`),
+/// not runtime packages: dnf never installs into it, and each extension seeds
+/// its rpm database from the rootfs or a dependency's sysroot, so a runtime
+/// package change does not make it stale. `avocado install` runs the ext
+/// installs before this, so removing the whole installroot deleted the trees
+/// they had just written, and the next `build -r <rt>` failed the
+/// package-database probe (ENG-2897 / B-22). A missing installroot is not an
+/// error.
+fn runtime_installroot_clean_command(installroot_path: &str) -> String {
+    format!(
+        r#"[ ! -d "{installroot_path}" ] || find "{installroot_path}" -mindepth 1 -maxdepth 1 ! -name extensions -exec rm -rf {{}} +"#
+    )
+}
+
 /// The shell test for "is this runtime's rpm database already seeded".
 ///
 /// Named rather than inlined so the test below asserts the string production
@@ -1045,6 +1062,64 @@ mod tests {
         .await
         .unwrap();
         assert!(proceed, "with no clean needed the reinstall proceeds");
+    }
+
+    /// The clean before a reinstall must keep the extension sysroots under the
+    /// runtime installroot. `avocado install` runs every ext install before
+    /// the runtime install, so removing `runtimes/<rt>/extensions/` deleted the
+    /// trees they had just written, and `build -r <rt>` then failed the
+    /// package-database probe (ENG-2897 / B-22). Runs the production script
+    /// under `sh` against a temp tree.
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_clean_keeps_extension_sysroots() {
+        let prefix = tempfile::tempdir().unwrap();
+        let root = prefix.path().join("runtimes/dev");
+        std::fs::create_dir_all(root.join("var/lib/rpm")).unwrap();
+        std::fs::write(root.join("var/lib/rpm/rpmdb.sqlite"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/less"), b"x").unwrap();
+        std::fs::write(root.join(".hidden"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("extensions/app/var/lib/rpm")).unwrap();
+        std::fs::write(root.join("extensions/app/var/lib/rpm/rpmdb.sqlite"), b"x").unwrap();
+
+        let run = |script: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("AVOCADO_PREFIX", prefix.path())
+                .output()
+                .unwrap()
+        };
+
+        let out = run(super::runtime_installroot_clean_command(
+            "$AVOCADO_PREFIX/runtimes/dev",
+        ));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !root.join("var").exists(),
+            "the runtime rpm database must go"
+        );
+        assert!(!root.join("usr").exists(), "runtime package files must go");
+        assert!(!root.join(".hidden").exists(), "dotfiles must go");
+        assert!(
+            root.join("extensions/app/var/lib/rpm/rpmdb.sqlite")
+                .exists(),
+            "extension sysroots must survive the runtime clean"
+        );
+
+        // A runtime that was never installed has nothing to clean.
+        let out = run(super::runtime_installroot_clean_command(
+            "$AVOCADO_PREFIX/runtimes/never-installed",
+        ));
+        assert!(
+            out.status.success(),
+            "a missing installroot is not an error"
+        );
     }
 
     #[test]

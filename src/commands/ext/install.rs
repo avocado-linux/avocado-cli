@@ -198,6 +198,40 @@ pub(crate) fn sysroot_probe_line(extension: &str) -> String {
     )
 }
 
+/// One line for a batch read: `seeded:<ext>:::yes|no`, `yes` only when every
+/// runtime in `runtimes` has a seeded `runtimes/<rt>/extensions/<ext>` tree.
+///
+/// On the multi-runtime path the main probe reads the per-target tree, which
+/// is not the tree `build -r <rt>` reads. A per-runtime copy removed after the
+/// seed (a runtime clean, `avocado runtime clean`, a manual delete) left the
+/// fast path skipping the extension, so no later plain install reseeded it
+/// (ENG-2897 / B-22). Same rpm-database test as [`ext_sysroot_seeded_test`].
+fn seed_targets_probe_line(extension: &str, runtimes: &[String]) -> String {
+    let test = runtimes
+        .iter()
+        .map(|rt| {
+            format!("[ -d \"$AVOCADO_PREFIX/runtimes/{rt}/extensions/{extension}/var/lib/rpm\" ]")
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
+    format!("\nprintf 'seeded:{extension}:::%s\\n' \"$({test} && echo yes || echo no)\"")
+}
+
+/// Whether the fast path finds every per-runtime tree this install seeds.
+/// Always true with no seed targets, where the main probe covers the one
+/// tree that matters.
+fn seed_targets_present(
+    stamp_reads: &HashMap<String, Option<String>>,
+    extension: &str,
+    seed_runtimes: &[String],
+) -> bool {
+    seed_runtimes.is_empty()
+        || stamp_reads
+            .get(&format!("seeded:{extension}"))
+            .and_then(|v| v.as_deref())
+            == Some("yes")
+}
+
 /// Undo the seed after a failed first transaction. The seed copies the rpm
 /// database before dnf runs; left behind, it makes an empty sysroot look
 /// installed to [`ext_sysroot_seeded_test`], and a stamp written by another
@@ -964,6 +998,9 @@ impl ExtInstallCommand {
                 let mut command = generate_batch_read_stamps_script(&reqs);
                 for (name, _) in extensions_to_install.iter().filter(|(n, _)| stamp_safe(n)) {
                     command.push_str(&sysroot_probe_line(name));
+                    if !self.seed_runtimes.is_empty() {
+                        command.push_str(&seed_targets_probe_line(name, &self.seed_runtimes));
+                    }
                 }
                 let run_config = RunConfig {
                     container_image: container_image.to_string(),
@@ -1009,7 +1046,8 @@ impl ExtInstallCommand {
                 let sysroot_present = stamp_reads
                     .get(&format!("sysroot:{ext_name}"))
                     .and_then(|v| v.as_deref())
-                    == Some("yes");
+                    == Some("yes")
+                    && seed_targets_present(&stamp_reads, ext_name, &self.seed_runtimes);
                 // `avocado update` clears the lock's package pins to force
                 // re-resolution against the new snapshot; a dependency-free
                 // extension would otherwise keep a matching config hash,
@@ -2418,6 +2456,45 @@ mod tests {
         assert_eq!(get("sysroot:bare").as_deref(), Some("no"));
         assert_eq!(get("sysroot:seeded").as_deref(), Some("yes"));
         assert_eq!(get("sysroot:absent").as_deref(), Some("no"));
+    }
+
+    /// On the multi-runtime path the fast path must also see each per-runtime
+    /// tree the install seeds. Before ENG-2897 / B-22 it read only the
+    /// per-target tree, so a per-runtime copy removed after the seed was never
+    /// reseeded by a later plain install. Runs the probe under `sh`.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_seed_target_blocks_the_fast_path() {
+        let prefix = tempfile::tempdir().unwrap();
+        let ext_tree = |rt: &str| prefix.path().join(format!("runtimes/{rt}/extensions/app"));
+        std::fs::create_dir_all(ext_tree("rt-a").join("var/lib/rpm")).unwrap();
+        std::fs::create_dir_all(ext_tree("rt-b").join("var/lib/rpm")).unwrap();
+        let seeds = vec!["rt-a".to_string(), "rt-b".to_string()];
+
+        let probe = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(seed_targets_probe_line("app", &seeds))
+                .env("AVOCADO_PREFIX", prefix.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse_batch_stamps_output(&String::from_utf8_lossy(&out.stdout))
+        };
+
+        assert!(seed_targets_present(&probe(), "app", &seeds));
+
+        // The runtime clean that B-22 is about took one runtime's copy away.
+        std::fs::remove_dir_all(ext_tree("rt-a")).unwrap();
+        assert!(!seed_targets_present(&probe(), "app", &seeds));
+
+        // With no seed targets the main probe covers the only tree, so this
+        // term never blocks, even when no probe line was written.
+        assert!(seed_targets_present(&HashMap::new(), "app", &[]));
     }
 
     /// A failed first transaction takes its seeded database with it and
