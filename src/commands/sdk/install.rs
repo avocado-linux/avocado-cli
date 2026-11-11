@@ -409,6 +409,35 @@ done
 exec "${AVOCADO_DEPMOD:-/sbin/depmod}" "${FLAGS[@]}" -b "$ROOT" "$KVER"
 "#;
 
+/// `update-alternatives` for SDK host (nativesdk) package scriptlets.
+///
+/// nativesdk postinsts call `update-alternatives` with absolute SDK paths, so
+/// their links already point into the SDK. opkg's `update-alternatives` keeps
+/// its registry at `$OPKG_OFFLINE_ROOT/usr/lib/opkg/alternatives`, and with no
+/// offline root that is the SDK container's own registry. The container image
+/// registers the same names (uname, mkdir, mv, ...), so opkg moved the
+/// container's `/usr/bin` links into the SDK, and the registry was lost with
+/// the container. `$OPKG_OFFLINE_ROOT` cannot simply be the SDK prefix: opkg
+/// prepends it to the link paths, which are already absolute. So run it
+/// against a throwaway root that maps the SDK prefix onto itself and keeps
+/// the registry in the SDK.
+const SDK_HOST_UPDATE_ALTERNATIVES: &str = r#"#!/bin/bash
+root=$(mktemp -d) || exit 1
+trap 'rm -rf "$root"' EXIT
+mkdir -p "$AVOCADO_SDK_PREFIX/usr/lib/opkg/alternatives" "$root/usr/lib/opkg" "$root$(dirname "$AVOCADO_SDK_PREFIX")"
+ln -s "$AVOCADO_SDK_PREFIX/usr/lib/opkg/alternatives" "$root/usr/lib/opkg/alternatives"
+ln -s "$AVOCADO_SDK_PREFIX" "$root$AVOCADO_SDK_PREFIX"
+OPKG_OFFLINE_ROOT="$root" "$AVOCADO_SDK_PREFIX/usr/bin/update-alternatives" "$@"
+"#;
+
+/// Environment for a dnf invocation that installs or removes SDK host
+/// (nativesdk) packages with their scriptlets, so those scriptlets reach
+/// [`SDK_HOST_UPDATE_ALTERNATIVES`] first. `$D` stays unset: the packages
+/// install in place at their real SDK paths, not into an install root.
+pub(crate) fn sdk_host_scriptlet_env() -> &'static str {
+    "PATH=$AVOCADO_SDK_PREFIX/sdk-host-scripts/bin:$PATH \\\n"
+}
+
 /// `$INTERCEPT_DIR/postinst_intercept` for target-package scriptlets.
 const POSTINST_INTERCEPT: &str = r#"#!/bin/sh
 # OE postinsts defer some work to an intercept when they run offline ($D set):
@@ -1679,6 +1708,13 @@ cat > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept <
 @POSTINST_INTERCEPT@INTERCEPT_EOF
 chmod +x $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/intercepts/postinst_intercept
 
+# SDK host (nativesdk) package scriptlets keep their alternatives registry in
+# the SDK, not in the container (sdk_host_scriptlet_env puts this first on PATH).
+mkdir -p $AVOCADO_SDK_PREFIX/sdk-host-scripts/bin
+cat > $AVOCADO_SDK_PREFIX/sdk-host-scripts/bin/update-alternatives << 'SDK_HOST_UA_EOF'
+@SDK_HOST_UPDATE_ALTERNATIVES@SDK_HOST_UA_EOF
+chmod +x $AVOCADO_SDK_PREFIX/sdk-host-scripts/bin/update-alternatives
+
 # The scriptlet contract these wrappers implement; installs check it before
 # running scriptlets (scriptlet_contract_check).
 echo "@SCRIPTLET_CONTRACT@" > $AVOCADO_SDK_PREFIX/ext-rpm-config-scripts/contract
@@ -1698,6 +1734,7 @@ MACROS_EOF
         .replace("@DEPMODWRAPPER@", DEPMODWRAPPER)
         .replace("@SCRIPTLET_SHELL@", SCRIPTLET_SHELL)
         .replace("@POSTINST_INTERCEPT@", POSTINST_INTERCEPT)
+        .replace("@SDK_HOST_UPDATE_ALTERNATIVES@", SDK_HOST_UPDATE_ALTERNATIVES)
         .replace("@SCRIPTLET_CONTRACT@", crate::utils::stamps::SCRIPTLET_CONTRACT);
 
         let run_config = RunConfig {
@@ -2131,23 +2168,7 @@ fi
                 task_id: TaskId::SdkPackages,
                 renderer: ctx.renderer.clone(),
             });
-            let command = format!(
-                r#"
-RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
-RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
-$DNF_SDK_HOST \
-    $DNF_SDK_HOST_OPTS \
-    $DNF_SDK_COMBINED_REPO_CONF \
-    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
-    {} \
-    {} \
-    install \
-    {}
-"#,
-                dnf_args_str,
-                yes,
-                sdk_packages.join(" ")
-            );
+            let command = sdk_packages_install_command(&dnf_args_str, yes, &sdk_packages);
 
             // Use the container helper's run_in_container method
             let run_config = RunConfig {
@@ -2284,6 +2305,28 @@ async fn run_container_command(
     }
 }
 
+/// The dnf install of the SDK packages (sdk.packages and extension SDK
+/// dependencies). Unlike the bootstrap and SDK target installs, this one runs
+/// the nativesdk scriptlets, so it carries [`sdk_host_scriptlet_env`].
+fn sdk_packages_install_command(dnf_args_str: &str, yes: &str, packages: &[String]) -> String {
+    format!(
+        r#"
+{sdk_host_env}RPM_ETCCONFIGDIR=$AVOCADO_SDK_PREFIX \
+RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm \
+$DNF_SDK_HOST \
+    $DNF_SDK_HOST_OPTS \
+    $DNF_SDK_COMBINED_REPO_CONF \
+    --disablerepo=${{AVOCADO_TARGET}}-target-ext \
+    {dnf_args_str} \
+    {yes} \
+    install \
+    {packages}
+"#,
+        sdk_host_env = sdk_host_scriptlet_env(),
+        packages = packages.join(" ")
+    )
+}
+
 /// The dnf pass that makes an existing SDK sysroot follow the feed after
 /// `avocado update` (or on a first install, where it is a no-op). Empty when the
 /// lock carries pins - then the lock, not the feed, says which versions belong.
@@ -2398,6 +2441,101 @@ mod tests {
                 "{file}: a no-chroot install skips the scriptlet contract check"
             );
         }
+    }
+
+    /// A nativesdk postinst registers an alternative with absolute SDK paths.
+    /// The link lands in the SDK, the registry lands in the SDK (not in the
+    /// container's /usr/lib/opkg), and the throwaway root is removed. The stub
+    /// keeps the parts of opkg's update-alternatives that use
+    /// $OPKG_OFFLINE_ROOT.
+    #[cfg(unix)]
+    #[test]
+    fn sdk_host_update_alternatives_keeps_the_registry_in_the_sdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = dir.path().join("opt/_avocado/qemuarm64/sdk/aarch64");
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(sdk.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(sdk.join("bin")).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(sdk.join("bin/uname.coreutils"), "").unwrap();
+        write_script(
+            &sdk.join("usr/bin"),
+            "update-alternatives",
+            r#"#!/bin/sh
+set -e
+ad="$OPKG_OFFLINE_ROOT/usr/lib/opkg/alternatives"
+[ "$1" = --install ] || exit 2
+mkdir -p "$ad"
+echo "$2" > "$ad/$3"
+echo "$4 $5" >> "$ad/$3"
+ln -snf "$4" "$OPKG_OFFLINE_ROOT$2"
+"#,
+        );
+        let bin = tempfile::tempdir().unwrap();
+        let wrapper = write_script(
+            bin.path(),
+            "update-alternatives",
+            SDK_HOST_UPDATE_ALTERNATIVES,
+        );
+        let link = sdk.join("bin/uname");
+        let target = sdk.join("bin/uname.coreutils");
+        let status = run_status(
+            std::process::Command::new(&wrapper)
+                .arg("--install")
+                .arg(&link)
+                .arg("uname")
+                .arg(&target)
+                .arg("100")
+                .env("AVOCADO_SDK_PREFIX", &sdk)
+                .env("TMPDIR", &tmp),
+        );
+        assert!(status.success());
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(
+            std::fs::read_to_string(sdk.join("usr/lib/opkg/alternatives/uname")).unwrap(),
+            format!("{}\n{} 100\n", link.display(), target.display())
+        );
+        assert_eq!(
+            std::fs::read_dir(&tmp).unwrap().count(),
+            0,
+            "the throwaway root must be removed"
+        );
+    }
+
+    /// The SDK packages install runs nativesdk scriptlets with the SDK host
+    /// wrapper first on PATH and without `$D`: the packages install in place,
+    /// so an install root would double their paths.
+    #[cfg(unix)]
+    #[test]
+    fn sdk_packages_install_runs_scriptlets_with_the_sdk_host_env() {
+        let sdk = tempfile::tempdir().unwrap();
+        let host_bin = sdk.path().join("sdk-host-scripts/bin");
+        std::fs::create_dir_all(&host_bin).unwrap();
+        write_script(&host_bin, "update-alternatives", "#!/bin/sh\n");
+        let dnf = write_script(
+            sdk.path(),
+            "dnf",
+            "#!/bin/sh\necho \"$(command -v update-alternatives)|$D|$OPKG_OFFLINE_ROOT\"\n",
+        );
+        let command = sdk_packages_install_command("", "-y", &["nativesdk-coreutils".to_string()]);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("AVOCADO_SDK_PREFIX", sdk.path())
+            .env("DNF_SDK_HOST", &dnf)
+            .env_remove("D")
+            .env_remove("OPKG_OFFLINE_ROOT")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("{}||", host_bin.join("update-alternatives").display())
+        );
     }
 
     /// The kernel postinst's offline call runs depmod against the root and
