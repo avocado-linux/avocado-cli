@@ -173,12 +173,7 @@ impl RubiconCommand {
             }
             RubiconAction::Cancel { board, job } => {
                 let b = self.board(board).await?;
-                let job = remote::queue_of(&b)
-                    .iter()
-                    .filter_map(|e| e["id"].as_str())
-                    .find(|id| id.starts_with(job.as_str()))
-                    .map(String::from)
-                    .unwrap_or_else(|| job.clone());
+                let job = job_id(&remote::queue_of(&b), job)?;
                 let r = match &b.hub {
                     Hub::Local => remote::cancel_local(&job).await?,
                     Hub::Connect { .. } => {
@@ -733,6 +728,27 @@ fn once_each(mut boards: Vec<Board>) -> Vec<Board> {
     boards
 }
 
+/// The queued job `wanted` names: its id, or a prefix of only one id. Not
+/// in the queue: as given (the hub has the final word).
+fn job_id(queue: &[Value], wanted: &str) -> Result<String> {
+    let ids: Vec<&str> = queue.iter().filter_map(|e| e["id"].as_str()).collect();
+    if ids.contains(&wanted) {
+        return Ok(wanted.to_string());
+    }
+    let found: Vec<&str> = ids
+        .into_iter()
+        .filter(|id| id.starts_with(wanted))
+        .collect();
+    match found[..] {
+        [] => Ok(wanted.to_string()),
+        [id] => Ok(id.to_string()),
+        _ => bail!(
+            "{wanted:?} matches several jobs; give more of the id:\n  {}",
+            found.join("\n  ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +762,23 @@ mod tests {
             vm: None,
             connect_profile: None,
         }
+    }
+
+    #[test]
+    fn cancel_names_one_job_never_the_first_of_several() {
+        let q = [
+            json!({"id": "3f2a1c0d-1"}),
+            json!({"id": "3f2a1c0d-2"}),
+            json!({"id": "3f2a"}),
+        ];
+        let e = job_id(&q, "3f2a1").unwrap_err().to_string();
+        assert!(e.contains("3f2a1c0d-1") && e.contains("3f2a1c0d-2"), "{e}");
+        // An exact id wins over the longer ids it prefixes.
+        assert_eq!(job_id(&q, "3f2a").unwrap(), "3f2a");
+        assert_eq!(job_id(&q, "3f2a1c0d-2").unwrap(), "3f2a1c0d-2");
+        assert_eq!(job_id(&q[..1], "3f").unwrap(), "3f2a1c0d-1");
+        // Not queued here: the hub decides.
+        assert_eq!(job_id(&q, "beef").unwrap(), "beef");
     }
 
     #[test]
