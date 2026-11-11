@@ -433,7 +433,9 @@ impl SdkCompileCommand {
 
     /// The lock pins a compiled section is built against: the SDK (the
     /// toolchain) and the target sysroot (the libraries it links). `None` when
-    /// the lock cannot be read, and then no section is skipped.
+    /// there is no lock file or it cannot be read, and then no section is
+    /// skipped. `LockFile::load` returns an empty lock for a missing file, so
+    /// the file is checked first.
     fn lock_pins(
         &self,
         config: &Config,
@@ -448,6 +450,9 @@ impl SdkCompileCommand {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .to_path_buf()
             });
+        if !LockFile::get_path(&src_dir).exists() && !LockFile::legacy_path(&src_dir).exists() {
+            return None;
+        }
         let lock = LockFile::load(&src_dir).ok()?;
         let mut pins = std::collections::BTreeMap::new();
         pins.insert(
@@ -1179,5 +1184,34 @@ extensions:
             cmd.plan_section(&merged, root, &app_section(), None, None, Some(&pins("s"))),
             SectionPlan::Run(None)
         );
+    }
+
+    /// No lock file means no pins to compare, so no section is skipped.
+    /// `LockFile::load` returns an empty lock for a missing file, which would
+    /// otherwise hash like a real, empty pin set.
+    #[test]
+    fn lock_pins_need_a_lock_file() {
+        let dir = skip_project();
+        let config_path = dir.path().join("avocado.yaml");
+        std::fs::write(&config_path, SKIP_YAML).unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let cmd = SdkCompileCommand::new(
+            config_path.display().to_string(),
+            false,
+            vec![],
+            None,
+            None,
+            None,
+        );
+        assert!(cmd.lock_pins(&config, "qemuarm64").is_none());
+
+        crate::utils::lockfile::LockFile::new()
+            .save(dir.path())
+            .unwrap();
+        let pins = cmd
+            .lock_pins(&config, "qemuarm64")
+            .expect("lock file exists");
+        assert!(pins.contains_key("sdk_pins"));
+        assert!(pins.contains_key("target_sysroot_pins"));
     }
 }
