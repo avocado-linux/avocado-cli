@@ -70,6 +70,7 @@ pub enum StampCommand {
     Sign,
     Provision,
     CompileDeps,
+    Compile,
 }
 
 impl fmt::Display for StampCommand {
@@ -81,6 +82,7 @@ impl fmt::Display for StampCommand {
             StampCommand::Sign => write!(f, "sign"),
             StampCommand::Provision => write!(f, "provision"),
             StampCommand::CompileDeps => write!(f, "compile-deps"),
+            StampCommand::Compile => write!(f, "compile"),
         }
     }
 }
@@ -277,6 +279,26 @@ impl Stamp {
         )
     }
 
+    /// Create the stamp of one `sdk.compile` section.
+    ///
+    /// Stored under `sdk/{host_arch}/compile/{section}.stamp`, next to the
+    /// build directory it describes (`$AVOCADO_SDK_PREFIX/build/{section}`).
+    pub fn sdk_compile(
+        section: &str,
+        target: &str,
+        inputs: StampInputs,
+        outputs: StampOutputs,
+    ) -> Self {
+        Self::new(
+            StampCommand::Compile,
+            StampComponent::Sdk,
+            Some(section.to_string()),
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Create extension install stamp
     pub fn ext_install(
         name: &str,
@@ -456,6 +478,9 @@ impl Stamp {
     /// the host architecture where the SDK runs) to support --runs-on with different architectures.
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name) {
+            (StampComponent::Sdk, Some(section)) => {
+                format!("sdk/{}/{}/{}.stamp", self.target, self.command, section)
+            }
             (StampComponent::Sdk, _) => format!("sdk/{}/{}.stamp", self.target, self.command),
             (StampComponent::Extension, Some(name)) => {
                 format!("ext/{}/{}.stamp", name, self.command)
@@ -568,6 +593,16 @@ impl StampRequirement {
         }
     }
 
+    /// Compile section requirement for the local host architecture
+    pub fn sdk_compile(section: &str) -> Self {
+        Self {
+            command: StampCommand::Compile,
+            component: StampComponent::Sdk,
+            component_name: Some(section.to_string()),
+            host_arch: Some(get_local_arch().to_string()),
+        }
+    }
+
     /// Extension install requirement
     pub fn ext_install(name: &str) -> Self {
         Self::new(StampCommand::Install, StampComponent::Extension, Some(name))
@@ -635,6 +670,17 @@ impl StampRequirement {
     /// running on remotes with different CPU architectures via --runs-on.
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, Some(section), Some(arch)) => {
+                format!("sdk/{}/{}/{}.stamp", arch, self.command, section)
+            }
+            (StampComponent::Sdk, Some(section), None) => {
+                format!(
+                    "sdk/{}/{}/{}.stamp",
+                    get_local_arch(),
+                    self.command,
+                    section
+                )
+            }
             (StampComponent::Sdk, _, Some(arch)) => {
                 format!("sdk/{}/{}.stamp", arch, self.command)
             }
@@ -665,6 +711,9 @@ impl StampRequirement {
     /// Human-readable description
     pub fn description(&self) -> String {
         match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, Some(section), _) => {
+                format!("compile section '{section}'")
+            }
             (StampComponent::Sdk, _, Some(arch)) => {
                 format!("SDK {} ({})", self.command, arch)
             }
@@ -704,6 +753,9 @@ impl StampRequirement {
                 Some(remote) => format!("avocado sdk install --runs-on {remote}"),
                 None => "avocado sdk install".to_string(),
             },
+            (StampComponent::Sdk, Some(section), StampCommand::Compile) => {
+                format!("avocado sdk compile {section}")
+            }
             (StampComponent::Extension, Some(name), StampCommand::Install) => {
                 format!("avocado ext install {name}")
             }
@@ -1559,6 +1611,158 @@ pub fn compute_compile_deps_input_hash(
 
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
+}
+
+/// Compute input hash for one `sdk.compile` section run by `ext build` for
+/// `ext_name`: everything the section's compile script is known to read.
+///
+/// - the `sdk.compile.<section>` node itself
+/// - the bytes of its `compile:` script, resolved the way
+///   [`fold_package_scripts`] resolves it
+/// - the calling extension's `package_files` tree, the only declared list of
+///   the sources a compile script reads (see [`sdk_compile_inputs_are_complete`])
+/// - the SDK settings the container is started with
+/// - `environment`: facts only the caller knows, such as the identity of the SDK
+///   install and compile-deps stamps (see [`stamp_identity_from_batch`]), so a
+///   toolchain change runs the section again
+///
+/// The section is shared by every extension that names it, but the hash folds
+/// the caller's `package_files`. Two callers with different lists move the hash
+/// in turn, and the section runs as often as it did before there was a stamp.
+pub fn compute_sdk_compile_input_hash(
+    config: &serde_yaml::Value,
+    section: &str,
+    ext_name: &str,
+    project_root: &Path,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<StampInputs> {
+    let sdk = config.get("sdk");
+    let section_node = sdk
+        .and_then(|s| s.get("compile"))
+        .and_then(|c| c.get(section))
+        .ok_or_else(|| anyhow::anyhow!("sdk.compile.{section} not found in config"))?;
+    let ext = config.get("extensions").and_then(|e| e.get(ext_name));
+    let content_root = ext.and_then(|e| ext_content_root(e, project_root));
+
+    let mut hash_data = serde_yaml::Mapping::new();
+    let key = |k: &str| serde_yaml::Value::String(format!("sdk.compile.{section}.{k}"));
+    hash_data.insert(key("config"), section_node.clone());
+
+    if let Some(script) = section_node.get("compile").and_then(|v| v.as_str()) {
+        let root = match content_root.as_deref() {
+            Some(c) if c.join(script).is_file() => c,
+            _ => project_root,
+        };
+        fold_file_content(
+            &mut hash_data,
+            &format!("sdk.compile.{section}.compile_script"),
+            root,
+            script,
+        )?;
+    }
+
+    if let (Some(files), Some(root)) = (
+        ext.and_then(|e| e.get("package_files"))
+            .and_then(|v| v.as_sequence()),
+        content_root.as_deref(),
+    ) {
+        let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.package_files")),
+            serde_yaml::Value::String(package_files_digest(root, &patterns)?),
+        );
+    }
+
+    for k in ["image", "repo_url", "repo_release", "container_args"] {
+        if let Some(v) = sdk.and_then(|s| s.get(k)) {
+            hash_data.insert(serde_yaml::Value::String(format!("sdk.{k}")), v.clone());
+        }
+    }
+
+    for (k, v) in environment {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("env.{k}")),
+            serde_yaml::Value::String(v.clone()),
+        );
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Whether [`compute_sdk_compile_input_hash`] describes everything the
+/// section's compile script reads when `ext build` runs it for `ext_name`.
+/// The section may be skipped only when this holds.
+///
+/// A compile script reads source files that no config key names. Without a
+/// list of them, a source edit leaves every input unmoved, the section is
+/// skipped, and the extension ships the previous binary with exit 0. The
+/// extension's `package_files` is that list, and it is the same declaration
+/// that lets `ext build` skip itself ([`ext_build_inputs_are_complete`]). So
+/// the rule is the same: no declared, host-visible `package_files`, no skip.
+///
+/// It also needs the compile script on the host. A remote extension's scripts
+/// are unpacked into the SDK volume, where nothing here can hash them.
+pub fn sdk_compile_inputs_are_complete(
+    config: &serde_yaml::Value,
+    section: &str,
+    ext_name: &str,
+    project_root: &Path,
+) -> bool {
+    let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) else {
+        return false;
+    };
+    // A `package_files` list under a `target-<name>:` override is not the one
+    // the hash folds, for the reason given on
+    // `declares_post_build_in_target_override`.
+    let overrides_package_files = ext.as_mapping().is_some_and(|m| {
+        m.iter().any(|(key, value)| {
+            key.as_str().is_some_and(|k| k.starts_with("target-"))
+                && value.get("package_files").is_some()
+        })
+    });
+    if overrides_package_files {
+        return false;
+    }
+    let Some(content_root) = ext_content_root(ext, project_root) else {
+        return false;
+    };
+    let declares_sources = ext
+        .get("package_files")
+        .and_then(|v| v.as_sequence())
+        .is_some_and(|files| !files.is_empty());
+    let script_on_host = config
+        .get("sdk")
+        .and_then(|s| s.get("compile"))
+        .and_then(|c| c.get(section))
+        .and_then(|sec| sec.get("compile"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|script| {
+            content_root.join(script).is_file() || project_root.join(script).is_file()
+        });
+    declares_sources && script_on_host
+}
+
+/// The parts of a stamp in a batch read that say what it was made from and
+/// what it produced, without its timestamp. `"absent"` when there is no stamp.
+/// A step folds this into its own input hash when it depends on the other
+/// step's result but the other step records no `content_hash`.
+pub fn stamp_identity_from_batch(batch_output: &str, req: &StampRequirement) -> String {
+    parse_batch_stamps_output(batch_output)
+        .get(&req.relative_path())
+        .and_then(|json| json.as_deref())
+        .and_then(|json| Stamp::from_json(json).ok())
+        .map(|stamp| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                stamp.version,
+                stamp.inputs.config_hash,
+                stamp.inputs.package_list_hash.unwrap_or_default(),
+                stamp.outputs.installed_packages_hash.unwrap_or_default(),
+                stamp.outputs.content_hash.unwrap_or_default(),
+            )
+        })
+        .unwrap_or_else(|| "absent".to_string())
 }
 
 /// Compute input hash for **extension install**, folding in the state of the
@@ -8658,5 +8862,193 @@ rootfs:
         let hash =
             |rt: &str| image_hash_in("rootfs", "filesystem: erofs\n", cfg, Some(rt), root).unwrap();
         assert_ne!(hash("main"), hash("release"));
+    }
+
+    // ========================================================================
+    // Compile section stamp (B-32)
+    // ========================================================================
+
+    const COMPILE_SECTION_YAML: &str = r#"
+sdk:
+  image: sdk:2024
+  compile:
+    app-compile:
+      compile: compile.sh
+      packages:
+        gcc: "*"
+extensions:
+  my-ext:
+    package_files: [src]
+    packages:
+      app:
+        compile: app-compile
+        install: install.sh
+"#;
+
+    fn compile_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("compile.sh"), "make\n").unwrap();
+        std::fs::write(root.join("install.sh"), "install app $DEST\n").unwrap();
+        std::fs::write(root.join("src/main.c"), "int main() {}\n").unwrap();
+        dir
+    }
+
+    fn compile_hash_at(
+        root: &Path,
+        yaml: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> String {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        compute_sdk_compile_input_hash(&v, "app-compile", "my-ext", root, env)
+            .unwrap()
+            .config_hash
+    }
+
+    #[test]
+    fn sdk_compile_stamp_path_is_per_arch_and_section() {
+        let req = StampRequirement::sdk_compile("app-compile");
+        assert_eq!(
+            req.relative_path(),
+            format!("sdk/{}/compile/app-compile.stamp", get_local_arch())
+        );
+        assert_eq!(req.description(), "compile section 'app-compile'");
+        assert_eq!(req.fix_command(), "avocado sdk compile app-compile");
+
+        // The writer and the reader agree on the path.
+        let stamp = Stamp::sdk_compile(
+            get_local_arch(),
+            get_local_arch(),
+            StampInputs::new("h".to_string()),
+            StampOutputs::default(),
+        );
+        assert_eq!(
+            stamp.relative_path(),
+            format!("sdk/{0}/compile/{0}.stamp", get_local_arch())
+        );
+        let stamp = Stamp::sdk_compile(
+            "app-compile",
+            get_local_arch(),
+            StampInputs::new("h".to_string()),
+            StampOutputs::default(),
+        );
+        assert_eq!(stamp.relative_path(), req.relative_path());
+
+        // The SDK install stamp path does not change.
+        assert_eq!(
+            StampRequirement::sdk_install().relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
+    }
+
+    /// The reported case: an edit to the extension's install script reruns the
+    /// extension build, and must not move the compile section's hash. Every
+    /// input the compile script reads must move it.
+    #[test]
+    fn sdk_compile_hash_ignores_install_script_and_tracks_compile_inputs() {
+        let dir = compile_project();
+        let root = dir.path();
+        let env = std::collections::BTreeMap::new();
+        let base = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+
+        std::fs::write(root.join("install.sh"), "install -m755 app $DEST\n").unwrap();
+        assert_eq!(
+            base,
+            compile_hash_at(root, COMPILE_SECTION_YAML, &env),
+            "install script is not a compile input"
+        );
+
+        std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
+        let source_edit = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+        assert_ne!(base, source_edit, "source under package_files");
+
+        std::fs::write(root.join("compile.sh"), "make -j4\n").unwrap();
+        let script_edit = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+        assert_ne!(source_edit, script_edit, "compile script content");
+
+        let config_edit = COMPILE_SECTION_YAML.replace("gcc: \"*\"", "gcc: \"13.*\"");
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, &config_edit, &env),
+            "section packages"
+        );
+
+        let image_edit = COMPILE_SECTION_YAML.replace("sdk:2024", "sdk:2026");
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, &image_edit, &env),
+            "SDK image"
+        );
+
+        let mut toolchain = std::collections::BTreeMap::new();
+        toolchain.insert("sdk_install".to_string(), "5:abc:::".to_string());
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, COMPILE_SECTION_YAML, &toolchain),
+            "SDK install stamp"
+        );
+    }
+
+    #[test]
+    fn sdk_compile_skip_needs_declared_sources_on_the_host() {
+        let dir = compile_project();
+        let root = dir.path();
+        let complete = |yaml: &str| {
+            let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            sdk_compile_inputs_are_complete(&v, "app-compile", "my-ext", root)
+        };
+
+        assert!(complete(COMPILE_SECTION_YAML));
+
+        // No source list: a source edit would not move the hash.
+        assert!(!complete(
+            &COMPILE_SECTION_YAML.replace("    package_files: [src]\n", "")
+        ));
+        assert!(!complete(
+            &COMPILE_SECTION_YAML.replace("package_files: [src]", "package_files: []")
+        ));
+
+        // A source the host cannot see.
+        assert!(!complete(&COMPILE_SECTION_YAML.replace(
+            "    package_files: [src]\n",
+            "    package_files: [src]\n    source:\n      type: git\n      url: https://example.com/x.git\n",
+        )));
+
+        // A source list the hash does not read.
+        assert!(!complete(&COMPILE_SECTION_YAML.replace(
+            "    package_files: [src]\n",
+            "    package_files: [src]\n    target-qemuarm64:\n      package_files: [other]\n",
+        )));
+
+        // A compile script that is not on the host.
+        std::fs::remove_file(root.join("compile.sh")).unwrap();
+        assert!(!complete(COMPILE_SECTION_YAML));
+    }
+
+    #[test]
+    fn stamp_identity_ignores_the_timestamp() {
+        let req = StampRequirement::sdk_install();
+        let batch = |stamp: &Stamp| {
+            format!(
+                "{}:::{}",
+                req.relative_path(),
+                serde_json::to_string(stamp).unwrap()
+            )
+        };
+        let mut stamp = Stamp::sdk_install(
+            get_local_arch(),
+            StampInputs::new("h1".to_string()),
+            StampOutputs::default(),
+        );
+        let first = stamp_identity_from_batch(&batch(&stamp), &req);
+        stamp.timestamp += chrono::Duration::hours(1);
+        assert_eq!(first, stamp_identity_from_batch(&batch(&stamp), &req));
+
+        stamp.outputs.installed_packages_hash = Some("pkgs".to_string());
+        assert_ne!(first, stamp_identity_from_batch(&batch(&stamp), &req));
+
+        let missing = format!("{}:::null", req.relative_path());
+        assert_eq!(stamp_identity_from_batch(&missing, &req), "absent");
     }
 }

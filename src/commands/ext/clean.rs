@@ -21,6 +21,9 @@ pub struct ExtCleanCommand {
     /// scoped extension sysroot tree via `AVOCADO_RUNTIME` in the
     /// container env. When `None`, legacy per-target behavior.
     runtime: Option<String>,
+    /// Leave the compile sections the extension uses alone: do not run their
+    /// clean scripts, and keep their stamps.
+    skip_compile: bool,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -43,6 +46,7 @@ impl ExtCleanCommand {
             dnf_args,
             sdk_arch: None,
             runtime: None,
+            skip_compile: false,
             composed_config: None,
         }
     }
@@ -56,6 +60,12 @@ impl ExtCleanCommand {
     /// Set the runtime context. See [`super::build::ExtBuildCommand::with_runtime`].
     pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Set whether to leave the extension's compile sections alone
+    pub fn with_skip_compile(mut self, skip_compile: bool) -> Self {
+        self.skip_compile = skip_compile;
         self
     }
 
@@ -106,14 +116,16 @@ impl ExtCleanCommand {
 
         // Execute clean scripts for compile dependencies BEFORE cleaning the extension
         // This allows clean scripts to access build artifacts if needed
-        self.execute_compile_clean_scripts(
-            config,
-            &ext_config,
-            &container_image,
-            &target,
-            ext_script_workdir.as_deref(),
-        )
-        .await?;
+        if !self.skip_compile {
+            self.execute_compile_clean_scripts(
+                config,
+                &ext_config,
+                &container_image,
+                &target,
+                ext_script_workdir.as_deref(),
+            )
+            .await?;
+        }
 
         self.clean_extension(&container_image, &target).await
     }
@@ -254,13 +266,17 @@ impl ExtCleanCommand {
 
             // Build clean command with optional workdir prefix
             // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext>/ instead of /opt/src
+            // The section stamp goes first: a cleaned section must compile again.
+            let remove_stamp = crate::utils::stamps::remove_own_stamp_line(
+                &StampRequirement::sdk_compile(&section_name),
+            );
             let clean_command = if let Some(workdir) = ext_script_workdir {
                 format!(
-                    r#"cd "{workdir}" && if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                    r#"{remove_stamp}cd "{workdir}" && if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
                 )
             } else {
                 format!(
-                    r#"if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                    r#"{remove_stamp}if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
                 )
             };
 

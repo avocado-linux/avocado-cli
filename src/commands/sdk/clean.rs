@@ -228,8 +228,12 @@ impl SdkCleanCommand {
             );
 
             // Build clean command - scripts are relative to src_dir (/opt/src in container)
+            // The section stamp goes first: a cleaned section must compile again.
             let clean_command = format!(
-                r#"if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{section_name} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                r#"{}if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_BUILD_DIR=$AVOCADO_SDK_PREFIX/build/{section_name} AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#,
+                crate::utils::stamps::remove_own_stamp_line(&StampRequirement::sdk_compile(
+                    section_name
+                )),
             );
 
             if self.verbose {
