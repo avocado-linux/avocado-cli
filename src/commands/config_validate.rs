@@ -337,8 +337,13 @@ impl Replacer {
     fn apply(&self, text: &str) -> String {
         let mut found: Vec<(usize, usize, &str)> = Vec::new();
         for (from, to) in &self.pairs {
-            for (start, _) in text.match_indices(from.as_str()) {
+            // Each search starts one character after the last place found,
+            // not after its end, so a place that overlaps it is found too.
+            let mut at = 0;
+            while let Some(i) = text[at..].find(from.as_str()) {
+                let start = at + i;
                 found.push((start, start + from.len(), to));
+                at = start + text[start..].chars().next().map_or(1, char::len_utf8);
             }
         }
         // By start, the longest first, so a value that contains another is
@@ -355,7 +360,10 @@ impl Replacer {
                 }
                 if next_end > end {
                     end = next_end;
-                    templates.push(next_to);
+                    // A value that overlaps itself is one template.
+                    if templates.last() != Some(&next_to) {
+                        templates.push(next_to);
+                    }
                 }
                 found.next();
             }
@@ -1031,6 +1039,14 @@ mod tests {
             "prefix-{{ env.TOKEN }}"
         );
         assert_eq!(replacer.apply("x abcd y"), "x {{ env.A }} y");
+    }
+
+    /// A value can overlap its own next occurrence; that one is hidden too.
+    #[test]
+    fn a_value_that_overlaps_itself_is_hidden_whole() {
+        let replacer = Replacer::new(vec![("abab".to_string(), "{{ env.TOKEN }}".to_string())]);
+        assert_eq!(replacer.apply("x ababab y"), "x {{ env.TOKEN }} y");
+        assert_eq!(replacer.apply("ababab-ab"), "{{ env.TOKEN }}-ab");
     }
 
     /// Each error path goes through the same mapping; every one still gets
