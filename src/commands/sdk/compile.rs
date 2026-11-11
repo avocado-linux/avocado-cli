@@ -51,19 +51,14 @@ struct SkipContext<'a> {
     hash_root_mounted: bool,
 }
 
-/// Whether a container arg passes host state into the build that its text
-/// does not show: an env flag with a bare name (`-e CFLAGS`, docker then
-/// passes the host's current value), or `--env-file` (docker reads the file
-/// when the container starts). Hashing the text would miss a change to either.
-/// A config arg can hold several words (`-e CFLAGS`), so each is split first.
-/// An `-e` packed behind other short flags, as in `-ie CFLAGS` or `-ieX=1`:
-/// the operand is the rest of the word, or the next word when nothing follows.
-fn packed_env_flag(words: &[String], i: usize) -> Option<(usize, &str)> {
+/// A short flag packed behind others, as in `-ie CFLAGS` or `-itv/x:/y`: the
+/// operand is the rest of the word, or the next word when nothing follows.
+fn packed_short_flag(words: &[String], i: usize, flag: char) -> Option<(usize, &str)> {
     let flags = words.get(i)?.strip_prefix('-')?;
     if flags.starts_with('-') {
         return None;
     }
-    let at = flags.find('e')?;
+    let at = flags.find(flag)?;
     let rest = &flags[at + 1..];
     if rest.is_empty() {
         Some((2, words.get(i + 1).map_or("", |w| w.as_str())))
@@ -72,6 +67,54 @@ fn packed_env_flag(words: &[String], i: usize) -> Option<(usize, &str)> {
     }
 }
 
+/// A `-v`/`--volume` or `--mount` flag and its operand, in any form docker
+/// accepts.
+fn mount_flag(words: &[String], i: usize) -> Option<(usize, &str)> {
+    let a = words.get(i)?.as_str();
+    for long in ["--volume", "--mount"] {
+        if a == long {
+            return Some((2, words.get(i + 1).map_or("", |w| w.as_str())));
+        }
+        if let Some(operand) = a.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
+            return Some((1, operand));
+        }
+    }
+    packed_short_flag(words, i, 'v')
+}
+
+/// Whether a mount only exposes the host's devices: the `/dev` and `/sys`
+/// mounts that provisioning needs. Any other host path or named volume holds
+/// files the hash does not read.
+fn mounts_only_devices(operand: &str) -> bool {
+    let source =
+        if operand.contains("source=") || operand.contains("src=") || operand.contains("type=") {
+            // `--mount type=bind,source=/dev,target=/dev`
+            if operand.split(',').any(|kv| kv == "type=tmpfs") {
+                return true;
+            }
+            operand
+                .split(',')
+                .find_map(|kv| {
+                    kv.strip_prefix("source=")
+                        .or_else(|| kv.strip_prefix("src="))
+                })
+                .unwrap_or("")
+        } else {
+            // `-v /dev:/dev[:opts]`
+            operand.split(':').next().unwrap_or("")
+        };
+    ["/dev", "/sys"]
+        .iter()
+        .any(|d| source == *d || source.starts_with(&format!("{d}/")))
+}
+
+/// Whether a container arg passes host state into the build that its text
+/// does not show: an env flag with a bare name (`-e CFLAGS`, docker then
+/// passes the host's current value), `--env-file` (docker reads the file when
+/// the container starts), or a mount of a host folder or volume other than
+/// `/dev` and `/sys` (the build can read files there). Hashing the text would
+/// miss a change to any of them. A config arg can hold several words
+/// (`-e CFLAGS`), so each is split first.
 fn passes_host_state(container_args: &[String]) -> bool {
     let words: Vec<String> = container_args
         .iter()
@@ -79,16 +122,18 @@ fn passes_host_state(container_args: &[String]) -> bool {
         .collect();
     let mut i = 0;
     while i < words.len() {
-        if words[i].starts_with("--env-file") {
+        if words[i].starts_with("--env-file") || words[i].starts_with("--volumes-from") {
             return true;
         }
-        if let Some((taken, operand)) = docker_env_flag(&words, i) {
+        if let Some((taken, operand)) =
+            docker_env_flag(&words, i).or_else(|| packed_short_flag(&words, i, 'e'))
+        {
             if !operand.contains('=') {
                 return true;
             }
             i += taken;
-        } else if let Some((taken, operand)) = packed_env_flag(&words, i) {
-            if !operand.contains('=') {
+        } else if let Some((taken, operand)) = mount_flag(&words, i) {
+            if !mounts_only_devices(operand) {
                 return true;
             }
             i += taken;
@@ -1179,7 +1224,7 @@ extensions:
     /// Docker passes host state the arg text does not show: the host's value
     /// for a bare env name, and the contents of an env file.
     #[test]
-    fn section_never_skips_with_host_env_passthrough() {
+    fn section_never_skips_with_host_state_passthrough() {
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
@@ -1197,6 +1242,14 @@ extensions:
             vec!["-itCFLAGS".to_string(), "-ieCFLAGS".to_string()],
             vec!["--env-file=build.env".to_string()],
             vec!["--env-file".to_string(), "build.env".to_string()],
+            vec!["-v /home/me/vendor-sdk:/opt/vendor".to_string()],
+            vec!["-v".to_string(), "vendor-vol:/opt/vendor".to_string()],
+            vec!["--volume=/opt/sdk:/opt/sdk".to_string()],
+            vec!["-itv/opt/sdk:/opt/sdk".to_string()],
+            vec!["--mount type=bind,source=/opt/sdk,target=/opt/sdk".to_string()],
+            vec!["--mount src=vendor-vol,dst=/opt/vendor".to_string()],
+            vec!["--volumes-from builder".to_string()],
+            vec!["-v /devices:/devices".to_string()],
         ] {
             let mut c = ctx(&merged, root, &batch, &p);
             c.container_args = Some(&args);
@@ -1208,7 +1261,7 @@ extensions:
         }
 
         // A value in the text is hashed, and the provision args every
-        // reference carries pass no host state.
+        // reference uses pass no host state.
         for args in [
             vec!["--env=CFLAGS=-O2".to_string()],
             vec!["-ie CFLAGS=-O2".to_string()],
@@ -1218,6 +1271,9 @@ extensions:
                 "-v /dev:/dev".to_string(),
                 "-v /sys:/sys".to_string(),
             ],
+            vec!["--volume=/dev/bus/usb:/dev/bus/usb:ro".to_string()],
+            vec!["--mount type=bind,source=/sys,target=/sys".to_string()],
+            vec!["--mount type=tmpfs,target=/scratch".to_string()],
         ] {
             assert!(!passes_host_state(&args), "{args:?}");
         }
