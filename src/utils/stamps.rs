@@ -2541,11 +2541,14 @@ fn ext_has_compile_package(ext: &serde_yaml::Value) -> bool {
 /// ignored by the hash, and treating it as a promise would restore the silent
 /// skip it is meant to prevent.
 ///
-/// A package with both `compile` and `install` is the same gap. `ext build`
-/// runs its compile section and then its install script, and both read files
-/// that no config key lists: a source tree, the compile output, whatever the
-/// install script copies out of the project. The hash reads only the bytes of
-/// the two scripts, so it needs the same `package_files` declaration (B-31).
+/// A package with both `compile` and `install` never skips here. `ext build`
+/// runs its compile section and then its install script, and the compile
+/// reads more than this hash can see: the SDK image, the lock pins, the host
+/// env and mounts the container args pass in. A skip here would also skip the
+/// compile step's own check, which reads all of them, and ship the old binary
+/// after a re-pin (B-32). The compile step decides instead
+/// (`compute_sdk_compile_input_hash`), and the install script reruns, which
+/// costs seconds.
 ///
 /// The conservative answer for everything else is to rebuild. A hook run costs
 /// one script; a wrong answer costs a developer their afternoon on the device.
@@ -2568,7 +2571,10 @@ pub fn ext_build_inputs_are_complete(
     if declares_build_step_in_override(ext) {
         return false;
     }
-    if ext.get("post_build").and_then(|v| v.as_str()).is_none() && !runs_compile_install(ext) {
+    if runs_compile_install(ext) {
+        return false;
+    }
+    if ext.get("post_build").and_then(|v| v.as_str()).is_none() {
         return true;
     }
     // Every condition the fold is gated on, and nothing else. Reproducing only
@@ -7730,10 +7736,12 @@ find() {
     /// reach for: a source tree, the compile output, files the install script
     /// copies out of the project. The hash reads only the two scripts' bytes,
     /// so a source edit moved nothing and `ext build` said "up to date" over
-    /// the previous build (B-31). It is the same gap as a `post_build` hook,
-    /// and `package_files` buys the skip back the same way.
+    /// the previous build (B-31). Declared sources do not buy the skip back:
+    /// the compile also reads the SDK image, the lock pins and the host state
+    /// the container args pass, and a skip here would skip the compile step's
+    /// check of them too (B-32). The compile step decides instead.
     #[test]
-    fn a_compile_install_extension_may_be_skipped_only_when_declared() {
+    fn a_compile_install_extension_never_skips_ext_build() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let config = |body: &str| -> serde_yaml::Value {
@@ -7751,8 +7759,8 @@ find() {
             "{compiled_installed}    package_files: []\n"
         ))));
 
-        // Declared sources are hashed, so an edit under them moves the hash.
-        assert!(complete(&config(&format!("{compiled_installed}{files}"))));
+        // Declared sources leave the call to the compile step.
+        assert!(!complete(&config(&format!("{compiled_installed}{files}"))));
 
         // A source the host cannot see adds nothing to the hash, whatever it
         // declares.
@@ -7793,15 +7801,14 @@ find() {
             "    qemux86-64:\n      packages:\n        curl: \"8.*\"\n"
         )));
 
-        // A path source has a content root, so its declaration is hashed.
+        // A path source has a content root, so the compile step can hash its
+        // declaration.
         std::fs::create_dir_all(root.join("vendored")).unwrap();
         let path_src = "    source:\n      type: path\n      path: vendored\n";
-        assert!(complete(&config(&format!(
-            "{compiled_installed}{files}{path_src}"
-        ))));
-        assert!(!complete(&config(&format!(
-            "{compiled_installed}{path_src}"
-        ))));
+        let hashable =
+            |body: &str| declared_sources_are_hashable(&config(body)["extensions"]["app"], root);
+        assert!(hashable(&format!("{compiled_installed}{files}{path_src}")));
+        assert!(!hashable(&format!("{compiled_installed}{path_src}")));
     }
 
     /// The build stamp sits at `ext/<name>/build.stamp` for the whole target,
@@ -9290,8 +9297,8 @@ extensions:
         }
     }
 
-    /// The `ext build` skip uses the same rule: a compile+install extension
-    /// whose `package_files` points through a symlink is rebuilt.
+    /// The source check both skips share refuses a `package_files` entry that
+    /// points through a symlink.
     #[cfg(unix)]
     #[test]
     fn ext_build_skip_refuses_symlinked_sources() {
@@ -9302,9 +9309,15 @@ extensions:
             &COMPILE_SECTION_YAML.replace("package_files: [src]", "package_files: [src-link]"),
         )
         .unwrap();
-        assert!(!ext_build_inputs_are_complete(&v, "my-ext", root));
+        assert!(!declared_sources_are_hashable(
+            &v["extensions"]["my-ext"],
+            root
+        ));
         let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
-        assert!(ext_build_inputs_are_complete(&v, "my-ext", root));
+        assert!(declared_sources_are_hashable(
+            &v["extensions"]["my-ext"],
+            root
+        ));
     }
 
     /// A glob that passes through a symlinked directory matches nothing, so
@@ -9322,20 +9335,17 @@ extensions:
             serde_yaml::from_str(&COMPILE_SECTION_YAML.replace("package_files: [src]", files))
                 .unwrap()
         };
-        assert!(!ext_build_inputs_are_complete(
-            &with("package_files: ['vsrc/*.c']"),
-            "my-ext",
+        assert!(!declared_sources_are_hashable(
+            &with("package_files: ['vsrc/*.c']")["extensions"]["my-ext"],
             root
         ));
         std::os::unix::fs::symlink("../vendor/src/sub", root.join("src/sub")).unwrap();
-        assert!(!ext_build_inputs_are_complete(
-            &with("package_files: ['src/**/*.c']"),
-            "my-ext",
+        assert!(!declared_sources_are_hashable(
+            &with("package_files: ['src/**/*.c']")["extensions"]["my-ext"],
             root
         ));
-        assert!(ext_build_inputs_are_complete(
-            &with("package_files: ['vendor/src/*.c']"),
-            "my-ext",
+        assert!(declared_sources_are_hashable(
+            &with("package_files: ['vendor/src/*.c']")["extensions"]["my-ext"],
             root
         ));
     }

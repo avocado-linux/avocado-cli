@@ -2194,7 +2194,7 @@
         },
         "package_files": {
           "$ref": "#/definitions/stringList",
-          "description": "Glob patterns for the files 'avocado ext package' ships. Replaces the default set (the config file, overlays, compile and install scripts); the version file is always added. For an extension with a compile package, these are also the declared sources of the build: 'avocado build' skips the extension and its sdk.compile sections only while these files, the scripts and the config do not change. Without this list, the compile sections run on every extension build."
+          "description": "Glob patterns for the files 'avocado ext package' ships. Replaces the default set (the config file, overlays, compile and install scripts); the version file is always added. For an extension with a compile package, these are also the declared sources of the build: 'avocado build' skips its sdk.compile sections only while these files, the scripts, the config, the SDK and the lock pins do not change. Without this list, the compile sections run on every extension build."
         },
         "release": {
           "type": "string",
