@@ -1544,6 +1544,30 @@ if [ -n "$unit_file" ]; then
         wanted_by="$wanted_by $(sed -n '/^\[Install\]/,/^\[/{{/^WantedBy=/s/^WantedBy=//p;}}' "$1" | tr ',' ' ')"
         required_by="$required_by $(sed -n '/^\[Install\]/,/^\[/{{/^RequiredBy=/s/^RequiredBy=//p;}}' "$1" | tr ',' ' ')"
     }}
+    # Targets can name the instance through specifiers, as templates do
+    # (WantedBy=sys-subsystem-net-devices-%i.device); `systemctl enable`
+    # expands them, so link under the expanded name or systemd never reads
+    # the .wants directory. %i is the instance as written, %I unescaped
+    # ("-" is "/"), %% a literal %. Any other specifier fails the build
+    # rather than linking a name systemd will not read.
+    instance=""
+    if [ -n "$template" ]; then instance="${{service#*@}}"; instance="${{instance%.*}}"; fi
+    _avocado_expand() {{
+        printf '%s\n' "$1" | AVOCADO_INSTANCE="$instance" awk '{{
+            i = ENVIRON["AVOCADO_INSTANCE"]; s = $0; out = ""
+            while ((p = index(s, "%")) > 0) {{
+                c = substr(s, p + 1, 1); out = out substr(s, 1, p - 1)
+                if (c == "%") out = out "%"
+                else if (c == "i") out = out i
+                else if (c == "I" && index(i, "\\") == 0) {{ u = i; gsub("-", "/", u); out = out u }}
+                else exit 1
+                s = substr(s, p + 2)
+            }}
+            print out s
+        }}' && return
+        echo "Error: enable_services lists $service, whose [Install] names $1, with a specifier this build cannot expand. Only %i, %I and %% are supported."
+        return 1
+    }}
     wanted_by=""
     required_by=""
     _avocado_collect_install "$unit_file"
@@ -1570,6 +1594,7 @@ if [ -n "$unit_file" ]; then
     required_by=$(echo $required_by)
 
     for target in $wanted_by; do
+        target=$(_avocado_expand "$target") || {{ echo "$target"; exit 1; }}
         target_dir="$sysroot/etc/systemd/system/$target.wants"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
@@ -1578,6 +1603,7 @@ if [ -n "$unit_file" ]; then
     done
 
     for target in $required_by; do
+        target=$(_avocado_expand "$target") || {{ echo "$target"; exit 1; }}
         target_dir="$sysroot/etc/systemd/system/$target.requires"
         mkdir -p "$target_dir"
         ln -sf "$unit_target" "$target_dir/$service"
@@ -1593,10 +1619,11 @@ if [ -n "$unit_file" ]; then
     fi
     echo "Successfully enabled $service"
 elif [ -n "$template" ]; then
-    # The template can come from the rootfs (serial-getty@.service ships with
-    # systemd), which this build cannot see; AVOCADO_ENABLE_SERVICES still
-    # starts the instance when the extension merges.
-    echo "Warning: enable_services lists $service, but its template $template is not in the extension sysroot ($sysroot); it is not linked at build time; AVOCADO_ENABLE_SERVICES starts it when the extension merges."
+    # A template from the rootfs (serial-getty@.service ships with systemd) is
+    # out of this build's sight, and nothing on the device enables the
+    # instance at merge time, so it fails like any missing unit.
+    echo "Error: enable_services lists $service, but its template $template is not in the extension sysroot ($sysroot). If the template comes from the rootfs, drop $service from enable_services and ship the link in the overlay instead: overlay/etc/systemd/system/<target>.wants/$service -> /usr/lib/systemd/system/$template."
+    exit 1
 else
     echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
     exit 1
@@ -2446,13 +2473,15 @@ extensions:
         // An [Install] section carrying neither key enables nothing either.
         assert!(script.contains("has no WantedBy= or RequiredBy="));
 
-        // Each failure path exits non-zero rather than falling through. Two
-        // guards, so two exits, and the build script must not continue past
-        // either - the whole point is that a silent pass is what shipped the bug.
+        // Each failure path exits non-zero rather than falling through: the
+        // missing unit, the missing template, no install target, a specifier
+        // in each of WantedBy= and RequiredBy=, and awk's own exit on one. The
+        // build script must not continue past any - the whole point is that a
+        // silent pass is what shipped the bug.
         assert_eq!(
             script.matches("exit 1").count(),
-            2,
-            "both the missing-unit and no-install-target guards must exit non-zero"
+            6,
+            "every enable_services guard must exit non-zero"
         );
     }
 
@@ -2949,8 +2978,8 @@ extensions:
     }
 
     /// An instance is enabled through its template, linked under the instance
-    /// name as `systemctl enable` does. One whose template comes from the
-    /// rootfs (serial-getty@.service) cannot be linked here, so it warns.
+    /// name as `systemctl enable` does, with the instance expanded into
+    /// targets that name it.
     #[test]
     #[cfg(unix)]
     fn a_template_instance_is_enabled_through_its_template() {
@@ -2961,31 +2990,83 @@ extensions:
         std::fs::create_dir_all(&unit_dir).unwrap();
         std::fs::write(
             unit_dir.join("wpa_supplicant@.service"),
-            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target sys-subsystem-net-devices-%i.device\n",
         )
         .unwrap();
 
-        let out = run_overlay_script(
-            &confext_script_for(
-                root,
-                OverlayMode::Merge,
-                &[
-                    "wpa_supplicant@wlan0.service",
-                    "serial-getty@ttyGS0.service",
-                ],
-            ),
+        run_overlay_script(
+            &confext_script_for(root, OverlayMode::Merge, &["wpa_supplicant@wlan0.service"]),
             root,
             None,
         );
-        let wants = root.join("sysroots/app/etc/systemd/system/multi-user.target.wants");
-        assert_eq!(
-            std::fs::read_link(wants.join("wpa_supplicant@wlan0.service")).unwrap(),
-            std::path::Path::new("/usr/lib/systemd/system/wpa_supplicant@.service")
+        let etc = root.join("sysroots/app/etc/systemd/system");
+        for wants in [
+            "multi-user.target.wants",
+            "sys-subsystem-net-devices-wlan0.device.wants",
+        ] {
+            assert_eq!(
+                std::fs::read_link(etc.join(wants).join("wpa_supplicant@wlan0.service")).unwrap(),
+                std::path::Path::new("/usr/lib/systemd/system/wpa_supplicant@.service")
+            );
+        }
+        assert!(!etc
+            .join("sys-subsystem-net-devices-%i.device.wants")
+            .exists());
+    }
+
+    /// An instance whose template comes from the rootfs (serial-getty@.service)
+    /// cannot be linked here and nothing enables it on the device, so the build
+    /// fails and says how to ship the link instead.
+    #[test]
+    #[cfg(unix)]
+    fn a_rootfs_template_instance_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        std::fs::create_dir_all(root.join("sysroots/app")).unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["serial-getty@ttyGS0.service"]),
+            root,
+            None,
         );
-        assert!(!wants.join("serial-getty@ttyGS0.service").exists());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
         assert!(
-            out.contains("Warning: enable_services lists serial-getty@ttyGS0.service, but its template serial-getty@.service is not in the extension sysroot"),
-            "{out}"
+            stdout.contains("its template serial-getty@.service is not in the extension sysroot"),
+            "{stdout}"
+        );
+        assert!(
+            stdout
+                .contains("overlay/etc/systemd/system/<target>.wants/serial-getty@ttyGS0.service"),
+            "{stdout}"
+        );
+    }
+
+    /// A specifier the build cannot expand fails rather than linking a target
+    /// name systemd never reads.
+    #[test]
+    #[cfg(unix)]
+    fn an_unsupported_target_specifier_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("foo@.service"),
+            "[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=%p.target\n",
+        )
+        .unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["foo@bar.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("names %p.target, with a specifier"),
+            "{stdout}"
         );
     }
 
