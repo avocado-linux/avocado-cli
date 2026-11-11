@@ -124,37 +124,48 @@ impl VmConnectCommand {
                 let id = crate::utils::vm::state::instance_id(
                     &crate::utils::vm::state::VmPaths::resolve()?,
                 )?;
-                target
-                    .exec(&format!(
-                        "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
-                         for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
-                         printf '%s' {cfg} > {d}/config.toml && chmod 0600 {d}/config.toml && \
-                         printf '%s\\n' {id} > {idf} && sync && \
-                         systemctl restart avocado-conn",
-                        d = hub::CONN_DIR,
-                        idf = hub::DEVICE_ID_FILE,
-                    ))
-                    .await
-                    .context("could not start avocado-conn in the VM")?;
-                print_info("Claiming…", OutputLevel::Normal);
-                for _ in 0..30 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let (out, _) = target
-                        .exec(&format!("cat {state_file} 2>/dev/null || true"))
-                        .await?;
-                    if let Ok(s) = serde_json::from_str::<serde_json::Value>(out.trim()) {
-                        let _ = target
-                            .exec(&format!("rm -f {d}/*.prev", d = hub::CONN_DIR))
-                            .await;
-                        print_success(
-                            &format!(
-                                "VM connected as '{name}' (device {})",
-                                s["device_id"].as_str().unwrap_or("?")
-                            ),
-                            OutputLevel::Normal,
-                        );
-                        return Ok(());
+                // From here the previous identity is set aside: every way out
+                // but a claim puts it back.
+                let claimed = async {
+                    target
+                        .exec(&format!(
+                            "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
+                             for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
+                             printf '%s' {cfg} > {d}/config.toml && chmod 0600 {d}/config.toml && \
+                             printf '%s\\n' {id} > {idf} && sync && \
+                             systemctl restart avocado-conn",
+                            d = hub::CONN_DIR,
+                            idf = hub::DEVICE_ID_FILE,
+                        ))
+                        .await
+                        // Not the exec error: it quotes the command, and with
+                        // it the config's still-valid claim token.
+                        .map_err(|_| anyhow::anyhow!("could not start avocado-conn in the VM"))?;
+                    print_info("Claiming…", OutputLevel::Normal);
+                    for _ in 0..30 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let (out, _) = target
+                            .exec(&format!("cat {state_file} 2>/dev/null || true"))
+                            .await?;
+                        if let Ok(s) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+                            return Ok(Some(s));
+                        }
                     }
+                    anyhow::Ok(None)
+                }
+                .await;
+                if let Ok(Some(s)) = &claimed {
+                    let _ = target
+                        .exec(&format!("rm -f {d}/*.prev", d = hub::CONN_DIR))
+                        .await;
+                    print_success(
+                        &format!(
+                            "VM connected as '{name}' (device {})",
+                            s["device_id"].as_str().unwrap_or("?")
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    return Ok(());
                 }
                 // Put the previous identity back rather than leave none.
                 let _ = target
@@ -165,10 +176,13 @@ impl VmConnectCommand {
                         d = hub::CONN_DIR
                     ))
                     .await;
-                bail!(
-                    "avocado-conn did not claim within 30 s (previous connection restored, if any); \
-                     check `avocado vm shell -- journalctl -u avocado-conn`"
-                )
+                match claimed {
+                    Err(e) => Err(e.context("previous connection restored, if any")),
+                    _ => bail!(
+                        "avocado-conn did not claim within 30 s (previous connection restored, if any); \
+                         check `avocado vm shell -- journalctl -u avocado-conn`"
+                    ),
+                }
             }
         }
     }
