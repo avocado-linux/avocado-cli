@@ -247,6 +247,47 @@ pub fn default_board(config_path: &str) -> Result<String> {
         )
 }
 
+/// The scopes a hub command uses on a claimed board (as Connect mints them
+/// for its own commands).
+fn command_scopes(command: &str) -> &'static [&'static str] {
+    match command {
+        "rubicon_dut" => &["dut"],
+        "rubicon_update" => &["update"],
+        "rubicon_console" => &["console"],
+        "rubicon_claim" => &["admin"],
+        _ => &["dut", "usbip", "console"],
+    }
+}
+
+/// A token for a command through this machine's VM on a claimed board,
+/// from Connect (Connect adds its own to commands it relays). `None` for an
+/// unclaimed board.
+pub async fn local_token(
+    board: &Board,
+    command: &str,
+    connect_profile: Option<&str>,
+) -> Result<Option<String>> {
+    if board.hub != Hub::Local || board.info["claimed"] != true {
+        return Ok(None);
+    }
+    let name = board
+        .name
+        .as_deref()
+        .context("the board is claimed but has not said its name yet")?;
+    let (c, org) = connect(connect_profile, None).context(
+        "the board is claimed: commands need a token from Connect (`avocado connect auth login`)",
+    )?;
+    let r = c
+        .json(
+            Method::POST,
+            &format!("/api/orgs/{org}/rubicon-tokens"),
+            Some(&json!({"name": name, "scopes": command_scopes(command)})),
+        )
+        .await
+        .with_context(|| format!("token for {name} ({})", command_scopes(command).join(", ")))?;
+    Ok(r["data"]["token"].as_str().map(String::from))
+}
+
 /// Run a hub command on `board` and follow it to its result: the agent's
 /// `command_result` line (local) or Connect's command record, normalized
 /// to `{status, result}`. The job log streams to stdout.
@@ -258,6 +299,10 @@ pub async fn run_command(
 ) -> Result<Value> {
     match &board.hub {
         Hub::Local => {
+            let mut params = params;
+            if let Some(t) = local_token(board, command, connect_profile).await? {
+                params["rubicon_token"] = json!(t);
+            }
             let req = json!({
                 "type": "command",
                 "id": uuid::Uuid::new_v4().to_string(),
@@ -414,7 +459,11 @@ impl RemoteProvision {
             .find(|p| p.extension().is_some_and(|e| e == "bundle"))
             .context("the pack produced no bundle")?;
         match &board.hub {
-            Hub::Local => self.run_local(&bundle, &board.address).await,
+            Hub::Local => {
+                let token =
+                    local_token(&board, "provision", self.connect_profile.as_deref()).await?;
+                self.run_local(&bundle, &board.address, token).await
+            }
             Hub::Connect { vm, vm_name } => {
                 let (c, org) = connect(self.connect_profile.as_deref(), None)?;
                 print_info(
@@ -452,7 +501,7 @@ impl RemoteProvision {
     }
 
     /// Hand the job to this machine's VM agent and follow it to the end.
-    async fn run_local(&self, bundle: &Path, address: &str) -> Result<()> {
+    async fn run_local(&self, bundle: &Path, address: &str, token: Option<String>) -> Result<()> {
         let paths = VmPaths::resolve()?;
         let ws = share::read_recorded_workspace(&paths)?
             .map(Ok)
@@ -485,6 +534,7 @@ impl RemoteProvision {
                 "address": address,
                 "profile": self.provision_profile,
                 "bundle": {"name": name, "bundle_json": meta, "blobs": blobs},
+                "rubicon_token": token,
             },
         });
         let r = follow_local(req).await?;
