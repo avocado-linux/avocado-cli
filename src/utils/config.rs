@@ -2281,7 +2281,7 @@ impl Config {
 
             // Merge external config into main config
             let mut external_config = external_config;
-            Self::resolve_rubicon_run_names(&mut external_config, &main_config, target)?;
+            Self::resolve_rubicon_run_names(&mut external_config, &main_config, ext_name, target);
             Self::merge_external_config(
                 &mut main_config,
                 &external_config,
@@ -2812,7 +2812,12 @@ impl Config {
 
             // Merge the remote extension config with include patterns
             let mut ext_config = ext_config;
-            Self::resolve_rubicon_run_names(&mut ext_config, main_config, Some(&resolved_target))?;
+            Self::resolve_rubicon_run_names(
+                &mut ext_config,
+                main_config,
+                &ext_name,
+                Some(&resolved_target),
+            );
             Self::merge_external_config(
                 main_config,
                 &ext_config,
@@ -3039,31 +3044,47 @@ impl Config {
     /// will, before they merge: matched as written, the project's
     /// `enter-jetson` and the extension's template both went in, and the
     /// final interpolation let the extension's replace the project's.
+    ///
+    /// Names resolve against the project with the extension's own section
+    /// merged in (project wins), so `boot-{{ config.extensions.bsp.version }}`
+    /// sees a version the BSP supplies. A name still unresolvable here (a
+    /// value only composition provides) stays raw for the final pass.
     fn resolve_rubicon_run_names(
         ext_config: &mut serde_yaml::Value,
         main_config: &serde_yaml::Value,
+        ext_name: &str,
         target: Option<&str>,
-    ) -> Result<()> {
+    ) {
         use crate::utils::interpolation::{preprocess_text, AvocadoContext};
+        let has_run = ext_config
+            .get("rubicon")
+            .and_then(|r| r.get("run"))
+            .is_some_and(|r| r.is_mapping());
+        if !has_run {
+            return;
+        }
+        let mut tree = main_config.clone();
+        Self::merge_external_config(&mut tree, ext_config, ext_name, &[], &[]);
         let Some(run) = ext_config
             .get_mut("rubicon")
             .and_then(|r| r.get_mut("run"))
             .and_then(|r| r.as_mapping_mut())
         else {
-            return Ok(());
+            return;
         };
-        let context = AvocadoContext::from_main_config(main_config, target, None);
+        let context = AvocadoContext::from_main_config(&tree, target, None);
         *run = std::mem::take(run)
             .into_iter()
             .map(|(name, steps)| {
                 let name = match name.as_str() {
-                    Some(n) => preprocess_text(n, main_config, &context)?.into(),
+                    Some(n) => preprocess_text(n, &tree, &context)
+                        .map(Into::into)
+                        .unwrap_or(name),
                     None => name,
                 };
-                Ok((name, steps))
+                (name, steps)
             })
-            .collect::<Result<_>>()?;
-        Ok(())
+            .collect();
     }
 
     /// Merge an external config into the main config.
@@ -15903,11 +15924,32 @@ rubicon:
 ",
         )
         .unwrap();
-        Config::resolve_rubicon_run_names(&mut ext, &main, None).unwrap();
+        Config::resolve_rubicon_run_names(&mut ext, &main, "bsp", None);
         Config::merge_external_config(&mut main, &ext, "bsp", &[], &[]);
         crate::utils::interpolation::interpolate_config(&mut main, None, None).unwrap();
         let c: Config = serde_yaml::from_value(main).unwrap();
         assert_eq!(steps(&c, "enter-jetson"), vec![RubiconStep::WaitMs(1)]);
+    }
+
+    #[test]
+    fn an_extension_run_profile_name_sees_the_extensions_own_values() {
+        let main: serde_yaml::Value = serde_yaml::from_str("default_target: jetson\n").unwrap();
+        let mut ext: serde_yaml::Value = serde_yaml::from_str(
+            "extensions:
+  bsp:
+    version: \"1.2\"
+rubicon:
+  run:
+    \"boot-{{ config.extensions.bsp.version }}\": [ { wait_ms: 1 } ]
+    \"late-{{ config.extensions.other.version }}\": [ { wait_ms: 1 } ]
+",
+        )
+        .unwrap();
+        Config::resolve_rubicon_run_names(&mut ext, &main, "bsp", None);
+        let run = ext["rubicon"]["run"].as_mapping().unwrap();
+        assert!(run.contains_key("boot-1.2"));
+        // Not available until composition: left for the final pass.
+        assert!(run.contains_key("late-{{ config.extensions.other.version }}"));
     }
 
     #[test]
