@@ -193,11 +193,14 @@ fn templated_values(
 }
 
 /// The entries of a mapping before and after interpolation, as
-/// `((raw key, raw value), (expanded key, expanded value))`. A templated key
-/// is removed and reinserted at the end, so entries pair by key first and
-/// the leftover templated keys pair in order. When interpolation changed the
-/// number of entries (two keys expanded to one, or the distro override was
-/// folded in), the leftovers cannot be told apart and are not paired.
+/// `((raw key, raw value), (expanded key, expanded value))`. Entries pair by
+/// key first. A templated key is removed and reinserted under its expansion,
+/// and over several passes in another order, so each leftover expanded key
+/// pairs with the one templated key whose text around the `{{ }}` it
+/// matches (`key_pattern`). When interpolation changed the number of entries
+/// (two keys expanded to one, or the distro override was folded in), or a
+/// leftover key matches no templated key or more than one, the leftovers
+/// cannot be told apart and none of them are paired.
 #[allow(clippy::type_complexity)]
 fn paired_entries<'a>(
     r: &'a serde_yaml::Mapping,
@@ -214,36 +217,61 @@ fn paired_entries<'a>(
             None => raw_left.push((k, rv)),
         }
     }
-    if r.len() == x.len() {
-        let raw_left = raw_left
-            .into_iter()
-            .filter(|(k, _)| k.as_str().is_some_and(|k| k.contains("{{")));
-        let x_left = x.iter().filter(|(k, _)| !r.contains_key(*k));
-        pairs.extend(raw_left.zip(x_left));
+    if r.len() != x.len() {
+        return pairs;
+    }
+    let raw_left: Vec<_> = raw_left
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v, key_pattern(k.as_str()?)?)))
+        .collect();
+    let mut left = Vec::new();
+    for (xk, xv) in x.iter().filter(|(k, _)| !r.contains_key(*k)) {
+        let mut matches = raw_left
+            .iter()
+            .filter(|(_, _, pattern)| xk.as_str().is_some_and(|k| pattern.is_match(k)));
+        match (matches.next(), matches.next()) {
+            (Some((rk, rv, _)), None) => left.push(((*rk, *rv), (xk, xv))),
+            _ => return pairs,
+        }
+    }
+    let raw_keys: std::collections::HashSet<_> = left.iter().map(|((rk, _), _)| *rk).collect();
+    if raw_keys.len() == left.len() {
+        pairs.extend(left);
     }
     pairs
+}
+
+/// The `{{ ... }}` templates in a string. The same pattern as interpolation.
+fn template_regex() -> &'static regex::Regex {
+    static TEMPLATE: OnceLock<regex::Regex> = OnceLock::new();
+    TEMPLATE.get_or_init(|| regex::Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap())
+}
+
+/// A pattern that matches every expansion of a templated key: its text
+/// around the templates, which any text may replace. `None` for a key with
+/// no template.
+fn key_pattern(key: &str) -> Option<regex::Regex> {
+    let mut pattern = String::from("^");
+    let mut end = 0;
+    for m in template_regex().find_iter(key) {
+        pattern.push_str(&regex::escape(&key[end..m.start()]));
+        pattern.push_str("(?s:.*)");
+        end = m.end();
+    }
+    if end == 0 {
+        return None;
+    }
+    pattern.push_str(&regex::escape(&key[end..]));
+    pattern.push('$');
+    regex::Regex::new(&pattern).ok()
 }
 
 /// Each env var a template in `doc` reads, as `(value, "{{ env.NAME }}")`.
 /// Unset and empty values are left out: they cannot reveal anything.
 fn env_values(doc: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
     use serde_yaml::Value;
-    static TEMPLATE: OnceLock<regex::Regex> = OnceLock::new();
-    let template = TEMPLATE.get_or_init(|| regex::Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap());
     match doc {
-        Value::String(s) => {
-            for capture in template.captures_iter(s) {
-                let Some(name) = capture[1].trim().strip_prefix("env.") else {
-                    continue;
-                };
-                match std::env::var(name) {
-                    Ok(value) if !value.is_empty() => {
-                        out.push((value, format!("{{{{ env.{name} }}}}")));
-                    }
-                    _ => {}
-                }
-            }
-        }
+        Value::String(s) => env_values_in(s, out),
         Value::Sequence(items) => {
             for item in items {
                 env_values(item, out);
@@ -257,6 +285,27 @@ fn env_values(doc: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
         }
         Value::Tagged(tagged) => env_values(&tagged.value, out),
         _ => {}
+    }
+}
+
+/// The env vars that `text` reads, then the ones their values read: a value
+/// that holds a template is expanded on the next interpolation pass.
+fn env_values_in(text: &str, out: &mut Vec<(String, String)>) {
+    for capture in template_regex().captures_iter(text) {
+        let Some(name) = capture[1].trim().strip_prefix("env.") else {
+            continue;
+        };
+        let template = format!("{{{{ env.{name} }}}}");
+        if out.iter().any(|(_, t)| *t == template) {
+            continue;
+        }
+        match std::env::var(name) {
+            Ok(value) if !value.is_empty() => {
+                out.push((value.clone(), template));
+                env_values_in(&value, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -277,10 +326,20 @@ fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> S
             continue;
         }
         let quoted = serde_json::to_string(&bare).unwrap_or_default();
-        pairs.push((quoted, serde_json::to_string(template).unwrap_or_default()));
+        let quoted_template = serde_json::to_string(template).unwrap_or_default();
         if bare.chars().count() >= 4 {
+            // Inside a longer JSON string the value is escaped but not
+            // quoted on its own.
+            let escaped = &quoted[1..quoted.len() - 1];
+            if escaped != bare {
+                pairs.push((
+                    escaped.to_string(),
+                    quoted_template[1..quoted_template.len() - 1].to_string(),
+                ));
+            }
             pairs.push((bare, template.clone()));
         }
+        pairs.push((quoted, quoted_template));
     }
     // Longest first, so a value that contains another is replaced whole.
     pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
@@ -650,9 +709,18 @@ mod tests {
     /// Run `f` with `AVOCADO_TEST_VALIDATE_MARKER` set to a marker value that
     /// stands in for a secret.
     fn with_marker<T>(f: impl FnOnce() -> T) -> T {
-        std::env::set_var("AVOCADO_TEST_VALIDATE_MARKER", MARKER);
+        with_env(&[("AVOCADO_TEST_VALIDATE_MARKER", MARKER)], f)
+    }
+
+    /// Run `f` with each `AVOCADO_TEST_VALIDATE_<name>` set to its value.
+    fn with_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
         let out = f();
-        std::env::remove_var("AVOCADO_TEST_VALIDATE_MARKER");
+        for (name, _) in vars {
+            std::env::remove_var(name);
+        }
         out
     }
 
@@ -739,10 +807,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_literal_key_equal_to_an_env_value_is_kept() {
-        std::env::set_var("AVOCADO_TEST_VALIDATE_KEY", "extensions");
-        let report =
-            validate("runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_KEY }}\":\n    extensions: 5\n");
-        std::env::remove_var("AVOCADO_TEST_VALIDATE_KEY");
+        let report = with_env(&[("AVOCADO_TEST_VALIDATE_KEY", "extensions")], || {
+            validate("runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_KEY }}\":\n    extensions: 5\n")
+        });
         let paths: Vec<_> = report.errors.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -762,14 +829,98 @@ mod tests {
             format!("runtimes:\n  dev:\n    extensions: []\n  \"{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}\":\n{survivor}"),
             format!("runtimes:\n  \"{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}\":\n    extensions: []\n  \"{{{{env.AVOCADO_TEST_VALIDATE_KEY}}}}\":\n{survivor}"),
         ] {
-            std::env::set_var("AVOCADO_TEST_VALIDATE_KEY", "dev");
-            let report = with_marker(|| validate(&yaml));
-            std::env::remove_var("AVOCADO_TEST_VALIDATE_KEY");
+            let report = with_env(
+                &[
+                    ("AVOCADO_TEST_VALIDATE_KEY", "dev"),
+                    ("AVOCADO_TEST_VALIDATE_MARKER", MARKER),
+                ],
+                || validate(&yaml),
+            );
             assert!(!report.errors.is_empty(), "{yaml}");
             for e in &report.errors {
                 assert!(!e.path.contains(MARKER), "{e:?}");
                 assert!(!e.message.contains(MARKER), "{e:?}");
             }
+        }
+    }
+
+    /// An env value that holds a template brings in another env var on the
+    /// next interpolation pass. That value is hidden too.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_read_through_another_is_not_shown() {
+        let report = with_env(
+            &[
+                ("AVOCADO_TEST_VALIDATE_KEY", "dev"),
+                (
+                    "AVOCADO_TEST_VALIDATE_INDIRECT",
+                    "{{ env.AVOCADO_TEST_VALIDATE_MARKER }}",
+                ),
+                ("AVOCADO_TEST_VALIDATE_MARKER", MARKER),
+            ],
+            || {
+                validate(
+                    "runtimes:\n  dev:\n    extensions: []\n  \"{{ env.AVOCADO_TEST_VALIDATE_KEY }}\":\n    extensions:\n      - \"{{ env.AVOCADO_TEST_VALIDATE_INDIRECT }}\": {enabled: 5}\n",
+                )
+            },
+        );
+        assert!(!report.errors.is_empty());
+        for e in &report.errors {
+            assert!(!e.path.contains(MARKER), "{e:?}");
+            assert!(!e.message.contains(MARKER), "{e:?}");
+        }
+    }
+
+    /// Inside a longer JSON string an env value is escaped, not quoted on
+    /// its own.
+    #[test]
+    #[serial_test::serial]
+    fn an_escaped_env_value_is_not_shown() {
+        let report = with_env(
+            &[
+                ("AVOCADO_TEST_VALIDATE_KEY", "dev"),
+                ("AVOCADO_TEST_VALIDATE_QUOTED", "LEAK\"MARKER"),
+            ],
+            || {
+                validate(
+                    "runtimes:\n  dev:\n    extensions: []\n  \"{{ env.AVOCADO_TEST_VALIDATE_KEY }}\":\n    extensions: {app: \"prefix-{{ env.AVOCADO_TEST_VALIDATE_QUOTED }}\"}\n",
+                )
+            },
+        );
+        assert!(!report.errors.is_empty());
+        for e in &report.errors {
+            assert!(!e.message.contains("LEAK"), "{e:?}");
+        }
+    }
+
+    /// A key whose env value holds a template is expanded on a later pass
+    /// and reinserted after the others, so keys do not pair by order. They
+    /// pair by the text around the template, and when that is ambiguous the
+    /// key only has its env value hidden.
+    #[test]
+    #[serial_test::serial]
+    fn keys_expanded_over_several_passes_keep_their_templates() {
+        let env = [
+            (
+                "AVOCADO_TEST_VALIDATE_FIRST",
+                "{{ env.AVOCADO_TEST_VALIDATE_LAST }}",
+            ),
+            ("AVOCADO_TEST_VALIDATE_LAST", "prod"),
+            ("AVOCADO_TEST_VALIDATE_SECOND", "dev"),
+        ];
+        for (yaml, path) in [
+            (
+                "runtimes:\n  \"app-{{ env.AVOCADO_TEST_VALIDATE_FIRST }}\":\n    extensions: 5\n  \"lib-{{ env.AVOCADO_TEST_VALIDATE_SECOND }}\":\n    extensions: []\n",
+                "/runtimes/app-{{ env.AVOCADO_TEST_VALIDATE_FIRST }}/extensions",
+            ),
+            (
+                "runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_FIRST }}\":\n    extensions: 5\n  \"{{ env.AVOCADO_TEST_VALIDATE_SECOND }}\":\n    extensions: []\n",
+                "/runtimes/{{ env.AVOCADO_TEST_VALIDATE_LAST }}/extensions",
+            ),
+        ] {
+            let report = with_env(&env, || validate(yaml));
+            let paths: Vec<_> = report.errors.iter().map(|e| e.path.as_str()).collect();
+            assert_eq!(paths, [path], "{yaml}");
         }
     }
 
