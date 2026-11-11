@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://docs.peridio.com/schemas/avocado-config.json
-cli_requirement: ">=0.41.0"
+cli_requirement: ">=1.0.0"
 
 default_target: "{target}"
 

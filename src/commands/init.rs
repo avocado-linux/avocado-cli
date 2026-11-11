@@ -1122,6 +1122,34 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn template_requirement_matches_prerelease() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
+        init_cmd.execute().await.unwrap();
+
+        let content = fs::read_to_string(PathBuf::from(temp_path).join("avocado.yaml")).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let requirement = yaml["cli_requirement"].as_str().unwrap();
+        assert_eq!(requirement, ">=1.0.0");
+
+        let dev = semver::Version::parse("1.1.0-dev").unwrap();
+        let old = semver::Version::parse("0.99.0").unwrap();
+        assert!(crate::utils::version::cli_requirement_satisfied_by(requirement, &dev).unwrap());
+        assert!(!crate::utils::version::cli_requirement_satisfied_by(requirement, &old).unwrap());
+    }
+
+    #[tokio::test]
     async fn test_init_default_target() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
@@ -1146,7 +1174,7 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
-        assert!(content.contains("cli_requirement: \">=0.41.0\""));
+        assert!(content.contains("cli_requirement: \">=1.0.0\""));
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: edge"));
         assert!(content.contains("release: 2026"));
