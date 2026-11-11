@@ -290,7 +290,15 @@ pub async fn local_token(
         )
         .await
         .with_context(|| format!("token for {name} ({})", command_scopes(command).join(", ")))?;
-    Ok(r["data"]["token"].as_str().map(String::from))
+    issued_token(&r)
+        .map(Some)
+        .with_context(|| format!("Connect sent no token for {name}"))
+}
+
+/// The token in a `rubicon-tokens` answer. A claimed board refuses a
+/// command without one, so a missing token is an error, not "unclaimed".
+fn issued_token(r: &Value) -> Option<String> {
+    s(&r["data"]["token"])
 }
 
 /// Run a hub command on `board` and follow it to its result: the agent's
@@ -840,6 +848,18 @@ mod tests {
             console_writer(&b, 3600).as_deref(),
             Some("console (writer), 50m")
         );
+    }
+
+    #[test]
+    fn a_claimed_boards_token_must_be_a_nonempty_string() {
+        assert_eq!(
+            issued_token(&json!({"data": {"token": "t1"}})).as_deref(),
+            Some("t1")
+        );
+        // A non-JSON success body reads as null: an error, not unclaimed.
+        assert_eq!(issued_token(&Value::Null), None);
+        assert_eq!(issued_token(&json!({"data": {"token": ""}})), None);
+        assert_eq!(issued_token(&json!({"data": {"token": 7}})), None);
     }
 
     #[test]
