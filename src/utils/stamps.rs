@@ -1613,33 +1613,31 @@ pub fn compute_compile_deps_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
-/// Compute input hash for one `sdk.compile` section run by `ext build` for
-/// `ext_name`: everything the section's compile script is known to read.
+/// Compute input hash for one `sdk.compile` section run by `ext build`:
+/// everything the section's compile script is known to read.
 ///
 /// - the `sdk.compile.<section>` node itself
 /// - the bytes of `script`, the compile script that runs (resolved for the
 ///   target), found the way [`fold_package_scripts`] finds it
-/// - the calling extension's `package_files` tree, the only declared list of
-///   the sources a compile script reads (see [`sdk_compile_inputs_are_complete`])
+/// - the `package_files` tree and `source` of every extension in `exts`. The
+///   lists are the only declared record of the sources a compile script reads
+///   (see [`sdk_compile_inputs_are_complete`])
 /// - the SDK settings the container is started with
 /// - `environment`: facts only the caller knows, such as the lock pins of the
 ///   SDK and the target sysroot (see [`locked_packages_hash`]), so a toolchain
 ///   or library change runs the section again
 ///
-/// `ext` is the extension's node with its `target-<name>:`, `kernel-<spec>:`
-/// and bare-target overrides already resolved, as `ext build` uses it. The
-/// unresolved node can name a different `package_files` or `source` than the
-/// one the build reads.
-///
-/// The section is shared by every extension that names it, but the hash folds
-/// the caller's `package_files`. Two callers with different lists move the hash
-/// in turn, and the section runs as often as it did before there was a stamp.
+/// `exts` holds every extension that names the section, the calling extension
+/// first, each node with its `target-<name>:`, `kernel-<spec>:` and bare-target
+/// overrides resolved as `ext build` resolves them. The stamp is keyed by the
+/// section alone, so its hash must not depend on which extension builds it: a
+/// source that one extension lists and another does not must still move it.
+/// The script is found under the calling extension's content root.
 pub fn compute_sdk_compile_input_hash(
     config: &serde_yaml::Value,
     section: &str,
     script: &str,
-    ext_name: &str,
-    ext: &serde_yaml::Value,
+    exts: &[(String, serde_yaml::Value)],
     project_root: &Path,
     environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<StampInputs> {
@@ -1648,7 +1646,9 @@ pub fn compute_sdk_compile_input_hash(
         .and_then(|s| s.get("compile"))
         .and_then(|c| c.get(section))
         .ok_or_else(|| anyhow::anyhow!("sdk.compile.{section} not found in config"))?;
-    let content_root = ext_content_root(ext, project_root);
+    let caller_root = exts
+        .first()
+        .and_then(|(_, ext)| ext_content_root(ext, project_root));
 
     let mut hash_data = serde_yaml::Mapping::new();
     let key = |k: &str| serde_yaml::Value::String(format!("sdk.compile.{section}.{k}"));
@@ -1657,25 +1657,27 @@ pub fn compute_sdk_compile_input_hash(
     fold_file_content(
         &mut hash_data,
         &format!("sdk.compile.{section}.compile_script"),
-        compile_script_root(content_root.as_deref(), project_root, script),
+        compile_script_root(caller_root.as_deref(), project_root, script),
         script,
     )?;
 
-    if let (Some(files), Some(root)) = (
-        ext.get("package_files").and_then(|v| v.as_sequence()),
-        content_root.as_deref(),
-    ) {
-        let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-        hash_data.insert(
-            serde_yaml::Value::String(format!("ext.{ext_name}.package_files")),
-            serde_yaml::Value::String(package_files_digest(root, &patterns)?),
-        );
-    }
-    if let Some(source) = ext.get("source") {
-        hash_data.insert(
-            serde_yaml::Value::String(format!("ext.{ext_name}.source")),
-            source.clone(),
-        );
+    for (ext_name, ext) in exts {
+        if let (Some(files), Some(root)) = (
+            ext.get("package_files").and_then(|v| v.as_sequence()),
+            ext_content_root(ext, project_root),
+        ) {
+            let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.package_files")),
+                serde_yaml::Value::String(package_files_digest(&root, &patterns)?),
+            );
+        }
+        if let Some(source) = ext.get("source") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.source")),
+                source.clone(),
+            );
+        }
     }
 
     for k in ["image", "repo_url", "repo_release", "container_args"] {
@@ -1696,36 +1698,79 @@ pub fn compute_sdk_compile_input_hash(
 }
 
 /// Whether [`compute_sdk_compile_input_hash`] describes everything the
-/// compile script reads when `ext build` runs it for the extension `ext`
-/// (resolved for the target). The section may be skipped only when this holds.
+/// compile script reads when `ext build` runs it. `exts` is every extension
+/// that names the section, the caller first, each resolved for the target. The
+/// section may be skipped only when this holds.
 ///
 /// A compile script reads source files that no config key names. Without a
 /// list of them, a source edit leaves every input unmoved, the section is
-/// skipped, and the extension ships the previous binary with exit 0. The
+/// skipped, and the extension ships the previous binary with exit 0. An
 /// extension's `package_files` is that list, and it is the same declaration
 /// that lets `ext build` skip itself ([`ext_build_inputs_are_complete`]). So
-/// the rule is the same: no declared, host-visible `package_files`, no skip.
+/// the rule is the same, for each extension that names the section: its
+/// sources are declared and can be hashed ([`declared_sources_are_hashable`]).
 ///
-/// It also needs the compile script on the host. A remote extension's scripts
-/// are unpacked into the SDK volume, where nothing here can hash them.
+/// It also needs the compile script on the host, as a regular file. A remote
+/// extension's scripts are unpacked into the SDK volume, where nothing here can
+/// hash them, and the content digest hashes a top-level symlink by its link.
 pub fn sdk_compile_inputs_are_complete(
-    ext: &serde_yaml::Value,
+    exts: &[(String, serde_yaml::Value)],
     script: &str,
     project_root: &Path,
 ) -> bool {
-    let Some(content_root) = ext_content_root(ext, project_root) else {
+    let Some(caller_root) = exts
+        .first()
+        .and_then(|(_, ext)| ext_content_root(ext, project_root))
+    else {
         return false;
     };
-    let declares_sources = ext
-        .get("package_files")
-        .and_then(|v| v.as_sequence())
-        .is_some_and(|files| !files.is_empty());
-    // A regular file, not a symlink: the content digest hashes a top-level
-    // symlink by its link, so an edit to the file it points to would not move
-    // the hash.
-    let script_path = compile_script_root(Some(&content_root), project_root, script).join(script);
+    let script_path = compile_script_root(Some(&caller_root), project_root, script).join(script);
     let script_on_host = std::fs::symlink_metadata(script_path).is_ok_and(|m| m.is_file());
-    declares_sources && script_on_host
+    script_on_host
+        && exts
+            .iter()
+            .all(|(_, ext)| declared_sources_are_hashable(ext, project_root))
+}
+
+/// Whether an extension declares the sources it is built from in a way the
+/// hash can follow: a non-empty `package_files` list under a content root the
+/// host can read, with no symlink among the paths it selects, and with neither
+/// `package_files` nor `source` set again under an override.
+///
+/// - A host that cannot see the source (a git- or package-sourced extension)
+///   cannot hash a byte of it.
+/// - The content digest hashes a symlink by its link, not by what it points
+///   to, so an edit made through it would not move the hash.
+/// - The hashes that read the unresolved node (the `ext build` input hash)
+///   fold the top-level list, never one an override sets for this target.
+///
+/// Used by both the `ext build` skip and the compile section skip, so the two
+/// cannot disagree about what counts as declared.
+pub fn declared_sources_are_hashable(ext: &serde_yaml::Value, project_root: &Path) -> bool {
+    if declares_sources_in_override(ext) {
+        return false;
+    }
+    let Some(root) = ext_content_root(ext, project_root) else {
+        return false;
+    };
+    let Some(files) = ext.get("package_files").and_then(|v| v.as_sequence()) else {
+        return false;
+    };
+    let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+    !patterns.is_empty() && !package_files_select_a_symlink(&root, &patterns)
+}
+
+/// Whether the build reads from the same tree the hash reads.
+///
+/// Without `src_dir`, the SDK container mounts the working directory at
+/// `/opt/src`, while every input hash reads files under the config file's
+/// directory (`Config::project_root`). Run from another directory, the build
+/// compiles one tree and the hash reads another, so no skip may trust it.
+pub fn hash_root_is_mounted(project_root: &Path, mounted_src_dir: &Path) -> bool {
+    match (project_root.canonicalize(), mounted_src_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Where a compile script is read from: the extension's content root when the
@@ -2528,12 +2573,7 @@ pub fn ext_build_inputs_are_complete(
     // out: `content_root` is `None` for any source the host cannot see, so a
     // package- or git-sourced extension can carry the full declaration while
     // not one byte of it reaches the hash.
-    ext_has_compile_package(ext)
-        && ext_content_root(ext, project_root).is_some()
-        && ext
-            .get("package_files")
-            .and_then(|v| v.as_sequence())
-            .is_some_and(|files| !files.is_empty())
+    ext_has_compile_package(ext) && declared_sources_are_hashable(ext, project_root)
 }
 
 /// Whether an override declares a `post_build` hook, or a package `compile`
@@ -2568,6 +2608,78 @@ fn declares_build_step_in_override(ext: &serde_yaml::Value) -> bool {
         m.iter()
             .any(|(key, value)| !matches!(key.as_str(), Some("packages")) && declares(value))
     })
+}
+
+/// Whether an override sets `package_files` or `source`. The keys at the top
+/// of the extension node are the ones a hash of the unresolved node reads; the
+/// same key below any other key (`target-<name>:`, `kernel-<spec>:`, a bare
+/// target, or an override nested in one) can replace them for the build.
+fn declares_sources_in_override(ext: &serde_yaml::Value) -> bool {
+    fn declares(node: &serde_yaml::Value) -> bool {
+        let Some(map) = node.as_mapping() else {
+            return false;
+        };
+        map.iter().any(|(key, value)| {
+            matches!(key.as_str(), Some("package_files" | "source")) || declares(value)
+        })
+    }
+    ext.as_mapping().is_some_and(|m| m.values().any(declares))
+}
+
+/// Whether any path a `package_files` list selects is a symlink or holds one.
+/// Literal entries are checked as they are, and globs are expanded the way
+/// [`package_files_digest`] expands them. A path that cannot be read counts
+/// as a symlink: the answer must fail toward "no skip". A missing one does
+/// not, because the digest already fails on it.
+fn package_files_select_a_symlink(root: &Path, patterns: &[&str]) -> bool {
+    let is_glob = |p: &str| p.contains(['*', '?', '[']);
+    let mut selected: Vec<std::path::PathBuf> = patterns
+        .iter()
+        .filter(|p| !is_glob(p))
+        .map(|p| root.join(p))
+        .collect();
+    let globs: Vec<globset::GlobMatcher> = match patterns
+        .iter()
+        .filter(|p| is_glob(p))
+        .map(|p| {
+            globset::GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .map(|g| g.compile_matcher())
+        })
+        .collect()
+    {
+        Ok(globs) => globs,
+        Err(_) => return true,
+    };
+    if !globs.is_empty() {
+        for entry in walkdir::WalkDir::new(root) {
+            let Ok(entry) = entry else { return true };
+            let Some(rel) = entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .and_then(|r| r.to_str())
+            else {
+                continue;
+            };
+            if !rel.is_empty() && globs.iter().any(|g| g.is_match(rel)) {
+                selected.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    selected
+        .iter()
+        .any(|path| match std::fs::symlink_metadata(path) {
+            // A missing entry is not a symlink. `package_files_digest` refuses it,
+            // and a hash that fails is never skipped on.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            Ok(m) if m.file_type().is_symlink() => true,
+            Ok(_) => walkdir::WalkDir::new(path)
+                .into_iter()
+                .any(|entry| entry.map_or(true, |e| e.path_is_symlink())),
+        })
 }
 
 /// Whether any package declares both a `compile` section and an `install`
@@ -8913,8 +9025,8 @@ extensions:
         env: &std::collections::BTreeMap<String, String>,
     ) -> String {
         let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        let ext = &v["extensions"]["my-ext"];
-        compute_sdk_compile_input_hash(&v, "app-compile", "compile.sh", "my-ext", ext, root, env)
+        let exts = [("my-ext".to_string(), v["extensions"]["my-ext"].clone())];
+        compute_sdk_compile_input_hash(&v, "app-compile", "compile.sh", &exts, root, env)
             .unwrap()
             .config_hash
     }
@@ -9009,7 +9121,8 @@ extensions:
         let root = dir.path();
         let complete = |yaml: &str| {
             let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-            sdk_compile_inputs_are_complete(&v["extensions"]["my-ext"], "compile.sh", root)
+            let exts = [("my-ext".to_string(), v["extensions"]["my-ext"].clone())];
+            sdk_compile_inputs_are_complete(&exts, "compile.sh", root)
         };
 
         assert!(complete(COMPILE_SECTION_YAML));
@@ -9062,8 +9175,7 @@ extensions:
                 &v,
                 "app-compile",
                 "compile.sh",
-                "my-ext",
-                &resolved,
+                &[("my-ext".to_string(), resolved.clone())],
                 root,
                 &env,
             )
@@ -9075,7 +9187,7 @@ extensions:
         std::fs::write(root.join("arm-src/arm.c"), "int arm = 1;\n").unwrap();
         assert_ne!(base, hash(), "source under the resolved package_files");
         assert!(sdk_compile_inputs_are_complete(
-            &resolved,
+            &[("my-ext".to_string(), resolved.clone())],
             "compile.sh",
             root
         ));
@@ -9096,8 +9208,7 @@ extensions:
                 &v,
                 "app-compile",
                 "compile-arm.sh",
-                "my-ext",
-                ext,
+                &[("my-ext".to_string(), ext.clone())],
                 root,
                 &env,
             )
@@ -9107,6 +9218,74 @@ extensions:
         let base = hash();
         std::fs::write(root.join("compile-arm.sh"), "make arm -j4\n").unwrap();
         assert_ne!(base, hash());
+    }
+
+    /// The shared rule both skips use. Sources must be declared, readable by
+    /// the host, free of symlinks, and not set again under an override.
+    #[test]
+    fn declared_sources_are_hashable_refuses_what_the_hash_cannot_follow() {
+        let dir = compile_project();
+        let root = dir.path();
+        let ok = |yaml: &str| {
+            let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            declared_sources_are_hashable(&v, root)
+        };
+        assert!(ok("package_files: [src]\n"));
+        assert!(ok("package_files: ['src/*.c']\n"));
+        assert!(!ok("package_files: []\n"));
+        assert!(!ok("overlay: overlay\n"));
+        assert!(!ok("package_files: [src]\nsource: {type: git, url: x}\n"));
+
+        // An override that sets the sources the unresolved hash never reads.
+        for form in ["target-qemuarm64", "kernel-6.6", "qemuarm64"] {
+            assert!(!ok(&format!(
+                "package_files: [src]\n{form}:\n  package_files: [other]\n"
+            )));
+            assert!(!ok(&format!(
+                "package_files: [src]\n{form}:\n  source: {{type: path, path: x}}\n"
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            // A symlink inside a listed directory, and one a glob selects.
+            std::os::unix::fs::symlink("main.c", root.join("src/link.c")).unwrap();
+            assert!(!ok("package_files: [src]\n"));
+            assert!(!ok("package_files: ['src/*.c']\n"));
+            std::fs::remove_file(root.join("src/link.c")).unwrap();
+            assert!(ok("package_files: [src]\n"));
+
+            // A top-level symlinked entry.
+            std::os::unix::fs::symlink("src", root.join("src-link")).unwrap();
+            assert!(!ok("package_files: [src-link]\n"));
+        }
+    }
+
+    /// The `ext build` skip uses the same rule: a compile+install extension
+    /// whose `package_files` points through a symlink is rebuilt.
+    #[cfg(unix)]
+    #[test]
+    fn ext_build_skip_refuses_symlinked_sources() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::os::unix::fs::symlink("src", root.join("src-link")).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(
+            &COMPILE_SECTION_YAML.replace("package_files: [src]", "package_files: [src-link]"),
+        )
+        .unwrap();
+        assert!(!ext_build_inputs_are_complete(&v, "my-ext", root));
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        assert!(ext_build_inputs_are_complete(&v, "my-ext", root));
+    }
+
+    #[test]
+    fn hash_root_is_mounted_compares_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(hash_root_is_mounted(root, &root.join("sub/..")));
+        assert!(!hash_root_is_mounted(&root.join("sub"), root));
+        assert!(!hash_root_is_mounted(&root.join("missing"), root));
     }
 
     /// A re-pin in the lock moves the pins digest even when no config changes.
