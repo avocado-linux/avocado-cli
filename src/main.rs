@@ -208,6 +208,10 @@ enum Commands {
         /// destination directory name otherwise.
         #[arg(long)]
         name: Option<String>,
+        /// Omit the default remote extensions (avocado-ext-dev,
+        /// avocado-ext-sshd-dev, the board BSP) from the generated config
+        #[arg(long)]
+        minimal: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
         output: OutputFormat,
@@ -2260,6 +2264,7 @@ async fn main() -> Result<()> {
             reference_commit,
             reference_repo,
             name,
+            minimal,
             output,
         } => {
             let init_cmd = InitCommand::new(
@@ -2271,7 +2276,8 @@ async fn main() -> Result<()> {
                 reference_repo,
                 name,
                 output,
-            );
+            )
+            .with_minimal(minimal);
             init_cmd.execute().await?;
             Ok(())
         }
