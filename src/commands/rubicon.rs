@@ -299,12 +299,13 @@ impl RubiconCommand {
     /// does not stop the others; any failure fails the command.
     async fn update_all(&self, fw: &Firmware) -> Result<()> {
         use futures_util::StreamExt;
-        let boards: Vec<Board> = self
-            .all_boards()
-            .await?
-            .into_iter()
-            .filter(|b| b.info["online"] == true)
-            .collect();
+        let boards = once_each(
+            self.all_boards()
+                .await?
+                .into_iter()
+                .filter(|b| b.info["online"] == true)
+                .collect(),
+        );
         if boards.is_empty() {
             bail!("no online Rubicons to update");
         }
@@ -367,8 +368,8 @@ impl RubiconCommand {
         Ok(())
     }
 
-    /// Every board reachable from here, each once (this machine's VM is also
-    /// one of the org's VMs in Connect).
+    /// Every board reachable from here, once per hub that drives it (this
+    /// machine's VM, also one of the org's VMs in Connect, counts once).
     async fn all_boards(&self) -> Result<Vec<Board>> {
         let mut boards = Vec::new();
         if self.via != Via::Connect {
@@ -391,11 +392,6 @@ impl RubiconCommand {
                 boards.retain(|b| b.vm_instance.as_deref() != Some(me.as_str()));
             }
         }
-        let mut seen = HashSet::new();
-        boards.retain(|b| match &b.name {
-            Some(n) => seen.insert(n.clone()),
-            None => true,
-        });
         Ok(boards)
     }
 
@@ -723,6 +719,17 @@ fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
     }
 }
 
+/// Each physical board once (by its firmware name), however many hubs
+/// drive it: one firmware update per board, not one per hub.
+fn once_each(mut boards: Vec<Board>) -> Vec<Board> {
+    let mut seen = HashSet::new();
+    boards.retain(|b| match &b.name {
+        Some(n) => seen.insert(n.clone()),
+        None => true,
+    });
+    boards
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +770,29 @@ mod tests {
         std::fs::write(&path, "rubicon: [not, a, map]\n").unwrap();
         let err = command(path_str, None).project().unwrap_err();
         assert!(format!("{err:#}").contains(path_str), "{err:#}");
+    }
+
+    #[test]
+    fn update_all_takes_each_board_once() {
+        let b = |name: Option<&str>, vm: &str| Board {
+            address: "10.0.0.1".into(),
+            name: name.map(String::from),
+            label: None,
+            hub: Hub::Connect {
+                vm: vm.into(),
+                vm_name: vm.into(),
+            },
+            info: json!({}),
+            vm_instance: None,
+        };
+        let boards = vec![
+            b(Some("rubicon-a"), "x"),
+            b(Some("rubicon-a"), "y"),
+            b(None, "x"),
+            b(None, "y"),
+        ];
+        let hubs: Vec<_> = once_each(boards).into_iter().map(|b| b.hub).collect();
+        assert_eq!(hubs.len(), 3);
     }
 
     #[test]
