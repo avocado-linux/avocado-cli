@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::commands::connect::client::{self, ConnectClient};
 use crate::commands::connect::upload::{compute_sha256_with_parts, PART_SIZE};
@@ -274,43 +273,13 @@ impl ProvisionJobCommand {
         if !self.wait {
             return Ok(());
         }
-        let base = format!("/api/orgs/{org}/vms/{}/commands/{id}", self.vm);
-        let mut after: i64 = -1;
-        loop {
-            let logs = c
-                .json(Method::GET, &format!("{base}/logs?after_seq={after}"), None)
-                .await?;
-            for chunk in logs["data"].as_array().into_iter().flatten() {
-                for l in chunk["lines"].as_array().into_iter().flatten() {
-                    println!("{}", l.as_str().unwrap_or_default());
-                }
-            }
-            if let Some(n) = logs["next_after_seq"].as_i64() {
-                after = n;
-            }
-            let state = c.json(Method::GET, &base, None).await?;
-            let st = state["data"]["state"].as_str().unwrap_or("");
-            if matches!(st, "completed" | "failed" | "expired") {
-                let result = &state["data"]["result"];
-                for check in result["checks"].as_array().into_iter().flatten() {
-                    println!(
-                        "check {}: {}",
-                        check["name"].as_str().unwrap_or("?"),
-                        check["status"].as_str().unwrap_or("?")
-                    );
-                }
-                let pass = st == "completed" && result["status"] == "pass";
-                println!(
-                    "job {id}: {st}, result {}",
-                    result["status"].as_str().unwrap_or("none")
-                );
-                if !pass {
-                    bail!("provision job did not pass");
-                }
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
+        let r = crate::commands::provision_remote::follow_connect(&c, &org, &self.vm, &id).await?;
+        println!(
+            "job {id}: {}, result {}",
+            r["status"].as_str().unwrap_or("?"),
+            r["result"]["status"].as_str().unwrap_or("none")
+        );
+        crate::commands::provision_remote::report(&r, "provision job")
     }
 }
 
