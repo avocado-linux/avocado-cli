@@ -2157,24 +2157,36 @@ fn ext_build_hash_data(
         // version names the image file and rides the kabtool `-v`; the rest
         // become unit wiring, sysusers entries, passwd/group edits, module
         // lists. None of them is a file, so the node is the whole input.
-        for k in [
-            "types",
-            "source",
-            "image",
-            "version",
-            "enable_services",
-            "on_merge",
-            "on_unmerge",
-            "sysusers",
-            "kernel_modules",
-            "ld_so_conf_d",
-            "scopes",
-            "reload_service_manager",
-            "users",
-            "groups",
-        ] {
-            if let Some(v) = ext.get(k) {
-                hash_data.insert(key(k), v.clone());
+        // Each key is read from the base block and from every
+        // `target-<name>:` override block: the build resolves the overrides
+        // for its target, and folding all of them over-invalidates across
+        // targets rather than missing a change. The base block keeps its
+        // key names, so a config with no override keeps its hash.
+        let overrides = ext.as_mapping().into_iter().flatten().filter_map(|(k, v)| {
+            let k = k.as_str()?;
+            k.starts_with("target-").then(|| (format!("{k}."), v))
+        });
+        for (prefix, node) in std::iter::once((String::new(), ext)).chain(overrides) {
+            for k in [
+                "types",
+                "source",
+                "image",
+                "version",
+                "enable_services",
+                "modprobe",
+                "on_merge",
+                "on_unmerge",
+                "sysusers",
+                "kernel_modules",
+                "ld_so_conf_d",
+                "scopes",
+                "reload_service_manager",
+                "users",
+                "groups",
+            ] {
+                if let Some(v) = node.get(k) {
+                    hash_data.insert(key(&format!("{prefix}{k}")), v.clone());
+                }
             }
         }
         // `version: {file, key}` reads the version out of a file at build time.
@@ -7235,6 +7247,41 @@ find() {
             "    var_files:\n      - \"var/lib/docker/**\"\n    subvolumes:\n      lib/x:\n        nodatacow: true",
         );
         assert_eq!(ext_build_hash(&base), ext_build_hash(&with));
+    }
+
+    /// `ext build` writes each `modprobe` entry to the release file, so a
+    /// change to the list alone must rebuild, not report "up to date".
+    #[test]
+    fn ext_build_hash_includes_modprobe() {
+        let base = ext_with_extras("    modprobe: [uvcvideo]");
+        let changed = ext_with_extras("    modprobe: [uvcvideo, br_netfilter]");
+        assert_ne!(ext_build_hash(&base), ext_build_hash(&changed));
+        assert_ne!(ext_build_hash(&ext_with_extras("")), ext_build_hash(&base));
+    }
+
+    /// `ext build` merges `target-<name>:` overrides before it writes the
+    /// release file, so a key set only in an override must move the hash too.
+    #[test]
+    fn ext_build_hash_sees_target_override_keys() {
+        for (key, before, after) in [
+            ("modprobe", "[uvcvideo]", "[uvcvideo, br_netfilter]"),
+            ("on_merge", "[\"echo a\"]", "[\"echo b\"]"),
+        ] {
+            let with = |list: &str| {
+                ext_with_extras(&format!("    target-qemux86-64:\n      {key}: {list}"))
+            };
+            assert_ne!(
+                ext_build_hash(&with(before)),
+                ext_build_hash(&with(after)),
+                "{key} in an override"
+            );
+        }
+        // A key in the base block and the same key in an override are
+        // different inputs.
+        let base = ext_with_extras("    modprobe: [uvcvideo]");
+        let same_in_override =
+            ext_with_extras("    target-qemux86-64:\n      modprobe: [uvcvideo]");
+        assert_ne!(ext_build_hash(&base), ext_build_hash(&same_in_override));
     }
 
     #[test]
