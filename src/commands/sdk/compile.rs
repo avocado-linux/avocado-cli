@@ -7,7 +7,13 @@ use crate::utils::{
     config::{ComposedConfig, Config},
     container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
-    stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
+    stamps::{
+        compute_sdk_compile_input_hash, generate_batch_read_stamps_script,
+        generate_output_listing_probe, generate_write_stamp_script, get_local_arch,
+        output_listing_from_batch, own_stamp_is_current, remove_own_stamp_line,
+        sdk_compile_inputs_are_complete, stamp_identity_from_batch, validate_stamps_batch, Stamp,
+        StampInputs, StampOutputs, StampRequirement,
+    },
     target::resolve_target_required,
 };
 
@@ -16,6 +22,15 @@ use crate::utils::{
 pub struct CompileSection {
     pub name: String,
     pub script: String,
+}
+
+/// What `execute` does with one compile section.
+#[derive(Debug, PartialEq)]
+enum SectionPlan {
+    /// The section stamp is current and the build directory is there.
+    Skip,
+    /// Run the script. With inputs, write the section stamp when it succeeds.
+    Run(Option<StampInputs>),
 }
 
 /// Implementation of the 'sdk compile' command.
@@ -40,6 +55,10 @@ pub struct SdkCompileCommand {
     /// If set, scripts are executed from this directory instead of /opt/src.
     /// Used for remote extensions where scripts are in $AVOCADO_PREFIX/includes/<ext>/
     pub workdir: Option<String>,
+    /// The extension whose `ext build` runs these sections. Only then may a
+    /// section be skipped: its stamp folds that extension's `package_files`.
+    /// A direct `sdk compile` always runs.
+    pub extension: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     /// TUI context for output capture when running under a parent orchestrator
@@ -66,6 +85,7 @@ impl SdkCompileCommand {
             no_stamps: false,
             sdk_arch: None,
             workdir: None,
+            extension: None,
             composed_config: None,
             tui_context: None,
         }
@@ -74,6 +94,12 @@ impl SdkCompileCommand {
     /// Set the working directory for compile scripts (container path)
     pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
         self.workdir = workdir;
+        self
+    }
+
+    /// Set the extension whose build runs these sections (see [`Self::extension`])
+    pub fn with_extension(mut self, extension: Option<String>) -> Self {
+        self.extension = extension;
         self
     }
 
@@ -123,6 +149,7 @@ impl SdkCompileCommand {
 
         // Validate stamps before proceeding (unless --no-stamps)
         // SDK compile requires SDK to be installed
+        let mut stamp_batch: Option<String> = None;
         if !self.no_stamps {
             let container_image = config
                 .get_sdk_image()
@@ -133,7 +160,23 @@ impl SdkCompileCommand {
 
             let requirements = vec![StampRequirement::sdk_install()];
 
-            let batch_script = generate_batch_read_stamps_script(&requirements);
+            // Under `ext build`, the same round-trip reads what the section skip
+            // needs: the section stamps, the compile-deps stamp, and which
+            // section build directories exist.
+            let mut batch_script = generate_batch_read_stamps_script(&requirements);
+            if self.extension.is_some() {
+                let mut own: Vec<StampRequirement> = self
+                    .sections
+                    .iter()
+                    .map(|s| StampRequirement::sdk_compile(s))
+                    .collect();
+                own.push(StampRequirement::compile_deps_install());
+                batch_script = format!(
+                    "{batch_script}\n{}\n{}",
+                    generate_batch_read_stamps_script(&own),
+                    generate_output_listing_probe("\"$AVOCADO_SDK_PREFIX/build\"/*"),
+                );
+            }
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
                 target: target.clone(),
@@ -165,6 +208,7 @@ impl SdkCompileCommand {
                     ))
                     .print_and_exit();
             }
+            stamp_batch = output;
         }
 
         // Debug: Check if sdk.compile was parsed
@@ -269,8 +313,24 @@ impl SdkCompileCommand {
         let target = resolve_target_required(self.target.as_deref(), config)?;
 
         let mut overall_success = true;
+        let project_root = config.project_root(&self.config_path);
 
         for section in &filtered_sections {
+            let plan = self.plan_section(
+                &composed.merged_value,
+                &project_root,
+                &section.name,
+                stamp_batch.as_deref(),
+                merged_container_args.as_deref(),
+            );
+            if plan == SectionPlan::Skip {
+                print_success(
+                    &format!("Compile section '{}' is up to date.", section.name),
+                    OutputLevel::Normal,
+                );
+                continue;
+            }
+
             print_info(
                 &format!(
                     "Compiling section '{}' with script '{}'",
@@ -297,6 +357,24 @@ impl SdkCompileCommand {
                     section.script, section.script, section.script, section.script
                 )
             };
+
+            // The old stamp goes before the script runs, so a failed or
+            // interrupted run never leaves one behind. The new one is written
+            // only after the script exits 0.
+            let own_req = StampRequirement::sdk_compile(section_name);
+            let mut compile_command = format!(
+                "{}{compile_command} || exit 1\n",
+                remove_own_stamp_line(&own_req)
+            );
+            if let SectionPlan::Run(Some(inputs)) = plan {
+                let stamp = Stamp::sdk_compile(
+                    section_name,
+                    get_local_arch(),
+                    inputs,
+                    StampOutputs::default(),
+                );
+                compile_command.push_str(&generate_write_stamp_script(&stamp)?);
+            }
 
             let config = RunConfig {
                 container_image: container_image.to_string(),
@@ -344,6 +422,83 @@ impl SdkCompileCommand {
         }
 
         Ok(())
+    }
+
+    /// Decide whether one section runs, and whether its run writes a stamp.
+    ///
+    /// A section is skipped only under `ext build` with stamps on, when its
+    /// inputs are complete (`sdk_compile_inputs_are_complete`), its stamp is
+    /// current, and its build directory exists. Everything else runs, as every
+    /// section did before there was a stamp.
+    fn plan_section(
+        &self,
+        merged: &serde_yaml::Value,
+        project_root: &std::path::Path,
+        section: &str,
+        batch: Option<&str>,
+        container_args: Option<&[String]>,
+    ) -> SectionPlan {
+        let (Some(extension), Some(batch)) = (self.extension.as_deref(), batch) else {
+            return SectionPlan::Run(None);
+        };
+        if !sdk_compile_inputs_are_complete(merged, section, extension, project_root) {
+            let declares_sources = merged
+                .get("extensions")
+                .and_then(|e| e.get(extension))
+                .and_then(|e| e.get("package_files"))
+                .is_some();
+            if !declares_sources {
+                print_info(
+                    &format!(
+                        "Compile section '{section}' runs on every build of extension \
+                         '{extension}'. Add package_files to the extension to skip the \
+                         section when its sources do not change."
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+            return SectionPlan::Run(None);
+        }
+
+        let mut environment = std::collections::BTreeMap::new();
+        environment.insert(
+            "sdk_install".to_string(),
+            stamp_identity_from_batch(batch, &StampRequirement::sdk_install()),
+        );
+        environment.insert(
+            "compile_deps".to_string(),
+            stamp_identity_from_batch(batch, &StampRequirement::compile_deps_install()),
+        );
+        environment.insert(
+            "container_args".to_string(),
+            container_args.unwrap_or_default().join("\n"),
+        );
+        environment.insert(
+            "sdk_arch".to_string(),
+            self.sdk_arch.clone().unwrap_or_default(),
+        );
+        environment.insert(
+            "workdir".to_string(),
+            self.workdir.clone().unwrap_or_default(),
+        );
+        // A hash that cannot be computed is a reason to run, not to fail: the
+        // section ran without a stamp before, and the build reports the same
+        // file error from its own input hash.
+        let Ok(inputs) =
+            compute_sdk_compile_input_hash(merged, section, extension, project_root, &environment)
+        else {
+            return SectionPlan::Run(None);
+        };
+
+        let build_dir_present = output_listing_from_batch(batch)
+            .iter()
+            .any(|d| d == section);
+        if build_dir_present
+            && own_stamp_is_current(batch, &StampRequirement::sdk_compile(section), &inputs)
+        {
+            return SectionPlan::Skip;
+        }
+        SectionPlan::Run(Some(inputs))
     }
 
     /// Extract compile sections from configuration.
@@ -673,5 +828,206 @@ dependencies = { gcc = "*" }
             "Should fail after clean --stamps"
         );
         assert_eq!(result_after.missing.len(), 1);
+    }
+
+    // ========================================================================
+    // Compile section skip (B-32)
+    // ========================================================================
+
+    const SKIP_YAML: &str = r#"
+sdk:
+  image: sdk:2024
+  compile:
+    app-compile:
+      compile: compile.sh
+extensions:
+  my-ext:
+    package_files: [src]
+    packages:
+      app:
+        compile: app-compile
+        install: install.sh
+"#;
+
+    fn skip_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("compile.sh"), "make\n").unwrap();
+        std::fs::write(dir.path().join("install.sh"), "install app $DEST\n").unwrap();
+        std::fs::write(dir.path().join("src/main.c"), "int main() {}\n").unwrap();
+        dir
+    }
+
+    fn ext_build_compile() -> SdkCompileCommand {
+        SdkCompileCommand::new(
+            "avocado.yaml".to_string(),
+            false,
+            vec!["app-compile".to_string()],
+            None,
+            None,
+            None,
+        )
+        .with_extension(Some("my-ext".to_string()))
+    }
+
+    /// A batch read as `execute` gets it back: the SDK install stamp, the
+    /// section stamp (if any), and the build directories that exist.
+    fn batch_with(section_stamp: Option<&Stamp>, build_dirs: &str) -> String {
+        use crate::utils::stamps::OUTPUT_LISTING_KEY;
+        let sdk = Stamp::sdk_install(
+            get_local_arch(),
+            StampInputs::new("sdk".to_string()),
+            StampOutputs::default(),
+        );
+        let own = match section_stamp {
+            Some(stamp) => serde_json::to_string(stamp).unwrap(),
+            None => "null".to_string(),
+        };
+        format!(
+            "{}:::{}\n{}:::{own}\n{}:::null\n{OUTPUT_LISTING_KEY}:::{build_dirs}\n",
+            StampRequirement::sdk_install().relative_path(),
+            serde_json::to_string(&sdk).unwrap(),
+            StampRequirement::sdk_compile("app-compile").relative_path(),
+            StampRequirement::compile_deps_install().relative_path(),
+        )
+    }
+
+    /// The stamp a successful run writes, so the next run can be compared.
+    fn stamp_written_by(plan: SectionPlan) -> Stamp {
+        let SectionPlan::Run(Some(inputs)) = plan else {
+            panic!("expected a run that writes a stamp, got {plan:?}");
+        };
+        Stamp::sdk_compile(
+            "app-compile",
+            get_local_arch(),
+            inputs,
+            StampOutputs::default(),
+        )
+    }
+
+    #[test]
+    fn unchanged_section_is_skipped_after_an_install_script_edit() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile();
+
+        // First build: no stamp, so the section runs and writes one.
+        let first = cmd.plan_section(
+            &merged,
+            root,
+            "app-compile",
+            Some(&batch_with(None, "")),
+            None,
+        );
+        let stamp = stamp_written_by(first);
+
+        // The reported case: only install.sh changes. The section is skipped.
+        std::fs::write(root.join("install.sh"), "install -m755 app $DEST\n").unwrap();
+        let batch = batch_with(Some(&stamp), "app-compile");
+        assert_eq!(
+            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            SectionPlan::Skip
+        );
+
+        // A source edit under package_files runs it again.
+        std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
+        assert!(matches!(
+            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            SectionPlan::Run(Some(_))
+        ));
+    }
+
+    #[test]
+    fn section_runs_when_its_build_directory_is_gone() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile();
+        let stamp = stamp_written_by(cmd.plan_section(
+            &merged,
+            root,
+            "app-compile",
+            Some(&batch_with(None, "")),
+            None,
+        ));
+
+        let batch = batch_with(Some(&stamp), "other-section");
+        assert!(matches!(
+            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            SectionPlan::Run(Some(_))
+        ));
+    }
+
+    #[test]
+    fn section_runs_when_the_container_args_change() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile();
+        let stamp = stamp_written_by(cmd.plan_section(
+            &merged,
+            root,
+            "app-compile",
+            Some(&batch_with(None, "")),
+            None,
+        ));
+
+        let batch = batch_with(Some(&stamp), "app-compile");
+        let args = vec!["--env=OPT=1".to_string()];
+        assert!(matches!(
+            cmd.plan_section(&merged, root, "app-compile", Some(&batch), Some(&args)),
+            SectionPlan::Run(Some(_))
+        ));
+    }
+
+    /// Without `package_files`, no stamp is written and the section always
+    /// runs, as before.
+    #[test]
+    fn section_without_declared_sources_always_runs() {
+        let dir = skip_project();
+        let root = dir.path();
+        let yaml = SKIP_YAML.replace("    package_files: [src]\n", "");
+        let merged: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let batch = batch_with(None, "app-compile");
+        assert_eq!(
+            ext_build_compile().plan_section(&merged, root, "app-compile", Some(&batch), None),
+            SectionPlan::Run(None)
+        );
+    }
+
+    /// A direct `sdk compile` and a run with `--no-stamps` (no batch read)
+    /// always run, and write no stamp.
+    #[test]
+    fn direct_compile_and_no_stamps_always_run() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile();
+        let stamp = stamp_written_by(cmd.plan_section(
+            &merged,
+            root,
+            "app-compile",
+            Some(&batch_with(None, "")),
+            None,
+        ));
+        let batch = batch_with(Some(&stamp), "app-compile");
+
+        let direct = SdkCompileCommand::new(
+            "avocado.yaml".to_string(),
+            false,
+            vec!["app-compile".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            direct.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            SectionPlan::Run(None)
+        );
+        assert_eq!(
+            cmd.plan_section(&merged, root, "app-compile", None, None),
+            SectionPlan::Run(None)
+        );
     }
 }
