@@ -7,7 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-11
+
+### Added
+- **Per-target distro overrides.** A `target-<name>:` block inside `distro:`
+  now applies to that target (it was silently ignored), so one board can stay
+  on another release or channel:
+  `distro: { release: 2026, target-raspberrypi0-2w: { release: 2024 } }`. A key
+  the block sets replaces the base key whole, in the loaded config and in
+  `{{ config.distro.* }}` / `{{ avocado.distro.* }}` (the SDK image tag
+  included). `update --target` resolves the snapshot from that target's feed.
+- **`runtimes.<r>.var.initial_os_rollback`** (default `true`). `false` leaves
+  the OS bundle out of the provisioned var image, which saves its size; a
+  rollback to the provisioned OS is then not possible on the device. The
+  signed manifest and OTA are unaffected, and var-staging keeps the bundle for
+  Connect uploads.
+
+### Changed
+- **`enable_services` on an extension without `confext`** is reported as a
+  warning, not under an `[ERROR]` label: it was never fatal.
+
 ### Fixed
+- **`enable_services` accepts a template instance** such as
+  `wpa_supplicant@wlan0.service`. `ext build` failed with "no such unit" even
+  when the extension shipped `wpa_supplicant@.service`; it now links the
+  instance to its template, as `systemctl enable` does. An instance whose
+  template the extension doesn't ship (one from the rootfs, such as
+  `serial-getty@.service`) still fails, and the error now says to ship the
+  link in the overlay instead.
+- **`ext install` then `ext build` works in a project with one runtime**
+  (including the implicit `default`). `ext install` filled only the
+  per-target sysroot, and `ext build` then refused with "no package
+  database". This broke the shared extension CI on 1.0.0. `ext install` now
+  takes `-r/--runtime` and otherwise uses the sole or default runtime, and
+  `avocado install <pkgs> -e <ext>` and `avocado uninstall <pkgs> -e <ext>`
+  fill that same runtime sysroot.
+- **Bumping an extension's version leaves only the current release file.**
+  Every earlier version's `extension-release` file stayed in the sysroot and
+  shipped, and the device ran each one's `AVOCADO_ON_MERGE` hook.
+- **A re-provision no longer reuses a larger, stale var image.** `mkfs.btrfs`
+  wrote into the existing file without shrinking it, so the var kept the size
+  of the largest one ever built in the project.
+- **`--sdk-arch` reaches `ext image` and the provision version query.** On an
+  arm64 host with an x86_64 SDK, `build --sdk-arch x86-64` failed at the
+  extension image step (`mkfs.erofs: command not found`).
+- **`connect runtimes list` shows draft runtimes.** It filtered to published
+  ones, so a runtime uploaded a moment ago looked missing.
+- **`avocado-ext-cli` builds again.** Its packaged source left out `schemas/`,
+  which the CLI includes at compile time.
 - **A release's `SHA256SUMS` verifies every archive.** The Windows checksum
   had no trailing newline, so it ran into the next line and
   `sha256sum -c SHA256SUMS` failed for the Windows and Linux (gnu) archives.
@@ -1481,6 +1528,7 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.1.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.1.0
 [1.0.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0
 [1.0.0-rc.5]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.5
 [1.0.0-rc.4]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.4
