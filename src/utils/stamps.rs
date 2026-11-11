@@ -1661,7 +1661,10 @@ pub fn compute_sdk_compile_input_hash(
         script,
     )?;
 
-    for (ext_name, ext) in exts {
+    // By name, so the hash is the same whichever extension builds the section.
+    let mut by_name: Vec<&(String, serde_yaml::Value)> = exts.iter().collect();
+    by_name.sort_by(|a, b| a.0.cmp(&b.0));
+    for (ext_name, ext) in by_name {
         if let (Some(files), Some(root)) = (
             ext.get("package_files").and_then(|v| v.as_sequence()),
             ext_content_root(ext, project_root),
@@ -2652,6 +2655,32 @@ fn package_files_select_a_symlink(root: &Path, patterns: &[&str]) -> bool {
         Ok(globs) => globs,
         Err(_) => return true,
     };
+    // The walk below does not follow links, so a glob that has to pass through
+    // a symlinked directory would match nothing and the digest would record
+    // `(no match)` for good. Refuse any symlink on or under a glob's literal
+    // directory prefix.
+    for pattern in patterns.iter().filter(|p| is_glob(p)) {
+        let mut base = root.to_path_buf();
+        for part in Path::new(pattern).components() {
+            if part.as_os_str().to_str().is_some_and(is_glob) {
+                break;
+            }
+            base.push(part);
+            match std::fs::symlink_metadata(&base) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return true,
+                Ok(m) if m.file_type().is_symlink() => return true,
+                Ok(_) => {}
+            }
+        }
+        if base.is_dir()
+            && walkdir::WalkDir::new(&base)
+                .into_iter()
+                .any(|entry| entry.map_or(true, |e| e.path_is_symlink()))
+        {
+            return true;
+        }
+    }
     if !globs.is_empty() {
         for entry in walkdir::WalkDir::new(root) {
             let Ok(entry) = entry else { return true };
@@ -9276,6 +9305,39 @@ extensions:
         assert!(!ext_build_inputs_are_complete(&v, "my-ext", root));
         let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
         assert!(ext_build_inputs_are_complete(&v, "my-ext", root));
+    }
+
+    /// A glob that passes through a symlinked directory matches nothing, so
+    /// its digest never moves. The skip is refused, whether the link is the
+    /// glob's literal prefix or sits under it.
+    #[cfg(unix)]
+    #[test]
+    fn a_glob_through_a_symlinked_directory_is_not_hashable() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("vendor/src/sub")).unwrap();
+        std::fs::write(root.join("vendor/src/foo.c"), "int foo;\n").unwrap();
+        std::os::unix::fs::symlink("vendor/src", root.join("vsrc")).unwrap();
+        let with = |files: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&COMPILE_SECTION_YAML.replace("package_files: [src]", files))
+                .unwrap()
+        };
+        assert!(!ext_build_inputs_are_complete(
+            &with("package_files: ['vsrc/*.c']"),
+            "my-ext",
+            root
+        ));
+        std::os::unix::fs::symlink("../vendor/src/sub", root.join("src/sub")).unwrap();
+        assert!(!ext_build_inputs_are_complete(
+            &with("package_files: ['src/**/*.c']"),
+            "my-ext",
+            root
+        ));
+        assert!(ext_build_inputs_are_complete(
+            &with("package_files: ['vendor/src/*.c']"),
+            "my-ext",
+            root
+        ));
     }
 
     #[test]

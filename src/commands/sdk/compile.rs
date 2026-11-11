@@ -56,6 +56,22 @@ struct SkipContext<'a> {
 /// passes the host's current value), or `--env-file` (docker reads the file
 /// when the container starts). Hashing the text would miss a change to either.
 /// A config arg can hold several words (`-e CFLAGS`), so each is split first.
+/// An `-e` packed behind other short flags, as in `-ie CFLAGS` or `-ieX=1`:
+/// the operand is the rest of the word, or the next word when nothing follows.
+fn packed_env_flag(words: &[String], i: usize) -> Option<(usize, &str)> {
+    let flags = words.get(i)?.strip_prefix('-')?;
+    if flags.starts_with('-') {
+        return None;
+    }
+    let at = flags.find('e')?;
+    let rest = &flags[at + 1..];
+    if rest.is_empty() {
+        Some((2, words.get(i + 1).map_or("", |w| w.as_str())))
+    } else {
+        Some((1, rest))
+    }
+}
+
 fn passes_host_state(container_args: &[String]) -> bool {
     let words: Vec<String> = container_args
         .iter()
@@ -67,6 +83,11 @@ fn passes_host_state(container_args: &[String]) -> bool {
             return true;
         }
         if let Some((taken, operand)) = docker_env_flag(&words, i) {
+            if !operand.contains('=') {
+                return true;
+            }
+            i += taken;
+        } else if let Some((taken, operand)) = packed_env_flag(&words, i) {
             if !operand.contains('=') {
                 return true;
             }
@@ -1171,6 +1192,9 @@ extensions:
             vec!["-e".to_string(), "CFLAGS".to_string()],
             vec!["-e CFLAGS".to_string()],
             vec!["-eCFLAGS".to_string()],
+            vec!["-ie CFLAGS".to_string()],
+            vec!["-ie".to_string(), "CFLAGS".to_string()],
+            vec!["-itCFLAGS".to_string(), "-ieCFLAGS".to_string()],
             vec!["--env-file=build.env".to_string()],
             vec!["--env-file".to_string(), "build.env".to_string()],
         ] {
@@ -1187,6 +1211,7 @@ extensions:
         // reference carries pass no host state.
         for args in [
             vec!["--env=CFLAGS=-O2".to_string()],
+            vec!["-ie CFLAGS=-O2".to_string()],
             vec![
                 "--privileged".to_string(),
                 "--network=host".to_string(),
@@ -1258,6 +1283,15 @@ extensions:
             cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
             SectionPlan::Run(Some(_))
         ));
+
+        // The stamp one caller writes is current for the other.
+        let ab = ext_build_compile(&merged, &["ext-a", "ext-b"]);
+        let batch = after_first_build(&ab, &merged, root);
+        let ba = ext_build_compile(&merged, &["ext-b", "ext-a"]);
+        assert_eq!(
+            ba.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Skip
+        );
 
         // One naming extension without a source list: no skip for anyone.
         let undeclared = yaml.replace("    package_files: [libfoo-src, src]\n", "");
