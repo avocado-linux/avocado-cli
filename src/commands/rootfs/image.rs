@@ -21,6 +21,11 @@ use crate::utils::{
 /// Namespace UUID for deterministic OS build ID generation (shared with runtime build).
 pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
+/// Removes every non-directory under `$ROOTFS_WORK/boot`, keeping the
+/// directory tree (mountpoints). See `DEFAULT_ROOTFS_POST_INSTALL`.
+pub const BOOT_STRIP_KEEP_DIRS: &str =
+    "[ -d \"$ROOTFS_WORK/boot\" ] && find \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete || true";
+
 /// Default post-install commands for the rootfs build. Run on the work
 /// directory (`$ROOTFS_WORK`) after package install + overlay, before
 /// the identity stamp and `mkfs.erofs`. These mirror what Yocto's
@@ -37,7 +42,11 @@ pub const DEFAULT_ROOTFS_POST_INSTALL: &[&str] = &[
     "ln -sfn usr/lib \"$ROOTFS_WORK/lib\"",
     // Strip dirs that Yocto's avocado-image-rootfs.bb also stripped.
     "rm -rf \"$ROOTFS_WORK/media\" \"$ROOTFS_WORK/mnt\" \"$ROOTFS_WORK/srv\"",
-    "rm -rf \"$ROOTFS_WORK/boot/\"*",
+    // Strip what packages put under /boot (kernel images, DTBs: they ship
+    // outside the rootfs), but keep its directories: they are mountpoints
+    // packages rely on (e.g. /boot/efi for a Jetson's boot-efi.mount), and a
+    // read-only rootfs cannot create one at boot.
+    BOOT_STRIP_KEEP_DIRS,
     "mkdir -p \"$ROOTFS_WORK/opt\"",
     // Empty /etc/machine-id for stateless systemd on read-only rootfs.
     "touch \"$ROOTFS_WORK/etc/machine-id\"",
@@ -920,6 +929,48 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The /boot strip removes files and links but keeps directories, so a
+    /// package-owned mountpoint such as /boot/efi survives into the image.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_keeps_mountpoint_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let boot = root.path().join("boot");
+        std::fs::create_dir_all(boot.join("efi")).unwrap();
+        std::fs::create_dir_all(boot.join("extlinux")).unwrap();
+        std::fs::write(boot.join("Image-6.18.52"), b"k").unwrap();
+        std::fs::write(boot.join("extlinux/extlinux.conf"), b"c").unwrap();
+        std::os::unix::fs::symlink("Image-6.18.52", boot.join("Image")).unwrap();
+
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(boot.join("efi").is_dir());
+        assert!(boot.join("extlinux").is_dir());
+        assert!(!boot.join("Image-6.18.52").exists());
+        assert!(!boot.join("extlinux/extlinux.conf").exists());
+        assert!(std::fs::symlink_metadata(boot.join("Image")).is_err());
+    }
+
+    /// A rootfs without /boot is not an error.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_tolerates_missing_boot() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+    }
 
     /// `.exports` records exactly the variables that are set, as sourceable
     /// `export` lines, so a reused image replays what a full build exported
