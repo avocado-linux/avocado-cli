@@ -164,7 +164,7 @@ fn feed_key_id() -> Option<String> {
     let token = match std::env::var("AVOCADO_CONNECT_TOKEN") {
         Ok(t) if !t.is_empty() => t,
         _ => {
-            let cfg = crate::commands::connect::client::load_config().ok()??;
+            let cfg = crate::commands::connect::client::load_stored_config().ok()??;
             let (_, profile) = cfg.resolve_profile(None, None).ok()?;
             profile.token.clone()
         }
@@ -1283,7 +1283,7 @@ impl ResolvedFeedSet {
                     .join(", ")
             );
         }
-        let profiles = crate::commands::connect::client::load_config()
+        let profiles = crate::commands::connect::client::load_stored_config()
             .ok()
             .flatten();
         // No fixed User-Agent on the client: the header is set per request, from

@@ -605,8 +605,36 @@ fn get_config_path() -> Result<PathBuf> {
     Ok(get_config_dir()?.join(CONFIG_FILE))
 }
 
-/// Load the config from disk.
+/// The profile name `AVOCADO_CONNECT_TOKEN` stands in as.
+pub const ENV_PROFILE: &str = "AVOCADO_CONNECT_TOKEN";
+
+/// The config a command authenticates with. `AVOCADO_CONNECT_TOKEN`, when
+/// set, replaces the stored profiles (at `AVOCADO_CONNECT_URL`, else
+/// https://connect.peridio.com), as it does for feeds, so CI needs no
+/// `credentials.json`. Commands that write profiles back read
+/// [`load_stored_config`] instead, so the env token is never saved.
 pub fn load_config() -> Result<Option<ConnectConfig>> {
+    match std::env::var("AVOCADO_CONNECT_TOKEN") {
+        Ok(token) if !token.is_empty() => Ok(Some(ConnectConfig::new_with_profile(
+            ENV_PROFILE,
+            Profile {
+                api_url: std::env::var("AVOCADO_CONNECT_URL")
+                    .unwrap_or_else(|_| "https://connect.peridio.com".to_string()),
+                token,
+                user: ProfileUser {
+                    email: String::new(),
+                    name: ENV_PROFILE.to_string(),
+                },
+                created_at: String::new(),
+                organization_id: None,
+            },
+        ))),
+        _ => load_stored_config(),
+    }
+}
+
+/// Load the stored profiles from disk.
+pub fn load_stored_config() -> Result<Option<ConnectConfig>> {
     let path = get_config_path()?;
     if !path.exists() {
         return Ok(None);
@@ -2061,6 +2089,23 @@ fn list_runtimes_url(api_url: &str, org: &str, project: &str, status: Option<&st
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `AVOCADO_CONNECT_TOKEN` authenticates every `connect` command with no
+    /// `credentials.json`, at `AVOCADO_CONNECT_URL` when that is set.
+    #[test]
+    #[serial_test::serial]
+    fn the_env_token_stands_in_for_the_stored_profiles() {
+        std::env::set_var("AVOCADO_CONNECT_TOKEN", "ci-token");
+        std::env::set_var("AVOCADO_CONNECT_URL", "https://connect.example");
+        let cfg = load_config();
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+        std::env::remove_var("AVOCADO_CONNECT_URL");
+        let cfg = cfg.unwrap().expect("a config from the env token");
+        let (name, profile) = cfg.resolve_profile(None, Some("some-org")).unwrap();
+        assert_eq!(name, ENV_PROFILE);
+        assert_eq!(profile.token, "ci-token");
+        assert_eq!(profile.api_url, "https://connect.example");
+    }
 
     #[test]
     fn list_runtimes_url_without_filter_includes_drafts() {
