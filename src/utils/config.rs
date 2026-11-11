@@ -4167,10 +4167,39 @@ impl Config {
                     );
                 }
             }
-            // No loops. A name nothing defines may come from an extension
-            // that is not installed yet (a fresh clone, a hub's `sdk
-            // install`): `check_rubicon_refs` catches it where it is used.
-            self.expand_steps(name, false)?;
+        }
+        // No loops. A name nothing defines may come from an extension that is
+        // not installed yet (a fresh clone, a hub's `sdk install`):
+        // `check_rubicon_refs` catches it where it is used. Each profile is
+        // walked once, unexpanded: a chain of profiles that each run the one
+        // before twice expands exponentially.
+        fn visit<'a>(
+            run: &'a BTreeMap<String, Vec<RubiconStep>>,
+            name: &'a str,
+            stack: &mut Vec<&'a str>,
+            done: &mut HashSet<&'a str>,
+        ) -> Result<()> {
+            if stack.contains(&name) {
+                anyhow::bail!("rubicon.run: {} -> {name} loops", stack.join(" -> "));
+            }
+            let Some(steps) = run.get(name).filter(|_| !done.contains(name)) else {
+                return Ok(());
+            };
+            stack.push(name);
+            for step in steps {
+                if let RubiconStep::Run(inner) = step {
+                    visit(run, inner, stack, done)?;
+                }
+            }
+            stack.pop();
+            done.insert(name);
+            Ok(())
+        }
+        if let Some(run) = run {
+            let mut done = HashSet::new();
+            for name in run.keys() {
+                visit(run, name, &mut Vec::new(), &mut done)?;
+            }
         }
         Ok(())
     }
@@ -4179,8 +4208,18 @@ impl Config {
     /// time, once extensions are installed.
     pub fn check_rubicon_refs(&self) -> Result<()> {
         let run = self.rubicon.as_ref().map(|r| &r.run);
-        for name in run.into_iter().flat_map(|m| m.keys()) {
-            self.rubicon_steps(name)?;
+        for (from, steps) in run.into_iter().flatten() {
+            for step in steps {
+                if let RubiconStep::Run(name) = step {
+                    if !run.is_some_and(|m| m.contains_key(name)) {
+                        anyhow::bail!(
+                            "no run profile {name:?} (from rubicon.run.{from}) under rubicon.run \
+                             (defined: {})",
+                            self.rubicon_run_names()
+                        );
+                    }
+                }
+            }
         }
         for (profile, cfg) in self.provision_profiles.iter().flatten() {
             let Some(r) = &cfg.rubicon else { continue };
@@ -4215,15 +4254,9 @@ impl Config {
     /// Run profile `name` as the hub runs it: `run:` steps replaced by the
     /// steps of the run profile they name, recursively.
     pub fn rubicon_steps(&self, name: &str) -> Result<Vec<RubiconStep>> {
-        self.expand_steps(name, true)
-    }
-
-    /// `rubicon_steps`; unless `strict`, names nothing defines are skipped.
-    fn expand_steps(&self, name: &str, strict: bool) -> Result<Vec<RubiconStep>> {
         fn expand(
             c: &Config,
             name: &str,
-            strict: bool,
             stack: &mut Vec<String>,
             out: &mut Vec<RubiconStep>,
         ) -> Result<()> {
@@ -4231,9 +4264,6 @@ impl Config {
                 anyhow::bail!("rubicon.run: {} -> {name} loops", stack.join(" -> "));
             }
             let steps = c.rubicon.as_ref().and_then(|r| r.run.get(name));
-            if steps.is_none() && !strict {
-                return Ok(());
-            }
             let steps = steps.with_context(|| {
                 let from = stack
                     .last()
@@ -4247,7 +4277,7 @@ impl Config {
             stack.push(name.to_string());
             for step in steps {
                 match step {
-                    RubiconStep::Run(inner) => expand(c, inner, strict, stack, out)?,
+                    RubiconStep::Run(inner) => expand(c, inner, stack, out)?,
                     s => out.push(s.clone()),
                 }
             }
@@ -4255,7 +4285,7 @@ impl Config {
             Ok(())
         }
         let mut out = Vec::new();
-        expand(self, name, strict, &mut Vec::new(), &mut out)?;
+        expand(self, name, &mut Vec::new(), &mut out)?;
         Ok(out)
     }
 
@@ -15785,6 +15815,20 @@ provision:
             .unwrap();
             assert!(c.validate_rubicon().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn validation_walks_run_profiles_without_expanding_them() {
+        // p63 expands to 2^63 steps: validating by expansion never returns.
+        let mut yaml = "rubicon:\n  run:\n    p0: [ { wait_ms: 1 } ]\n".to_string();
+        for i in 1..64 {
+            let prev = i - 1;
+            yaml += &format!("    p{i}: [ {{ run: p{prev} }}, {{ run: p{prev} }} ]\n");
+        }
+        let c: Config = serde_yaml::from_str(&yaml).unwrap();
+        c.validate_rubicon().unwrap();
+        c.check_rubicon_refs().unwrap();
+        assert_eq!(c.rubicon_steps("p3").unwrap().len(), 8);
     }
 
     fn steps(c: &Config, name: &str) -> Vec<RubiconStep> {
