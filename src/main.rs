@@ -6080,22 +6080,9 @@ mod tests {
         );
     }
 
-    /// `avocado update` runs an SDK container to drop the install stamps
-    /// (`UpdateCommand::refresh_sdk_metadata`). Without an arm here,
-    /// `ensure_routed_for_process` never runs, `DOCKER_HOST` is never pointed at
-    /// the avocado-vm socket, and on macOS the container start hits the local
-    /// Docker socket and fails. The pin advance still succeeds and the failure
-    /// only prints at INFO, so the user sees success while the stamps still
-    /// read current and the next install skips dnf.
     #[test]
     fn needs_vm_routing_gates_rubicon_commands_that_compose_the_project() {
-        let routed = |args: &[&str]| {
-            needs_vm_routing(
-                &Cli::try_parse_from(args)
-                    .expect("args should parse")
-                    .command,
-            )
-        };
+        let routed = |args: &[&str]| needs_vm_routing(&parse_cli(args));
         for c in [
             &["run", "enter-recovery"][..],
             &["show"],
@@ -6116,6 +6103,13 @@ mod tests {
         }
     }
 
+    /// `avocado update` runs an SDK container to drop the install stamps
+    /// (`UpdateCommand::refresh_sdk_metadata`). Without an arm here,
+    /// `ensure_routed_for_process` never runs, `DOCKER_HOST` is never pointed at
+    /// the avocado-vm socket, and on macOS the container start hits the local
+    /// Docker socket and fails. The pin advance still succeeds and the failure
+    /// only prints at INFO, so the user sees success while the stamps still
+    /// read current and the next install skips dnf.
     #[test]
     fn needs_vm_routing_gates_update() {
         let cmd = |args: &[&str]| {
