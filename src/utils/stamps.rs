@@ -1617,14 +1617,19 @@ pub fn compute_compile_deps_input_hash(
 /// `ext_name`: everything the section's compile script is known to read.
 ///
 /// - the `sdk.compile.<section>` node itself
-/// - the bytes of its `compile:` script, resolved the way
-///   [`fold_package_scripts`] resolves it
+/// - the bytes of `script`, the compile script that runs (resolved for the
+///   target), found the way [`fold_package_scripts`] finds it
 /// - the calling extension's `package_files` tree, the only declared list of
 ///   the sources a compile script reads (see [`sdk_compile_inputs_are_complete`])
 /// - the SDK settings the container is started with
-/// - `environment`: facts only the caller knows, such as the identity of the SDK
-///   install and compile-deps stamps (see [`stamp_identity_from_batch`]), so a
-///   toolchain change runs the section again
+/// - `environment`: facts only the caller knows, such as the lock pins of the
+///   SDK and the target sysroot (see [`locked_packages_hash`]), so a toolchain
+///   or library change runs the section again
+///
+/// `ext` is the extension's node with its `target-<name>:`, `kernel-<spec>:`
+/// and bare-target overrides already resolved, as `ext build` uses it. The
+/// unresolved node can name a different `package_files` or `source` than the
+/// one the build reads.
 ///
 /// The section is shared by every extension that names it, but the hash folds
 /// the caller's `package_files`. Two callers with different lists move the hash
@@ -1632,7 +1637,9 @@ pub fn compute_compile_deps_input_hash(
 pub fn compute_sdk_compile_input_hash(
     config: &serde_yaml::Value,
     section: &str,
+    script: &str,
     ext_name: &str,
+    ext: &serde_yaml::Value,
     project_root: &Path,
     environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<StampInputs> {
@@ -1641,35 +1648,37 @@ pub fn compute_sdk_compile_input_hash(
         .and_then(|s| s.get("compile"))
         .and_then(|c| c.get(section))
         .ok_or_else(|| anyhow::anyhow!("sdk.compile.{section} not found in config"))?;
-    let ext = config.get("extensions").and_then(|e| e.get(ext_name));
-    let content_root = ext.and_then(|e| ext_content_root(e, project_root));
+    let content_root = ext_content_root(ext, project_root);
 
     let mut hash_data = serde_yaml::Mapping::new();
     let key = |k: &str| serde_yaml::Value::String(format!("sdk.compile.{section}.{k}"));
     hash_data.insert(key("config"), section_node.clone());
 
-    if let Some(script) = section_node.get("compile").and_then(|v| v.as_str()) {
-        let root = match content_root.as_deref() {
-            Some(c) if c.join(script).is_file() => c,
-            _ => project_root,
-        };
-        fold_file_content(
-            &mut hash_data,
-            &format!("sdk.compile.{section}.compile_script"),
-            root,
-            script,
-        )?;
-    }
+    let root = match content_root.as_deref() {
+        Some(c) if c.join(script).is_file() => c,
+        _ => project_root,
+    };
+    fold_file_content(
+        &mut hash_data,
+        &format!("sdk.compile.{section}.compile_script"),
+        root,
+        script,
+    )?;
 
     if let (Some(files), Some(root)) = (
-        ext.and_then(|e| e.get("package_files"))
-            .and_then(|v| v.as_sequence()),
+        ext.get("package_files").and_then(|v| v.as_sequence()),
         content_root.as_deref(),
     ) {
         let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
         hash_data.insert(
             serde_yaml::Value::String(format!("ext.{ext_name}.package_files")),
             serde_yaml::Value::String(package_files_digest(root, &patterns)?),
+        );
+    }
+    if let Some(source) = ext.get("source") {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.source")),
+            source.clone(),
         );
     }
 
@@ -1691,8 +1700,8 @@ pub fn compute_sdk_compile_input_hash(
 }
 
 /// Whether [`compute_sdk_compile_input_hash`] describes everything the
-/// section's compile script reads when `ext build` runs it for `ext_name`.
-/// The section may be skipped only when this holds.
+/// compile script reads when `ext build` runs it for the extension `ext`
+/// (resolved for the target). The section may be skipped only when this holds.
 ///
 /// A compile script reads source files that no config key names. Without a
 /// list of them, a source edit leaves every input unmoved, the section is
@@ -1704,26 +1713,10 @@ pub fn compute_sdk_compile_input_hash(
 /// It also needs the compile script on the host. A remote extension's scripts
 /// are unpacked into the SDK volume, where nothing here can hash them.
 pub fn sdk_compile_inputs_are_complete(
-    config: &serde_yaml::Value,
-    section: &str,
-    ext_name: &str,
+    ext: &serde_yaml::Value,
+    script: &str,
     project_root: &Path,
 ) -> bool {
-    let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) else {
-        return false;
-    };
-    // A `package_files` list under a `target-<name>:` override is not the one
-    // the hash folds, for the reason given on
-    // `declares_post_build_in_target_override`.
-    let overrides_package_files = ext.as_mapping().is_some_and(|m| {
-        m.iter().any(|(key, value)| {
-            key.as_str().is_some_and(|k| k.starts_with("target-"))
-                && value.get("package_files").is_some()
-        })
-    });
-    if overrides_package_files {
-        return false;
-    }
     let Some(content_root) = ext_content_root(ext, project_root) else {
         return false;
     };
@@ -1731,16 +1724,21 @@ pub fn sdk_compile_inputs_are_complete(
         .get("package_files")
         .and_then(|v| v.as_sequence())
         .is_some_and(|files| !files.is_empty());
-    let script_on_host = config
-        .get("sdk")
-        .and_then(|s| s.get("compile"))
-        .and_then(|c| c.get(section))
-        .and_then(|sec| sec.get("compile"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|script| {
-            content_root.join(script).is_file() || project_root.join(script).is_file()
-        });
+    let script_on_host = content_root.join(script).is_file() || project_root.join(script).is_file();
     declares_sources && script_on_host
+}
+
+/// Digest of the lockfile pins of one sysroot of `target`, the same digest the
+/// sysroot install stamps record ([`package_list_hash`]). The SDK and
+/// compile-deps stamps hash only config, so a re-pin moves neither of them.
+/// A compile section folds this instead, so it runs again against the new
+/// toolchain or libraries.
+pub fn locked_packages_hash(
+    lock: &crate::utils::lockfile::LockFile,
+    target: &str,
+    sysroot: &crate::utils::lockfile::SysrootType,
+) -> String {
+    package_list_hash(lock.get_sysroot_versions(target, sysroot))
 }
 
 /// The parts of a stamp in a batch read that say what it was made from and
@@ -8901,7 +8899,8 @@ extensions:
         env: &std::collections::BTreeMap<String, String>,
     ) -> String {
         let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        compute_sdk_compile_input_hash(&v, "app-compile", "my-ext", root, env)
+        let ext = &v["extensions"]["my-ext"];
+        compute_sdk_compile_input_hash(&v, "app-compile", "compile.sh", "my-ext", ext, root, env)
             .unwrap()
             .config_hash
     }
@@ -8996,7 +8995,7 @@ extensions:
         let root = dir.path();
         let complete = |yaml: &str| {
             let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-            sdk_compile_inputs_are_complete(&v, "app-compile", "my-ext", root)
+            sdk_compile_inputs_are_complete(&v["extensions"]["my-ext"], "compile.sh", root)
         };
 
         assert!(complete(COMPILE_SECTION_YAML));
@@ -9015,15 +9014,96 @@ extensions:
             "    package_files: [src]\n    source:\n      type: git\n      url: https://example.com/x.git\n",
         )));
 
-        // A source list the hash does not read.
-        assert!(!complete(&COMPILE_SECTION_YAML.replace(
-            "    package_files: [src]\n",
-            "    package_files: [src]\n    target-qemuarm64:\n      package_files: [other]\n",
-        )));
-
         // A compile script that is not on the host.
         std::fs::remove_file(root.join("compile.sh")).unwrap();
         assert!(!complete(COMPILE_SECTION_YAML));
+    }
+
+    /// The hash reads the extension node it is given, which `ext build`
+    /// resolves for the target. A `package_files` override (`target-<name>:`,
+    /// `kernel-<spec>:`, a bare target key) is then the list that is hashed.
+    #[test]
+    fn sdk_compile_hash_reads_the_resolved_extension() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("arm-src")).unwrap();
+        std::fs::write(root.join("arm-src/arm.c"), "int arm;\n").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        let resolved: serde_yaml::Value =
+            serde_yaml::from_str("package_files: [arm-src]\n").unwrap();
+        let env = std::collections::BTreeMap::new();
+        let hash = || {
+            compute_sdk_compile_input_hash(
+                &v,
+                "app-compile",
+                "compile.sh",
+                "my-ext",
+                &resolved,
+                root,
+                &env,
+            )
+            .unwrap()
+            .config_hash
+        };
+
+        let base = hash();
+        std::fs::write(root.join("arm-src/arm.c"), "int arm = 1;\n").unwrap();
+        assert_ne!(base, hash(), "source under the resolved package_files");
+        assert!(sdk_compile_inputs_are_complete(
+            &resolved,
+            "compile.sh",
+            root
+        ));
+    }
+
+    /// The hash reads the script that runs, which may differ from the
+    /// section's unresolved `compile:` key.
+    #[test]
+    fn sdk_compile_hash_reads_the_script_that_runs() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::write(root.join("compile-arm.sh"), "make arm\n").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        let ext = &v["extensions"]["my-ext"];
+        let env = std::collections::BTreeMap::new();
+        let hash = || {
+            compute_sdk_compile_input_hash(
+                &v,
+                "app-compile",
+                "compile-arm.sh",
+                "my-ext",
+                ext,
+                root,
+                &env,
+            )
+            .unwrap()
+            .config_hash
+        };
+        let base = hash();
+        std::fs::write(root.join("compile-arm.sh"), "make arm -j4\n").unwrap();
+        assert_ne!(base, hash());
+    }
+
+    /// A re-pin in the lock moves the pins digest even when no config changes.
+    #[test]
+    fn locked_packages_hash_moves_on_a_re_pin() {
+        use crate::utils::lockfile::{LockFile, SysrootType};
+        let mut lock = LockFile::new();
+        lock.update_sysroot_versions(
+            "qemuarm64",
+            &SysrootType::TargetSysroot,
+            [("libfoo".to_string(), "1.0-r0".to_string())].into(),
+        );
+        let first = locked_packages_hash(&lock, "qemuarm64", &SysrootType::TargetSysroot);
+        lock.update_sysroot_versions(
+            "qemuarm64",
+            &SysrootType::TargetSysroot,
+            [("libfoo".to_string(), "1.1-r0".to_string())].into(),
+        );
+        assert_ne!(
+            first,
+            locked_packages_hash(&lock, "qemuarm64", &SysrootType::TargetSysroot)
+        );
     }
 
     #[test]

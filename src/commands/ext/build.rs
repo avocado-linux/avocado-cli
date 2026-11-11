@@ -1939,7 +1939,7 @@ fi
                 self.dnf_args.clone(),
             )
             .with_workdir(ext_script_workdir.map(|s| s.to_string()))
-            .with_extension(Some(self.extension.clone()))
+            .with_extension(self.extension.clone(), ext_config.clone())
             .with_no_stamps(self.no_stamps);
             if let Some(ref ctx) = effective_tui_context {
                 compile_command = compile_command.with_tui_context(ctx.clone());

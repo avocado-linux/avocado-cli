@@ -10,9 +10,9 @@ use crate::utils::{
     stamps::{
         compute_sdk_compile_input_hash, generate_batch_read_stamps_script,
         generate_output_listing_probe, generate_write_stamp_script, get_local_arch,
-        output_listing_from_batch, own_stamp_is_current, remove_own_stamp_line,
-        sdk_compile_inputs_are_complete, stamp_identity_from_batch, validate_stamps_batch, Stamp,
-        StampInputs, StampOutputs, StampRequirement,
+        locked_packages_hash, output_listing_from_batch, own_stamp_is_current,
+        remove_own_stamp_line, sdk_compile_inputs_are_complete, stamp_identity_from_batch,
+        validate_stamps_batch, Stamp, StampInputs, StampOutputs, StampRequirement,
     },
     target::resolve_target_required,
 };
@@ -55,10 +55,11 @@ pub struct SdkCompileCommand {
     /// If set, scripts are executed from this directory instead of /opt/src.
     /// Used for remote extensions where scripts are in $AVOCADO_PREFIX/includes/<ext>/
     pub workdir: Option<String>,
-    /// The extension whose `ext build` runs these sections. Only then may a
-    /// section be skipped: its stamp folds that extension's `package_files`.
-    /// A direct `sdk compile` always runs.
-    pub extension: Option<String>,
+    /// The extension whose `ext build` runs these sections, with its node
+    /// resolved for the target as `ext build` uses it. Only then may a section
+    /// be skipped: its stamp folds that extension's `package_files`. A direct
+    /// `sdk compile` always runs.
+    pub extension: Option<(String, serde_yaml::Value)>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     /// TUI context for output capture when running under a parent orchestrator
@@ -97,9 +98,10 @@ impl SdkCompileCommand {
         self
     }
 
-    /// Set the extension whose build runs these sections (see [`Self::extension`])
-    pub fn with_extension(mut self, extension: Option<String>) -> Self {
-        self.extension = extension;
+    /// Set the extension whose build runs these sections and its resolved
+    /// config node (see [`Self::extension`])
+    pub fn with_extension(mut self, name: String, config: serde_yaml::Value) -> Self {
+        self.extension = Some((name, config));
         self
     }
 
@@ -314,14 +316,19 @@ impl SdkCompileCommand {
 
         let mut overall_success = true;
         let project_root = config.project_root(&self.config_path);
+        let lock_pins = match (&self.extension, &stamp_batch) {
+            (Some(_), Some(_)) => self.lock_pins(config, &target),
+            _ => None,
+        };
 
         for section in &filtered_sections {
             let plan = self.plan_section(
                 &composed.merged_value,
                 &project_root,
-                &section.name,
+                section,
                 stamp_batch.as_deref(),
                 merged_container_args.as_deref(),
+                lock_pins.as_ref(),
             );
             if plan == SectionPlan::Skip {
                 print_success(
@@ -424,6 +431,40 @@ impl SdkCompileCommand {
         Ok(())
     }
 
+    /// The lock pins a compiled section is built against: the SDK (the
+    /// toolchain) and the target sysroot (the libraries it links). `None` when
+    /// the lock cannot be read, and then no section is skipped.
+    fn lock_pins(
+        &self,
+        config: &Config,
+        target: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        use crate::utils::lockfile::{LockFile, SysrootType};
+        let src_dir = config
+            .get_resolved_src_dir(&self.config_path)
+            .unwrap_or_else(|| {
+                std::path::Path::new(&self.config_path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf()
+            });
+        let lock = LockFile::load(&src_dir).ok()?;
+        let mut pins = std::collections::BTreeMap::new();
+        pins.insert(
+            "sdk_pins".to_string(),
+            locked_packages_hash(
+                &lock,
+                target,
+                &SysrootType::Sdk(get_local_arch().to_string()),
+            ),
+        );
+        pins.insert(
+            "target_sysroot_pins".to_string(),
+            locked_packages_hash(&lock, target, &SysrootType::TargetSysroot),
+        );
+        Some(pins)
+    }
+
     /// Decide whether one section runs, and whether its run writes a stamp.
     ///
     /// A section is skipped only under `ext build` with stamps on, when its
@@ -434,23 +475,22 @@ impl SdkCompileCommand {
         &self,
         merged: &serde_yaml::Value,
         project_root: &std::path::Path,
-        section: &str,
+        section: &CompileSection,
         batch: Option<&str>,
         container_args: Option<&[String]>,
+        lock_pins: Option<&std::collections::BTreeMap<String, String>>,
     ) -> SectionPlan {
-        let (Some(extension), Some(batch)) = (self.extension.as_deref(), batch) else {
+        let (Some((extension, ext)), Some(batch), Some(lock_pins)) =
+            (self.extension.as_ref(), batch, lock_pins)
+        else {
             return SectionPlan::Run(None);
         };
-        if !sdk_compile_inputs_are_complete(merged, section, extension, project_root) {
-            let declares_sources = merged
-                .get("extensions")
-                .and_then(|e| e.get(extension))
-                .and_then(|e| e.get("package_files"))
-                .is_some();
-            if !declares_sources {
+        let name = section.name.as_str();
+        if !sdk_compile_inputs_are_complete(ext, &section.script, project_root) {
+            if ext.get("package_files").is_none() {
                 print_info(
                     &format!(
-                        "Compile section '{section}' runs on every build of extension \
+                        "Compile section '{name}' runs on every build of extension \
                          '{extension}'. Add package_files to the extension to skip the \
                          section when its sources do not change."
                     ),
@@ -460,7 +500,7 @@ impl SdkCompileCommand {
             return SectionPlan::Run(None);
         }
 
-        let mut environment = std::collections::BTreeMap::new();
+        let mut environment = lock_pins.clone();
         environment.insert(
             "sdk_install".to_string(),
             stamp_identity_from_batch(batch, &StampRequirement::sdk_install()),
@@ -484,17 +524,21 @@ impl SdkCompileCommand {
         // A hash that cannot be computed is a reason to run, not to fail: the
         // section ran without a stamp before, and the build reports the same
         // file error from its own input hash.
-        let Ok(inputs) =
-            compute_sdk_compile_input_hash(merged, section, extension, project_root, &environment)
-        else {
+        let Ok(inputs) = compute_sdk_compile_input_hash(
+            merged,
+            name,
+            &section.script,
+            extension,
+            ext,
+            project_root,
+            &environment,
+        ) else {
             return SectionPlan::Run(None);
         };
 
-        let build_dir_present = output_listing_from_batch(batch)
-            .iter()
-            .any(|d| d == section);
+        let build_dir_present = output_listing_from_batch(batch).iter().any(|d| d == name);
         if build_dir_present
-            && own_stamp_is_current(batch, &StampRequirement::sdk_compile(section), &inputs)
+            && own_stamp_is_current(batch, &StampRequirement::sdk_compile(name), &inputs)
         {
             return SectionPlan::Skip;
         }
@@ -858,7 +902,7 @@ extensions:
         dir
     }
 
-    fn ext_build_compile() -> SdkCompileCommand {
+    fn ext_build_compile(merged: &serde_yaml::Value) -> SdkCompileCommand {
         SdkCompileCommand::new(
             "avocado.yaml".to_string(),
             false,
@@ -867,7 +911,22 @@ extensions:
             None,
             None,
         )
-        .with_extension(Some("my-ext".to_string()))
+        .with_extension("my-ext".to_string(), merged["extensions"]["my-ext"].clone())
+    }
+
+    fn app_section() -> CompileSection {
+        CompileSection {
+            name: "app-compile".to_string(),
+            script: "compile.sh".to_string(),
+        }
+    }
+
+    fn pins(sdk: &str) -> std::collections::BTreeMap<String, String> {
+        [
+            ("sdk_pins".to_string(), sdk.to_string()),
+            ("target_sysroot_pins".to_string(), "t".to_string()),
+        ]
+        .into()
     }
 
     /// A batch read as `execute` gets it back: the SDK install stamp, the
@@ -910,15 +969,16 @@ extensions:
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile();
+        let cmd = ext_build_compile(&merged);
 
         // First build: no stamp, so the section runs and writes one.
         let first = cmd.plan_section(
             &merged,
             root,
-            "app-compile",
+            &app_section(),
             Some(&batch_with(None, "")),
             None,
+            Some(&pins("s")),
         );
         let stamp = stamp_written_by(first);
 
@@ -926,14 +986,28 @@ extensions:
         std::fs::write(root.join("install.sh"), "install -m755 app $DEST\n").unwrap();
         let batch = batch_with(Some(&stamp), "app-compile");
         assert_eq!(
-            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
             SectionPlan::Skip
         );
 
         // A source edit under package_files runs it again.
         std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
         assert!(matches!(
-            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
             SectionPlan::Run(Some(_))
         ));
     }
@@ -943,18 +1017,26 @@ extensions:
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile();
+        let cmd = ext_build_compile(&merged);
         let stamp = stamp_written_by(cmd.plan_section(
             &merged,
             root,
-            "app-compile",
+            &app_section(),
             Some(&batch_with(None, "")),
             None,
+            Some(&pins("s")),
         ));
 
         let batch = batch_with(Some(&stamp), "other-section");
         assert!(matches!(
-            cmd.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
             SectionPlan::Run(Some(_))
         ));
     }
@@ -964,21 +1046,74 @@ extensions:
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile();
+        let cmd = ext_build_compile(&merged);
         let stamp = stamp_written_by(cmd.plan_section(
             &merged,
             root,
-            "app-compile",
+            &app_section(),
             Some(&batch_with(None, "")),
             None,
+            Some(&pins("s")),
         ));
 
         let batch = batch_with(Some(&stamp), "app-compile");
         let args = vec!["--env=OPT=1".to_string()];
         assert!(matches!(
-            cmd.plan_section(&merged, root, "app-compile", Some(&batch), Some(&args)),
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                Some(&args),
+                Some(&pins("s"))
+            ),
             SectionPlan::Run(Some(_))
         ));
+    }
+
+    /// A re-pin of the SDK in the lock runs the section again.
+    #[test]
+    fn section_runs_when_the_lock_pins_change() {
+        let dir = skip_project();
+        let root = dir.path();
+        let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
+        let cmd = ext_build_compile(&merged);
+        let stamp = stamp_written_by(cmd.plan_section(
+            &merged,
+            root,
+            &app_section(),
+            Some(&batch_with(None, "")),
+            None,
+            Some(&pins("s")),
+        ));
+        let batch = batch_with(Some(&stamp), "app-compile");
+        assert_eq!(
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
+            SectionPlan::Skip
+        );
+        assert!(matches!(
+            cmd.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s2"))
+            ),
+            SectionPlan::Run(Some(_))
+        ));
+        // No readable lock: nothing to compare the pins with, so it runs.
+        assert_eq!(
+            cmd.plan_section(&merged, root, &app_section(), Some(&batch), None, None),
+            SectionPlan::Run(None)
+        );
     }
 
     /// Without `package_files`, no stamp is written and the section always
@@ -991,7 +1126,14 @@ extensions:
         let merged: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let batch = batch_with(None, "app-compile");
         assert_eq!(
-            ext_build_compile().plan_section(&merged, root, "app-compile", Some(&batch), None),
+            ext_build_compile(&merged).plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
             SectionPlan::Run(None)
         );
     }
@@ -1003,13 +1145,14 @@ extensions:
         let dir = skip_project();
         let root = dir.path();
         let merged: serde_yaml::Value = serde_yaml::from_str(SKIP_YAML).unwrap();
-        let cmd = ext_build_compile();
+        let cmd = ext_build_compile(&merged);
         let stamp = stamp_written_by(cmd.plan_section(
             &merged,
             root,
-            "app-compile",
+            &app_section(),
             Some(&batch_with(None, "")),
             None,
+            Some(&pins("s")),
         ));
         let batch = batch_with(Some(&stamp), "app-compile");
 
@@ -1022,11 +1165,18 @@ extensions:
             None,
         );
         assert_eq!(
-            direct.plan_section(&merged, root, "app-compile", Some(&batch), None),
+            direct.plan_section(
+                &merged,
+                root,
+                &app_section(),
+                Some(&batch),
+                None,
+                Some(&pins("s"))
+            ),
             SectionPlan::Run(None)
         );
         assert_eq!(
-            cmd.plan_section(&merged, root, "app-compile", None, None),
+            cmd.plan_section(&merged, root, &app_section(), None, None, Some(&pins("s"))),
             SectionPlan::Run(None)
         );
     }
