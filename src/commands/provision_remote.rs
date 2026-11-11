@@ -460,18 +460,23 @@ fn queued_line(v: &Value) -> String {
 /// One request to this machine's VM agent, streamed back line by line. Its
 /// own process group: Ctrl-C at the terminal is ours to handle, not ssh's.
 fn agent_ctl(req: &Value) -> Result<std::process::Child> {
+    use std::io::Write;
     use std::os::unix::process::CommandExt;
-    // Quoted, not base64: the VM image has no `base64`.
-    let req = crate::utils::shell::shell_escape(&req.to_string());
     let target = lifecycle::ssh_target_for_running()?;
-    Command::new("ssh")
+    let mut child = Command::new("ssh")
         .args(target.base_args())
-        .arg(format!("printf '%s' {req} | avocado-vm-agent ctl"))
-        .stdin(Stdio::null())
+        .arg("avocado-vm-agent ctl")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .process_group(0)
         .spawn()
-        .context("ssh to the VM")
+        .context("ssh to the VM")?;
+    // On stdin, not the command line: the request carries the board token.
+    let mut stdin = child.stdin.take().context("ssh stdin")?;
+    stdin
+        .write_all(req.to_string().as_bytes())
+        .context("sending the request to the VM agent")?;
+    Ok(child)
 }
 
 /// Cancel a command on this machine's VM; the agent's answer.

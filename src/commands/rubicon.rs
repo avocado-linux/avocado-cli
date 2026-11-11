@@ -460,13 +460,16 @@ impl RubiconCommand {
         if let Some(port) = port {
             cmd.push_str(&format!(" --port {port}"));
         }
+        let target = lifecycle::ssh_target_for_running()?;
         if let Some(t) = token {
-            cmd.push_str(&format!(" --token {}", sh_quote(&t)));
+            // Not on the command line, where the host's process list shows
+            // it: stashed in the guest, read and removed as the console starts.
+            let f = sh_quote(&crate::utils::vm::hub::stash_secret(&target, &t)?);
+            cmd.push_str(&format!(" --token \"$(cat {f}; rm -f {f})\""));
         }
         if write {
             cmd.push_str(&format!(" --by {}", sh_quote(&remote::requester())));
         }
-        let target = lifecycle::ssh_target_for_running()?;
         let mut ssh = Command::new("ssh");
         ssh.args(target.base_args());
         if write {

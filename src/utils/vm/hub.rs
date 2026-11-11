@@ -77,10 +77,9 @@ pub fn host_facts(paths: &VmPaths) -> Value {
 
 /// Send one request line to the agent and return its reply.
 pub async fn agent_request(target: &SshTarget, req: &Value) -> Result<Value> {
-    // Quoted, not base64: the VM image has no `base64`.
-    let req = crate::utils::shell::shell_escape(&req.to_string());
+    // On stdin, not the command line: a request can carry a board token.
     let (out, _) = target
-        .exec(&format!("printf '%s' {req} | avocado-vm-agent ctl"))
+        .exec_stdin("avocado-vm-agent ctl", req.to_string().as_bytes())
         .await
         .context("the VM agent did not answer (is it running a hub-capable build?)")?;
     let reply: Value = serde_json::from_str(out.trim())
@@ -89,6 +88,33 @@ pub async fn agent_request(target: &SshTarget, req: &Value) -> Result<Value> {
         bail!("agent refused: {}", reply.get("error").unwrap_or(&reply));
     }
     Ok(reply)
+}
+
+/// Put `token` in a 0600 file in the guest, sent over stdin; its path. For a
+/// command whose stdin is taken (an interactive console), which then reads
+/// and removes it, so the token is never on the host's command line.
+pub fn stash_secret(target: &SshTarget, token: &str) -> Result<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ssh")
+        .args(target.base_args())
+        .arg("umask 077; f=$(mktemp /run/avocado-vm-agent/secret.XXXXXX) && cat > \"$f\" && echo \"$f\"")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("ssh to the VM")?;
+    child
+        .stdin
+        .take()
+        .context("ssh stdin")?
+        .write_all(token.as_bytes())
+        .context("handing the board token to the VM")?;
+    let out = child.wait_with_output().context("ssh wait failed")?;
+    if !out.status.success() {
+        bail!("could not hand the board token to the VM ({})", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Push host facts + the Rubicon list to the agent.
