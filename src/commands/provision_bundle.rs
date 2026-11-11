@@ -608,17 +608,21 @@ fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()>
     Ok(())
 }
 
-/// Rewrite the packing host's SDK path (`…/sdk/<arch>/…`) to this host's.
 /// Carry the feed the packing host resolved against (`AVOCADO_REPO_URL`, else
-/// the config's) so the hub installs the same SDK and packages. A loopback
-/// URL becomes the address the local avocado-vm reaches this host at; a hub
-/// elsewhere could not reach the packing host's loopback in any case.
+/// the config's) so the hub installs the same SDK and packages. Kept as
+/// written: the bundle is portable, and a `--bundle` replay on this host
+/// reaches its loopback as it is.
 pub fn carry_feed(env: &mut HashMap<String, String>, repo_url: Option<String>) {
     if let Some(url) = repo_url {
-        env.insert(
-            "AVOCADO_REPO_URL".into(),
-            crate::utils::vm::hub::guest_api_url(&url),
-        );
+        env.insert("AVOCADO_REPO_URL".into(), url);
+    }
+}
+
+/// For a job on this machine's avocado-vm: a loopback feed becomes the
+/// address the VM reaches this host at.
+pub fn feed_for_local_vm(meta: &mut BundleMeta) {
+    if let Some(url) = meta.env.get_mut("AVOCADO_REPO_URL") {
+        *url = crate::utils::vm::hub::guest_api_url(url);
     }
 }
 
@@ -629,6 +633,7 @@ fn carried_feed(meta: &BundleMeta) -> Option<(&str, &str)> {
         .map(|u| ("AVOCADO_REPO_URL", u.as_str()))
 }
 
+/// Rewrite the packing host's SDK path (`…/sdk/<arch>/…`) to this host's.
 pub fn localize_env(meta: &BundleMeta) -> HashMap<String, String> {
     let from = format!("/sdk/{}/", sdk_arch_dir(&meta.sdk_host_arch));
     let to = format!("/sdk/{}/", sdk_arch_dir(std::env::consts::ARCH));
@@ -934,16 +939,16 @@ mod tests {
     }
 
     #[test]
-    fn the_packing_hosts_feed_rides_along_reachable_from_the_vm() {
+    fn the_packing_hosts_feed_rides_along_and_only_a_local_vm_job_rewrites_it() {
         let mut env = HashMap::new();
         carry_feed(&mut env, None);
         assert!(env.is_empty(), "no feed configured: nothing carried");
+        // The bundle keeps the URL as written: a replay on this host reaches
+        // its own loopback.
         carry_feed(&mut env, Some("http://localhost:8086".into()));
-        assert_eq!(env["AVOCADO_REPO_URL"], "http://10.0.2.2:8086");
-        carry_feed(&mut env, Some("http://10.10.0.10:8086".into()));
-        assert_eq!(env["AVOCADO_REPO_URL"], "http://10.10.0.10:8086");
+        assert_eq!(env["AVOCADO_REPO_URL"], "http://localhost:8086");
 
-        let meta: BundleMeta = serde_json::from_value(serde_json::json!({
+        let mut meta: BundleMeta = serde_json::from_value(serde_json::json!({
             "format": FORMAT, "target": "t", "runtime": "r", "sdk_host_arch": "x86_64",
             "env": env, "avocado_yaml": "", "avocado_lock": "", "provision_script": "",
             "clear": [], "files": [], "small_files": [], "created_at": "", "cli_version": ""
@@ -951,8 +956,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             carried_feed(&meta),
-            Some(("AVOCADO_REPO_URL", "http://10.10.0.10:8086"))
+            Some(("AVOCADO_REPO_URL", "http://localhost:8086"))
         );
+        // Submitted to this machine's VM: the guest's way to the host.
+        feed_for_local_vm(&mut meta);
+        assert_eq!(meta.env["AVOCADO_REPO_URL"], "http://10.0.2.2:8086");
+        meta.env
+            .insert("AVOCADO_REPO_URL".into(), "http://10.10.0.10:8086".into());
+        feed_for_local_vm(&mut meta);
+        assert_eq!(meta.env["AVOCADO_REPO_URL"], "http://10.10.0.10:8086");
     }
 
     #[test]

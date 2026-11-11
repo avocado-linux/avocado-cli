@@ -704,7 +704,9 @@ impl RemoteProvision {
         let ws = share::read_recorded_workspace(&paths)?
             .map(Ok)
             .unwrap_or_else(|| share::resolve_workspace(None))?;
-        let meta: BundleMeta = serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
+        let mut meta: BundleMeta =
+            serde_json::from_slice(&std::fs::read(bundle.join("bundle.json"))?)?;
+        crate::commands::provision_bundle::feed_for_local_vm(&mut meta);
         let blobs: Vec<Value> = meta
             .blobs()
             .iter()
