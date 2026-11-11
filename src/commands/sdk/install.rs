@@ -1255,21 +1255,17 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
         // Merge target-dev lock
-        if (need_target_dev || clean_target_sysroot) && target_dev_result.is_ok() {
-            if let Some(target_locks) = target_dev_lock.targets.get(target) {
-                let entry = final_lock.targets.entry(target.to_string()).or_default();
-                entry.target_sysroot = target_locks.target_sysroot.clone();
-                // In-memory only, like the rootfs merge: without it the save
-                // re-merges the old kernel's keys from disk.
-                entry
-                    .cleared_sections
-                    .extend(target_locks.cleared_sections.iter().cloned());
-            }
-            // Post-install: query versions and update lock file. A wipe-only
-            // run (nothing to install) has nothing to record.
-            if let (true, Some((_, ref all_compile_package_names, ref base_pkg))) =
-                (need_target_dev, &target_dev_command)
-            {
+        let target_dev_ok = target_dev_result.is_ok();
+        merge_target_sysroot_lock(
+            &mut final_lock,
+            &target_dev_lock,
+            target,
+            need_target_dev && target_dev_ok,
+            clean_target_sysroot,
+        );
+        if need_target_dev && target_dev_ok {
+            // Post-install: query versions and update lock file.
+            if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
                 print_success(
                     "Installed target-sysroot with compile dependencies.",
                     OutputLevel::Normal,
@@ -2417,6 +2413,35 @@ $DNF_SDK_HOST \
     )
 }
 
+/// Carry the target-sysroot section of the install's lock into the one that is
+/// saved: after a successful install, and after any wipe whatever the install
+/// did. A wipe drops the old kernel's pins while the resolver has already
+/// recorded the new kernel; saving one without the other would leave the old
+/// kernel's versions pinned against the new kernel, and the next run (pin
+/// unchanged, so no clean) would request them again into the empty sysroot.
+/// Same rule as the rootfs install: a failed reinstall must not leave a stale
+/// package map.
+fn merge_target_sysroot_lock(
+    final_lock: &mut LockFile,
+    target_dev_lock: &LockFile,
+    target: &str,
+    installed: bool,
+    cleaned: bool,
+) {
+    if !(installed || cleaned) {
+        return;
+    }
+    if let Some(target_locks) = target_dev_lock.targets.get(target) {
+        let entry = final_lock.targets.entry(target.to_string()).or_default();
+        entry.target_sysroot = target_locks.target_sysroot.clone();
+        // In-memory only, like the rootfs merge: without it the save re-merges
+        // the old kernel's keys from disk.
+        entry
+            .cleared_sections
+            .extend(target_locks.cleared_sections.iter().cloned());
+    }
+}
+
 /// The target-sysroot, relative to `$AVOCADO_PREFIX`.
 const TARGET_SYSROOT_DIR: &str = "sdk/target-sysroot";
 
@@ -2457,6 +2482,37 @@ mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    /// A wipe followed by a failed install still saves the cleared section: the
+    /// old kernel's pins must not survive next to the new kernel's pin.
+    #[test]
+    fn failed_install_after_wipe_drops_the_old_kernels_pins() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "jetson-agx-thor";
+        let ts = SysrootType::TargetSysroot;
+        let old = "kernel-devsrc-6.18.52-yocto-standard";
+
+        let mut on_disk = LockFile::new();
+        on_disk.set_locked_version(target, &ts, old, "6.18.52-r0");
+        on_disk.set_kernel_version(target, &ts, "6.18.52-yocto-standard");
+        on_disk.save(temp_dir.path()).unwrap();
+
+        // The resolver has re-pinned the kernel; the install's lock was wiped.
+        let mut final_lock = LockFile::load(temp_dir.path()).unwrap();
+        final_lock.set_kernel_version(target, &ts, "6.8.12-l4t");
+        let mut target_dev_lock = final_lock.clone();
+        target_dev_lock.clear_target_sysroot(target);
+
+        merge_target_sysroot_lock(&mut final_lock, &target_dev_lock, target, false, true);
+        final_lock.save(temp_dir.path()).unwrap();
+
+        let saved = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(saved.get_locked_version(target, &ts, old), None);
+        assert_eq!(
+            saved.get_kernel_version(target, &ts),
+            Some(&"6.8.12-l4t".to_string())
+        );
+    }
 
     /// The target-sysroot is cleaned only when its kernel pin moves: not on a
     /// first install, and not when it stays put.

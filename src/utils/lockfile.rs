@@ -694,10 +694,11 @@ pub struct TargetLocks {
 
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
-    /// Not persisted. `merge_with` checks only "rootfs" and "initramfs": for
-    /// those it keeps the in-memory section as it is and ignores the disk
-    /// copy, so a `save()` after a clean doesn't pull old packages back from
-    /// the on-disk lockfile. Other keys are recorded but not read.
+    /// Not persisted. `merge_with` checks "rootfs", "initramfs" and
+    /// "target-sysroot": for those it keeps the in-memory section as it is and
+    /// ignores the disk copy, so a `save()` after a clean doesn't pull old
+    /// packages back from the on-disk lockfile. Other keys are recorded but not
+    /// read.
     #[serde(skip)]
     pub cleared_sections: HashSet<String>,
 }
