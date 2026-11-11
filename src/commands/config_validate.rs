@@ -147,22 +147,28 @@ pub fn validate(content: &str) -> Report {
     // Messages quote the value after interpolation, which for `{{ env.X }}`
     // is whatever the environment holds, a token included. Show the template
     // the user wrote instead: it names the line to fix and reveals nothing.
+    // Paths go through the interpolated keys, so a templated key is shown as
+    // its template there too.
     let mut templated = Vec::new();
-    templated_values(&doc, &interpolated, &mut templated);
+    let mut keys = Vec::new();
+    templated_values(&doc, &interpolated, &mut templated, &mut keys);
     for e in &mut report.errors {
         e.message = show_templates(&e.message, &templated);
+        e.path = show_key_templates(&e.path, &keys);
     }
     report
 }
 
 /// Every scalar that interpolation changed, as `(expanded, template)`, found
-/// by walking the raw and the interpolated document together. A templated
-/// mapping key is removed and reinserted at the end, so entries pair by key
-/// first and the leftover (renamed) entries pair in order.
+/// by walking the raw and the interpolated document together. The templated
+/// mapping keys are also in `keys`, as strings. A templated mapping key is
+/// removed and reinserted at the end, so entries pair by key first and the
+/// leftover (renamed) entries pair in order.
 fn templated_values(
     raw: &serde_yaml::Value,
     expanded: &serde_yaml::Value,
     out: &mut Vec<(serde_yaml::Value, String)>,
+    keys: &mut Vec<(String, String)>,
 ) {
     use serde_yaml::Value;
     match (raw, expanded) {
@@ -171,21 +177,24 @@ fn templated_values(
         }
         (Value::Sequence(r), Value::Sequence(x)) => {
             for (r, x) in r.iter().zip(x) {
-                templated_values(r, x, out);
+                templated_values(r, x, out, keys);
             }
         }
         (Value::Mapping(r), Value::Mapping(x)) => {
             let mut raw_left = Vec::new();
             for (k, rv) in r {
                 match x.get(k) {
-                    Some(xv) => templated_values(rv, xv, out),
+                    Some(xv) => templated_values(rv, xv, out, keys),
                     None => raw_left.push((k, rv)),
                 }
             }
             let x_left = x.iter().filter(|(k, _)| !r.contains_key(*k));
             for ((rk, rv), (xk, xv)) in raw_left.into_iter().zip(x_left) {
-                templated_values(rk, xk, out);
-                templated_values(rv, xv, out);
+                if let (Value::String(template), Value::String(key)) = (rk, xk) {
+                    keys.push((key.clone(), template.clone()));
+                }
+                templated_values(rk, xk, out, keys);
+                templated_values(rv, xv, out, keys);
             }
         }
         _ => {}
@@ -221,6 +230,22 @@ fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> S
         out = out.replace(&from, &to);
     }
     out
+}
+
+/// `pointer` with each segment that is a templated key after interpolation
+/// replaced by the key's template, pointer-escaped.
+fn show_key_templates(pointer: &str, keys: &[(String, String)]) -> String {
+    pointer
+        .split('/')
+        .skip(1)
+        .map(|segment| {
+            let key = segment.replace("~1", "/").replace("~0", "~");
+            match keys.iter().find(|(expanded, _)| *expanded == key) {
+                Some((_, template)) => template.replace('~', "~0").replace('/', "~1"),
+                None => segment.to_string(),
+            }
+        })
+        .fold(String::new(), |path, segment| path + "/" + &segment)
 }
 
 /// A JSON pointer as the dotted key path the lint warnings use.
@@ -557,6 +582,45 @@ mod tests {
         });
         assert!(!errors.is_empty());
         assert!(!errors.iter().any(|e| e.contains(MARKER)), "{errors:?}");
+    }
+
+    /// An error path goes through the interpolated keys; a key read from the
+    /// environment is shown as its template there too.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_as_a_key_is_not_shown_in_the_path() {
+        for (yaml, path) in [
+            (
+                "runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\":\n    extensions: 5\n",
+                "/runtimes/{{ env.AVOCADO_TEST_VALIDATE_MARKER }}/extensions",
+            ),
+            (
+                "runtimes:\n  \"dev-{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\":\n    extensions: 5\n",
+                "/runtimes/dev-{{ env.AVOCADO_TEST_VALIDATE_MARKER }}/extensions",
+            ),
+        ] {
+            let report = with_marker(|| validate(yaml));
+            assert!(!report.errors.is_empty(), "{yaml}");
+            for e in &report.errors {
+                assert!(!e.path.contains(MARKER), "{e:?}");
+                assert!(!e.message.contains(MARKER), "{e:?}");
+            }
+            assert!(
+                report.errors.iter().any(|e| e.path == path),
+                "{:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn a_templated_key_in_a_path_is_pointer_escaped() {
+        let keys = vec![("a/secret~1".to_string(), "a/{{ env.X }}~1".to_string())];
+        assert_eq!(
+            show_key_templates("/repos/a~1secret~01/x", &keys),
+            "/repos/a~1{{ env.X }}~01/x"
+        );
+        assert_eq!(show_key_templates("", &keys), "");
     }
 
     #[test]
