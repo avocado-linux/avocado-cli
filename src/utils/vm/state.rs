@@ -248,9 +248,18 @@ pub fn instance_id(paths: &VmPaths) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             paths.ensure()?;
             let id = uuid::Uuid::new_v4().hyphenated().to_string();
-            std::fs::write(&p, format!("{id}\n"))
-                .with_context(|| format!("failed to write {}", p.display()))?;
-            Ok(id)
+            // Publish a fully written file without clobbering: a concurrent
+            // first use that wins the race keeps its id, and we read it back.
+            let mut tmp = tempfile::NamedTempFile::new_in(&paths.root).with_context(|| {
+                format!("failed to create temp file in {}", paths.root.display())
+            })?;
+            use std::io::Write as _;
+            writeln!(tmp, "{id}").with_context(|| format!("failed to write {}", p.display()))?;
+            match tmp.persist_noclobber(&p) {
+                Ok(_) => Ok(id),
+                Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => instance_id(paths),
+                Err(e) => Err(e.error).with_context(|| format!("failed to write {}", p.display())),
+            }
         }
         Err(e) => Err(e).with_context(|| format!("failed to read {}", p.display())),
     }
@@ -375,6 +384,20 @@ mod tests {
         // Survives the transient cleanup every stop runs.
         cleanup_transient(&paths);
         assert_eq!(instance_id(&paths).unwrap(), first);
+    }
+
+    #[test]
+    fn instance_id_concurrent_first_use_agrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path());
+        let ids: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| instance_id(&paths).unwrap()))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(instance_id(&paths).unwrap(), ids[0]);
     }
 
     #[test]
