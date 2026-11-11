@@ -899,6 +899,9 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
                 env_vars: Some(env),
                 container_args: config
                     .merge_provision_container_args(self.profile.as_deref(), None),
+                // The restored includes are what the hook runs on: no live
+                // extension sources mounted over them, read-write.
+                ext_path_mounts: Some(HashMap::new()),
                 ..Default::default()
             })
             .await
