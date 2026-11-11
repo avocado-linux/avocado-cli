@@ -1654,14 +1654,10 @@ pub fn compute_sdk_compile_input_hash(
     let key = |k: &str| serde_yaml::Value::String(format!("sdk.compile.{section}.{k}"));
     hash_data.insert(key("config"), section_node.clone());
 
-    let root = match content_root.as_deref() {
-        Some(c) if c.join(script).is_file() => c,
-        _ => project_root,
-    };
     fold_file_content(
         &mut hash_data,
         &format!("sdk.compile.{section}.compile_script"),
-        root,
+        compile_script_root(content_root.as_deref(), project_root, script),
         script,
     )?;
 
@@ -1724,8 +1720,26 @@ pub fn sdk_compile_inputs_are_complete(
         .get("package_files")
         .and_then(|v| v.as_sequence())
         .is_some_and(|files| !files.is_empty());
-    let script_on_host = content_root.join(script).is_file() || project_root.join(script).is_file();
+    // A regular file, not a symlink: the content digest hashes a top-level
+    // symlink by its link, so an edit to the file it points to would not move
+    // the hash.
+    let script_path = compile_script_root(Some(&content_root), project_root, script).join(script);
+    let script_on_host = std::fs::symlink_metadata(script_path).is_ok_and(|m| m.is_file());
     declares_sources && script_on_host
+}
+
+/// Where a compile script is read from: the extension's content root when the
+/// script is there, else the project root. The same rule as
+/// [`fold_package_scripts`].
+fn compile_script_root<'a>(
+    content_root: Option<&'a Path>,
+    project_root: &'a Path,
+    script: &str,
+) -> &'a Path {
+    match content_root {
+        Some(c) if c.join(script).is_file() => c,
+        _ => project_root,
+    }
 }
 
 /// Digest of the lockfile pins of one sysroot of `target`, the same digest the
@@ -9013,6 +9027,17 @@ extensions:
             "    package_files: [src]\n",
             "    package_files: [src]\n    source:\n      type: git\n      url: https://example.com/x.git\n",
         )));
+
+        // A symlinked compile script: the digest hashes the link, not the
+        // file it points to, so an edit there would not move the hash.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("scripts")).unwrap();
+            std::fs::write(root.join("scripts/build.sh"), "make\n").unwrap();
+            std::fs::remove_file(root.join("compile.sh")).unwrap();
+            std::os::unix::fs::symlink("scripts/build.sh", root.join("compile.sh")).unwrap();
+            assert!(!complete(COMPILE_SECTION_YAML));
+        }
 
         // A compile script that is not on the host.
         std::fs::remove_file(root.join("compile.sh")).unwrap();
