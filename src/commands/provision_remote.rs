@@ -581,6 +581,20 @@ pub struct RemoteProvision {
     pub interactive: bool,
 }
 
+/// A job's bundle directory, removed when dropped unless taken out (left
+/// for a job that may still read it).
+/// ponytail: a job left running when we stop following keeps its bundle
+/// until removed by hand; prune by age if those pile up.
+struct JobDir(Option<PathBuf>);
+
+impl Drop for JobDir {
+    fn drop(&mut self) {
+        if let Some(d) = &self.0 {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
 /// A board's address as a single directory name.
 fn staging_name(address: &str) -> String {
     let name: String = address
@@ -612,9 +626,9 @@ impl RemoteProvision {
             connect_profile: self.connect_profile.as_deref(),
         };
         let board = resolve(&wanted, &scope).await?;
-        // One staging directory per board: a board runs one job at a time,
-        // while provisions to different boards (from one project or several)
-        // run side by side and must not clear each other's bundle.
+        // One directory per job: provisions run side by side (to different
+        // boards, or queued on one), and each job's bundle must outlive the
+        // others' packing until its hub has read it.
         let out = match &board.hub {
             // Inside the VM's workspace share: the guest reads it in place.
             Hub::Local => {
@@ -626,9 +640,10 @@ impl RemoteProvision {
             }
             Hub::Connect { .. } => self.src_dir.join(".avocado/rubicon-bundle"),
         }
-        .join(staging_name(&board.address));
-        let _ = std::fs::remove_dir_all(&out);
+        .join(staging_name(&board.address))
+        .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&out)?;
+        let job_dir = JobDir(Some(out.clone()));
         // The caller's --env values (per-run choices such as a provisioning
         // profile's ERASE_* options) are not packed into the bundle, which
         // is stored and replayed; they ride with the job instead.
@@ -644,7 +659,7 @@ impl RemoteProvision {
             Hub::Local => {
                 let token =
                     local_token(&board, "provision", self.connect_profile.as_deref()).await?;
-                self.run_local(&bundle, &board.address, token, &job_env)
+                self.run_local(&bundle, job_dir, &board.address, token, &job_env)
                     .await
             }
             Hub::Connect { vm, vm_name } => {
@@ -669,8 +684,10 @@ impl RemoteProvision {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                let id = upload_bundle(&c, &org, &bundle, &name, json!({})).await?;
-                let _ = std::fs::remove_dir_all(&out);
+                let id = upload_bundle(&c, &org, &bundle, &name, json!({})).await;
+                // Connect has the blobs (or the upload failed): not needed.
+                drop(job_dir);
+                let id = id?;
                 ProvisionJobCommand {
                     vm: vm.clone(),
                     rubicon: board.address.clone(),
@@ -696,6 +713,7 @@ impl RemoteProvision {
     async fn run_local(
         &self,
         bundle: &Path,
+        mut job_dir: JobDir,
         address: &str,
         token: Option<String>,
         env: &HashMap<String, String>,
@@ -740,7 +758,15 @@ impl RemoteProvision {
                 "requested_by": requester(),
             },
         });
-        let r = follow_local(req).await?;
+        let r = match follow_local(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                // The job may still be running in the VM, reading the bundle.
+                job_dir.0 = None;
+                return Err(e);
+            }
+        };
+        drop(job_dir);
         report(&r, &format!("provision on Rubicon {address}"))?;
         print_success(
             &format!("Provisioned through Rubicon {address}"),
@@ -803,6 +829,25 @@ mod tests {
         assert_eq!(staging_name("../x"), ".._x");
         assert_eq!(staging_name(".."), "_..");
         assert_eq!(staging_name(""), "_");
+    }
+
+    #[test]
+    fn a_jobs_bundle_goes_with_it_unless_the_hub_may_still_read_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        drop(JobDir(Some(a.clone())));
+        assert!(!a.exists());
+        let mut kept = JobDir(Some(b.clone()));
+        kept.0 = None;
+        drop(kept);
+        assert!(b.exists());
+        // Packs of different runtimes from one project stage apart.
+        assert_ne!(
+            crate::commands::provision_bundle::stage_dir("dev", "t"),
+            crate::commands::provision_bundle::stage_dir("prod", "t")
+        );
     }
 
     fn board(address: &str, name: &str, label: Option<&str>, hub: Hub) -> Board {

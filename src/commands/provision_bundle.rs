@@ -51,8 +51,13 @@ use crate::utils::output::{print_info, print_success, OutputLevel};
 pub const FORMAT: u32 = 2;
 /// Files at least this big are stored as their own blob.
 pub const LARGE_FILE: u64 = 1 << 20;
-/// Where the container stages a pack, relative to the project dir.
-pub const STAGE_DIR: &str = ".avocado/bundle-stage";
+/// Where the container stages a pack, relative to the project dir: one per
+/// runtime and target, so packs of different runtimes from one project
+/// (side by side, to different boards) don't clear each other's staging.
+/// Two packs of the same runtime already share its build output.
+pub fn stage_dir(runtime: &str, target: &str) -> String {
+    format!(".avocado/bundle-stage/{runtime}-{target}")
+}
 /// Where `--bundle` keeps blobs and its working files, relative to the cwd.
 const WORK_DIR: &str = ".avocado-bundle";
 
@@ -217,7 +222,7 @@ impl BundleMeta {
 /// The shell that replaces the hook call when packing. Runs in the SDK
 /// container after the var section ran (var-staging holds the primed Docker
 /// images). Stages `files.tsv` (large files by sha256), `blobs/`, and the
-/// small-files archive under /opt/src/STAGE_DIR. Fails closed: the runtime
+/// small-files archive under /opt/src/`stage_dir`. Fails closed: the runtime
 /// shell has no `set -e`.
 pub fn pack_tail(runtime: &str, target: &str) -> String {
     format!(
@@ -249,7 +254,7 @@ if [ -n "$AVOCADO_STONE_MANIFEST" ]; then
         *) echo "[ERROR] stone manifest $AVOCADO_STONE_MANIFEST is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
     esac
 fi
-OUT=/opt/src/{STAGE_DIR}
+OUT=/opt/src/{stage}
 rm -rf "$OUT" && mkdir -p "$OUT/blobs" || exit 1
 echo "$paths" > "$OUT/paths" || exit 1
 # The stone manifest names the default provision profile (for the bundle's
@@ -293,6 +298,7 @@ rm -f "$OUT/small.found" "$OUT/small.list"
 set +f
 "#,
         small_max = LARGE_FILE - 1,
+        stage = stage_dir(runtime, target),
     )
 }
 
@@ -357,7 +363,7 @@ pub struct PackInputs<'a> {
 
 /// Turn the container's staging into `<out>/<runtime>-<target>.bundle/`.
 pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
-    let stage = p.src_dir.join(STAGE_DIR);
+    let stage = p.src_dir.join(stage_dir(p.runtime, p.target));
     let lock = p.src_dir.join("avocado.lock");
     if !lock.exists() {
         bail!(
