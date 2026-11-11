@@ -47,7 +47,7 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             suffix: ""
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             suffix: ""
           - os: ubuntu-22.04
