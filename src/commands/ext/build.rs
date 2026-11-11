@@ -316,6 +316,11 @@ impl ExtBuildCommand {
             .get_sdk_image()
             .ok_or_else(|| anyhow::anyhow!("No SDK container image specified in configuration"))?;
 
+        // The sysroot tree this build writes, as the container resolves it.
+        // Read by the stamp check below and hashed again into the stamp it
+        // writes, so both describe the same tree.
+        let mut sysroot_tree: Option<String> = None;
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config_path, config)?
@@ -335,7 +340,7 @@ impl ExtBuildCommand {
             // sysroot it would build — the two facts the skip below needs.
             let own_req = crate::utils::stamps::StampRequirement::ext_build(&self.extension);
             let batch_script = format!(
-                "{}\n{}\n{}{}",
+                "{}\n{}\n{}{}\n{}",
                 generate_batch_read_stamps_script(&required),
                 generate_batch_read_stamps_script(std::slice::from_ref(&own_req)),
                 crate::utils::stamps::generate_output_listing_probe(&format!(
@@ -343,6 +348,7 @@ impl ExtBuildCommand {
                     self.extension
                 )),
                 crate::commands::ext::install::sysroot_probe_line(&self.extension),
+                crate::utils::stamps::ext_sysroot_tree_probe(),
             );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -389,6 +395,10 @@ impl ExtBuildCommand {
                 &lock_src_dir,
             )
             .ok();
+            let tree = crate::utils::stamps::ext_sysroot_tree_from_batch(
+                output.as_deref().unwrap_or(""),
+                self.runtime.as_deref(),
+            );
             let build_inputs = compute_ext_build_input_hash(
                 parsed,
                 &self.extension,
@@ -396,8 +406,10 @@ impl ExtBuildCommand {
                 Some(target.as_str()),
                 self.runtime.as_deref(),
                 self.target_board.as_deref(),
+                Some(&tree),
             )
             .ok();
+            sysroot_tree = Some(tree);
             let mut current_inputs: Vec<crate::utils::stamps::CurrentInput<'_>> = Vec::new();
             if let Some(ref i) = install_inputs {
                 current_inputs.push((StampComponent::Extension, StampCommand::Install, i));
@@ -438,16 +450,18 @@ impl ExtBuildCommand {
             }
 
             // Skip: this step's own stamp is current for every input computed
-            // above — config, compile and install script content, the
-            // `package_files` source tree, the overlay — and the sysroot it
-            // built is still there. Nothing it would do could change the tree.
+            // above (config, compile and install script content, the
+            // `package_files` source tree, the overlay, the sysroot tree it
+            // builds per runtime or per target), and that sysroot is still
+            // there. Nothing it would do could change the tree.
             // The stamp is left as it is; `ext image` reads the same
             // content_hash from it and reaches the same verdict.
             //
             // The skip is only sound while those inputs describe the whole
-            // build. A `post_build` hook installs content the config never
-            // names, so an extension with one is rebuilt unless it declares
-            // `package_files` — see `ext_build_inputs_are_complete`.
+            // build. A `post_build` hook or a compile/install package installs
+            // content that no config key lists, so such an extension is
+            // rebuilt unless it declares `package_files`. See
+            // `ext_build_inputs_are_complete`.
             let sysroot_present = crate::utils::stamps::output_listing_from_batch(batch)
                 .iter()
                 .any(|d| d == &self.extension);
@@ -952,6 +966,9 @@ impl ExtBuildCommand {
             // Use the composed/merged config (which includes remote extension configs)
             // rather than re-reading the raw local file, so that path-based extension
             // packages are included in the hash for proper staleness detection.
+            let tree = sysroot_tree.unwrap_or_else(|| {
+                crate::utils::stamps::ext_sysroot_tree_from_batch("", self.runtime.as_deref())
+            });
             let inputs = compute_ext_build_input_hash(
                 parsed,
                 &self.extension,
@@ -959,6 +976,7 @@ impl ExtBuildCommand {
                 Some(target.as_str()),
                 self.runtime.as_deref(),
                 self.target_board.as_deref(),
+                Some(&tree),
             )?;
             let outputs = StampOutputs::default();
             let stamp = Stamp::ext_build(&self.extension, &target, inputs, outputs);

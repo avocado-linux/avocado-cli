@@ -292,13 +292,14 @@ impl ExtImageCommand {
             // the listing is matched against the exact filename once it is.
             let own_req = crate::utils::stamps::StampRequirement::ext_image(&self.extension);
             let batch_script = format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}",
                 generate_batch_read_stamps_script(&required),
                 generate_batch_read_stamps_script(std::slice::from_ref(&own_req)),
                 crate::utils::stamps::generate_output_listing_probe(&format!(
                     "\"$AVOCADO_PREFIX/output/extensions/{n}-\"*.raw \"$AVOCADO_PREFIX/output/extensions/{n}-\"*.kab",
                     n = self.extension
                 )),
+                crate::utils::stamps::ext_sysroot_tree_probe(),
             );
             let run_config = RunConfig {
                 container_image: container_image.to_string(),
@@ -346,6 +347,12 @@ impl ExtImageCommand {
                 &lock_src_dir,
             )
             .ok();
+            // Hashed against the tree this run would image, so a build stamp
+            // written for another runtime's tree is stale here.
+            let sysroot_tree = crate::utils::stamps::ext_sysroot_tree_from_batch(
+                output.as_deref().unwrap_or(""),
+                self.runtime.as_deref(),
+            );
             let build_inputs = compute_ext_build_input_hash(
                 parsed,
                 &self.extension,
@@ -353,6 +360,7 @@ impl ExtImageCommand {
                 Some(target.as_str()),
                 self.runtime.as_deref(),
                 self.target_board.as_deref(),
+                Some(&sysroot_tree),
             )
             .ok();
             build_content_hash = crate::utils::stamps::content_hash_from_batch(

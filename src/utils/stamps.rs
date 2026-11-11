@@ -1866,6 +1866,9 @@ pub fn compute_ext_install_input_hash_current(
 ///
 /// Excludes `var_files`, `subvolumes`, and the resolved `filesystem` —
 /// those only affect the image step.
+///
+/// `sysroot_tree` is the tree the build writes, as the container resolves
+/// `$AVOCADO_EXT_SYSROOTS` (see [`ext_sysroot_tree_probe`]).
 pub fn compute_ext_build_input_hash(
     config: &serde_yaml::Value,
     ext_name: &str,
@@ -1873,6 +1876,7 @@ pub fn compute_ext_build_input_hash(
     target: Option<&str>,
     runtime: Option<&str>,
     cli_target_board: Option<&str>,
+    sysroot_tree: Option<&str>,
 ) -> Result<StampInputs> {
     let hash_data = ext_build_hash_data(
         config,
@@ -1881,6 +1885,7 @@ pub fn compute_ext_build_input_hash(
         target,
         runtime,
         cli_target_board,
+        sysroot_tree,
     )?;
     let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
     Ok(StampInputs::new(config_hash))
@@ -2115,8 +2120,21 @@ fn ext_build_hash_data(
     target: Option<&str>,
     runtime: Option<&str>,
     cli_target_board: Option<&str>,
+    sysroot_tree: Option<&str>,
 ) -> Result<serde_yaml::Mapping> {
     let mut hash_data = serde_yaml::Mapping::new();
+
+    // The tree this build writes. The stamp path is one per extension for the
+    // target, but each runtime has its own sysroot tree, and with no runtime
+    // `$AVOCADO_EXT_SYSROOTS` is a link to the tree of the runtime that ran
+    // last. Without the tree in the hash, a stamp written for one tree let a
+    // build of another tree skip and ship its old files (B-31).
+    if let Some(tree) = sysroot_tree {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("ext.{ext_name}.sysroot_tree")),
+            serde_yaml::Value::String(tree.to_string()),
+        );
+    }
 
     if let Some(ext) = config.get("extensions").and_then(|e| e.get(ext_name)) {
         let content_root = ext_content_root(ext, project_root);
@@ -2247,6 +2265,12 @@ fn ext_has_compile_package(ext: &serde_yaml::Value) -> bool {
 /// ignored by the hash, and treating it as a promise would restore the silent
 /// skip it is meant to prevent.
 ///
+/// A package with both `compile` and `install` is the same gap. `ext build`
+/// runs its compile section and then its install script, and both read files
+/// that no config key lists: a source tree, the compile output, whatever the
+/// install script copies out of the project. The hash reads only the bytes of
+/// the two scripts, so it needs the same `package_files` declaration (B-31).
+///
 /// The conservative answer for everything else is to rebuild. A hook run costs
 /// one script; a wrong answer costs a developer their afternoon on the device.
 pub fn ext_build_inputs_are_complete(
@@ -2263,10 +2287,12 @@ pub fn ext_build_inputs_are_complete(
     // never the one the hash folded: `ext build` resolves the overrides, the
     // hash reads the unresolved node. No `package_files` list can cover that,
     // because the hook's own bytes are missing from every input too. Rebuild.
-    if declares_post_build_in_target_override(ext) {
+    // The same holds for a `compile` or `install` key under an override:
+    // `fold_package_scripts` reads only the top-level `packages:`.
+    if declares_build_step_in_override(ext) {
         return false;
     }
-    if ext.get("post_build").and_then(|v| v.as_str()).is_none() {
+    if ext.get("post_build").and_then(|v| v.as_str()).is_none() && !runs_compile_install(ext) {
         return true;
     }
     // Every condition the fold is gated on, and nothing else. Reproducing only
@@ -2282,19 +2308,50 @@ pub fn ext_build_inputs_are_complete(
             .is_some_and(|files| !files.is_empty())
 }
 
-/// Whether any `target-<name>:` override declares a `post_build` hook.
+/// Whether an override declares a `post_build` hook, or a package `compile`
+/// or `install` key.
 ///
-/// `ext build` merges those overrides before it runs the hook
-/// (`get_merged_ext_config_with_board`, `resolve_remote_ext_config`), while
-/// every input hash reads the unresolved node. A hook that only an override
-/// names therefore runs with not even its own bytes in the hash.
-fn declares_post_build_in_target_override(ext: &serde_yaml::Value) -> bool {
-    ext.as_mapping().is_some_and(|m| {
-        m.iter().any(|(key, value)| {
-            key.as_str().is_some_and(|k| k.starts_with("target-"))
-                && value.get("post_build").and_then(|v| v.as_str()).is_some()
+/// `ext build` merges `target-<name>:` overrides (and the deprecated bare
+/// `<target>:` form, and overrides nested in them) before it runs the hook or
+/// the scripts (`get_merged_ext_config_with_board`,
+/// `resolve_remote_ext_config`), while every input hash reads the unresolved
+/// node. A step that only an override declares therefore runs with not even
+/// its own bytes in the hash. One key is enough: an `install` in an override
+/// pairs with a `compile` at the top level after the merge.
+///
+/// Any mapping below the extension node other than its own `packages:` is
+/// checked, so a bare target key is found without knowing the target. No
+/// other key of an extension holds a `post_build` or a package spec.
+fn declares_build_step_in_override(ext: &serde_yaml::Value) -> bool {
+    fn declares(node: &serde_yaml::Value) -> bool {
+        let Some(map) = node.as_mapping() else {
+            return false;
+        };
+        map.iter().any(|(key, value)| match key.as_str() {
+            Some("post_build") => value.as_str().is_some(),
+            Some("packages") => value.as_mapping().is_some_and(|pkgs| {
+                pkgs.values()
+                    .any(|spec| spec.get("compile").is_some() || spec.get("install").is_some())
+            }),
+            _ => declares(value),
         })
+    }
+    ext.as_mapping().is_some_and(|m| {
+        m.iter()
+            .any(|(key, value)| !matches!(key.as_str(), Some("packages")) && declares(value))
     })
+}
+
+/// Whether any package declares both a `compile` section and an `install`
+/// script. Those are the packages `ext build` compiles and installs
+/// (`handle_compile_dependencies`); a compile section alone never runs there.
+fn runs_compile_install(node: &serde_yaml::Value) -> bool {
+    node.get("packages")
+        .and_then(|p| p.as_mapping())
+        .is_some_and(|m| {
+            m.values()
+                .any(|spec| spec.get("compile").is_some() && spec.get("install").is_some())
+        })
 }
 
 /// One digest over every file a `package_files` list names, patterns expanded
@@ -3205,6 +3262,34 @@ pub fn output_listing_from_batch(batch_output: &str) -> Vec<String> {
         .and_then(|v| v.as_deref())
         .map(|line| line.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// Batch key for [`ext_sysroot_tree_probe`].
+const EXT_SYSROOT_TREE_KEY: &str = "ext_sysroot_tree";
+
+/// Shell for a batch read that prints the tree `$AVOCADO_EXT_SYSROOTS`
+/// resolves to in this container run. With `AVOCADO_RUNTIME` set it is
+/// `runtimes/<rt>/extensions`; without it, `$AVOCADO_PREFIX/extensions`, which
+/// the entrypoint makes a link to the tree of the runtime that ran last. The
+/// link is followed, so the result is the tree a build really writes.
+pub fn ext_sysroot_tree_probe() -> String {
+    format!(
+        r#"printf '{EXT_SYSROOT_TREE_KEY}:::%s\n' "$(readlink -f "$AVOCADO_EXT_SYSROOTS" 2>/dev/null || echo "$AVOCADO_EXT_SYSROOTS")""#
+    )
+}
+
+/// The tree reported by [`ext_sysroot_tree_probe`]. When the batch has no
+/// answer, the path the entrypoint would export for `runtime` stands in. It
+/// can differ from the probed path, which costs a rebuild and never a skip.
+pub fn ext_sysroot_tree_from_batch(batch_output: &str, runtime: Option<&str>) -> String {
+    parse_batch_stamps_output(batch_output)
+        .get(EXT_SYSROOT_TREE_KEY)
+        .and_then(|v| v.clone())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| match runtime {
+            Some(rt) => format!("$AVOCADO_PREFIX/runtimes/{rt}/extensions"),
+            None => "$AVOCADO_PREFIX/extensions".to_string(),
+        })
 }
 
 /// Whether the stamp at `req` in a batch read exists and is current for
@@ -5968,15 +6053,23 @@ extensions:
     }
 
     fn ext_build_hash(value: &serde_yaml::Value) -> String {
-        compute_ext_build_input_hash(value, "my-ext", std::path::Path::new("."), None, None, None)
-            .unwrap()
-            .config_hash
+        compute_ext_build_input_hash(
+            value,
+            "my-ext",
+            std::path::Path::new("."),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .config_hash
     }
 
     /// `compute_ext_build_input_hash` against a real project root.
     fn ext_build_hash_at(root: &Path, yaml: &str) -> Result<String> {
         let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        Ok(compute_ext_build_input_hash(&v, "my-ext", root, None, None, None)?.config_hash)
+        Ok(compute_ext_build_input_hash(&v, "my-ext", root, None, None, None, None)?.config_hash)
     }
 
     /// A compiled extension: the compile script (via `sdk.compile.<section>`),
@@ -7228,6 +7321,150 @@ find() {
         assert!(ext_build_inputs_are_complete(&config(hook), "other", root));
     }
 
+    /// A package with both `compile` and `install` runs the compile section and
+    /// then the install script inside `ext build`. Both read whatever they
+    /// reach for: a source tree, the compile output, files the install script
+    /// copies out of the project. The hash reads only the two scripts' bytes,
+    /// so a source edit moved nothing and `ext build` said "up to date" over
+    /// the previous build (B-31). It is the same gap as a `post_build` hook,
+    /// and `package_files` buys the skip back the same way.
+    #[test]
+    fn a_compile_install_extension_may_be_skipped_only_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = |body: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&format!("extensions:\n  app:\n{body}")).unwrap()
+        };
+        let complete = |cfg: &serde_yaml::Value| ext_build_inputs_are_complete(cfg, "app", root);
+
+        let compiled_installed =
+            "    packages:\n      pkg:\n        compile: sec\n        install: install.sh\n";
+        let files = "    package_files:\n      - src\n";
+
+        // The reported bug: the scripts read sources nothing declares.
+        assert!(!complete(&config(compiled_installed)));
+        assert!(!complete(&config(&format!(
+            "{compiled_installed}    package_files: []\n"
+        ))));
+
+        // Declared sources are hashed, so an edit under them moves the hash.
+        assert!(complete(&config(&format!("{compiled_installed}{files}"))));
+
+        // A source the host cannot see adds nothing to the hash, whatever it
+        // declares.
+        let packaged = "    source:\n      type: package\n      version: \"*\"\n";
+        assert!(!complete(&config(&format!(
+            "{compiled_installed}{files}{packaged}"
+        ))));
+
+        // `ext build` runs only packages that declare both; a compile section
+        // with no install script never runs there.
+        assert!(complete(&config(
+            "    packages:\n      pkg:\n        compile: sec\n"
+        )));
+
+        // A pair under a `target-<name>:` override runs with neither script in
+        // the hash, which reads the unresolved node.
+        let target_pair = "    target-qemux86-64:\n      packages:\n        pkg:\n          compile: sec\n          install: install.sh\n";
+        assert!(!complete(&config(target_pair)));
+        assert!(!complete(&config(&format!("{target_pair}{files}"))));
+
+        // The merge pairs keys across levels: a top-level `compile` and an
+        // override's `install` run together, and the install script reaches
+        // no hash at all.
+        let compile_only = "    packages:\n      pkg:\n        compile: sec\n";
+        let target_install =
+            "    target-qemux86-64:\n      packages:\n        pkg:\n          install: install.sh\n";
+        assert!(!complete(&config(&format!(
+            "{compile_only}{target_install}"
+        ))));
+
+        // The deprecated bare `<target>:` key is merged the same way.
+        let bare_pair = "    qemux86-64:\n      packages:\n        pkg:\n          compile: sec\n          install: install.sh\n";
+        assert!(!complete(&config(bare_pair)));
+        let bare_hook = "    qemux86-64:\n      post_build: install.sh\n";
+        assert!(!complete(&config(bare_hook)));
+        // An override that only pins a version runs no script.
+        assert!(complete(&config(
+            "    qemux86-64:\n      packages:\n        curl: \"8.*\"\n"
+        )));
+
+        // A path source has a content root, so its declaration is hashed.
+        std::fs::create_dir_all(root.join("vendored")).unwrap();
+        let path_src = "    source:\n      type: path\n      path: vendored\n";
+        assert!(complete(&config(&format!(
+            "{compiled_installed}{files}{path_src}"
+        ))));
+        assert!(!complete(&config(&format!(
+            "{compiled_installed}{path_src}"
+        ))));
+    }
+
+    /// The build stamp sits at `ext/<name>/build.stamp` for the whole target,
+    /// while each runtime builds its own sysroot tree, and with no runtime the
+    /// tree is whichever one `$AVOCADO_PREFIX/extensions` links to. A stamp
+    /// written for one tree must never let `ext build` skip another, or
+    /// `build -r rt-b` keeps an old or empty tree after `build -r rt-a`
+    /// rebuilt (B-31). The hash is keyed by the resolved tree, so a plain
+    /// overlay with no templating still moves it.
+    #[test]
+    fn ext_build_hash_is_keyed_by_the_sysroot_tree_it_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("overlay/etc")).unwrap();
+        std::fs::write(tmp.path().join("overlay/etc/app.conf"), "plain\n").unwrap();
+        let config: serde_yaml::Value =
+            serde_yaml::from_str("extensions:\n  my-ext:\n    overlay: overlay\n").unwrap();
+        let hash = |runtime: Option<&str>, tree: &str| {
+            compute_ext_build_input_hash(
+                &config,
+                "my-ext",
+                tmp.path(),
+                Some("qemux86-64"),
+                runtime,
+                None,
+                Some(tree),
+            )
+            .unwrap()
+            .config_hash
+        };
+        let tree_a = "/opt/_avocado/qemux86-64/runtimes/rt-a/extensions";
+        let tree_b = "/opt/_avocado/qemux86-64/runtimes/rt-b/extensions";
+
+        assert_ne!(hash(Some("rt-a"), tree_a), hash(Some("rt-b"), tree_b));
+        // With no runtime, the tree the link resolves to is what counts: a
+        // stamp from a build through the link to rt-b does not cover rt-a.
+        assert_ne!(hash(None, tree_a), hash(None, tree_b));
+        // The same tree is still the same input, so a rebuild of one runtime
+        // keeps its fast path, whichever way the tree was reached.
+        assert_eq!(hash(Some("rt-a"), tree_a), hash(Some("rt-a"), tree_a));
+        assert_eq!(hash(Some("rt-a"), tree_a), hash(None, tree_a));
+    }
+
+    /// The tree comes from the container. When the batch has no answer, the
+    /// stand-in is the path the entrypoint would export, which can only cost a
+    /// rebuild.
+    #[test]
+    fn ext_sysroot_tree_is_read_from_the_batch_or_stood_in() {
+        let batch = "ext/app/build.stamp:::null\n\
+                     ext_sysroot_tree:::/opt/_avocado/qemuarm64/runtimes/rt-b/extensions\n";
+        assert_eq!(
+            ext_sysroot_tree_from_batch(batch, None),
+            "/opt/_avocado/qemuarm64/runtimes/rt-b/extensions"
+        );
+        assert_eq!(
+            ext_sysroot_tree_from_batch("ext_sysroot_tree:::\n", Some("rt-a")),
+            "$AVOCADO_PREFIX/runtimes/rt-a/extensions"
+        );
+        assert_eq!(
+            ext_sysroot_tree_from_batch("", None),
+            "$AVOCADO_PREFIX/extensions"
+        );
+        // The probe follows the link, and its line parses back.
+        let probe = ext_sysroot_tree_probe();
+        assert!(probe.contains("readlink -f \"$AVOCADO_EXT_SYSROOTS\""));
+        assert!(probe.starts_with("printf 'ext_sysroot_tree:::"));
+    }
+
     #[test]
     fn ext_build_content_changes_invalidate_when_post_build_set() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7235,14 +7472,16 @@ find() {
         std::fs::write(&script, b"#!/bin/sh\necho original\n").unwrap();
 
         let config = ext_with_extras("    post_build: build.sh");
-        let h1 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None)
-            .unwrap()
-            .config_hash;
+        let h1 =
+            compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None, None)
+                .unwrap()
+                .config_hash;
 
         std::fs::write(&script, b"#!/bin/sh\necho edited\n").unwrap();
-        let h2 = compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None)
-            .unwrap()
-            .config_hash;
+        let h2 =
+            compute_ext_build_input_hash(&config, "my-ext", tmp.path(), None, None, None, None)
+                .unwrap()
+                .config_hash;
 
         assert_ne!(
             h1, h2,
@@ -7893,6 +8132,7 @@ extensions:
             Some("qemux86-64"),
             Some("dev"),
             None,
+            None,
         )
         .unwrap()
         .config_hash;
@@ -7902,6 +8142,7 @@ extensions:
             tmp.path(),
             Some("qemux86-64"),
             Some("prod"),
+            None,
             None,
         )
         .unwrap()
@@ -7942,6 +8183,7 @@ extensions:
             Some("imx8mp-var-dart"),
             None,
             Some("variscite-sonata"),
+            None,
         )
         .unwrap()
         .config_hash;
@@ -7952,6 +8194,7 @@ extensions:
             Some("imx8mp-var-dart"),
             None,
             Some("other-board"),
+            None,
         )
         .unwrap()
         .config_hash;
