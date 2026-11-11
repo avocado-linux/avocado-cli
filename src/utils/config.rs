@@ -3225,13 +3225,22 @@ impl Config {
         }) {
             let main_map = main_config.as_mapping_mut();
             if let Some(main_map) = main_map {
+                // An empty `rubicon:` (or `run:`) is null in YAML: a section
+                // to merge into, not a reason to skip the extension's.
+                let empty = || serde_yaml::Value::Mapping(Default::default());
                 let rubicon = main_map
                     .entry(serde_yaml::Value::String("rubicon".into()))
-                    .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                    .or_insert_with(empty);
+                if rubicon.is_null() {
+                    *rubicon = empty();
+                }
                 if let Some(rubicon) = rubicon.as_mapping_mut() {
                     let run = rubicon
                         .entry(serde_yaml::Value::String(key.into()))
-                        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                        .or_insert_with(empty);
+                    if run.is_null() {
+                        *run = empty();
+                    }
                     if let Some(run) = run.as_mapping_mut() {
                         for (name, steps) in external_run {
                             if !run.contains_key(name) {
@@ -11955,6 +11964,18 @@ extensions:
         let ext_section = main_config.get("extensions").unwrap().as_mapping().unwrap();
         assert!(ext_section.contains_key(serde_yaml::Value::String("local-ext".to_string())));
         assert!(ext_section.contains_key(serde_yaml::Value::String("external-ext".to_string())));
+    }
+
+    #[test]
+    fn an_empty_rubicon_section_still_takes_an_extensions_run_profiles() {
+        // `rubicon:` with nothing under it is null in YAML.
+        let mut main: serde_yaml::Value =
+            serde_yaml::from_str("rubicon:\nextensions:\n  bsp: {}\n").unwrap();
+        let bsp: serde_yaml::Value =
+            serde_yaml::from_str("rubicon:\n  run:\n    enter:\n      - out: {power: on}\n")
+                .unwrap();
+        Config::merge_external_config(&mut main, &bsp, "bsp", &[], &[]);
+        assert!(main["rubicon"]["run"]["enter"].is_sequence(), "{main:?}");
     }
 
     /// Helper: run `merge_external_config` and return the resulting
