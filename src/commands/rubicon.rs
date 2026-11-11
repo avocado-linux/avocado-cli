@@ -64,6 +64,8 @@ pub enum RubiconAction {
 pub struct RubiconCommand {
     pub action: RubiconAction,
     pub config_path: String,
+    /// The root `--target`: whose run profiles and `rubicon.default`.
+    pub target: Option<String>,
     pub via: Via,
     pub vm: Option<String>,
     pub connect_profile: Option<String>,
@@ -82,7 +84,7 @@ impl RubiconCommand {
     async fn board(&self, wanted: &Option<String>) -> Result<Board> {
         let wanted = match wanted {
             Some(w) => w.clone(),
-            None => remote::default_board(&self.config_path, None)?,
+            None => remote::default_board(&self.config_path, self.target.as_deref())?,
         };
         remote::resolve(&wanted, &self.scope()).await
     }
@@ -90,7 +92,7 @@ impl RubiconCommand {
     /// The project config, if there is one here (for run profiles, the
     /// console rate).
     fn project(&self) -> Option<Config> {
-        Config::load_composed(&self.config_path, None)
+        Config::load_composed(&self.config_path, self.target.as_deref())
             .ok()
             .map(|c| c.config)
     }
@@ -718,6 +720,32 @@ fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command(config_path: &str, target: Option<&str>) -> RubiconCommand {
+        RubiconCommand {
+            action: RubiconAction::List,
+            config_path: config_path.into(),
+            target: target.map(String::from),
+            via: Via::Auto,
+            vm: None,
+            connect_profile: None,
+        }
+    }
+
+    #[test]
+    fn project_follows_the_root_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: a\nrubicon:\n  wiring:\n    ssr1: \"{{ avocado.target }} REC\"\n",
+        )
+        .unwrap();
+        let c = command(path.to_str().unwrap(), Some("thor"))
+            .project()
+            .unwrap();
+        assert_eq!(c.rubicon.unwrap().wiring["ssr1"], "thor REC");
+    }
 
     #[test]
     fn state_reads_both_hubs_shapes() {

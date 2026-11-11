@@ -3578,6 +3578,7 @@ async fn main() -> Result<()> {
             RubiconCommand {
                 action,
                 config_path: config,
+                target: cli.target,
                 via,
                 vm,
                 connect_profile,
