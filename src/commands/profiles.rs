@@ -146,7 +146,7 @@ impl ProfilesListCommand {
         // `provision.fields`.
         let provision = manifest.provision.as_ref();
 
-        let rubicon = rubicon_refs(config, &self.config_path);
+        let rubicon = rubicon_refs(config, &self.config_path, self.target.as_deref());
 
         if self.output.is_json() {
             emit_json_object(&json!({
@@ -318,12 +318,15 @@ struct StoneManifest {
 }
 
 /// Each provision profile's Rubicon run profiles, and whether each run
-/// profile is the project's own or comes from an extension.
-fn rubicon_refs(config: &Config, config_path: &str) -> JsonValue {
+/// profile is the project's own or comes from an extension. The project's
+/// names are interpolated for `target` as the composed config's are, so
+/// `boot-check-{{ avocado.target }}` is its own once it reads `boot-check-jetson`.
+fn rubicon_refs(config: &Config, config_path: &str, target: Option<&str>) -> JsonValue {
     let own: BTreeSet<String> = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
-        .and_then(|v| {
+        .and_then(|mut v| {
+            crate::utils::interpolation::interpolate_config(&mut v, target, None).ok()?;
             v.get("rubicon")?.get("run")?.as_mapping().map(|m| {
                 m.keys()
                     .filter_map(|k| k.as_str().map(String::from))
@@ -493,7 +496,7 @@ mod tests {
              provision:\n  tegraflash:\n    rubicon: { before: enter, after: boot-check }\n  usb: {}\n",
         )
         .unwrap();
-        let r = rubicon_refs(&composed, path.to_str().unwrap());
+        let r = rubicon_refs(&composed, path.to_str().unwrap(), None);
         assert_eq!(
             r,
             json!({"tegraflash": {
@@ -501,6 +504,24 @@ mod tests {
                 "after": {"name": "boot-check", "from": "project"},
             }})
         );
+    }
+
+    #[test]
+    fn a_templated_project_run_profile_is_still_the_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "rubicon:\n  run:\n    \"boot-check-{{ avocado.target }}\": []\n",
+        )
+        .unwrap();
+        let composed: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    boot-check-jetson: []\n\
+             provision:\n  p:\n    rubicon: { after: boot-check-jetson }\n",
+        )
+        .unwrap();
+        let r = rubicon_refs(&composed, path.to_str().unwrap(), Some("jetson"));
+        assert_eq!(r["p"]["after"]["from"], "project");
     }
 
     /// The command under test — only `target` matters for resolution.
