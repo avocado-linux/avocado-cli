@@ -147,28 +147,30 @@ pub fn validate(content: &str) -> Report {
     // Messages quote the value after interpolation, which for `{{ env.X }}`
     // is whatever the environment holds, a token included. Show the template
     // the user wrote instead: it names the line to fix and reveals nothing.
-    // Paths go through the interpolated keys, so a templated key is shown as
-    // its template there too.
+    // Paths go through the interpolated keys, so they get the same treatment.
+    // Every env value a template reads is hidden too, for the places where
+    // the two documents do not pair.
     let mut templated = Vec::new();
-    let mut keys = Vec::new();
-    templated_values(&doc, &interpolated, &mut templated, &mut keys);
+    templated_values(&doc, &interpolated, &mut templated);
+    let mut env = Vec::new();
+    env_values(&doc, &mut env);
+    templated.extend(
+        env.iter()
+            .map(|(value, template)| (serde_yaml::Value::String(value.clone()), template.clone())),
+    );
     for e in &mut report.errors {
         e.message = show_templates(&e.message, &templated);
-        e.path = show_key_templates(&e.path, &keys);
+        e.path = source_pointer(&doc, &interpolated, &e.path, &env);
     }
     report
 }
 
 /// Every scalar that interpolation changed, as `(expanded, template)`, found
-/// by walking the raw and the interpolated document together. The templated
-/// mapping keys are also in `keys`, as strings. A templated mapping key is
-/// removed and reinserted at the end, so entries pair by key first and the
-/// leftover (renamed) entries pair in order.
+/// by walking the raw and the interpolated document together.
 fn templated_values(
     raw: &serde_yaml::Value,
     expanded: &serde_yaml::Value,
     out: &mut Vec<(serde_yaml::Value, String)>,
-    keys: &mut Vec<(String, String)>,
 ) {
     use serde_yaml::Value;
     match (raw, expanded) {
@@ -177,26 +179,83 @@ fn templated_values(
         }
         (Value::Sequence(r), Value::Sequence(x)) => {
             for (r, x) in r.iter().zip(x) {
-                templated_values(r, x, out, keys);
+                templated_values(r, x, out);
             }
         }
         (Value::Mapping(r), Value::Mapping(x)) => {
-            let mut raw_left = Vec::new();
-            for (k, rv) in r {
-                match x.get(k) {
-                    Some(xv) => templated_values(rv, xv, out, keys),
-                    None => raw_left.push((k, rv)),
-                }
-            }
-            let x_left = x.iter().filter(|(k, _)| !r.contains_key(*k));
-            for ((rk, rv), (xk, xv)) in raw_left.into_iter().zip(x_left) {
-                if let (Value::String(template), Value::String(key)) = (rk, xk) {
-                    keys.push((key.clone(), template.clone()));
-                }
-                templated_values(rk, xk, out, keys);
-                templated_values(rv, xv, out, keys);
+            for ((rk, rv), (xk, xv)) in paired_entries(r, x) {
+                templated_values(rk, xk, out);
+                templated_values(rv, xv, out);
             }
         }
+        _ => {}
+    }
+}
+
+/// The entries of a mapping before and after interpolation, as
+/// `((raw key, raw value), (expanded key, expanded value))`. A templated key
+/// is removed and reinserted at the end, so entries pair by key first and
+/// the leftover templated keys pair in order. When interpolation changed the
+/// number of entries (two keys expanded to one, or the distro override was
+/// folded in), the leftovers cannot be told apart and are not paired.
+#[allow(clippy::type_complexity)]
+fn paired_entries<'a>(
+    r: &'a serde_yaml::Mapping,
+    x: &'a serde_yaml::Mapping,
+) -> Vec<(
+    (&'a serde_yaml::Value, &'a serde_yaml::Value),
+    (&'a serde_yaml::Value, &'a serde_yaml::Value),
+)> {
+    let mut pairs = Vec::new();
+    let mut raw_left = Vec::new();
+    for (k, rv) in r {
+        match x.get(k) {
+            Some(xv) => pairs.push(((k, rv), (k, xv))),
+            None => raw_left.push((k, rv)),
+        }
+    }
+    if r.len() == x.len() {
+        let raw_left = raw_left
+            .into_iter()
+            .filter(|(k, _)| k.as_str().is_some_and(|k| k.contains("{{")));
+        let x_left = x.iter().filter(|(k, _)| !r.contains_key(*k));
+        pairs.extend(raw_left.zip(x_left));
+    }
+    pairs
+}
+
+/// Each env var a template in `doc` reads, as `(value, "{{ env.NAME }}")`.
+/// Unset and empty values are left out: they cannot reveal anything.
+fn env_values(doc: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
+    use serde_yaml::Value;
+    static TEMPLATE: OnceLock<regex::Regex> = OnceLock::new();
+    let template = TEMPLATE.get_or_init(|| regex::Regex::new(r"\{\{\s*([^}]+)\s*\}\}").unwrap());
+    match doc {
+        Value::String(s) => {
+            for capture in template.captures_iter(s) {
+                let Some(name) = capture[1].trim().strip_prefix("env.") else {
+                    continue;
+                };
+                match std::env::var(name) {
+                    Ok(value) if !value.is_empty() => {
+                        out.push((value, format!("{{{{ env.{name} }}}}")));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                env_values(item, out);
+            }
+        }
+        Value::Mapping(map) => {
+            for (k, v) in map {
+                env_values(k, out);
+                env_values(v, out);
+            }
+        }
+        Value::Tagged(tagged) => env_values(&tagged.value, out),
         _ => {}
     }
 }
@@ -232,20 +291,78 @@ fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> S
     out
 }
 
-/// `pointer` with each segment that is a templated key after interpolation
-/// replaced by the key's template, pointer-escaped.
-fn show_key_templates(pointer: &str, keys: &[(String, String)]) -> String {
-    pointer
-        .split('/')
-        .skip(1)
-        .map(|segment| {
-            let key = segment.replace("~1", "/").replace("~0", "~");
-            match keys.iter().find(|(expanded, _)| *expanded == key) {
-                Some((_, template)) => template.replace('~', "~0").replace('/', "~1"),
-                None => segment.to_string(),
+/// `pointer`, a path into the interpolated config, as the path into the
+/// config the user wrote: a templated key is shown as its template. Where a
+/// mapping does not pair (`paired_entries`), the walk stops, and from there
+/// on each segment only has its env values hidden (`hide_env`).
+fn source_pointer(
+    raw: &serde_yaml::Value,
+    expanded: &serde_yaml::Value,
+    pointer: &str,
+    env: &[(String, String)],
+) -> String {
+    let mut at = Some((raw, expanded));
+    let mut out = String::new();
+    for segment in pointer.split('/').skip(1) {
+        let key = segment.replace("~1", "/").replace("~0", "~");
+        let shown = match at.and_then(|(r, x)| source_step(r, x, &key)) {
+            Some((shown, r, x)) => {
+                at = Some((r, x));
+                shown
             }
-        })
-        .fold(String::new(), |path, segment| path + "/" + &segment)
+            None => {
+                at = None;
+                hide_env(&key, env)
+            }
+        };
+        out.push('/');
+        out.push_str(&shown.replace('~', "~0").replace('/', "~1"));
+    }
+    out
+}
+
+/// One step of `source_pointer`: the key the user wrote for `key`, and the
+/// raw and expanded values under it. A mapping that changed its number of
+/// entries may pair a key with another entry's value, so it is not walked.
+fn source_step<'a>(
+    raw: &'a serde_yaml::Value,
+    expanded: &'a serde_yaml::Value,
+    key: &str,
+) -> Option<(String, &'a serde_yaml::Value, &'a serde_yaml::Value)> {
+    use serde_yaml::Value;
+    let text = |k: &Value| match k {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    match (raw, expanded) {
+        (Value::Mapping(r), Value::Mapping(x)) if r.len() == x.len() => paired_entries(r, x)
+            .into_iter()
+            .find(|(_, (xk, _))| text(xk).as_deref() == Some(key))
+            .and_then(|((rk, rv), (_, xv))| Some((text(rk)?, rv, xv))),
+        (Value::Sequence(r), Value::Sequence(x)) => {
+            let i: usize = key.parse().ok()?;
+            Some((key.to_string(), r.get(i)?, x.get(i)?))
+        }
+        _ => None,
+    }
+}
+
+/// `key` with each env value in it replaced by its template. As in
+/// `show_templates`, a value of fewer than four characters is replaced only
+/// when it is the whole key.
+fn hide_env(key: &str, env: &[(String, String)]) -> String {
+    let mut env: Vec<_> = env
+        .iter()
+        .filter(|(value, _)| value == key || value.chars().count() >= 4)
+        .collect();
+    env.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    let mut out = key.to_string();
+    for (value, template) in env {
+        out = out.replace(value.as_str(), template);
+    }
+    out
 }
 
 /// A JSON pointer as the dotted key path the lint warnings use.
@@ -598,6 +715,10 @@ mod tests {
                 "runtimes:\n  \"dev-{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\":\n    extensions: 5\n",
                 "/runtimes/dev-{{ env.AVOCADO_TEST_VALIDATE_MARKER }}/extensions",
             ),
+            (
+                "runtimes:\n  \"dev/{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\":\n    extensions: 5\n",
+                "/runtimes/dev~1{{ env.AVOCADO_TEST_VALIDATE_MARKER }}/extensions",
+            ),
         ] {
             let report = with_marker(|| validate(yaml));
             assert!(!report.errors.is_empty(), "{yaml}");
@@ -613,14 +734,53 @@ mod tests {
         }
     }
 
+    /// Only the templated key is shown as its template, not a literal key
+    /// further down that has the same text as the env value.
     #[test]
-    fn a_templated_key_in_a_path_is_pointer_escaped() {
-        let keys = vec![("a/secret~1".to_string(), "a/{{ env.X }}~1".to_string())];
+    #[serial_test::serial]
+    fn a_literal_key_equal_to_an_env_value_is_kept() {
+        std::env::set_var("AVOCADO_TEST_VALIDATE_KEY", "extensions");
+        let report =
+            validate("runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_KEY }}\":\n    extensions: 5\n");
+        std::env::remove_var("AVOCADO_TEST_VALIDATE_KEY");
+        let paths: Vec<_> = report.errors.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
-            show_key_templates("/repos/a~1secret~01/x", &keys),
-            "/repos/a~1{{ env.X }}~01/x"
+            paths,
+            ["/runtimes/{{ env.AVOCADO_TEST_VALIDATE_KEY }}/extensions"]
         );
-        assert_eq!(show_key_templates("", &keys), "");
+    }
+
+    /// When templated keys expand to a key that is already there, one entry
+    /// overwrites the other, so the raw and the expanded entries no longer
+    /// pair. The env values in the surviving entry are still hidden.
+    #[test]
+    #[serial_test::serial]
+    fn env_values_under_colliding_keys_are_not_shown() {
+        let survivor =
+            "    extensions:\n      - \"{{ env.AVOCADO_TEST_VALIDATE_MARKER }}\": {enabled: 5}\n";
+        for yaml in [
+            format!("runtimes:\n  dev:\n    extensions: []\n  \"{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}\":\n{survivor}"),
+            format!("runtimes:\n  \"{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}\":\n    extensions: []\n  \"{{{{env.AVOCADO_TEST_VALIDATE_KEY}}}}\":\n{survivor}"),
+        ] {
+            std::env::set_var("AVOCADO_TEST_VALIDATE_KEY", "dev");
+            let report = with_marker(|| validate(&yaml));
+            std::env::remove_var("AVOCADO_TEST_VALIDATE_KEY");
+            assert!(!report.errors.is_empty(), "{yaml}");
+            for e in &report.errors {
+                assert!(!e.path.contains(MARKER), "{e:?}");
+                assert!(!e.message.contains(MARKER), "{e:?}");
+            }
+        }
+    }
+
+    /// The distro override is folded in before the check, so `distro` has
+    /// keys the user did not write there. They are not templates.
+    #[test]
+    fn a_folded_distro_key_keeps_its_path() {
+        let report =
+            validate("default_target: qemux86-64\ndistro:\n  target-qemux86-64:\n    channel: 5\n");
+        let paths: Vec<_> = report.errors.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/distro/channel"]);
     }
 
     #[test]
