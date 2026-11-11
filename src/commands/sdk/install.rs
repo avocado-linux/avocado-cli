@@ -6,7 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::commands::rootfs::install::{install_sysroot, SysrootInstallParams};
+use crate::commands::rootfs::clean::clean_sysroot_command;
+use crate::commands::rootfs::install::{
+    detect_sysroot_package_removals, install_sysroot, SysrootInstallParams,
+};
 use crate::utils::{
     config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
     container::{normalize_sdk_arch, RunConfig, SdkContainer, TuiContext},
@@ -653,6 +656,12 @@ impl SdkInstallCommand {
         // modules + the kernel-base shell from the wrong kernel sneaking
         // into target-sysroot on a 5.15 install). Same helper / cached
         // repoquery as the other install paths.
+        // Before the resolver re-pins it: the target-sysroot is cleaned when
+        // this changes (see `execute_parallel_phase`).
+        let prev_target_kver = bootstrap
+            .lock_file
+            .get_kernel_version(&target, &SysrootType::TargetSysroot)
+            .cloned();
         let off_kernel_excludes = {
             let mut resolve_params = ResolveParams {
                 container_helper: &container_helper,
@@ -698,6 +707,7 @@ impl SdkInstallCommand {
                 &target,
                 &off_kernel_excludes,
                 target_dev_feeds.as_ref(),
+                prev_target_kver.as_deref(),
             )
             .await;
 
@@ -735,6 +745,7 @@ impl SdkInstallCommand {
         target: &str,
         off_kernel_excludes: &[String],
         target_dev_feeds: Option<&crate::utils::feeds::FeedMaterialization>,
+        prev_target_kver: Option<&str>,
     ) -> Result<()> {
         let composed = &bootstrap.composed;
         let config = &composed.config;
@@ -778,27 +789,90 @@ impl SdkInstallCommand {
         let need_target_dev =
             (config.has_compile_sections() && !active_compile_sections.is_empty()) || provision_dto;
 
+        // The target-sysroot install is additive, like the rootfs one, so the
+        // same two cases need a clean sysroot first (see `install_sysroot`). On
+        // a kernel pin change the old kernel's packages stay beside the new
+        // kernel's, and per-kernel packages that own the same path
+        // (kernel-devsrc-<kver>'s /usr/src/kernel) refuse to co-install. A
+        // compile dependency dropped from the config stays installed. Both
+        // wipe the sysroot and drop its lock pins before the install.
+        let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
+        let mut target_dev_lock = lock_file.clone();
+        let target_kver_change = target_sysroot_kernel_change(
+            prev_target_kver,
+            lock_file
+                .get_kernel_version(target, &SysrootType::TargetSysroot)
+                .map(String::as_str),
+        );
+        let mut clean_target_sysroot = false;
+        if let Some((prev, new_kver)) = &target_kver_change {
+            print_info(
+                &format!(
+                    "target-sysroot: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                ),
+                OutputLevel::Normal,
+            );
+            target_dev_lock.clear_target_sysroot(target);
+            clean_target_sysroot = true;
+        }
+
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)
         let target_dev_command = if need_target_dev {
             let compile_dependencies = config.get_compile_dependencies();
-            let mut all_compile_packages: Vec<String> = Vec::new();
             let mut all_compile_package_names: Vec<String> = Vec::new();
             for section_name in &active_compile_sections {
                 if let Some(dependencies) = compile_dependencies.get(section_name) {
-                    let packages = self.build_package_list_with_lock(
-                        dependencies,
-                        lock_file,
+                    all_compile_package_names.extend(self.extract_package_names(dependencies));
+                }
+            }
+            all_compile_package_names.sort();
+            all_compile_package_names.dedup();
+
+            if target_kver_change.is_none() {
+                // The lock records the compile dependencies and the base package.
+                let effective: HashSet<String> = all_compile_package_names
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(target_sysroot_base_pkg.to_string()))
+                    .collect();
+                let removed = detect_sysroot_package_removals(
+                    &effective,
+                    &SysrootType::TargetSysroot,
+                    target,
+                    lock_file,
+                );
+                if !removed.is_empty() {
+                    print_info(
+                        &format!(
+                            "Packages removed from target-sysroot: {}. Cleaning sysroot for fresh install.",
+                            removed.join(", ")
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    target_dev_lock.remove_packages_from_sysroot(
                         target,
                         &SysrootType::TargetSysroot,
+                        &removed,
                     );
-                    all_compile_packages.extend(packages);
-                    all_compile_package_names.extend(self.extract_package_names(dependencies));
+                    clean_target_sysroot = true;
+                }
+            }
+
+            // Pins come from the cleaned lock, so a wipe does not reinstall the
+            // old kernel's versions.
+            let mut all_compile_packages: Vec<String> = Vec::new();
+            for section_name in &active_compile_sections {
+                if let Some(dependencies) = compile_dependencies.get(section_name) {
+                    all_compile_packages.extend(self.build_package_list_with_lock(
+                        dependencies,
+                        &target_dev_lock,
+                        target,
+                        &SysrootType::TargetSysroot,
+                    ));
                 }
             }
             all_compile_packages.sort();
             all_compile_packages.dedup();
-            all_compile_package_names.sort();
-            all_compile_package_names.dedup();
 
             // dnf never prompts here: this applies the package set avocado.yaml and
             // avocado.lock already declare, so there is no decision left to make.
@@ -814,10 +888,9 @@ impl SdkInstallCommand {
             } else {
                 off_kernel_excludes.join(" ")
             };
-            let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
             let target_sysroot_config_version = "*";
             let target_sysroot_pkg = build_package_spec_with_lock(
-                lock_file,
+                &target_dev_lock,
                 target,
                 &SysrootType::TargetSysroot,
                 target_sysroot_base_pkg,
@@ -829,7 +902,7 @@ impl SdkInstallCommand {
             // install here, earlier and clearer than the build-time backstop.
             let dto_hook_pkg = if provision_dto {
                 build_package_spec_with_lock(
-                    lock_file,
+                    &target_dev_lock,
                     target,
                     &SysrootType::TargetSysroot,
                     crate::utils::device_tree_overlay::DELIVERY_HOOK_PACKAGE,
@@ -839,8 +912,14 @@ impl SdkInstallCommand {
                 String::new()
             };
 
+            let wipe = if clean_target_sysroot {
+                clean_sysroot_command(TARGET_SYSROOT_DIR)
+            } else {
+                String::new()
+            };
             let command = format!(
                 r#"
+{wipe}
 unset RPM_CONFIGDIR
 RPM_ETCCONFIGDIR="$DNF_SDK_TARGET_PREFIX" \
 $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
@@ -859,6 +938,14 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             Some((
                 command,
                 all_compile_package_names,
+                target_sysroot_base_pkg.to_string(),
+            ))
+        } else if clean_target_sysroot {
+            // Nothing to install this run, but the old kernel's sysroot must
+            // not be there when a later run needs it: by then the pin matches.
+            Some((
+                clean_sysroot_command(TARGET_SYSROOT_DIR),
+                Vec::new(),
                 target_sysroot_base_pkg.to_string(),
             ))
         } else {
@@ -916,8 +1003,6 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
         let mut sdk_pkg_lock = lock_file.clone();
         let mut rootfs_lock = lock_file.clone();
         let mut initramfs_lock = lock_file.clone();
-        #[allow(unused_variables)]
-        let target_dev_lock = lock_file.clone();
 
         // Build SDK packages future
         let sdk_pkg_fut = self.install_sdk_packages(
@@ -1170,16 +1255,21 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
         // Merge target-dev lock
-        if need_target_dev && target_dev_result.is_ok() {
+        if (need_target_dev || clean_target_sysroot) && target_dev_result.is_ok() {
             if let Some(target_locks) = target_dev_lock.targets.get(target) {
-                final_lock
-                    .targets
-                    .entry(target.to_string())
-                    .or_default()
-                    .target_sysroot = target_locks.target_sysroot.clone();
+                let entry = final_lock.targets.entry(target.to_string()).or_default();
+                entry.target_sysroot = target_locks.target_sysroot.clone();
+                // In-memory only, like the rootfs merge: without it the save
+                // re-merges the old kernel's keys from disk.
+                entry
+                    .cleared_sections
+                    .extend(target_locks.cleared_sections.iter().cloned());
             }
-            // Post-install: query versions and update lock file
-            if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
+            // Post-install: query versions and update lock file. A wipe-only
+            // run (nothing to install) has nothing to record.
+            if let (true, Some((_, ref all_compile_package_names, ref base_pkg))) =
+                (need_target_dev, &target_dev_command)
+            {
                 print_success(
                     "Installed target-sysroot with compile dependencies.",
                     OutputLevel::Normal,
@@ -2327,6 +2417,18 @@ $DNF_SDK_HOST \
     )
 }
 
+/// The target-sysroot, relative to `$AVOCADO_PREFIX`.
+const TARGET_SYSROOT_DIR: &str = "sdk/target-sysroot";
+
+/// The (previous, new) kernel pin when the target-sysroot's changed. A first
+/// install (no previous pin) is not a change.
+fn target_sysroot_kernel_change(prev: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
+    match (prev, new) {
+        (Some(prev), Some(new)) if prev != new => Some((prev.to_string(), new.to_string())),
+        _ => None,
+    }
+}
+
 /// The dnf pass that makes an existing SDK sysroot follow the feed after
 /// `avocado update` (or on a first install, where it is a no-op). Empty when the
 /// lock carries pins - then the lock, not the feed, says which versions belong.
@@ -2355,6 +2457,29 @@ mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    /// The target-sysroot is cleaned only when its kernel pin moves: not on a
+    /// first install, and not when it stays put.
+    #[test]
+    fn target_sysroot_cleans_only_on_a_kernel_pin_change() {
+        assert_eq!(
+            target_sysroot_kernel_change(Some("6.18.52-yocto-standard"), Some("6.8.12-l4t")),
+            Some((
+                "6.18.52-yocto-standard".to_string(),
+                "6.8.12-l4t".to_string()
+            ))
+        );
+        assert_eq!(
+            target_sysroot_kernel_change(Some("6.8.12"), Some("6.8.12")),
+            None
+        );
+        assert_eq!(target_sysroot_kernel_change(None, Some("6.8.12")), None);
+        assert_eq!(target_sysroot_kernel_change(Some("6.8.12"), None), None);
+        // The wipe is the same command `avocado rootfs clean` runs, aimed at
+        // the target-sysroot.
+        assert!(clean_sysroot_command(TARGET_SYSROOT_DIR)
+            .contains(r#"rm -rf "$AVOCADO_PREFIX/sdk/target-sysroot""#));
+    }
 
     /// Write `body` to `dir/name` as an executable script.
     #[cfg(unix)]

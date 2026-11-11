@@ -549,7 +549,7 @@ fn post_dnf_steps(overlay_snippet: &str, sysroot_dir: &str) -> String {
 /// resolves newest-available instead of the locked NVR.
 ///
 /// Returns the removed names sorted, or empty when the sysroot is consistent.
-fn detect_sysroot_package_removals(
+pub(crate) fn detect_sysroot_package_removals(
     effective_names: &HashSet<String>,
     sysroot_type: &SysrootType,
     target: &str,

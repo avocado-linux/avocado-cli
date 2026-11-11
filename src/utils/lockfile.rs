@@ -1256,11 +1256,16 @@ impl LockFile {
                     other_target.initramfs,
                 );
             }
-            self_target.target_sysroot = merge_packages(
-                std::mem::take(&mut self_target.target_sysroot),
-                &base_target.target_sysroot,
-                other_target.target_sysroot,
-            );
+            if !self_target
+                .cleared_sections
+                .contains(&SysrootType::TargetSysroot.lock_key())
+            {
+                self_target.target_sysroot = merge_packages(
+                    std::mem::take(&mut self_target.target_sysroot),
+                    &base_target.target_sysroot,
+                    other_target.target_sysroot,
+                );
+            }
             // Legacy/global extensions namespace — still authoritative
             // for fetched-extension source metadata.
             self_target.extensions = merge_nested(
@@ -1854,11 +1859,14 @@ impl LockFile {
         }
     }
 
-    /// Clear target-sysroot entries for a specific target
+    /// Clear target-sysroot entries for a specific target and mark the section
+    /// as explicitly cleared so `merge_with` doesn't re-insert disk packages.
     pub fn clear_target_sysroot(&mut self, target: &str) {
-        if let Some(target_locks) = self.targets.get_mut(target) {
-            target_locks.target_sysroot.clear();
-        }
+        let entry = self.targets.entry(target.to_string()).or_default();
+        entry.target_sysroot.clear();
+        entry
+            .cleared_sections
+            .insert(SysrootType::TargetSysroot.lock_key());
     }
 
     /// Clear a specific extension's entries for a target, in the global
@@ -5343,6 +5351,41 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert_eq!(
             on_disk.get_locked_version(target, &SysrootType::Rootfs, "old-kmod"),
             None
+        );
+    }
+
+    /// A target-sysroot cleaned on a kernel pin change stays clean on save: the
+    /// old kernel's packages (kernel-devsrc-<old kver>) must not come back from
+    /// the disk copy, even for a lock that was not loaded from it.
+    #[test]
+    fn cleared_target_sysroot_is_not_remerged_from_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = "jetson-agx-thor";
+        let ts = SysrootType::TargetSysroot;
+
+        let mut initial = LockFile::new();
+        initial.set_locked_version(
+            target,
+            &ts,
+            "kernel-devsrc-6.18.52-yocto-standard",
+            "6.18.52-r0",
+        );
+        initial.save(temp_dir.path()).unwrap();
+
+        let mut task = LockFile::new();
+        task.clear_target_sysroot(target);
+        task.set_locked_version(target, &ts, "kernel-devsrc-6.8.12-l4t", "6.8.12-r0");
+        task.save(temp_dir.path()).unwrap();
+
+        let on_disk = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_locked_version(target, &ts, "kernel-devsrc-6.18.52-yocto-standard"),
+            None,
+            "the old kernel's package came back from disk"
+        );
+        assert_eq!(
+            on_disk.get_locked_version(target, &ts, "kernel-devsrc-6.8.12-l4t"),
+            Some(&"6.8.12-r0".to_string())
         );
     }
 
