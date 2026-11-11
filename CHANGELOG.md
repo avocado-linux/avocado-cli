@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connect uploads.
 
 ### Changed
+- **Extensions rebuild once after upgrading**, because the build hash gained
+  the sysroot tree as an input. Switching runtimes rebuilds the extension into
+  that runtime's tree, and an extension with a `compile`/`install` package and
+  no `package_files` rebuilds on every build.
 - **`enable_services` on an extension without `confext`** is reported as a
   warning, not under an `[ERROR]` label: it was never fatal.
 
@@ -55,6 +59,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones, so a runtime uploaded a moment ago looked missing.
 - **`avocado-ext-cli` builds again.** Its packaged source left out `schemas/`,
   which the CLI includes at compile time.
+- **`config validate` no longer shows env values.** A mapping key written as
+  `{{ env.X }}` put X's value in the error path (`path` in JSON output and the
+  dotted path), so a tool showing the result could leak a token. Paths now
+  show the template, and messages hide every env value interpolation read,
+  including its JSON-escaped form.
+- **`avocado install` keeps extension sysroots when a runtime reinstalls
+  clean.** Removing a package from `runtimes.<rt>.packages` made the runtime
+  install delete `runtimes/<rt>`, extension sysroots included, right after
+  the extension step wrote them. `build` then stopped with "has no package
+  database", and another `install` reported the extension up to date.
+- **The SDK install no longer moves the container's own tools.** nativesdk
+  postinsts ran `update-alternatives` against the container image's registry,
+  which moved names it shares with the SDK (`uname`, `mkdir`, `mv`, ...) out
+  of `/usr/bin`, the cause of "command not found" in later steps. The
+  registry now lives in the SDK.
+- **`ext build` no longer skips a stale sysroot.** An edit to a source an
+  `install` script copies did not change the build hash, and one runtime's
+  build stamp let another runtime's tree skip (`build -r rt-a`, then
+  `build -r rt-b` reported "up to date" with files missing).
 - **A release's `SHA256SUMS` verifies every archive.** The Windows checksum
   had no trailing newline, so it ran into the next line and
   `sha256sum -c SHA256SUMS` failed for the Windows and Linux (gnu) archives.
