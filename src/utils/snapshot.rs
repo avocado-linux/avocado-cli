@@ -53,17 +53,29 @@ pub struct SnapshotPointer {
 pub enum PinStatus {
     /// No pin recorded for this target.
     None,
-    /// Pin matches the configured release+channel — reuse it.
+    /// Pin matches the configured release+channel+repo URL — reuse it.
     Matches,
-    /// Pin is for a different release/channel than the config now names.
+    /// Pin is for a different release/channel/repo URL than the config now names.
     Mismatch,
 }
 
 /// Classify a recorded pin against the configured feed. Pure — unit-tested.
-pub fn pin_status(pin: Option<&RepoSnapshot>, release: &str, channel: &str) -> PinStatus {
+/// A pin recorded without a URL (older lock files) matches any URL.
+pub fn pin_status(
+    pin: Option<&RepoSnapshot>,
+    release: &str,
+    channel: &str,
+    repo_url: &str,
+) -> PinStatus {
+    let url_matches = |p: &RepoSnapshot| match &p.repo_url {
+        None => true,
+        Some(recorded) => recorded.trim_end_matches('/') == repo_url.trim_end_matches('/'),
+    };
     match pin {
         None => PinStatus::None,
-        Some(p) if p.release == release && p.channel == channel => PinStatus::Matches,
+        Some(p) if p.release == release && p.channel == channel && url_matches(p) => {
+            PinStatus::Matches
+        }
         Some(_) => PinStatus::Mismatch,
     }
 }
@@ -287,7 +299,12 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
     let client = build_client(config)?;
 
-    let effective = match pin_status(lock.get_repo_snapshot(target), &release, &channel) {
+    let effective = match pin_status(
+        lock.get_repo_snapshot(target),
+        &release,
+        &channel,
+        &repo_url,
+    ) {
         PinStatus::Matches => {
             let snap = lock.get_repo_snapshot(target).expect("matched");
             verify_pin_available(&client, &repo_url, snap, target).await?;
@@ -341,7 +358,7 @@ pub fn pinned_releasever(config: &Config, lock: &LockFile, target: &str) -> Opti
     }
     let (release, channel) = (config.get_distro_release()?, config.get_distro_channel()?);
     let snap = lock.get_repo_snapshot(target)?;
-    match pin_status(Some(snap), &release, &channel) {
+    match pin_status(Some(snap), &release, &channel, &config.effective_repo_url()) {
         PinStatus::Matches => Some(effective_releasever(
             &snap.release,
             &snap.channel,
@@ -388,15 +405,17 @@ mod tests {
     }
     use super::*;
 
-    fn snap(release: &str, channel: &str, id: &str) -> RepoSnapshot {
+    fn snap(release: &str, channel: &str, id: &str, url: Option<&str>) -> RepoSnapshot {
         RepoSnapshot {
             release: release.to_string(),
             channel: channel.to_string(),
             snapshot: id.to_string(),
-            repo_url: None,
+            repo_url: url.map(str::to_string),
             created: None,
         }
     }
+
+    const URL: &str = "https://repo.example.com";
 
     #[test]
     fn effective_releasever_injects_snapshot_segment() {
@@ -408,7 +427,7 @@ mod tests {
 
     #[test]
     fn pin_status_none_when_unpinned() {
-        assert_eq!(pin_status(None, "2026", "edge"), PinStatus::None);
+        assert_eq!(pin_status(None, "2026", "edge", URL), PinStatus::None);
     }
 
     /// The pin that `Config::load_composed` reads from the lock is not an
@@ -427,15 +446,43 @@ mod tests {
 
     #[test]
     fn pin_status_matches_same_feed() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "edge"), PinStatus::Matches);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+        let slashed = format!("{URL}/");
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", &slashed),
+            PinStatus::Matches
+        );
+        let unrecorded = snap("2026", "edge", "X", None);
+        assert_eq!(
+            pin_status(Some(&unrecorded), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+    }
+
+    #[test]
+    fn pin_with_other_url_is_not_matching() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", "https://mirror.example.com"),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
     fn pin_status_mismatch_on_channel_change() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "stable"), PinStatus::Mismatch);
-        assert_eq!(pin_status(Some(&p), "2027", "edge"), PinStatus::Mismatch);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "stable", URL),
+            PinStatus::Mismatch
+        );
+        assert_eq!(
+            pin_status(Some(&p), "2027", "edge", URL),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
