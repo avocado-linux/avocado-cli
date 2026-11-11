@@ -15027,6 +15027,96 @@ sdk:
         );
     }
 
+    /// A `distro.target-<name>:` block keeps one board on another release:
+    /// that target's distro, SDK image tag and feed follow it, every other
+    /// target (and no target) keeps the base, and no `target-*` key is left.
+    #[test]
+    #[serial]
+    fn a_target_block_overrides_the_distro_for_that_target_only() {
+        clear_env();
+        let yaml = "\
+distro:
+  release: 2026
+  channel: edge
+  target-raspberrypi0-2w:
+    release: 2024
+supported_targets: [raspberrypi0-2w, raspberrypi4]
+sdk:
+  image: \"docker.io/avocadolinux/sdk:{{ config.distro.release }}\"
+";
+        let (_dir, path) = project(yaml, None);
+        let feed = |target: Option<&str>| {
+            let c = Config::load_composed(&path, target).unwrap();
+            let distro = c.merged_value.get("distro").unwrap().as_mapping().unwrap();
+            assert!(
+                distro
+                    .keys()
+                    .all(|k| !k.as_str().unwrap().starts_with("target-")),
+                "{distro:?}"
+            );
+            (
+                c.config.get_sdk_image().cloned().unwrap(),
+                c.config.get_releasever().unwrap(),
+            )
+        };
+
+        assert_eq!(
+            feed(Some("raspberrypi0-2w")),
+            ("docker.io/avocadolinux/sdk:2024".into(), "2024/edge".into())
+        );
+        for target in [Some("raspberrypi4"), None] {
+            assert_eq!(
+                feed(target),
+                ("docker.io/avocadolinux/sdk:2026".into(), "2026/edge".into())
+            );
+        }
+    }
+
+    /// `version` is an alias of `release`, so an override in one spelling
+    /// replaces a base in the other instead of leaving both to collide.
+    #[test]
+    #[serial]
+    fn a_target_block_release_replaces_either_spelling() {
+        clear_env();
+        for (base, over) in [("version", "release"), ("release", "version")] {
+            let yaml = format!(
+                "distro:\n  {base}: 2026\n  channel: edge\n  target-raspberrypi0-2w:\n    {over}: 2024\n\
+                 supported_targets: [raspberrypi0-2w]\n"
+            );
+            let (_dir, path) = project(&yaml, None);
+            let c = Config::load_composed(&path, Some("raspberrypi0-2w")).unwrap();
+            assert_eq!(
+                c.config.get_releasever().unwrap(),
+                "2024/edge",
+                "{base} -> {over}"
+            );
+        }
+    }
+
+    /// A templated `default_target` picks its override once resolved.
+    #[test]
+    #[serial]
+    fn a_templated_default_target_picks_its_override() {
+        clear_env();
+        std::env::set_var("PROJECT_TARGET", "raspberrypi0-2w");
+        let yaml = "\
+default_target: \"{{ env.PROJECT_TARGET }}\"
+distro:
+  release: 2026
+  channel: edge
+  target-raspberrypi0-2w:
+    release: 2024
+supported_targets: [raspberrypi0-2w, raspberrypi4]
+";
+        let (_dir, path) = project(yaml, None);
+        let releasever = Config::load_composed(&path, None)
+            .unwrap()
+            .config
+            .get_releasever();
+        std::env::remove_var("PROJECT_TARGET");
+        assert_eq!(releasever.unwrap(), "2024/edge");
+    }
+
     /// The distro feed's baseurl in a named feed set takes the same value, so
     /// `sdk dnf` and `sdk run` fetch custom feeds from the pinned snapshot too.
     #[test]

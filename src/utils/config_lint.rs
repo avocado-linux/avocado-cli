@@ -660,6 +660,17 @@ sdk:
         assert_eq!(warnings(yaml), Vec::<String>::new());
     }
 
+    /// `distro.target-<name>:` is read, so it must not be reported as ignored,
+    /// while a typo inside one still is.
+    #[test]
+    fn accepts_a_distro_target_block() {
+        let yaml = "distro:\n  release: 2026\n  target-raspberrypi0-2w:\n    release: 2024\n    chanel: edge\n";
+        assert_eq!(
+            warnings(yaml),
+            vec!["unknown key 'distro.target-raspberrypi0-2w.chanel' is ignored; did you mean 'channel'?"]
+        );
+    }
+
     #[test]
     fn flags_unknown_keys_with_suggestions() {
         let yaml = "sdkk: {}\nruntimes:\n  dev:\n    extentions: [app]\n";

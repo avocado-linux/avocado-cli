@@ -460,6 +460,12 @@
           ]
         }
       },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/distroConfig",
+          "description": "Per-target override: a key it sets replaces that key in this block when building for that target."
+        }
+      },
       "additionalProperties": false
     },
     "distroRepoConfig": {
