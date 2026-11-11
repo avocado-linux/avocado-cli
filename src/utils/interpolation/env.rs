@@ -8,9 +8,25 @@
 //! - Replaces with empty string when variable is missing
 
 use anyhow::Result;
+use std::cell::RefCell;
 use std::env;
 
 use crate::utils::output::{print_warning, OutputLevel};
+
+thread_local! {
+    static READS: RefCell<Option<Vec<(String, String)>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` and return, with its result, each env var that `resolve` read
+/// while it ran, as `(name, value)`. This includes a var whose template a
+/// substitution only built on a later pass. `config validate` uses it to
+/// hide those values in what it prints.
+pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+    READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let reads = READS.with(|reads| reads.borrow_mut().take());
+    (out, reads.unwrap_or_default())
+}
 
 /// Resolve an environment variable template.
 ///
@@ -30,7 +46,14 @@ use crate::utils::output::{print_warning, OutputLevel};
 /// ```
 pub fn resolve(var_name: &str) -> Result<Option<String>> {
     match env::var(var_name) {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => {
+            READS.with(|reads| {
+                if let Some(reads) = reads.borrow_mut().as_mut() {
+                    reads.push((var_name.to_string(), value.clone()));
+                }
+            });
+            Ok(Some(value))
+        }
         Err(_) => {
             // Route through `print_warning` (not a raw `eprintln!`) so the
             // message is suppressed while a TUI renderer is active. A direct

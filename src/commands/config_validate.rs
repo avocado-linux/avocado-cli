@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value as Json};
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::OnceLock;
 
@@ -112,11 +113,25 @@ pub fn validate(content: &str) -> Report {
     // `{{ }}` template in a boolean or number field is not a type error. When
     // interpolation fails there is no such value: the raw template would only
     // give a misleading schema error, so the interpolation error is the one.
+    // The env vars it reads are recorded, so their values can be hidden in
+    // what is printed (see below).
     let mut interpolated = doc.clone();
-    if let Err(e) = crate::utils::interpolation::interpolate_config(&mut interpolated, None, None) {
+    let (interpolation, reads) = crate::utils::interpolation::env::record_reads(|| {
+        crate::utils::interpolation::interpolate_config(&mut interpolated, None, None)
+    });
+    let env: Vec<(String, String)> = reads
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| (value, format!("{{{{ env.{name} }}}}")))
+        .collect();
+    let env_values: Vec<_> = env
+        .iter()
+        .map(|(value, template)| (serde_yaml::Value::String(value.clone()), template.clone()))
+        .collect();
+    if let Err(e) = interpolation {
         report.errors.push(ConfigError {
             path: String::new(),
-            message: e.root_cause().to_string(),
+            message: show_templates(&e.root_cause().to_string(), &env_values),
         });
         return report;
     }
@@ -148,19 +163,17 @@ pub fn validate(content: &str) -> Report {
     // is whatever the environment holds, a token included. Show the template
     // the user wrote instead: it names the line to fix and reveals nothing.
     // Paths go through the interpolated keys, so they get the same treatment.
-    // Every env value a template reads is hidden too, for the places where
-    // the two documents do not pair.
+    // Every env value that interpolation read is hidden too, for the places
+    // where the two documents do not pair.
     let mut templated = Vec::new();
     templated_values(&doc, &interpolated, &mut templated);
-    let mut env = Vec::new();
-    env_values(&doc, &mut env);
-    templated.extend(
-        env.iter()
-            .map(|(value, template)| (serde_yaml::Value::String(value.clone()), template.clone())),
-    );
+    templated.extend(env_values);
+    let messages = template_replacer(&templated);
+    let env = EnvHider::new(&env);
+    let mut paired = HashMap::new();
     for e in &mut report.errors {
-        e.message = show_templates(&e.message, &templated);
-        e.path = source_pointer(&doc, &interpolated, &e.path, &env);
+        e.message = messages.apply(&e.message);
+        e.path = source_pointer(&doc, &interpolated, &e.path, &env, &mut paired);
     }
     report
 }
@@ -266,54 +279,16 @@ fn key_pattern(key: &str) -> Option<regex::Regex> {
     regex::Regex::new(&pattern).ok()
 }
 
-/// Each env var a template in `doc` reads, as `(value, "{{ env.NAME }}")`.
-/// Unset and empty values are left out: they cannot reveal anything.
-fn env_values(doc: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
-    use serde_yaml::Value;
-    match doc {
-        Value::String(s) => env_values_in(s, out),
-        Value::Sequence(items) => {
-            for item in items {
-                env_values(item, out);
-            }
-        }
-        Value::Mapping(map) => {
-            for (k, v) in map {
-                env_values(k, out);
-                env_values(v, out);
-            }
-        }
-        Value::Tagged(tagged) => env_values(&tagged.value, out),
-        _ => {}
-    }
-}
-
-/// The env vars that `text` reads, then the ones their values read: a value
-/// that holds a template is expanded on the next interpolation pass.
-fn env_values_in(text: &str, out: &mut Vec<(String, String)>) {
-    for capture in template_regex().captures_iter(text) {
-        let Some(name) = capture[1].trim().strip_prefix("env.") else {
-            continue;
-        };
-        let template = format!("{{{{ env.{name} }}}}");
-        if out.iter().any(|(_, t)| *t == template) {
-            continue;
-        }
-        match std::env::var(name) {
-            Ok(value) if !value.is_empty() => {
-                out.push((value.clone(), template));
-                env_values_in(&value, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// `message` with each expanded value replaced by its template. JSON-quoted
-/// forms (how the schema errors print values) are replaced for every value;
-/// bare forms (the loader's messages) only for values of four or more
-/// characters, so a short value cannot rewrite unrelated words.
+/// `message` with each expanded value replaced by its template.
 fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> String {
+    template_replacer(templated).apply(message)
+}
+
+/// Replaces each expanded value with its template. JSON-quoted forms (how
+/// the schema errors print values) are replaced for every value; bare forms
+/// (the loader's messages) only for values of four or more characters, so a
+/// short value cannot rewrite unrelated words.
+fn template_replacer(templated: &[(serde_yaml::Value, String)]) -> Replacer {
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (value, template) in templated {
         let bare = match value {
@@ -341,37 +316,74 @@ fn show_templates(message: &str, templated: &[(serde_yaml::Value, String)]) -> S
         }
         pairs.push((quoted, quoted_template));
     }
-    // Longest first, so a value that contains another is replaced whole.
-    pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
-    let mut out = message.to_string();
-    for (from, to) in pairs {
-        out = out.replace(&from, &to);
+    Replacer::new(pairs)
+}
+
+/// Replaces each `from` with its `to` in one pass, so a template put in is
+/// never matched again by a value that happens to occur in it. Longest
+/// first, so a value that contains another is replaced whole. Built once and
+/// applied to every error.
+struct Replacer {
+    re: Option<regex::Regex>,
+    pairs: Vec<(String, String)>,
+    to: HashMap<String, String>,
+}
+
+impl Replacer {
+    fn new(mut pairs: Vec<(String, String)>) -> Self {
+        pairs.retain(|(from, _)| !from.is_empty());
+        pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let alternatives: Vec<_> = pairs.iter().map(|(from, _)| regex::escape(from)).collect();
+        let re = (!pairs.is_empty())
+            .then(|| regex::Regex::new(&alternatives.join("|")).ok())
+            .flatten();
+        // The first of equal values wins, as the pattern tries it first.
+        let to = pairs.iter().rev().cloned().collect();
+        Self { re, pairs, to }
     }
-    out
+
+    fn apply(&self, text: &str) -> String {
+        match &self.re {
+            Some(re) => re
+                .replace_all(text, |c: &regex::Captures| self.to[&c[0]].clone())
+                .into_owned(),
+            // No values, or too many for one pattern: replace them one at a
+            // time, which still hides every value.
+            None => {
+                let mut out = text.to_string();
+                for (from, to) in &self.pairs {
+                    out = out.replace(from, to);
+                }
+                out
+            }
+        }
+    }
 }
 
 /// `pointer`, a path into the interpolated config, as the path into the
 /// config the user wrote: a templated key is shown as its template. Where a
 /// mapping does not pair (`paired_entries`), the walk stops, and from there
-/// on each segment only has its env values hidden (`hide_env`).
-fn source_pointer(
-    raw: &serde_yaml::Value,
-    expanded: &serde_yaml::Value,
+/// on each segment only has its env values hidden (`EnvHider`). Each
+/// mapping is paired once, in `paired`, however many errors go through it.
+fn source_pointer<'a>(
+    raw: &'a serde_yaml::Value,
+    expanded: &'a serde_yaml::Value,
     pointer: &str,
-    env: &[(String, String)],
+    env: &EnvHider,
+    paired: &mut PairedKeys<'a>,
 ) -> String {
     let mut at = Some((raw, expanded));
     let mut out = String::new();
     for segment in pointer.split('/').skip(1) {
         let key = segment.replace("~1", "/").replace("~0", "~");
-        let shown = match at.and_then(|(r, x)| source_step(r, x, &key)) {
+        let shown = match at.and_then(|(r, x)| source_step(r, x, &key, paired)) {
             Some((shown, r, x)) => {
                 at = Some((r, x));
                 shown
             }
             None => {
                 at = None;
-                hide_env(&key, env)
+                env.hide(&key)
             }
         };
         out.push('/');
@@ -380,6 +392,13 @@ fn source_pointer(
     out
 }
 
+/// For each interpolated mapping, by address: each of its keys as text,
+/// with the key the user wrote and the raw and expanded values under it.
+type PairedKeys<'a> = HashMap<
+    *const serde_yaml::Mapping,
+    HashMap<String, (String, &'a serde_yaml::Value, &'a serde_yaml::Value)>,
+>;
+
 /// One step of `source_pointer`: the key the user wrote for `key`, and the
 /// raw and expanded values under it. A mapping that changed its number of
 /// entries may pair a key with another entry's value, so it is not walked.
@@ -387,19 +406,24 @@ fn source_step<'a>(
     raw: &'a serde_yaml::Value,
     expanded: &'a serde_yaml::Value,
     key: &str,
+    paired: &mut PairedKeys<'a>,
 ) -> Option<(String, &'a serde_yaml::Value, &'a serde_yaml::Value)> {
     use serde_yaml::Value;
-    let text = |k: &Value| match k {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    };
     match (raw, expanded) {
-        (Value::Mapping(r), Value::Mapping(x)) if r.len() == x.len() => paired_entries(r, x)
-            .into_iter()
-            .find(|(_, (xk, _))| text(xk).as_deref() == Some(key))
-            .and_then(|((rk, rv), (_, xv))| Some((text(rk)?, rv, xv))),
+        (Value::Mapping(r), Value::Mapping(x)) => {
+            let keys = paired.entry(x as *const _).or_insert_with(|| {
+                if r.len() != x.len() {
+                    return HashMap::new();
+                }
+                paired_entries(r, x)
+                    .into_iter()
+                    .filter_map(|((rk, rv), (xk, xv))| {
+                        Some((key_text(xk)?, (key_text(rk)?, rv, xv)))
+                    })
+                    .collect()
+            });
+            keys.get(key).cloned()
+        }
         (Value::Sequence(r), Value::Sequence(x)) => {
             let i: usize = key.parse().ok()?;
             Some((key.to_string(), r.get(i)?, x.get(i)?))
@@ -408,20 +432,43 @@ fn source_step<'a>(
     }
 }
 
-/// `key` with each env value in it replaced by its template. As in
-/// `show_templates`, a value of fewer than four characters is replaced only
-/// when it is the whole key.
-fn hide_env(key: &str, env: &[(String, String)]) -> String {
-    let mut env: Vec<_> = env
-        .iter()
-        .filter(|(value, _)| value == key || value.chars().count() >= 4)
-        .collect();
-    env.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
-    let mut out = key.to_string();
-    for (value, template) in env {
-        out = out.replace(value.as_str(), template);
+/// A mapping key as it reads in a JSON pointer.
+fn key_text(key: &serde_yaml::Value) -> Option<String> {
+    match key {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
-    out
+}
+
+/// Hides the env values in a path segment. As in `template_replacer`, a
+/// value of fewer than four characters is replaced only when it is the
+/// whole segment.
+struct EnvHider {
+    env: Vec<(String, String)>,
+    long: Replacer,
+}
+
+impl EnvHider {
+    fn new(env: &[(String, String)]) -> Self {
+        let long = env
+            .iter()
+            .filter(|(value, _)| value.chars().count() >= 4)
+            .cloned()
+            .collect();
+        Self {
+            env: env.to_vec(),
+            long: Replacer::new(long),
+        }
+    }
+
+    fn hide(&self, key: &str) -> String {
+        match self.env.iter().find(|(value, _)| value == key) {
+            Some((_, template)) => template.clone(),
+            None => self.long.apply(key),
+        }
+    }
 }
 
 /// A JSON pointer as the dotted key path the lint warnings use.
@@ -922,6 +969,61 @@ mod tests {
             let paths: Vec<_> = report.errors.iter().map(|e| e.path.as_str()).collect();
             assert_eq!(paths, [path], "{yaml}");
         }
+    }
+
+    /// A template that substitutions build from pieces is only read on a
+    /// later pass. The env vars are taken from what interpolation read, not
+    /// from the text, so that value is hidden too.
+    #[test]
+    #[serial_test::serial]
+    fn an_env_value_read_through_an_assembled_template_is_not_shown() {
+        let report = with_env(
+            &[
+                ("AVOCADO_TEST_VALIDATE_PREFIX", "{{ env."),
+                ("AVOCADO_TEST_VALIDATE_MARKER", MARKER),
+            ],
+            || {
+                validate(
+                    "runtimes:\n  \"{{ env.AVOCADO_TEST_VALIDATE_PREFIX }}AVOCADO_TEST_VALIDATE_MARKER }}\":\n    extensions: 5\n",
+                )
+            },
+        );
+        assert!(!report.errors.is_empty());
+        for e in &report.errors {
+            assert!(!e.path.contains(MARKER), "{e:?}");
+            assert!(!e.message.contains(MARKER), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_template_put_in_is_not_replaced_again() {
+        let env = vec![
+            ("dummy-secret".to_string(), "{{ env.TOKEN }}".to_string()),
+            ("{{ env.".to_string(), "{{ env.PREFIX }}".to_string()),
+        ];
+        assert_eq!(EnvHider::new(&env).hide("dummy-secret"), "{{ env.TOKEN }}");
+    }
+
+    /// Each error path goes through the same mapping; every one still gets
+    /// its own key's template.
+    #[test]
+    #[serial_test::serial]
+    fn many_templated_keys_each_keep_their_template() {
+        let yaml: String = (0..200)
+            .map(|i| {
+                format!("  \"r{i}-{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}\":\n    extensions: 5\n")
+            })
+            .collect();
+        let report = with_env(&[("AVOCADO_TEST_VALIDATE_KEY", "dev")], || {
+            validate(&format!("runtimes:\n{yaml}"))
+        });
+        let mut paths: Vec<_> = report.errors.iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        let mut expected: Vec<_> = (0..200)
+            .map(|i| format!("/runtimes/r{i}-{{{{ env.AVOCADO_TEST_VALIDATE_KEY }}}}/extensions"))
+            .collect();
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     /// The distro override is folded in before the check, so `distro` has
