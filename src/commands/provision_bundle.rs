@@ -841,6 +841,15 @@ async fn fetch_blob(src: &str, sha: &str, cache: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Shell that copies `from` to `to` when `from` exists; fails closed.
+fn copy_if_present(from: &str, to: &str) -> String {
+    let (f, t) = (
+        crate::commands::rubicon::sh_quote(from),
+        crate::commands::rubicon::sh_quote(to),
+    );
+    format!("if [ -f {f} ]; then mkdir -p \"$(dirname {t})\" && cp {f} {t} || exit 1; fi\n")
+}
+
 /// The container script for `--bundle ... -- <argv>`: the command as given,
 /// each word quoted, nothing restored or provisioned.
 fn exec_script(argv: &[String]) -> String {
@@ -998,6 +1007,31 @@ impl BundleProvision {
         if self.verbose {
             env.insert("AVOCADO_VERBOSE".into(), "1".into());
         }
+        // The profile's state file, as `runtime provision` keeps it: this
+        // directory's copy (never the packing host's) in before the hook,
+        // and back out after it succeeds, so state persists across replays.
+        let (state_in, state_out) = match self.profile.as_deref() {
+            Some(profile) if self.exec.is_empty() => {
+                let rel = config.get_provision_state_file(profile);
+                if !plain_rel(&rel) {
+                    bail!("provision state file {rel:?} must be a path inside the project");
+                }
+                let host = format!("/opt/src/{rel}");
+                let ctr = crate::commands::runtime::provision::container_state_path(
+                    &meta.target,
+                    &meta.runtime,
+                );
+                env.insert("AVOCADO_PROVISION_STATE".into(), ctr.clone());
+                (
+                    copy_if_present(&host, &ctr),
+                    format!(
+                        "rc=$?; [ \"$rc\" -eq 0 ] || exit \"$rc\"\n{}",
+                        copy_if_present(&ctr, &host)
+                    ),
+                )
+            }
+            _ => Default::default(),
+        };
         let clear: String = meta
             .clear
             .iter()
@@ -1019,7 +1053,7 @@ B=/opt/src/{WORK_DIR}
     mkdir -p "$(dirname "$path")" && cp "$B/blobs/$h" "$path" && chmod "$mode" "$path" || exit 1
 done < "$B/files.tsv" || exit 1
 echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
-{provision}"#,
+{state_in}{provision}{state_out}"#,
                 provision = meta.provision_script,
             )
         };
@@ -1086,6 +1120,26 @@ mod tests {
             exec_script(&argv),
             "exec 'boardctl' 'recovery' 'it'\\''s; rm -rf /'\n"
         );
+    }
+
+    #[test]
+    fn state_is_copied_only_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("a.state"), tmp.path().join("x/y/b.state"));
+        let run = || {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &copy_if_present(&from.to_string_lossy(), &to.to_string_lossy()),
+                ])
+                .status()
+                .unwrap()
+        };
+        assert!(run().success(), "nothing to copy is not an error");
+        assert!(!to.exists());
+        std::fs::write(&from, "n=1").unwrap();
+        assert!(run().success());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "n=1");
     }
 
     #[test]

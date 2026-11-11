@@ -19,6 +19,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Where a provision profile's state file sits in the SDK volume while the
+/// hook runs (`$AVOCADO_PROVISION_STATE`).
+pub fn container_state_path(target_arch: &str, runtime: &str) -> String {
+    format!("/opt/_avocado/{target_arch}/output/runtimes/{runtime}/provision-state.state")
+}
+
 pub struct RuntimeProvisionConfig {
     pub runtime_name: String,
     pub config_path: String,
@@ -442,10 +448,8 @@ impl RuntimeProvisionCommand {
                 .state_file
                 .clone()
                 .unwrap_or_else(|| config.get_provision_state_file(profile));
-            let container_state_path = format!(
-                "/opt/_avocado/{}/output/runtimes/{}/provision-state.state",
-                target_arch, self.config.runtime_name
-            );
+            let container_state_path =
+                container_state_path(&target_arch, &self.config.runtime_name);
             env_vars.insert(
                 "AVOCADO_PROVISION_STATE".to_string(),
                 container_state_path.clone(),
