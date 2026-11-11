@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::utils::config::{Config, ProvisionRubicon, RubiconStep};
+use crate::utils::config::{ComposedConfig, Config, ProvisionRubicon, RubiconStep};
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
@@ -362,7 +362,7 @@ pub struct PackInputs<'a> {
     pub runtime: &'a str,
     pub env: &'a HashMap<String, String>,
     pub provision_script: String,
-    pub config: &'a Config,
+    pub composed: &'a ComposedConfig,
 }
 
 /// Turn the container's staging into `<out>/<runtime>-<target>.bundle/`.
@@ -400,8 +400,12 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         size: f.size,
     })
     .collect();
-    let (ext_sources, avocado_yaml) =
-        pack_ext_sources(p.config_path, p.target, &stage.join("blobs"))?;
+    let (ext_sources, avocado_yaml) = pack_ext_sources(
+        p.config_path,
+        p.target,
+        &required_extensions(p.composed, p.target)?,
+        &stage.join("blobs"),
+    )?;
     let meta = BundleMeta {
         format: FORMAT,
         target: p.target.into(),
@@ -420,7 +424,7 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         created_at: chrono::Utc::now().to_rfc3339(),
         cli_version: env!("AVOCADO_CLI_VERSION").into(),
         rubicon: bundle_rubicon(
-            p.config,
+            &p.composed.config,
             std::fs::read_to_string(stage.join("stone-manifest.json"))
                 .ok()
                 .and_then(|m| crate::commands::profiles::stone_default_profile(&m)),
@@ -461,13 +465,38 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Archive each path-sourced extension's directory into `blobs` and return
+/// The extensions the replay's `sdk install` uses for `target` (those its
+/// runtimes list, as there), plus everything they depend on.
+pub fn required_extensions(composed: &ComposedConfig, target: &str) -> Result<HashSet<String>> {
+    let graph = crate::utils::ext_deps::DependencyGraph::from_composed(composed, target)?;
+    let mut todo: Vec<String> = crate::utils::config::find_active_extensions(
+        &composed.config,
+        &composed.merged_value,
+        target,
+        &composed.config_path,
+        None,
+    )?
+    .into_iter()
+    .collect();
+    let mut out = HashSet::new();
+    while let Some(name) = todo.pop() {
+        if let Some(node) = graph.get(&name).filter(|_| !out.contains(&name)) {
+            todo.extend(node.depends_on.iter().map(|d| d.name.clone()));
+        }
+        out.insert(name);
+    }
+    Ok(out)
+}
+
+/// Archive each path-sourced extension in `required` into `blobs` and return
 /// them with the config text the bundle carries, its path sources pointing
 /// at the copies a hub unpacks (`.avocado-bundle/ext/<name>`) and its
-/// path-sourced image sections inlined.
+/// path-sourced image sections inlined. Other targets' extensions stay as
+/// written: absent on the hub, they are skipped like any unfetched source.
 pub fn pack_ext_sources(
     config_path: &Path,
     target: &str,
+    required: &HashSet<String>,
     blobs: &Path,
 ) -> Result<(Vec<ExtSourceArchive>, String)> {
     use crate::utils::config::ExtensionSource;
@@ -495,6 +524,9 @@ pub fn pack_ext_sources(
         let ExtensionSource::Path { path, .. } = source else {
             continue;
         };
+        if !required.contains(&name) {
+            continue;
+        }
         if !plain_name(&name) {
             bail!("extension name {name:?} cannot name a bundle directory");
         }
@@ -1007,6 +1039,18 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
 mod tests {
     use super::*;
 
+    /// Pack as `assemble` does: only what the target's runtimes need.
+    fn pack(cfg: &Path, blobs: &Path) -> (Vec<ExtSourceArchive>, String) {
+        let composed = Config::load_composed(cfg, Some("t")).unwrap();
+        pack_ext_sources(
+            cfg,
+            "t",
+            &required_extensions(&composed, "t").unwrap(),
+            blobs,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn exec_runs_the_command_as_given_and_nothing_else() {
         let argv: Vec<String> = ["boardctl", "recovery", "it's; rm -rf /"]
@@ -1063,11 +1107,35 @@ mod tests {
             "default_target: t\ndefault_target_board: b1\nextensions:\n  bsp-{{ avocado.target.board }}:\n    source:\n      type: path\n      path: ../extensions/bsp-{{ avocado.target.board }}\n",
         )
         .unwrap();
-        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let (a, yaml) = pack(&cfg, &tmp.path().join("blobs"));
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].name, "bsp-b1");
         assert!(yaml.contains(".avocado-bundle/ext/bsp-b1"), "{yaml}");
         assert!(!yaml.contains("../extensions"), "{yaml}");
+    }
+
+    #[test]
+    fn only_the_targets_extensions_and_their_dependencies_are_carried() {
+        // `bsp` is the runtime's and depends on `dep`; `other` belongs to no
+        // runtime here and its checkout is absent: packing must not need it.
+        let tmp = tempfile::tempdir().unwrap();
+        for e in ["bsp", "dep"] {
+            std::fs::create_dir_all(tmp.path().join(e)).unwrap();
+            std::fs::write(tmp.path().join(e).join("avocado.yaml"), "{}\n").unwrap();
+        }
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = project.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "default_target: t\nruntimes:\n  r:\n    extensions: [bsp]\nextensions:\n  bsp:\n    source: { type: path, path: ../bsp }\n    depends_on: [dep]\n  dep:\n    source: { type: path, path: ../dep }\n  other:\n    source: { type: path, path: ../other }\n",
+        )
+        .unwrap();
+        let (a, yaml) = pack(&cfg, &tmp.path().join("blobs"));
+        let mut names: Vec<_> = a.iter().map(|x| x.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["bsp", "dep"]);
+        assert!(yaml.contains("../other"), "left as written: {yaml}");
     }
 
     #[test]
@@ -1086,7 +1154,7 @@ mod tests {
             "src_dir: ../..\ndefault_target: t\nextensions:\n  bsp:\n    source:\n      type: path\n      path: bsp\n",
         )
         .unwrap();
-        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let (a, yaml) = pack(&cfg, &tmp.path().join("blobs"));
         assert_eq!(a.len(), 1);
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert!(doc.get("src_dir").is_none(), "{yaml}");
@@ -1116,7 +1184,7 @@ mod tests {
             "default_target: t\nrootfs:\n  source:\n    type: path\n    path: ../os/rootfs\n",
         )
         .unwrap();
-        let (_, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let (_, yaml) = pack(&cfg, &tmp.path().join("blobs"));
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert!(doc["rootfs"].get("source").is_none(), "{yaml}");
         assert_eq!(doc["rootfs"]["filesystem"].as_str(), Some("erofs-lz4"));
@@ -1144,7 +1212,7 @@ mod tests {
             "default_target: t\next_root: ../extensions\nextensions:\n  bsp:\n    source:\n      type: path\n      path: '{{ config.ext_root }}/bsp'\n",
         )
         .unwrap();
-        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let (a, yaml) = pack(&cfg, &tmp.path().join("blobs"));
         assert_eq!(a.len(), 1);
         assert!(yaml.contains(".avocado-bundle/ext/bsp"), "{yaml}");
         assert!(!yaml.contains("ext_root }}/bsp"), "{yaml}");
@@ -1165,10 +1233,10 @@ mod tests {
         let cfg = project.join("avocado.yaml");
         std::fs::write(
             &cfg,
-            "default_target: t\ndefault_target_board: b1\nruntimes:\n  r:\n    target_board: b2\nextensions:\n  bsp-{{ avocado.target.board }}:\n    source:\n      type: path\n      path: ../extensions/bsp-{{ avocado.target.board }}\n",
+            "default_target: t\ndefault_target_board: b1\nruntimes:\n  r:\n    target_board: b2\n    extensions: ['bsp-{{ avocado.target.board }}']\nextensions:\n  bsp-{{ avocado.target.board }}:\n    source:\n      type: path\n      path: ../extensions/bsp-{{ avocado.target.board }}\n",
         )
         .unwrap();
-        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        let (a, yaml) = pack(&cfg, &tmp.path().join("blobs"));
         assert_eq!(a[0].name, "bsp-b2");
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(doc["default_target_board"].as_str(), Some("b2"), "{yaml}");
@@ -1212,11 +1280,11 @@ mod tests {
         )
         .unwrap();
         let blobs = tmp.path().join("blobs");
-        let (a, yaml) = pack_ext_sources(&cfg, "t", &blobs).unwrap();
+        let (a, yaml) = pack(&cfg, &blobs);
         assert_eq!(a.len(), 1, "only the path source is carried");
         assert_eq!(a[0].name, "bsp-t");
         // Deterministic: packing again gives the same blob.
-        let (b, _) = pack_ext_sources(&cfg, "t", &blobs).unwrap();
+        let (b, _) = pack(&cfg, &blobs);
         assert_eq!(a[0].sha256, b[0].sha256);
         assert!(yaml.contains(".avocado-bundle/ext/bsp-t"), "{yaml}");
         assert!(!yaml.contains("../bsp"), "{yaml}");

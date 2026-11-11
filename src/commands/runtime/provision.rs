@@ -594,7 +594,7 @@ impl RuntimeProvisionCommand {
                     runtime: &self.config.runtime_name,
                     env: &env_snapshot,
                     provision_script,
-                    config,
+                    composed: &composed,
                 },
             )?;
             return Ok(());
