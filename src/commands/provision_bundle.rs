@@ -506,15 +506,8 @@ pub fn pack_ext_sources(
     // `{{ config.ext_root }}/bsp`), so resolve each written path against the
     // resolved document before looking it up.
     let ctx = AvocadoContext::from_main_config(&doc, Some(target), None);
-    // Pin the board the bundle was built for. It is often chosen by
-    // AVOCADO_TARGET_BOARD, which the hub does not have: without this the
-    // hub composes the project for its default board, and picks up another
-    // board's extensions and run profiles.
-    // ponytail: a runtime-level `target_board` still outranks this on the hub,
-    // as it did on the host unless the env overrode it; carry the env too if
-    // that combination shows up.
-    if let (Some(board), Some(map)) = (ctx.target_board.clone(), doc.as_mapping_mut()) {
-        map.insert("default_target_board".into(), board.into());
+    if let Some(board) = &ctx.target_board {
+        pin_board(&mut doc, board);
     }
     if let Some(exts) = doc.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
         for (_, ext) in exts.iter_mut() {
@@ -555,6 +548,32 @@ pub fn pack_ext_sources(
         map.remove("src_dir");
     }
     Ok((out, serde_yaml::to_string(&doc)?))
+}
+
+/// Pin the board the bundle was built for. It is often chosen by
+/// `AVOCADO_TARGET_BOARD` or `--target-board`, which the hub does not have:
+/// without this the hub composes the project for another board, and picks
+/// up that board's extensions and run profiles. A runtime's own
+/// `target_board` outranks `default_target_board`, so each one set is
+/// rewritten too.
+fn pin_board(doc: &mut serde_yaml::Value, board: &str) {
+    let Some(map) = doc.as_mapping_mut() else {
+        return;
+    };
+    map.insert("default_target_board".into(), board.into());
+    for (_, rt) in map
+        .get_mut("runtimes")
+        .and_then(|r| r.as_mapping_mut())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(rt) = rt
+            .as_mapping_mut()
+            .filter(|r| r.contains_key("target_board"))
+        {
+            rt.insert("target_board".into(), board.into());
+        }
+    }
 }
 
 /// A directory as a reproducible tar.gz: sorted, owner 0, mtime 0, the mode
@@ -1143,6 +1162,26 @@ mod tests {
         assert_eq!(a[0].name, "bsp-b2");
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(doc["default_target_board"].as_str(), Some("b2"), "{yaml}");
+    }
+
+    #[test]
+    #[serial_test::serial] // reads AVOCADO_TARGET_BOARD, which serial tests set
+    fn a_board_chosen_over_the_runtimes_own_is_pinned_over_it() {
+        // Packed with AVOCADO_TARGET_BOARD=b2 while the runtime says b1: the
+        // hub, without the env, must still compose b2.
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(
+            "default_target_board: b0\nruntimes:\n  r:\n    target_board: b1\n",
+        )
+        .unwrap();
+        pin_board(&mut doc, "b2");
+        assert_eq!(doc["default_target_board"].as_str(), Some("b2"));
+        let ctx =
+            crate::utils::interpolation::AvocadoContext::from_main_config(&doc, Some("t"), None);
+        assert_eq!(ctx.target_board.as_deref(), Some("b2"));
+        // A runtime that names no board is left alone.
+        let mut doc: serde_yaml::Value = serde_yaml::from_str("runtimes:\n  s: {}\n").unwrap();
+        pin_board(&mut doc, "b2");
+        assert!(doc["runtimes"]["s"].get("target_board").is_none());
     }
 
     #[test]
