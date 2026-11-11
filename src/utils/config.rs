@@ -1080,6 +1080,8 @@ pub struct RepoDef {
     pub password: Option<String>,
     pub ca: Option<String>,
     pub tls_verify: Option<bool>,
+    /// Rewrite a loopback host in `url` to one the build container can reach.
+    pub rewrite_loopback: Option<bool>,
 }
 
 /// Reference to a Docker image for priming on the var partition at build time.
