@@ -1047,6 +1047,9 @@ mod tests {
         let replacer = Replacer::new(vec![("abab".to_string(), "{{ env.TOKEN }}".to_string())]);
         assert_eq!(replacer.apply("x ababab y"), "x {{ env.TOKEN }} y");
         assert_eq!(replacer.apply("ababab-ab"), "{{ env.TOKEN }}-ab");
+        // Path segments that are not exactly the value go the same way.
+        let env = EnvHider::new(&[("abab".to_string(), "{{ env.TOKEN }}".to_string())]);
+        assert_eq!(env.hide("dev-ababab"), "dev-{{ env.TOKEN }}");
     }
 
     /// Each error path goes through the same mapping; every one still gets
