@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
-use crate::utils::volume::VolumeState;
+use crate::utils::volume::{VolumeManager, VolumeState};
 
 use super::save::ArchiveManifest;
 
@@ -59,6 +59,8 @@ impl LoadCommand {
                 );
             }
         }
+        // Read before the import, which can restore files into config_dir.
+        let previous = VolumeState::load_from_dir(config_dir).ok().flatten();
 
         if self.verbose {
             print_info(
@@ -93,6 +95,24 @@ impl LoadCommand {
             container_tool: self.container_tool.clone(),
         };
         volume_state.save_to_dir(config_dir)?;
+
+        // Only after the new state is written: a failed write must leave the
+        // project pointing at a volume that still exists. A failed removal
+        // only warns; the reaper later removes a volume replaced on this daemon.
+        if let Some(previous) = previous.filter(|p| p.volume_name != volume_name) {
+            let volumes = VolumeManager::new(self.container_tool.clone(), self.verbose);
+            if let Err(e) = volumes.remove_volume(&previous.volume_name).await {
+                print_warning(
+                    &format!(
+                        "{}. Remove the previous volume later with `{} volume rm {}`.",
+                        format!("{e:#}").trim_end(),
+                        self.container_tool,
+                        previous.volume_name
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
+        }
 
         print_success(
             &format!(
@@ -530,6 +550,110 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(30))
             .expect("load hung with the container blocked on stderr")
             .unwrap();
+    }
+
+    /// Write a minimal `save` archive with one volume entry to `path`.
+    #[cfg(unix)]
+    fn write_state_archive(path: &Path) {
+        let gz =
+            flate2::write::GzEncoder::new(File::create(path).unwrap(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        let mut add = |name: &str, data: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            tar.append_data(&mut h, name, data).unwrap();
+        };
+        let manifest = format!(
+            r#"{{"version":1,"created_at":"x","cli_version":"{}","target":"t","container_tool":"docker","volume_contents_path":"volume","include_src":false}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        add("avocado-state/manifest.json", manifest.as_bytes());
+        add("avocado-state/volume/file", b"data");
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// Run `load --force` over a project whose state names `avo-previous`,
+    /// with a tool that logs its calls and fails `volume rm` with `rm_error`
+    /// when given. Returns the logged calls and the volume now recorded.
+    #[cfg(unix)]
+    async fn force_load_over_previous_volume(rm_error: Option<&str>) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let calls = temp.path().join("calls");
+        let rm = match rm_error {
+            Some(err) => format!("echo \"{err}\" >&2; exit 1"),
+            None => "exit 0".to_string(),
+        };
+        let tool = temp.path().join("fake-docker");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> \"{}\"\n\
+                 case \"$1 $2\" in\n\
+                 \"volume rm\") {rm} ;;\n\
+                 run*) cat >/dev/null; exit 0 ;;\n\
+                 *) exit 0 ;;\n\
+                 esac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let archive = temp.path().join("state.tar.gz");
+        write_state_archive(&archive);
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        VolumeState {
+            volume_name: "avo-previous".to_string(),
+            source_path: project.display().to_string(),
+            container_tool: "docker".to_string(),
+        }
+        .save_to_dir(&project)
+        .unwrap();
+
+        LoadCommand::new(
+            archive.display().to_string(),
+            project.join("avocado.yaml").display().to_string(),
+            false,
+            tool.display().to_string(),
+            true,
+        )
+        .execute()
+        .await
+        .unwrap();
+
+        let recorded = VolumeState::load_from_dir(&project).unwrap().unwrap();
+        (fs::read_to_string(&calls).unwrap(), recorded.volume_name)
+    }
+
+    /// `load --force` replaces the project's volume. The new state is the
+    /// only reference the old volume had, so the old volume goes with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_load_removes_the_previous_volume() {
+        let (calls, recorded) = force_load_over_previous_volume(None).await;
+
+        assert_ne!(recorded, "avo-previous");
+        assert!(calls.contains("volume rm avo-previous\n"), "{calls}");
+        assert!(!calls.contains(&format!("volume rm {recorded}")), "{calls}");
+    }
+
+    /// The import already succeeded, so a previous volume that cannot be
+    /// removed (held by a container, say) only warns: the new state is
+    /// still written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_load_still_records_the_new_volume_when_removal_fails() {
+        let (calls, recorded) = force_load_over_previous_volume(Some(
+            "Error response from daemon: remove avo-previous: volume is in use - [0123456789ab]",
+        ))
+        .await;
+
+        assert_ne!(recorded, "avo-previous");
+        assert!(calls.contains("volume rm avo-previous\n"), "{calls}");
     }
 
     /// A read-only directory in an included src_dir gets its mode only after
