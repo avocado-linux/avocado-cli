@@ -319,44 +319,52 @@ fn template_replacer(templated: &[(serde_yaml::Value, String)]) -> Replacer {
     Replacer::new(pairs)
 }
 
-/// Replaces each `from` with its `to` in one pass, so a template put in is
-/// never matched again by a value that happens to occur in it. Longest
-/// first, so a value that contains another is replaced whole. Built once and
-/// applied to every error.
+/// Replaces each `from` with its `to`. Every place a value occurs is
+/// found in the original text, so a template put in is never matched again.
+/// Places that overlap (two values that share text) are replaced as one,
+/// by the templates of the values that make them up, so no part of either
+/// value stays. Built once and applied to every error.
 struct Replacer {
-    re: Option<regex::Regex>,
     pairs: Vec<(String, String)>,
-    to: HashMap<String, String>,
 }
 
 impl Replacer {
     fn new(mut pairs: Vec<(String, String)>) -> Self {
         pairs.retain(|(from, _)| !from.is_empty());
-        pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
-        let alternatives: Vec<_> = pairs.iter().map(|(from, _)| regex::escape(from)).collect();
-        let re = (!pairs.is_empty())
-            .then(|| regex::Regex::new(&alternatives.join("|")).ok())
-            .flatten();
-        // The first of equal values wins, as the pattern tries it first.
-        let to = pairs.iter().rev().cloned().collect();
-        Self { re, pairs, to }
+        Self { pairs }
     }
 
     fn apply(&self, text: &str) -> String {
-        match &self.re {
-            Some(re) => re
-                .replace_all(text, |c: &regex::Captures| self.to[&c[0]].clone())
-                .into_owned(),
-            // No values, or too many for one pattern: replace them one at a
-            // time, which still hides every value.
-            None => {
-                let mut out = text.to_string();
-                for (from, to) in &self.pairs {
-                    out = out.replace(from, to);
-                }
-                out
+        let mut found: Vec<(usize, usize, &str)> = Vec::new();
+        for (from, to) in &self.pairs {
+            for (start, _) in text.match_indices(from.as_str()) {
+                found.push((start, start + from.len(), to));
             }
         }
+        // By start, the longest first, so a value that contains another is
+        // replaced whole.
+        found.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+        let mut out = String::new();
+        let mut done = 0;
+        let mut found = found.into_iter().peekable();
+        while let Some((start, mut end, to)) = found.next() {
+            let mut templates = vec![to];
+            while let Some(&(next_start, next_end, next_to)) = found.peek() {
+                if next_start >= end {
+                    break;
+                }
+                if next_end > end {
+                    end = next_end;
+                    templates.push(next_to);
+                }
+                found.next();
+            }
+            out.push_str(&text[done..start]);
+            out.push_str(&templates.concat());
+            done = end;
+        }
+        out.push_str(&text[done..]);
+        out
     }
 }
 
@@ -1002,6 +1010,27 @@ mod tests {
             ("{{ env.".to_string(), "{{ env.PREFIX }}".to_string()),
         ];
         assert_eq!(EnvHider::new(&env).hide("dummy-secret"), "{{ env.TOKEN }}");
+    }
+
+    /// Values that share text are replaced as one, so no part of either
+    /// shows.
+    #[test]
+    fn overlapping_values_are_both_hidden() {
+        let replacer = Replacer::new(vec![
+            ("abcd".to_string(), "{{ env.A }}".to_string()),
+            ("cdefghijkl".to_string(), "{{ env.TOKEN }}".to_string()),
+            ("{{ env.".to_string(), "{{ env.PREFIX }}".to_string()),
+            ("dummy-secret".to_string(), "{{ env.TOKEN }}".to_string()),
+        ]);
+        assert_eq!(
+            replacer.apply("x abcdefghijkl y"),
+            "x {{ env.A }}{{ env.TOKEN }} y"
+        );
+        assert_eq!(
+            replacer.apply("prefix-dummy-secret"),
+            "prefix-{{ env.TOKEN }}"
+        );
+        assert_eq!(replacer.apply("x abcd y"), "x {{ env.A }} y");
     }
 
     /// Each error path goes through the same mapping; every one still gets
