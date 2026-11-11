@@ -2,6 +2,7 @@ use crate::commands::connect::client::{self as connect_client, ConnectClient};
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, is_vm_routing_active, RunConfig, SdkContainer},
+    feeds::args_have_host_network,
     lockfile::LockFile,
     output::{print_info, print_success, print_warning, OutputLevel},
     output_format::{emit_json_event, is_json_output_active},
@@ -1029,18 +1030,6 @@ struct MacDeployNet {
     forward: Option<OpenForward>,
 }
 
-/// True if `args` request host networking, in either the `--network=host` /
-/// `--net=host` form or the space-separated `--network host` / `--net host`
-/// form.
-fn args_have_host_network(args: &[String]) -> bool {
-    args.iter().enumerate().any(|(i, a)| {
-        a == "--network=host"
-            || a == "--net=host"
-            || ((a == "--network" || a == "--net")
-                && args.get(i + 1).map(|v| v == "host").unwrap_or(false))
-    })
-}
-
 /// Remove host-networking flags from container args so a published port (`-p`)
 /// takes effect. Handles both the `--network=host` / `--net=host` and
 /// space-separated `--network host` / `--net host` forms. See
@@ -1699,29 +1688,6 @@ mod tests {
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn test_args_have_host_network_eq_form() {
-        assert!(args_have_host_network(&sv(&[
-            "--privileged",
-            "--network=host"
-        ])));
-        assert!(args_have_host_network(&sv(&["--net=host"])));
-    }
-
-    #[test]
-    fn test_args_have_host_network_space_form() {
-        assert!(args_have_host_network(&sv(&["--network", "host"])));
-        assert!(args_have_host_network(&sv(&["--net", "host"])));
-    }
-
-    #[test]
-    fn test_args_have_host_network_none() {
-        assert!(!args_have_host_network(&sv(&["--privileged"])));
-        // `--network` followed by something other than host is not host networking.
-        assert!(!args_have_host_network(&sv(&["--network", "bridge"])));
-        assert!(!args_have_host_network(&sv(&[])));
     }
 
     #[test]

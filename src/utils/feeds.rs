@@ -60,6 +60,18 @@ pub const CONTAINER_FEEDS_DIR: &str = "/run/avocado-feeds";
 /// reaches the developer's machine rather than the container itself.
 pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 
+/// True if `args` request host networking, in either the `--network=host` /
+/// `--net=host` form or the space-separated `--network host` / `--net host`
+/// form.
+pub fn args_have_host_network(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        a == "--network=host"
+            || a == "--net=host"
+            || ((a == "--network" || a == "--net")
+                && args.get(i + 1).map(|v| v == "host").unwrap_or(false))
+    })
+}
+
 /// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
 /// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
 /// user-net address for this machine instead.
@@ -1737,6 +1749,33 @@ fi
 #[serial_test::serial]
 mod tests {
     use super::*;
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_args_have_host_network_eq_form() {
+        assert!(args_have_host_network(&sv(&[
+            "--privileged",
+            "--network=host"
+        ])));
+        assert!(args_have_host_network(&sv(&["--net=host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_space_form() {
+        assert!(args_have_host_network(&sv(&["--network", "host"])));
+        assert!(args_have_host_network(&sv(&["--net", "host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_none() {
+        assert!(!args_have_host_network(&sv(&["--privileged"])));
+        // `--network` followed by something other than host is not host networking.
+        assert!(!args_have_host_network(&sv(&["--network", "bridge"])));
+        assert!(!args_have_host_network(&sv(&[])));
+    }
 
     fn load(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("yaml parses")
