@@ -102,3 +102,24 @@ fn rubicon_with_usb_and_a_whole_port_hold_are_accepted() {
         );
     }
 }
+
+// Servo widths match `Config::validate_rubicon`: 0 (off) or 400-2600 us.
+#[test]
+fn rubicon_servo_width_is_zero_or_400_to_2600() {
+    for (us, ok) in [
+        (0, true),
+        (400, true),
+        (2600, true),
+        (1, false),
+        (399, false),
+        (2601, false),
+    ] {
+        assert_eq!(
+            accepts(&format!(
+                "rubicon:\n  run:\n    move:\n      - servo: {{ sv1: {us} }}\n"
+            )),
+            ok,
+            "{us}"
+        );
+    }
+}

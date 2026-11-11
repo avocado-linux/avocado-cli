@@ -2458,9 +2458,16 @@
           "type": "object",
           "description": "Set servo / linear-actuator outputs to a pulse width in us (servo: { sv1: 1800 }, about 1000-2000 for a hobby servo); 0 stops the pulses.",
           "additionalProperties": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 2600
+            "oneOf": [
+              {
+                "const": 0
+              },
+              {
+                "type": "integer",
+                "minimum": 400,
+                "maximum": 2600
+              }
+            ]
           }
         },
         "run": {
