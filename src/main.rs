@@ -2620,13 +2620,14 @@ async fn main() -> Result<()> {
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let config_path = config.clone();
+            let target = target.or(cli.target);
             let provision_cmd =
                 ProvisionCommand::new(crate::commands::provision::ProvisionConfig {
                     runtime,
                     config_path: config,
                     verbose,
                     force,
-                    target: target.or(cli.target),
+                    target: target.clone(),
                     target_board: park_target_board(target_board),
                     provision_profile: provision_profile.clone(),
                     env_vars: build_env_vars(provision_profile.as_ref(), env.as_ref()),
@@ -2648,6 +2649,7 @@ async fn main() -> Result<()> {
                     provision_profile,
                     src_dir,
                     config_path,
+                    target,
                     interactive,
                 }
                 .execute(provision_cmd)

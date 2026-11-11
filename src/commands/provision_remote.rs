@@ -238,9 +238,10 @@ pub async fn resolve(wanted: &str, scope: &Scope<'_>) -> Result<Board> {
     .with_context(|| format!("no VM in this Connect org drives a Rubicon named {wanted:?}"))
 }
 
-/// The board to use when none is named: the project's `rubicon.default`.
-pub fn default_board(config_path: &str) -> Result<String> {
-    let config = crate::utils::config::Config::load(config_path)?;
+/// The board to use when none is named: the project's `rubicon.default`,
+/// with `{{ avocado.target }}` as `target` (the command's `--target`).
+pub fn default_board(config_path: &str, target: Option<&str>) -> Result<String> {
+    let config = crate::utils::config::Config::load_for_target(config_path, target)?;
     config
         .rubicon
         .as_ref()
@@ -577,6 +578,9 @@ pub struct RemoteProvision {
     /// Project directory (where `--pack` stages into).
     pub src_dir: PathBuf,
     pub config_path: String,
+    /// The provision's `--target`: the bundle is built for it, so
+    /// `rubicon.default` resolves with it too.
+    pub target: Option<String>,
     /// `--interactive`: a human watches the console; no boot check.
     pub interactive: bool,
 }
@@ -617,7 +621,7 @@ fn staging_name(address: &str) -> String {
 impl RemoteProvision {
     pub async fn execute(&self, provision: ProvisionCommand) -> Result<()> {
         let wanted = match self.rubicon.trim() {
-            "" => default_board(&self.config_path)?,
+            "" => default_board(&self.config_path, self.target.as_deref())?,
             w => w.to_string(),
         };
         let scope = Scope {
@@ -779,6 +783,20 @@ impl RemoteProvision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_board_follows_the_commands_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: a\nrubicon:\n  default: \"bench-{{ avocado.target }}\"\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        // `--target b` builds the bundle for b: the board must be b's too.
+        assert_eq!(default_board(path, Some("b")).unwrap(), "bench-b");
+    }
 
     #[test]
     fn queue_lines_name_the_job_who_and_how_long() {

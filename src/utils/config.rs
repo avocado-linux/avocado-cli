@@ -4029,6 +4029,12 @@ impl Config {
 
     /// Load configuration from a file (supports YAML and TOML)
     pub fn load<P: AsRef<Path>>(config_path: P) -> Result<Self> {
+        Self::load_for_target(config_path, None)
+    }
+
+    /// [`Self::load`], with `{{ avocado.target }}` resolved to `target`
+    /// (`None`: `AVOCADO_TARGET`, then `default_target`).
+    pub fn load_for_target<P: AsRef<Path>>(config_path: P, target: Option<&str>) -> Result<Self> {
         let path = config_path.as_ref();
 
         if !path.exists() {
@@ -4039,18 +4045,22 @@ impl Config {
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         crate::utils::config_lint::warn_ignored_keys_once(path, &content);
 
-        Self::load_from_yaml_str(&content)
+        Self::load_from_yaml_str_for_target(&content, target)
             .with_context(|| format!("Failed to parse YAML config file: {}", path.display()))
     }
 
     /// Load configuration from a YAML string
     pub fn load_from_yaml_str(content: &str) -> Result<Self> {
+        Self::load_from_yaml_str_for_target(content, None)
+    }
+
+    fn load_from_yaml_str_for_target(content: &str, target: Option<&str>) -> Result<Self> {
         // Parse YAML into a Value first
         let mut parsed: serde_yaml::Value =
             serde_yaml::from_str(content).with_context(|| "Failed to parse YAML configuration")?;
 
         // Perform interpolation before deserializing to Config struct
-        crate::utils::interpolation::interpolate_config(&mut parsed, None, None)
+        crate::utils::interpolation::interpolate_config(&mut parsed, target, None)
             .with_context(|| "Failed to interpolate configuration values")?;
 
         // Deserialize to Config struct

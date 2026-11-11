@@ -82,7 +82,7 @@ impl RubiconCommand {
     async fn board(&self, wanted: &Option<String>) -> Result<Board> {
         let wanted = match wanted {
             Some(w) => w.clone(),
-            None => remote::default_board(&self.config_path)?,
+            None => remote::default_board(&self.config_path, None)?,
         };
         remote::resolve(&wanted, &self.scope()).await
     }
