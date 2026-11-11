@@ -203,6 +203,32 @@ impl SdkCleanCommand {
                 "No clean scripts defined for the specified sections.",
                 OutputLevel::Normal,
             );
+            // The sections were still asked to be cleaned, so their stamps go:
+            // the next `ext build` compiles them again.
+            let remove_stamps: String = self
+                .sections
+                .iter()
+                .map(|s| {
+                    crate::utils::stamps::remove_own_stamp_line(&StampRequirement::sdk_compile(s))
+                })
+                .collect();
+            let run_config = RunConfig {
+                container_image: ctx.container_image.to_string(),
+                target: ctx.target.to_string(),
+                command: remove_stamps,
+                verbose: self.verbose,
+                source_environment: false,
+                interactive: false,
+                repo_url: ctx.repo_url.clone(),
+                repo_release: ctx.repo_release.clone(),
+                container_args: ctx.merged_container_args.clone(),
+                dnf_args: self.dnf_args.clone(),
+                sdk_arch: self.sdk_arch.clone(),
+                ..Default::default()
+            };
+            if !ctx.container_helper.run_in_container(run_config).await? {
+                return Err(anyhow::anyhow!("Failed to remove compile section stamps"));
+            }
             return Ok(());
         }
 
