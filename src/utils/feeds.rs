@@ -295,6 +295,11 @@ pub struct ResolvedFeed {
     pub mount: Option<PathBuf>,
     #[serde(skip)]
     loopback_rewritten: bool,
+    /// Whether this feed's loopback host is rewritten for the container, decided
+    /// at resolve time from project configuration alone. Kept so the Connect path,
+    /// which has no URL until the mint returns, applies the same decision.
+    #[serde(skip)]
+    rewrite_loopback: bool,
     /// The locator as configured, for the lock: a `url:` with `$releasever` and
     /// `$target` expanded but WITHOUT the loopback rewrite, or a `path:` exactly
     /// as written. `baseurl` is the container's view — `host.docker.internal` on
@@ -486,6 +491,8 @@ impl ResolvedFeedSet {
         }
         let empty = HashMap::new();
         let repos = repos.unwrap_or(&empty);
+        let host_network =
+            args_have_host_network(config.get_sdk_container_args().map_or(&[], |a| a));
 
         // Validate definitions once, independent of enablement — in name order so
         // the first error reported is the same every run.
@@ -545,6 +552,7 @@ impl ResolvedFeedSet {
                     ("password", def.password.is_some()),
                     ("ca", def.ca.is_some()),
                     ("tls_verify", def.tls_verify.is_some()),
+                    ("rewrite_loopback", def.rewrite_loopback.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(k, set)| set.then_some(k))
@@ -592,6 +600,7 @@ impl ResolvedFeedSet {
                     ("gpgcheck", def.gpgcheck.is_some()),
                     ("targets", def.targets.is_some()),
                     ("stages", def.stages.is_some()),
+                    ("rewrite_loopback", def.rewrite_loopback.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(k, set)| set.then_some(k))
@@ -806,6 +815,7 @@ impl ResolvedFeedSet {
                     ca: None,
                     mount: None,
                     loopback_rewritten: false,
+                    rewrite_loopback: false,
                     placement: Placement::Any,
                 });
                 continue;
@@ -837,6 +847,10 @@ impl ResolvedFeedSet {
                 (None, Some(u)) => format!("basic:{}", short_sha256(u.as_bytes())),
                 (None, None) => "none".to_string(),
             };
+            // From project configuration alone: command-line container args are
+            // not consulted, so install and build stamp the same baseurl. An
+            // explicit key wins over detection.
+            let rewrite = def.rewrite_loopback.unwrap_or(!host_network);
             let common = |kind,
                           baseurl,
                           locality,
@@ -867,6 +881,7 @@ impl ResolvedFeedSet {
                     ca: def.ca.as_ref().map(|c| resolve_relative(config_dir, c)),
                     mount,
                     loopback_rewritten,
+                    rewrite_loopback: rewrite,
                     placement: addon_placement.get(name).copied().unwrap_or_default(),
                 }
             };
@@ -880,7 +895,11 @@ impl ResolvedFeedSet {
                 // container reachability, and on an ephemeral port it would make
                 // the lock churn every run.
                 let configured = expanded.clone();
-                let (expanded, rewritten) = rewrite_loopback(&expanded);
+                let (expanded, rewritten) = if rewrite {
+                    rewrite_loopback(&expanded)
+                } else {
+                    (expanded, false)
+                };
                 feeds.push(common(
                     FeedKind::Url,
                     expanded,
@@ -955,6 +974,7 @@ impl ResolvedFeedSet {
                 ca: None,
                 mount: None,
                 loopback_rewritten: false,
+                rewrite_loopback: false,
                 placement: Placement::Any,
             });
         }
@@ -1265,8 +1285,12 @@ impl ResolvedFeedSet {
             // `url:` feeds are rewritten at resolve time, but a Connect feed has no
             // URL until now, so it has to happen here or a local Connect silently
             // resolves to nothing.
-            let (baseurl, rewritten) =
-                rewrite_loopback(&format!("{}/{path}", minted.feed_url.trim_end_matches('/')));
+            let minted_url = format!("{}/{path}", minted.feed_url.trim_end_matches('/'));
+            let (baseurl, rewritten) = if feed.rewrite_loopback {
+                rewrite_loopback(&minted_url)
+            } else {
+                (minted_url, false)
+            };
             feed.baseurl = baseurl;
             feed.loopback_rewritten = rewritten;
             // The username is for log correlation only; the verifier reads the
@@ -1541,8 +1565,15 @@ fn resolve_relative(config_dir: &Path, p: &str) -> PathBuf {
 /// distro feed the same single report. Saying nothing was the previous
 /// behaviour, and it made an unreachable localhost feed look like a feed that
 /// was simply down.
-pub fn rewrite_loopback_reported(url: &str) -> String {
+///
+/// `host_network` is the decision derived from `sdk.container_args`: under host
+/// networking the container shares the host's loopback, so the URL is left alone.
+/// The `repos.*.rewrite_loopback` key does not apply to the distro feed.
+pub fn rewrite_loopback_reported(url: &str, host_network: bool) -> String {
     static REPORTED: std::sync::Once = std::sync::Once::new();
+    if host_network {
+        return url.to_string();
+    }
     let (rewritten, changed) = rewrite_loopback(url);
     if changed {
         let msg = rewritten.clone();
@@ -2924,5 +2955,140 @@ distro:
             })
             .expect("sh available");
         assert!(out.success(), "FEEDS_SETUP_SNIPPET failed sh -n");
+    }
+
+    fn local_feed_set(extra_key: &str, container_args: Option<&str>) -> ResolvedFeedSet {
+        let sdk = container_args
+            .map(|a| format!("sdk:\n  container_args: [{a}]\n"))
+            .unwrap_or_default();
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n{extra_key}{sdk}"
+        ));
+        ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn local_baseurl(set: &ResolvedFeedSet) -> String {
+        set.feeds
+            .iter()
+            .find(|f| f.name == "local")
+            .unwrap()
+            .baseurl
+            .clone()
+    }
+
+    /// Install hashes the projection with its command-line container args in
+    /// hand and build does not. The decision reads project configuration alone,
+    /// so the stamp cannot depend on them.
+    #[test]
+    fn stage_projection_equal_with_and_without_cli_args() {
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\nsdk:\n  container_args: [--privileged]\n"
+        ));
+        let cli = sv(&["--network=host"]);
+        // The merged view a container run would see differs ...
+        let merged = c.merge_sdk_container_args(Some(&cli)).unwrap();
+        assert!(args_have_host_network(&merged));
+        assert!(!args_have_host_network(c.get_sdk_container_args().unwrap()));
+        // ... but resolve takes no command-line args, so both stages agree.
+        let install = ResolvedFeedSet::resolve(&c, "t", Path::new("."), Some("2026/next"))
+            .unwrap()
+            .unwrap();
+        let build = ResolvedFeedSet::resolve(&c, "t", Path::new("."), Some("2026/next"))
+            .unwrap()
+            .unwrap();
+        for stage in [FeedStage::Ext, FeedStage::Rootfs] {
+            assert_eq!(
+                install.stage_projection_json(stage).unwrap(),
+                build.stage_projection_json(stage).unwrap()
+            );
+        }
+        assert!(local_baseurl(&install).contains(HOST_GATEWAY_ALIAS));
+    }
+
+    #[test]
+    fn loopback_rewritten_by_default_and_skipped_under_host_network() {
+        assert!(local_baseurl(&local_feed_set("", None)).contains(HOST_GATEWAY_ALIAS));
+        assert!(
+            local_baseurl(&local_feed_set("", Some("--privileged"))).contains(HOST_GATEWAY_ALIAS)
+        );
+        assert_eq!(
+            local_baseurl(&local_feed_set("", Some("--network=host"))),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            local_baseurl(&local_feed_set("", Some("--network, host"))),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn explicit_rewrite_loopback_key_wins_over_detection() {
+        let on = local_feed_set("    rewrite_loopback: true\n", Some("--network=host"));
+        assert!(local_baseurl(&on).contains(HOST_GATEWAY_ALIAS));
+        assert!(
+            on.feeds
+                .iter()
+                .find(|f| f.name == "local")
+                .unwrap()
+                .rewrite_loopback
+        );
+        let off = local_feed_set("    rewrite_loopback: false\n", None);
+        assert_eq!(local_baseurl(&off), "http://localhost:8080");
+        assert!(
+            !off.feeds
+                .iter()
+                .find(|f| f.name == "local")
+                .unwrap()
+                .rewrite_loopback
+        );
+    }
+
+    #[test]
+    fn connect_feed_stores_the_rewrite_decision() {
+        let mk = |extra: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: acme\n{extra}"
+            ));
+            ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap()
+                .unwrap()
+        };
+        let flag = |s: &ResolvedFeedSet| {
+            s.feeds
+                .iter()
+                .find(|f| f.name == "acme")
+                .unwrap()
+                .rewrite_loopback
+        };
+        assert!(flag(&mk("")));
+        assert!(!flag(&mk("    rewrite_loopback: false\n")));
+        assert!(!flag(&mk("sdk:\n  container_args: [--net=host]\n")));
+    }
+
+    #[test]
+    fn rewrite_loopback_key_is_rejected_on_distro_and_builtin_feeds() {
+        let c = load(&format!(
+            "{BASE}repos:\n  avocado-ext:\n    rewrite_loopback: true\n"
+        ));
+        let e = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).unwrap_err();
+        assert!(e.to_string().contains("rewrite_loopback"), "{e}");
+        let c = load(&format!(
+            "{BASE}repos:\n  {DEFAULT_DISTRO_FEED_NAME}:\n    url: https://repo.example.org\n    rewrite_loopback: true\n"
+        ));
+        let e = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).unwrap_err();
+        assert!(e.to_string().contains("rewrite_loopback"), "{e}");
+    }
+
+    #[test]
+    fn reported_rewrite_skips_distro_url_under_host_network() {
+        assert_eq!(
+            rewrite_loopback_reported("http://localhost:1/x", true),
+            "http://localhost:1/x"
+        );
+        assert!(
+            rewrite_loopback_reported("http://localhost:1/x", false).contains(HOST_GATEWAY_ALIAS)
+        );
     }
 }

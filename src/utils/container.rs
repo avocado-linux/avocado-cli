@@ -880,6 +880,26 @@ pub fn inject_kernel_cmdline(
     Ok(())
 }
 
+/// Host networking as the container will actually see it, from the container
+/// args the run carries (`sdk.container_args` and anything layered on it).
+fn run_config_has_host_network(config: &RunConfig) -> bool {
+    crate::utils::feeds::args_have_host_network(config.container_args.as_deref().unwrap_or(&[]))
+}
+
+/// The distro repository URL the container's `AVOCADO_SDK_REPO_URL` carries.
+/// No `ResolvedFeed` is in scope here, so the loopback rewrite follows the
+/// host-networking decision alone; `repos.*.rewrite_loopback` does not apply to
+/// the distro feed.
+fn distro_repo_url_for_container(config: &RunConfig) -> String {
+    crate::utils::feeds::rewrite_loopback_reported(
+        &config
+            .repo_url
+            .clone()
+            .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        run_config_has_host_network(config),
+    )
+}
+
 /// Configuration for running commands in containers
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -2098,12 +2118,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(&config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -2367,12 +2382,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -2703,10 +2713,11 @@ impl SdkContainer {
         }
         // A loopback distro feed (`distro.repo.url: http://localhost:…`) is
         // rewritten to the host-gateway alias in the env; the alias needs a route.
-        if config
-            .repo_url
-            .as_deref()
-            .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
+        if !run_config_has_host_network(config)
+            && config
+                .repo_url
+                .as_deref()
+                .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
         {
             add_hosts.push(crate::utils::feeds::host_gateway_add_host(
                 is_vm_routing_active(),
@@ -2876,12 +2887,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(&config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -3293,12 +3299,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -7199,5 +7200,25 @@ extensions:
                 "a run without --rm must keep its container: {log}"
             );
         }
+    }
+
+    #[test]
+    fn distro_repo_url_follows_host_networking_of_the_run() {
+        let url = |args: Option<Vec<String>>| {
+            let cfg = RunConfig {
+                repo_url: Some("http://localhost:9000".to_string()),
+                container_args: args,
+                ..Default::default()
+            };
+            (
+                distro_repo_url_for_container(&cfg),
+                run_config_has_host_network(&cfg),
+            )
+        };
+        let (rewritten, hn) = url(None);
+        assert!(rewritten.contains("host.docker.internal") && !hn);
+        let (kept, hn) = url(Some(vec!["--network=host".to_string()]));
+        assert_eq!(kept, "http://localhost:9000");
+        assert!(hn);
     }
 }
