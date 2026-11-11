@@ -481,7 +481,9 @@ enum Commands {
         /// Provision from a bundle with only the SDK installed (no build
         /// tree): a bundle directory made by `--pack`, or a job's spec.json
         /// (bundle.json + blob URLs). Blobs are cached by sha256 under
-        /// `.avocado-bundle/` in the current directory.
+        /// `.avocado-bundle/` in the current directory, which gets the
+        /// bundle's avocado.yaml/lock: run it in an empty directory (or one
+        /// an earlier replay used), never a project.
         #[arg(long = "bundle", conflicts_with_all = ["list", "name"])]
         bundle: Option<String>,
         /// With `--bundle`: run this command in the bundle's SDK container

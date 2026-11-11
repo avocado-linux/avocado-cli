@@ -633,6 +633,26 @@ fn carried_feed(meta: &BundleMeta) -> Option<(&str, &str)> {
         .map(|u| ("AVOCADO_REPO_URL", u.as_str()))
 }
 
+/// A replay writes the bundle's avocado.yaml and avocado.lock into the
+/// directory it runs in. Refuse one holding a project a replay didn't write
+/// (no `.avocado-bundle/files.tsv`, which every replay writes before them);
+/// a hub's work directory, reused job after job, passes.
+fn check_replay_dir(cwd: &Path) -> Result<()> {
+    if cwd.join(WORK_DIR).join("files.tsv").is_file() {
+        return Ok(());
+    }
+    for f in ["avocado.yaml", "avocado.lock"] {
+        if cwd.join(f).exists() {
+            bail!(
+                "{} was not written by a bundle replay, which would replace it; \
+                 run `avocado provision --bundle` from an empty directory",
+                cwd.join(f).display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite the packing host's SDK path (`…/sdk/<arch>/…`) to this host's.
 pub fn localize_env(meta: &BundleMeta) -> HashMap<String, String> {
     let from = format!("/sdk/{}/", sdk_arch_dir(&meta.sdk_host_arch));
@@ -790,6 +810,7 @@ impl BundleProvision {
         // Blob cache: fetch only what isn't here yet, keep only what this
         // bundle uses (bounds the disk to one bundle's worth).
         let cwd = std::env::current_dir()?;
+        check_replay_dir(&cwd)?;
         let work = cwd.join(WORK_DIR);
         let cache = work.join("blobs");
         std::fs::create_dir_all(&cache)?;
@@ -823,14 +844,16 @@ impl BundleProvision {
         }
 
         unpack_ext_sources(&meta, &cwd, &cache)?;
-        std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
-        std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
+        // files.tsv first: it marks the directory as a replay's (see
+        // `check_replay_dir`) before the project files are written.
         let tsv: String = meta
             .files
             .iter()
             .map(|f| format!("{}\t{}\t{}\n", f.sha256, f.mode, f.path))
             .collect();
         std::fs::write(work.join("files.tsv"), tsv)?;
+        std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
+        std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
 
         // The SDK matching the bundled lock. Reuses this directory's volume,
         // so later bundles for the same target skip the download.
@@ -1072,6 +1095,22 @@ mod tests {
         assert!(got.join("avocado.yaml").is_file());
         assert!(got.join("stone/x.json").is_file());
         assert!(!got.join(".git").exists(), "repo metadata stays home");
+    }
+
+    #[test]
+    fn a_replay_never_replaces_a_project_it_did_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        check_replay_dir(d).expect("an empty directory is fine");
+        std::fs::write(d.join("avocado.lock"), "{}").unwrap();
+        let e = check_replay_dir(d).unwrap_err().to_string();
+        assert!(e.contains("avocado.lock"), "{e}");
+        std::fs::write(d.join("avocado.yaml"), "default_target: t\n").unwrap();
+        assert!(check_replay_dir(d).is_err(), "a project is refused");
+        // A directory an earlier replay wrote (a hub's work dir) is reused.
+        std::fs::create_dir_all(d.join(WORK_DIR)).unwrap();
+        std::fs::write(d.join(WORK_DIR).join("files.tsv"), "").unwrap();
+        check_replay_dir(d).expect("a replay's own files are replaced");
     }
 
     #[test]
