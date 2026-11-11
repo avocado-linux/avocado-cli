@@ -1110,6 +1110,31 @@ mod tests {
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
+    /// A modprobe entry with shell text, or a hook entry with a line break,
+    /// is caught before the build writes it to the release file.
+    #[test]
+    fn bad_modprobe_and_hook_entries_are_errors() {
+        let errs = errors(
+            "default_target: qemux86-64\nruntimes:\n  dev:\n    extensions: [app]\nextensions:\n  app:\n    modprobe: [uvcvideo, \"nvidia $(reboot)\"]\n    on_merge: [\"echo one\\necho two\"]\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/extensions/app/modprobe/1 ")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.starts_with("/extensions/app/modprobe/0 ")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/extensions/app/on_merge/0 ")),
+            "{errs:?}"
+        );
+    }
+
     #[test]
     fn a_parse_error_is_the_only_error() {
         let report = validate("default_target: [\n");

@@ -10,6 +10,7 @@ use crate::utils::output::{
     print_error, print_info, print_success, print_warning, print_warning_above, OutputLevel,
 };
 use crate::utils::permissions::render_users_groups_script;
+use crate::utils::shell::shell_escape_double_quoted;
 use crate::utils::stamps::{
     compute_ext_build_input_hash, generate_batch_read_stamps_script,
     generate_write_stamp_script_with_digest, render_sysroot_digest_script, resolve_required_stamps,
@@ -659,6 +660,18 @@ impl ExtBuildCommand {
             // returns early while a renderer or `--json` is active, which covers
             // the interactive `avocado build`, so the services would silently
             // never be enabled on a run that looks clean.
+            print_warning_above(&message);
+        }
+
+        check_hook_entries(
+            &self.extension,
+            &modprobe_modules,
+            &on_merge_commands,
+            &on_unmerge_commands,
+        )?;
+        if let Some(message) =
+            modprobe_sysext_warning(&self.extension, &modprobe_modules, &ext_types)
+        {
             print_warning_above(&message);
         }
 
@@ -1374,52 +1387,26 @@ fi
         // Create modprobe commands section for AVOCADO_ON_MERGE. It is written
         // outside the kernel module check: a module can come from the rootfs
         // kernel or another extension, not only from this one.
-        let modprobe_section = if !modprobe_modules.is_empty() {
-            modprobe_modules
-                .iter()
-                .map(|module| {
-                    format!(
-                        r#"echo "AVOCADO_ON_MERGE=\"modprobe {module}\"" >> "$release_file"
-echo "[INFO] Added AVOCADO_ON_MERGE=\"modprobe {module}\" to release file""#
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
+        let modprobe_commands: Vec<String> = modprobe_modules
+            .iter()
+            .map(|module| format!("modprobe {module}"))
+            .collect();
+        let modprobe_section =
+            release_hook_section("AVOCADO_ON_MERGE", &modprobe_commands, |command| {
+                format!(r#"[INFO] Added AVOCADO_ON_MERGE=\"{command}\" to release file"#)
+            });
 
         // Create custom on_merge commands section
-        let custom_on_merge_section = if !on_merge_commands.is_empty() {
-            on_merge_commands
-                .iter()
-                .map(|command| {
-                    format!(
-                        r#"echo "AVOCADO_ON_MERGE=\"{command}\"" >> "$release_file"
-echo "[INFO] Added custom on_merge command to release file: {command}""#
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
+        let custom_on_merge_section =
+            release_hook_section("AVOCADO_ON_MERGE", on_merge_commands, |command| {
+                format!("[INFO] Added custom on_merge command to release file: {command}")
+            });
 
         // Create custom on_unmerge commands section
-        let custom_on_unmerge_section = if !on_unmerge_commands.is_empty() {
-            on_unmerge_commands
-                .iter()
-                .map(|command| {
-                    format!(
-                        r#"echo "AVOCADO_ON_UNMERGE=\"{command}\"" >> "$release_file"
-echo "[INFO] Added custom on_unmerge command to release file: {command}""#
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
+        let custom_on_unmerge_section =
+            release_hook_section("AVOCADO_ON_UNMERGE", on_unmerge_commands, |command| {
+                format!("[INFO] Added custom on_unmerge command to release file: {command}")
+            });
 
         let users_section = self.create_users_script_section(users_config, groups_config);
 
@@ -1673,36 +1660,16 @@ echo "[INFO] Added AVOCADO_ENABLE_SERVICES=\"{services_list}\" to release file""
         };
 
         // Create custom on_merge commands section for confext
-        let custom_on_merge_section = if !on_merge_commands.is_empty() {
-            on_merge_commands
-                .iter()
-                .map(|command| {
-                    format!(
-                        r#"echo "AVOCADO_ON_MERGE=\"{command}\"" >> "$release_file"
-echo "[INFO] Added custom on_merge command to release file: {command}""#
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
+        let custom_on_merge_section =
+            release_hook_section("AVOCADO_ON_MERGE", on_merge_commands, |command| {
+                format!("[INFO] Added custom on_merge command to release file: {command}")
+            });
 
         // Create custom on_unmerge commands section for confext
-        let custom_on_unmerge_section = if !on_unmerge_commands.is_empty() {
-            on_unmerge_commands
-                .iter()
-                .map(|command| {
-                    format!(
-                        r#"echo "AVOCADO_ON_UNMERGE=\"{command}\"" >> "$release_file"
-echo "[INFO] Added custom on_unmerge command to release file: {command}""#
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
+        let custom_on_unmerge_section =
+            release_hook_section("AVOCADO_ON_UNMERGE", on_unmerge_commands, |command| {
+                format!("[INFO] Added custom on_unmerge command to release file: {command}")
+            });
 
         format!(
             r#"
@@ -2051,6 +2018,95 @@ fi
     }
 }
 
+/// Shell lines that append `KEY="<command>"` to `$release_file` for each
+/// command and log it. `log` gets the escaped command and returns the log text.
+///
+/// Each command is escaped, so it reaches the release file as written and
+/// never runs in the build container. avocadoctl splits it on the device.
+fn release_hook_section(key: &str, commands: &[String], log: impl Fn(&str) -> String) -> String {
+    commands
+        .iter()
+        .map(|command| {
+            let command = shell_escape_double_quoted(command);
+            let log = log(&command);
+            format!(
+                r#"echo "{key}=\"{command}\"" >> "$release_file"
+echo "{log}""#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Check the `modprobe`, `on_merge` and `on_unmerge` entries of an extension.
+///
+/// Each entry becomes one line of the release file, which avocadoctl reads
+/// line by line, so an entry must not hold a line break. A `modprobe` entry
+/// is a module name, then optional parameters such as `param=value`.
+fn check_hook_entries(
+    extension: &str,
+    modprobe_modules: &[String],
+    on_merge_commands: &[String],
+    on_unmerge_commands: &[String],
+) -> Result<()> {
+    for entry in modprobe_modules {
+        if !is_valid_modprobe_entry(entry) {
+            return Err(anyhow::anyhow!(
+                "Extension '{extension}' has an invalid modprobe entry {entry:?}. \
+                 Use a module name (letters, digits, '_' or '-'), optionally followed \
+                 by parameters such as 'param=value'."
+            ));
+        }
+    }
+    for (key, commands) in [
+        ("on_merge", on_merge_commands),
+        ("on_unmerge", on_unmerge_commands),
+    ] {
+        if let Some(entry) = commands.iter().find(|c| c.contains(['\n', '\r'])) {
+            return Err(anyhow::anyhow!(
+                "Extension '{extension}' has an {key} entry with a line break: {entry:?}. \
+                 Put each command in its own list item."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A module name, then zero or more parameters, separated by spaces.
+/// Parameters are unquoted, because avocadoctl splits the line on whitespace.
+/// The schema's `modprobe` item pattern accepts the same entries.
+fn is_valid_modprobe_entry(entry: &str) -> bool {
+    let is_module_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+    let is_param_char = |c: char| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ',' | ':' | '/' | '=' | '+')
+    };
+    let mut words = entry.split(' ').filter(|w| !w.is_empty());
+    let Some(module) = words.next() else {
+        return false;
+    };
+    // A leading '-' would make modprobe read the module name as an option.
+    !module.starts_with('-')
+        && module.chars().all(is_module_char)
+        && words.all(|w| w.chars().all(is_param_char))
+}
+
+/// The text to warn with when an extension lists `modprobe` but does not build
+/// a sysext. Only the sysext release file gets the `modprobe` lines, so the
+/// modules would never load. `None` when nothing is wrong.
+fn modprobe_sysext_warning(
+    extension: &str,
+    modprobe_modules: &[String],
+    ext_types: &[&str],
+) -> Option<String> {
+    if modprobe_modules.is_empty() || ext_types.contains(&"sysext") {
+        return None;
+    }
+    Some(format!(
+        "Extension '{extension}' has modprobe configured but 'sysext' is not in types. \
+         The modules are loaded from the sysext. Please add 'sysext' to the types array."
+    ))
+}
+
 /// The text to warn with when an extension lists `enable_services` but does not
 /// build a confext, which is what links the units. `None` when nothing is wrong.
 ///
@@ -2112,6 +2168,119 @@ mod tests {
             enable_services_confext_warning("my-ext", &[], &["sysext"]),
             None
         );
+    }
+
+    /// modprobe lines are written only to the sysext release file, so a
+    /// confext-only extension with a modprobe list must be flagged.
+    #[test]
+    fn modprobe_without_a_sysext_is_flagged() {
+        let modules = vec!["uvcvideo".to_string()];
+        let message = modprobe_sysext_warning("my-ext", &modules, &["confext"])
+            .expect("modprobe without a sysext must be flagged");
+        assert!(message.contains("my-ext"));
+        assert!(message.contains("'sysext' is not in types"));
+        assert!(!message.starts_with("Warning"));
+    }
+
+    #[test]
+    fn modprobe_with_a_sysext_or_no_modprobe_is_not_flagged() {
+        let modules = vec!["uvcvideo".to_string()];
+        assert_eq!(
+            modprobe_sysext_warning("my-ext", &modules, &["sysext", "confext"]),
+            None
+        );
+        assert_eq!(
+            modprobe_sysext_warning("my-ext", &modules, &["sysext"]),
+            None
+        );
+        assert_eq!(modprobe_sysext_warning("my-ext", &[], &["confext"]), None);
+    }
+
+    const VALID_MODPROBE_ENTRIES: &[&str] = &[
+        "uvcvideo",
+        "br_netfilter",
+        "gpio-pca953x",
+        "nvidia NVreg_EnableGpuFirmware=0",
+        "usbcore quirks=0bda:8153:k autosuspend=-1",
+        "snd-hda-intel model=auto,generic power_save=1",
+        "brcmfmac firmware_path=/lib/firmware/brcm",
+    ];
+
+    const INVALID_MODPROBE_ENTRIES: &[&str] = &[
+        "",
+        " ",
+        r#"nvidia "x""#,
+        "nvidia $(reboot)",
+        "nvidia `reboot`",
+        "nvidia; reboot",
+        "nvidia\nreboot",
+        "nvidia\treboot",
+        "-v nvidia",
+        "nvidia param='a'",
+    ];
+
+    #[test]
+    fn modprobe_entries_accept_modules_with_parameters() {
+        for entry in VALID_MODPROBE_ENTRIES {
+            assert!(is_valid_modprobe_entry(entry), "{entry:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn modprobe_entries_reject_shell_text_and_line_breaks() {
+        for entry in INVALID_MODPROBE_ENTRIES {
+            assert!(
+                !is_valid_modprobe_entry(entry),
+                "{entry:?} must be rejected"
+            );
+        }
+    }
+
+    /// `avocado config validate` checks the schema pattern, and the build
+    /// checks `is_valid_modprobe_entry`. Both must agree on every entry.
+    #[test]
+    fn the_schema_modprobe_pattern_matches_the_build_check() {
+        let pattern = crate::utils::config_lint::schema()["definitions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find_map(|d| d.pointer("/properties/modprobe/items/pattern"))
+            .and_then(|p| p.as_str())
+            .expect("schema has a modprobe item pattern");
+        let re = regex::Regex::new(pattern).unwrap();
+        for entry in VALID_MODPROBE_ENTRIES
+            .iter()
+            .chain(INVALID_MODPROBE_ENTRIES)
+        {
+            assert_eq!(
+                re.is_match(entry),
+                is_valid_modprobe_entry(entry),
+                "schema and build check disagree on {entry:?}"
+            );
+        }
+    }
+
+    /// A bad entry fails the build with a config error that shows the entry,
+    /// not with a shell error from the build script.
+    #[test]
+    fn hook_entry_check_reports_the_bad_entry() {
+        let ok = vec!["uvcvideo".to_string()];
+        let hooks = vec![r#"sh -c "echo $(date)""#.to_string()];
+        assert!(check_hook_entries("my-ext", &ok, &hooks, &hooks).is_ok());
+
+        let bad = vec!["uvcvideo".to_string(), r#"nvidia "x""#.to_string()];
+        let err = check_hook_entries("my-ext", &bad, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("my-ext"), "{err}");
+        assert!(err.contains(r#""nvidia \"x\"""#), "{err}");
+
+        let multi_line = vec!["echo one\necho two".to_string()];
+        let err = check_hook_entries("my-ext", &ok, &[], &multi_line)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("on_unmerge"), "{err}");
+        assert!(err.contains(r#""echo one\necho two""#), "{err}");
     }
 
     /// Only an extension with packages needs an installed sysroot before it
@@ -3765,6 +3934,97 @@ extensions:
                     r#"AVOCADO_ON_MERGE="modprobe br_netfilter""#,
                 ],
                 "modules dir {modules:?}, release file:\n{release}"
+            );
+        }
+    }
+
+    // An on_merge or on_unmerge entry reaches the release file exactly as
+    // written. A quote must not break the build script, and `$(...)` or a
+    // backtick must not run in the build container: avocadoctl splits the
+    // value itself on the device, with no shell.
+    #[cfg(unix)]
+    #[test]
+    fn hook_entries_reach_the_release_file_verbatim() {
+        let cmd = ExtBuildCommand {
+            extension: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran");
+        let on_merge = vec![
+            r#"echo "quoted""#.to_string(),
+            r#"echo 7" screen"#.to_string(),
+            format!("echo $(touch {})", marker.display()),
+            format!("echo `touch {}`", marker.display()),
+            r"echo back\slash $HOME".to_string(),
+        ];
+        let on_unmerge = vec![r#"echo "bye""#.to_string()];
+        let scopes = ["system".to_string()];
+        let scripts = [
+            (
+                "usr/lib",
+                cmd.create_sysext_build_script(
+                    "1.0",
+                    &scopes,
+                    None,
+                    &[],
+                    &on_merge,
+                    &on_unmerge,
+                    None,
+                    None,
+                    false,
+                    "/opt/src",
+                ),
+            ),
+            (
+                "etc",
+                cmd.create_confext_build_script(
+                    "1.0",
+                    &scopes,
+                    None,
+                    &[],
+                    &on_merge,
+                    &on_unmerge,
+                    None,
+                    None,
+                    false,
+                    "/opt/src",
+                ),
+            ),
+        ];
+        std::fs::create_dir_all(tmp.path().join("sysroots/app")).unwrap();
+        for (dir, script) in scripts {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("AVOCADO_EXT_SYSROOTS", tmp.path().join("sysroots"))
+                .env("AVOCADO_PREFIX", tmp.path().join("prefix"))
+                .output()
+                .expect("run script");
+            assert!(
+                out.status.success(),
+                "{dir} script failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!marker.exists(), "{dir} script ran an on_merge entry");
+            let release = std::fs::read_to_string(
+                tmp.path()
+                    .join("sysroots/app")
+                    .join(dir)
+                    .join("extension-release.d/extension-release.app-1.0"),
+            )
+            .unwrap();
+            let expected: Vec<String> = on_merge
+                .iter()
+                .map(|c| format!("AVOCADO_ON_MERGE=\"{c}\""))
+                .collect();
+            assert_eq!(on_merge_lines(&release), expected, "{dir}");
+            assert!(
+                release
+                    .lines()
+                    .any(|l| l == r#"AVOCADO_ON_UNMERGE="echo "bye"""#),
+                "{dir} release file:\n{release}"
             );
         }
     }

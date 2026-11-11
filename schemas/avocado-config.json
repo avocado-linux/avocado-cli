@@ -1999,8 +1999,12 @@
         },
         "modprobe": {
           "title": "Kernel modules",
-          "$ref": "#/definitions/stringList",
-          "description": "Kernel modules to load when the extension is active. Modules must be available in the kernel or provided by the extension.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^ *[A-Za-z0-9_][A-Za-z0-9_-]*( +[A-Za-z0-9_.,:/=+-]+)* *$"
+          },
+          "description": "Kernel modules to load when the extension is active, each a module name optionally followed by parameters such as 'param=value'. Modules must be available in the kernel or provided by the extension. The extension must build a sysext.",
           "examples": [
             [
               "overlay",
@@ -2009,12 +2013,20 @@
           ]
         },
         "on_merge": {
-          "$ref": "#/definitions/stringList",
-          "description": "Commands run when the extension is merged."
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\r\\n]*$"
+          },
+          "description": "Commands run when the extension is merged. Each item is one command on one line."
         },
         "on_unmerge": {
-          "$ref": "#/definitions/stringList",
-          "description": "Commands run when the extension is unmerged."
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\r\\n]*$"
+          },
+          "description": "Commands run when the extension is unmerged. Each item is one command on one line."
         },
         "reload_service_manager": {
           "type": "boolean",
