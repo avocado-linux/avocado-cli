@@ -1008,6 +1008,12 @@ pub struct RubiconConfig {
     /// contribute it with their run profiles; the project wins per pin.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wiring: BTreeMap<String, String>,
+    /// What this CLI can't read, set aside at load (see
+    /// [`set_aside_unknown_rubicon`]): `rubicon.run.<name>` or
+    /// `provision.<profile>.rubicon` → the step or key it doesn't know.
+    /// Using one fails; loading a config that merely has one doesn't.
+    #[serde(skip)]
+    pub unsupported: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -1020,6 +1026,73 @@ pub struct RubiconConsole {
     /// (0, the default, is the first: FT4232H port A).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u32>,
+}
+
+/// The step kinds [`RubiconStep`] knows, as written in YAML.
+const RUBICON_STEPS: [&str; 12] = [
+    "out",
+    "pulse",
+    "servo",
+    "run",
+    "wait_ms",
+    "hold_usb",
+    "wait_usb",
+    "console_expect",
+    "console_send",
+    "sd_mux",
+    "mode",
+    "with_usb",
+];
+
+/// Take out of the composed config what a newer extension can carry and this
+/// CLI can't deserialize: a run profile with an unknown step kind, an unknown
+/// key in a provision profile's `rubicon:`. Extensions merge into every
+/// project, so failing the whole load would break every command for a user
+/// whose BSP is newer than their CLI; what is set aside fails when used.
+fn set_aside_unknown_rubicon(v: &mut serde_yaml::Value) -> BTreeMap<String, String> {
+    use serde_yaml::Value;
+    let mut out = BTreeMap::new();
+    if let Some(run) = v
+        .get_mut("rubicon")
+        .and_then(|r| r.get_mut("run"))
+        .and_then(Value::as_mapping_mut)
+    {
+        run.retain(|name, steps| {
+            let unknown = steps.as_sequence().into_iter().flatten().find_map(|st| {
+                let k = st.as_mapping()?.keys().next()?.as_str()?;
+                (!RUBICON_STEPS.contains(&k)).then(|| k.to_string())
+            });
+            match (name.as_str(), unknown) {
+                (Some(n), Some(k)) => {
+                    out.insert(format!("rubicon.run.{n}"), format!("step `{k}`"));
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
+    for key in PROVISION_KEYS {
+        let Some(profiles) = v.get_mut(key).and_then(Value::as_mapping_mut) else {
+            continue;
+        };
+        for (p, prof) in profiles.iter_mut() {
+            let Some(r) = prof.get_mut("rubicon").and_then(Value::as_mapping_mut) else {
+                continue;
+            };
+            let unknown: Vec<Value> = r
+                .keys()
+                .filter(|k| !matches!(k.as_str(), Some("before" | "after")))
+                .cloned()
+                .collect();
+            if let (Some(p), Some(k)) = (p.as_str(), unknown.first().and_then(Value::as_str)) {
+                out.insert(format!("provision.{p}.rubicon"), format!("key `{k}`"));
+            }
+            for k in unknown {
+                r.remove(&k);
+            }
+        }
+    }
+    out
 }
 
 /// One step of a Rubicon run profile. A Rubicon has generic outputs
@@ -2358,9 +2431,16 @@ impl Config {
         crate::utils::interpolation::interpolate_config(&mut main_config, target, cli_target_board)
             .with_context(|| "Failed to interpolate composed configuration")?;
 
+        let unsupported = set_aside_unknown_rubicon(&mut main_config);
         // Deserialize the merged config into the Config struct
         let mut config: Config = serde_yaml::from_value(main_config.clone())
             .with_context(|| "Failed to deserialize composed configuration")?;
+        if !unsupported.is_empty() {
+            config
+                .rubicon
+                .get_or_insert_with(Default::default)
+                .unsupported = unsupported;
+        }
         config.locked_releasever = config.read_locked_releasever(path, target);
 
         config.validate_cli_requirement()?;
@@ -4303,7 +4383,7 @@ impl Config {
         for (from, steps) in run.into_iter().flatten() {
             for step in steps {
                 if let RubiconStep::Run(name) = step {
-                    if !run.is_some_and(|m| m.contains_key(name)) {
+                    if !self.has_run_profile(name) {
                         anyhow::bail!(
                             "no run profile {name:?} (from rubicon.run.{from}) under rubicon.run \
                              (defined: {})",
@@ -4317,7 +4397,7 @@ impl Config {
             let Some(r) = &cfg.rubicon else { continue };
             for (when, name) in [("before", &r.before), ("after", &r.after)] {
                 let Some(name) = name else { continue };
-                if !run.is_some_and(|m| m.contains_key(name)) {
+                if !self.has_run_profile(name) {
                     anyhow::bail!(
                         "provision.{profile}.rubicon.{when}: no run profile {name:?} under \
                          rubicon.run (defined: {})",
@@ -4325,6 +4405,25 @@ impl Config {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Whether `name` is a run profile, including one set aside unread.
+    fn has_run_profile(&self, name: &str) -> bool {
+        self.rubicon.as_ref().is_some_and(|r| {
+            r.run.contains_key(name) || r.unsupported.contains_key(&format!("rubicon.run.{name}"))
+        })
+    }
+
+    /// Fails if `what` (`rubicon.run.<name>`, `provision.<p>.rubicon`) uses
+    /// something this CLI doesn't know.
+    pub fn check_rubicon_supported(&self, what: &str) -> Result<()> {
+        if let Some(k) = self.rubicon.as_ref().and_then(|r| r.unsupported.get(what)) {
+            anyhow::bail!(
+                "{what} uses {k}, which this avocado CLI doesn't know; update avocado \
+                 (it likely comes from an extension newer than this CLI)"
+            );
         }
         Ok(())
     }
@@ -4355,6 +4454,7 @@ impl Config {
             if stack.iter().any(|n| n == name) {
                 anyhow::bail!("rubicon.run: {} -> {name} loops", stack.join(" -> "));
             }
+            c.check_rubicon_supported(&format!("rubicon.run.{name}"))?;
             let steps = c.rubicon.as_ref().and_then(|r| r.run.get(name));
             let steps = steps.with_context(|| {
                 let from = stack
@@ -16019,6 +16119,48 @@ rubicon:
         c.validate_rubicon().unwrap();
         c.check_rubicon_refs().unwrap();
         assert_eq!(c.rubicon_steps("p3").unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_step_newer_than_this_cli_fails_only_the_profile_that_uses_it() {
+        let mut main: serde_yaml::Value = serde_yaml::from_str("default_target: x\n").unwrap();
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+rubicon:
+  run:
+    ok: [ { wait_ms: 1 } ]
+    newer: [ { wait_ms: 1 }, { warp_drive: { factor: 9 } } ]
+    via: [ { run: newer } ]
+provision:
+  p:
+    rubicon: { before: ok, after: ok, during: newer }
+"#,
+        )
+        .unwrap();
+        let source = ExtensionSource::Path {
+            path: ".".into(),
+            include: None,
+        };
+        Config::merge_external_config(&mut main, &ext, "bsp", &source.include_patterns(), &[]);
+        let unsupported = set_aside_unknown_rubicon(&mut main);
+        let mut c: Config = serde_yaml::from_value(main).expect("loads despite the unknown step");
+        c.rubicon.get_or_insert_with(Default::default).unsupported = unsupported;
+        c.validate_rubicon().unwrap();
+        c.check_rubicon_refs().unwrap();
+        assert_eq!(c.rubicon_steps("ok").unwrap().len(), 1);
+        for name in ["newer", "via"] {
+            let e = format!("{:#}", c.rubicon_steps(name).unwrap_err());
+            assert!(
+                e.contains("rubicon.run.newer uses step `warp_drive`"),
+                "{e}"
+            );
+        }
+        let e = format!(
+            "{:#}",
+            c.check_rubicon_supported("provision.p.rubicon")
+                .unwrap_err()
+        );
+        assert!(e.contains("key `during`"), "{e}");
     }
 
     fn steps(c: &Config, name: &str) -> Vec<RubiconStep> {

@@ -79,6 +79,11 @@ pub struct FileEntry {
     pub size: u64,
     /// Octal permission bits, as `stat -c %a` prints them.
     pub mode: String,
+    /// Numeric owner; 0 for bundles packed before owners were kept.
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +177,9 @@ pub fn bundle_rubicon(
     // has hooks (none: nothing runs around the provision).
     if profiles.is_empty() && wiring.is_empty() && console.is_none() {
         return Ok(None);
+    }
+    for name in profiles.keys() {
+        config.check_rubicon_supported(&format!("provision.{name}.rubicon"))?;
     }
     // Flattened (`run:` steps expanded): the hub runs plain steps.
     let run = profiles
@@ -289,10 +297,12 @@ echo "[INFO] Packing provisioning bundle from: $paths"
 # leave a shorter list behind (the shell has no pipefail here).
 find $paths \( $SKIP \) -prune -o -type f \( $BLOB \) -print > "$OUT/blobs.found" || exit 1
 LC_ALL=C sort "$OUT/blobs.found" > "$OUT/blobs.list" || exit 1
+# ponytail: a blob keeps its owner but not its xattrs (a file capability on a
+# binary over LARGE_FILE is lost); record them per blob if one ever needs it.
 while IFS= read -r f; do
     h=$(sha256sum "$f" | cut -d' ' -f1) || exit 1
     [ -e "$OUT/blobs/$h" ] || cp "$f" "$OUT/blobs/$h" || exit 1
-    printf '%s\t%s\t%s\t%s\n' "$h" "$(stat -c %s "$f")" "$(stat -c %a "$f")" "$f" >> "$OUT/files.tsv" || exit 1
+    printf '%s\t%s\t%s\n' "$h" "$(stat --printf '%s\t%a\t%u\t%g' "$f")" "$f" >> "$OUT/files.tsv" || exit 1
 done < "$OUT/blobs.list" || exit 1
 rm -f "$OUT/blobs.found" "$OUT/blobs.list"
 # Everything else (small files, symlinks, directories), one archive per
@@ -301,7 +311,10 @@ rm -f "$OUT/blobs.found" "$OUT/blobs.list"
 for p in $paths; do
     find "$p" \( $SKIP \) -prune -o -type f \( $BLOB \) -o -print > "$OUT/small.found" || exit 1
     LC_ALL=C sort "$OUT/small.found" > "$OUT/small.list" || exit 1
-    tar --no-recursion --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    # Owners and xattrs kept: var-staging carries service-owned directories
+    # and docker layers (overlay `trusted.*` markers, file capabilities).
+    tar --no-recursion --sort=name --mtime=@0 --numeric-owner \
+        --xattrs --xattrs-include='*' \
         -cf "$OUT/small.tar" -T "$OUT/small.list" || exit 1
     gzip -n -f "$OUT/small.tar" || exit 1
     h=$(sha256sum "$OUT/small.tar.gz" | cut -d' ' -f1) || exit 1
@@ -357,14 +370,15 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex)
 }
 
-/// Parse the container's `files.tsv` (sha, size, mode, path per line).
+/// Parse the container's `files.tsv` (sha, size, mode, uid, gid, path per
+/// line).
 pub fn parse_files_tsv(tsv: &str) -> Result<Vec<FileEntry>> {
     tsv.lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let mut c = l.splitn(4, '\t');
-            let (Some(sha), Some(size), Some(mode), Some(path)) =
-                (c.next(), c.next(), c.next(), c.next())
+            let mut c = l.splitn(6, '\t');
+            let (Some(sha), Some(size), Some(mode), Some(uid), Some(gid), Some(path)) =
+                (c.next(), c.next(), c.next(), c.next(), c.next(), c.next())
             else {
                 bail!("malformed files.tsv line: {l:?}");
             };
@@ -373,6 +387,8 @@ pub fn parse_files_tsv(tsv: &str) -> Result<Vec<FileEntry>> {
                 sha256: sha.to_string(),
                 size: size.parse()?,
                 mode: mode.to_string(),
+                uid: uid.parse()?,
+                gid: gid.parse()?,
             })
         })
         .collect()
@@ -405,10 +421,10 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         &std::fs::read_to_string(stage.join("small.tsv"))?
             .lines()
             .map(|l| {
-                // sha, size, root → the 4-column shape (mode unused)
+                // sha, size, root → the files.tsv shape (mode, owner unused)
                 let mut c = l.splitn(3, '\t');
                 format!(
-                    "{}\t{}\t-\t{}\n",
+                    "{}\t{}\t-\t0\t0\t{}\n",
                     c.next().unwrap_or(""),
                     c.next().unwrap_or(""),
                     c.next().unwrap_or("")
@@ -974,7 +990,12 @@ impl BundleProvision {
         let tsv: String = meta
             .files
             .iter()
-            .map(|f| format!("{}\t{}\t{}\n", f.sha256, f.mode, f.path))
+            .map(|f| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    f.sha256, f.mode, f.uid, f.gid, f.path
+                )
+            })
             .collect();
         std::fs::write(work.join("files.tsv"), tsv)?;
         std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
@@ -1045,7 +1066,12 @@ impl BundleProvision {
         let small: String = meta
             .small_files
             .iter()
-            .map(|a| format!("tar xzf \"$B/blobs/{}\" || exit 1\n", a.sha256))
+            .map(|a| {
+                format!(
+                    "tar --numeric-owner --xattrs --xattrs-include='*' -xzf \"$B/blobs/{}\" || exit 1\n",
+                    a.sha256
+                )
+            })
             .collect();
         let script = if !self.exec.is_empty() {
             exec_script(&self.exec)
@@ -1054,8 +1080,9 @@ impl BundleProvision {
                 r#"
 cd "$AVOCADO_PREFIX" || exit 1
 B=/opt/src/{WORK_DIR}
-{clear}{small}while IFS=$'\t' read -r h mode path; do
-    mkdir -p "$(dirname "$path")" && cp "$B/blobs/$h" "$path" && chmod "$mode" "$path" || exit 1
+{clear}{small}while IFS=$'\t' read -r h mode uid gid path; do
+    mkdir -p "$(dirname "$path")" && cp "$B/blobs/$h" "$path" && \
+        chown "$uid:$gid" "$path" && chmod "$mode" "$path" || exit 1
 done < "$B/files.tsv" || exit 1
 echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
 {state_in}{provision}{state_out}"#,
@@ -1527,18 +1554,24 @@ provision:
                     sha256: A.into(),
                     size: 10,
                     mode: "644".into(),
+                    uid: 0,
+                    gid: 0,
                 },
                 FileEntry {
                     path: "runtimes/dev/var-staging/lib/avocado/images/x.raw".into(),
                     sha256: A.into(),
                     size: 10,
                     mode: "644".into(),
+                    uid: 0,
+                    gid: 0,
                 },
                 FileEntry {
                     path: "output/runtimes/dev/stone/esp.img".into(),
                     sha256: B.into(),
                     size: 5,
                     mode: "644".into(),
+                    uid: 0,
+                    gid: 0,
                 },
             ],
             small_files: vec![SmallArchive {
@@ -1578,13 +1611,23 @@ provision:
     #[test]
     fn files_tsv_round_trip() {
         let f = parse_files_tsv(&format!(
-            "{A}\t10\t755\tkernel/6.18/Image\n{B}\t5\t644\ta b/c\n"
+            "{A}\t10\t755\t0\t0\tkernel/6.18/Image\n{B}\t5\t700\t998\t997\ta b/c\n"
         ))
         .unwrap();
         assert_eq!(f[0].path, "kernel/6.18/Image");
         assert_eq!(f[0].mode, "755");
         assert_eq!(f[1].path, "a b/c");
+        assert_eq!((f[1].uid, f[1].gid), (998, 997));
         assert!(parse_files_tsv("nope").is_err());
+    }
+
+    #[test]
+    fn bundles_packed_before_owners_were_kept_default_to_root() {
+        let f: FileEntry = serde_json::from_value(serde_json::json!(
+            {"path": "x", "sha256": A, "size": 1, "mode": "644"}
+        ))
+        .unwrap();
+        assert_eq!((f.uid, f.gid), (0, 0));
     }
 
     #[test]

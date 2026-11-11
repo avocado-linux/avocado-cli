@@ -195,6 +195,19 @@ impl ConnectUploadCommand {
         let project_config =
             load_config(&self.config_path).context("Failed to load avocado.yaml")?;
 
+        if self.provisionable {
+            // The pack runs in the SDK volume, which --file bypasses.
+            if self.file.is_some() {
+                anyhow::bail!("--provisionable can't be used with --file");
+            }
+            // Its SDK container output isn't routed through JSON events.
+            if self.output.is_json() {
+                anyhow::bail!("--provisionable can't be used with --output json");
+            }
+            // Before anything is uploaded: a pack refuses a signing runtime.
+            crate::commands::provision_bundle::check_unsigned(&project_config, &self.runtime)?;
+        }
+
         if self.file.is_some() {
             self.warn_sbom_skipped(if self.no_sbom { "no_sbom" } else { "file" });
             // --file path: host-side artifacts (unchanged legacy flow)
@@ -432,6 +445,10 @@ impl ConnectUploadCommand {
                 self.attach_provisioning(connect, project_config, &target, &runtime),
             )
             .await?;
+            // The status complete() returned isn't kept: a draft is what
+            // publish/deploy start from either way.
+            self.release(connect, &runtime.id, &runtime.version, "draft")
+                .await?;
         }
         Ok(())
     }
@@ -753,10 +770,27 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
+        if !self.provisionable {
+            self.release(connect, &runtime.id, &runtime.version, &runtime.status)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Publish (`--publish`) and deploy (`--deploy-cohort`) an uploaded
+    /// runtime. With `--provisionable` this runs after the bundle is
+    /// attached, so a failed attach leaves a draft rather than a release.
+    async fn release(
+        &self,
+        connect: &ConnectClient,
+        runtime_id: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<()> {
         let final_status = if self.publish {
             progress("Publishing runtime...", OutputLevel::Normal);
             let published = connect
-                .publish_runtime(&self.org, &self.project, &runtime.id)
+                .publish_runtime(&self.org, &self.project, runtime_id)
                 .await?;
             print_success(
                 &format!(
@@ -767,14 +801,14 @@ impl ConnectUploadCommand {
             );
             published.status
         } else {
-            runtime.status.clone()
+            status.to_string()
         };
 
         if is_json_output_active() {
             emit_json_event(&serde_json::json!({
                 "event": "complete",
-                "runtime_id": runtime.id,
-                "version": runtime.version,
+                "runtime_id": runtime_id,
+                "version": version,
                 "status": final_status,
             }));
         }
@@ -784,8 +818,8 @@ impl ConnectUploadCommand {
                 client: connect,
                 org: &self.org,
                 project: &self.project,
-                runtime_id: &runtime.id,
-                runtime_version: &runtime.version,
+                runtime_id,
+                runtime_version: version,
                 cohort_id,
                 name: self.deploy_name.as_deref(),
                 description: self.description.as_deref(),
@@ -835,48 +869,10 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        let final_status = if self.publish {
-            progress("Publishing runtime...", OutputLevel::Normal);
-            let published = connect
-                .publish_runtime(&self.org, &self.project, &runtime.id)
+        if !self.provisionable {
+            self.release(connect, &runtime.id, &result.version, &result.status)
                 .await?;
-            print_success(
-                &format!(
-                    "Runtime {} published (status: {})",
-                    published.version, published.status
-                ),
-                OutputLevel::Normal,
-            );
-            published.status
-        } else {
-            result.status.clone()
-        };
-
-        if is_json_output_active() {
-            emit_json_event(&serde_json::json!({
-                "event": "complete",
-                "runtime_id": runtime.id,
-                "version": result.version,
-                "status": final_status,
-            }));
         }
-
-        if let Some(ref cohort_id) = self.deploy_cohort {
-            super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
-                client: connect,
-                org: &self.org,
-                project: &self.project,
-                runtime_id: &runtime.id,
-                runtime_version: &result.version,
-                cohort_id,
-                name: self.deploy_name.as_deref(),
-                description: self.description.as_deref(),
-                tags: &self.deploy_tags,
-                activate: self.deploy_activate,
-            })
-            .await?;
-        }
-
         Ok(())
     }
 

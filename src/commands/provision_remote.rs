@@ -380,16 +380,27 @@ pub async fn follow_connect(c: &ConnectClient, org: &str, vm: &str, id: &str) ->
 
 /// Who is asking, for the hub's queue: `user@host`.
 pub fn requester() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "someone".into());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "someone".into());
+    format!("{user}@{}", host_name())
+}
+
+#[cfg(unix)]
+fn host_name() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: gethostname writes at most buf.len() bytes into buf.
-    let host = if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
         let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         String::from_utf8_lossy(&buf[..n]).into_owned()
     } else {
         "?".into()
-    };
-    format!("{user}@{host}")
+    }
+}
+
+#[cfg(not(unix))]
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "?".into())
 }
 
 /// A board's queue, holder first, from either hub's record of it.
@@ -469,16 +480,15 @@ fn queued_line(v: &Value) -> String {
 /// own process group: Ctrl-C at the terminal is ours to handle, not ssh's.
 fn agent_ctl(req: &Value) -> Result<std::process::Child> {
     use std::io::Write;
-    use std::os::unix::process::CommandExt;
     let target = lifecycle::ssh_target_for_running()?;
-    let mut child = Command::new("ssh")
-        .args(target.base_args())
-        .arg("avocado-vm-agent ctl")
+    let mut cmd = Command::new("ssh");
+    cmd.args(target.base_args())
+        .arg(hub::AGENT_CTL)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .context("ssh to the VM")?;
+        .stdout(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().context("ssh to the VM")?;
     // On stdin, not the command line: the request carries the board token.
     let mut stdin = child.stdin.take().context("ssh stdin")?;
     stdin

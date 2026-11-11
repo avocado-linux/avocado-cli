@@ -113,13 +113,20 @@ impl VmConnectCommand {
                         },
                     )
                     .await?;
+                // A server without VM claims drops `kind` and makes an
+                // ordinary device token: the VM would count as a device.
+                if token.kind.as_deref() != Some("vm") {
+                    bail!(
+                        "this Connect server does not issue VM claim tokens yet; not claiming \
+                         (the unused token expires in {TOKEN_TTL_MINUTES} minutes)"
+                    );
+                }
                 let raw = token
                     .token
                     .context("Connect did not return the claim token value")?;
 
+                // On stdin, not the command line: it carries the claim token.
                 let cfg = hub::conn_config(&api_url, &raw);
-                // Quoted, not base64: the VM image has no `base64`.
-                let cfg = crate::utils::shell::shell_escape(&cfg);
                 // A UUID: safe in the command line as is.
                 let id = crate::utils::vm::state::instance_id(
                     &crate::utils::vm::state::VmPaths::resolve()?,
@@ -128,15 +135,18 @@ impl VmConnectCommand {
                 // but a claim puts it back.
                 let claimed = async {
                     target
-                        .exec(&format!(
-                            "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
-                             for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
-                             printf '%s' {cfg} > {d}/config.toml && chmod 0600 {d}/config.toml && \
-                             printf '%s\\n' {id} > {idf} && sync && \
-                             systemctl restart avocado-conn",
-                            d = hub::CONN_DIR,
-                            idf = hub::DEVICE_ID_FILE,
-                        ))
+                        .exec_stdin(
+                            &format!(
+                                "systemctl stop avocado-conn 2>/dev/null; mkdir -p {d} && \
+                                 for f in config.toml claimed_state.json; do [ -f {d}/$f ] && mv {d}/$f {d}/$f.prev; done; \
+                                 (umask 077; cat > {d}/config.toml) && \
+                                 printf '%s\\n' {id} > {idf} && sync && \
+                                 systemctl restart avocado-conn",
+                                d = hub::CONN_DIR,
+                                idf = hub::DEVICE_ID_FILE,
+                            ),
+                            cfg.as_bytes(),
+                        )
                         .await
                         // Not the exec error: it quotes the command, and with
                         // it the config's still-valid claim token.

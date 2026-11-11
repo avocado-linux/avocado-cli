@@ -25,6 +25,12 @@ pub const CONN_DIR: &str = "/var/lib/avocado-conn";
 pub const DEVICE_ID_FILE: &str = "/var/lib/avocado-conn/device-id";
 /// The agent's API socket, avocado-conn's `[local_handler]`.
 pub const AGENT_API_SOCK: &str = "/run/avocado-vm-agent/api.sock";
+/// Runs `avocado-vm-agent ctl` only where the hub's API socket exists. A
+/// pre-hub agent ignores its arguments and starts up, detaching every vhci
+/// port in use; a VM without the socket has no hub, so nothing is run.
+pub const AGENT_CTL: &str = "[ -S /run/avocado-vm-agent/api.sock ] || \
+    { echo 'no hub in this VM (no agent API socket)' >&2; exit 3; }; \
+    exec avocado-vm-agent ctl";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RubiconEntry {
@@ -79,7 +85,7 @@ pub fn host_facts(paths: &VmPaths) -> Value {
 pub async fn agent_request(target: &SshTarget, req: &Value) -> Result<Value> {
     // On stdin, not the command line: a request can carry a board token.
     let (out, _) = target
-        .exec_stdin("avocado-vm-agent ctl", req.to_string().as_bytes())
+        .exec_stdin(AGENT_CTL, req.to_string().as_bytes())
         .await
         .context("the VM agent did not answer (is it running a hub-capable build?)")?;
     let reply: Value = serde_json::from_str(out.trim())
@@ -148,9 +154,9 @@ pub fn guest_api_url(api_url: &str) -> String {
     format!("{scheme}://10.0.2.2{port}{path}")
 }
 
-/// avocado-conn config for a VM: claim with the DMI UUID (stable per
-/// install, see `state::instance_id`) and hand unknown commands to the
-/// agent.
+/// avocado-conn config for a VM: claim with the instance id in
+/// `DEVICE_ID_FILE` (stable per install, see `state::instance_id`) and hand
+/// unknown commands to the agent.
 pub fn conn_config(api_url: &str, claim_token: &str) -> String {
     format!(
         "# Written by `avocado vm connect`.\n\
@@ -214,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn conn_config_claims_by_dmi_and_bridges_to_the_agent() {
+    fn conn_config_claims_by_instance_id_and_bridges_to_the_agent() {
         let c = conn_config("http://localhost:3001", "tok");
         let v: toml::Value = toml::from_str(&c).unwrap();
         assert_eq!(v["api_url"].as_str(), Some("http://10.0.2.2:3001"));

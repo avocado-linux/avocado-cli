@@ -296,6 +296,9 @@ pub struct ClaimTokenInfo {
     pub max_uses: Option<i64>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// `"vm"` for a VM claim token; absent on servers without VM claims.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
