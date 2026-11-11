@@ -603,9 +603,11 @@ impl SdkCompileCommand {
         };
         let name = section.name.as_str();
         if !sdk_compile_inputs_are_complete(extensions, &section.script, ctx.project_root) {
+            // Only with -v: most projects leave package_files out, and a line on
+            // every build would read as a warning.
             if let Some((undeclared, _)) = extensions
                 .iter()
-                .find(|(_, ext)| ext.get("package_files").is_none())
+                .find(|(_, ext)| self.verbose && ext.get("package_files").is_none())
             {
                 print_info(
                     &format!(
