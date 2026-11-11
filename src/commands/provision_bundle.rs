@@ -218,6 +218,16 @@ impl BundleMeta {
         out
     }
 
+    /// The blobs a replay fetches: all of them to provision; only the
+    /// extension sources (what `sdk install` reads) to run a command.
+    pub fn blobs_for(&self, exec: bool) -> Vec<BlobRef> {
+        let mut b = self.blobs();
+        if exec {
+            b.retain(|b| self.ext_sources.iter().any(|a| a.sha256 == b.sha256));
+        }
+        b
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.blobs().iter().map(|b| b.size).sum()
     }
@@ -894,13 +904,15 @@ impl BundleProvision {
         );
 
         // Blob cache: fetch only what isn't here yet, keep only what this
-        // bundle uses (bounds the disk to one bundle's worth).
+        // bundle uses (bounds the disk to one bundle's worth). A command run
+        // fetches no provisioning blobs but keeps any already cached for the
+        // provision that usually follows.
         let cwd = std::env::current_dir()?;
         check_replay_dir(&cwd)?;
         let work = cwd.join(WORK_DIR);
         let cache = work.join("blobs");
         std::fs::create_dir_all(&cache)?;
-        let needed = meta.blobs();
+        let needed = meta.blobs_for(!self.exec.is_empty());
         let (mut fetched, mut fetched_bytes) = (0, 0u64);
         for b in &needed {
             if cache.join(&b.sha256).exists() {
@@ -922,7 +934,7 @@ impl BundleProvision {
             ),
             OutputLevel::Normal,
         );
-        let keep: HashSet<&str> = needed.iter().map(|b| b.sha256.as_str()).collect();
+        let keep: HashSet<String> = meta.blobs().into_iter().map(|b| b.sha256).collect();
         for e in std::fs::read_dir(&cache)?.flatten() {
             if !keep.contains(&*e.file_name().to_string_lossy()) {
                 let _ = std::fs::remove_file(e.path());
@@ -1455,6 +1467,20 @@ provision:
         let blobs = m.blobs();
         assert_eq!(blobs.len(), 3, "A once, B once, the small-files archive");
         assert_eq!(m.total_bytes(), 10 + 5 + 1);
+    }
+
+    #[test]
+    fn a_command_run_fetches_only_extension_sources() {
+        let mut m = meta("x86_64");
+        m.ext_sources = vec![ExtSourceArchive {
+            name: "bsp".into(),
+            sha256: "d".repeat(64),
+            size: 2,
+        }];
+        assert_eq!(m.blobs_for(false).len(), 4);
+        let exec = m.blobs_for(true);
+        assert_eq!(exec.len(), 1);
+        assert_eq!(exec[0].sha256, "d".repeat(64));
     }
 
     #[test]
