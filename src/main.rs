@@ -2127,6 +2127,16 @@ fn run_with_json_lifecycle(
     Some(guard)
 }
 
+/// `provision --bundle` (whose `sdk install` runs as a plain-text child) and
+/// `--rubicon` (the hub's log relayed as text) emit human output only:
+/// refuse JSON rather than mix prose into a stream a caller parses.
+fn check_provision_output(output: OutputFormat, bundle: bool, rubicon: bool) -> Result<()> {
+    if output.is_json() && (bundle || rubicon) {
+        anyhow::bail!("--output json is not supported with --bundle or --rubicon");
+    }
+    Ok(())
+}
+
 /// Combine provision profile and env vars into a single HashMap
 fn build_env_vars(
     provision_profile: Option<&String>,
@@ -2591,6 +2601,7 @@ async fn main() -> Result<()> {
                     "--rubicon cannot be combined with --list, --pack, --bundle or --out"
                 );
             }
+            check_provision_output(output, bundle.is_some(), rubicon.is_some())?;
             if let Some(source) = bundle {
                 return crate::commands::provision_bundle::BundleProvision {
                     source,
@@ -5883,6 +5894,14 @@ mod tests {
     ///
     /// The needle is assembled at runtime so this assertion does not match its
     /// own source.
+    #[test]
+    fn provision_refuses_json_it_cannot_emit() {
+        check_provision_output(OutputFormat::Json, false, false).unwrap();
+        check_provision_output(OutputFormat::Human, true, true).unwrap();
+        assert!(check_provision_output(OutputFormat::Json, true, false).is_err());
+        assert!(check_provision_output(OutputFormat::Json, false, true).is_err());
+    }
+
     #[test]
     fn json_output_does_not_imply_force() {
         let src = include_str!("main.rs");
