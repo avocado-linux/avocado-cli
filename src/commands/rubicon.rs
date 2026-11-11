@@ -90,11 +90,14 @@ impl RubiconCommand {
     }
 
     /// The project config, if there is one here (for run profiles, the
-    /// console rate).
-    fn project(&self) -> Option<Config> {
+    /// console rate). A config that is there but doesn't load is an error.
+    fn project(&self) -> Result<Option<Config>> {
+        if !std::path::Path::new(&self.config_path).exists() {
+            return Ok(None);
+        }
         Config::load_composed(&self.config_path, self.target.as_deref())
-            .ok()
-            .map(|c| c.config)
+            .map(|c| Some(c.config))
+            .with_context(|| format!("loading {}", self.config_path))
     }
 
     pub async fn execute(self) -> Result<()> {
@@ -102,7 +105,7 @@ impl RubiconCommand {
             RubiconAction::List => self.list().await,
             RubiconAction::Show { board } => {
                 let b = self.board(board).await?;
-                let wiring = self.project().and_then(|c| Some(c.rubicon?.wiring));
+                let wiring = self.project()?.and_then(|c| Some(c.rubicon?.wiring));
                 show(&b, &wiring.unwrap_or_default());
                 Ok(())
             }
@@ -397,9 +400,12 @@ impl RubiconCommand {
     }
 
     async fn run(&self, board: &Option<String>, profile: &str) -> Result<()> {
-        let config = self.project().context(
-            "`avocado rubicon run` reads run profiles from the project: no avocado.yaml here",
-        )?;
+        let config = self.project()?.with_context(|| {
+            format!(
+                "`avocado rubicon run` reads run profiles from the project: no {} here",
+                self.config_path
+            )
+        })?;
         let steps = config.rubicon_steps(profile)?;
         let b = self.board(board).await?;
         let wiring = config
@@ -437,7 +443,7 @@ impl RubiconCommand {
                 b.describe()
             );
         }
-        let console = self.project().and_then(|c| c.rubicon?.console);
+        let console = self.project()?.and_then(|c| c.rubicon?.console);
         let (baud, port) = (
             console.as_ref().and_then(|c| c.baud),
             console.as_ref().and_then(|c| c.port),
@@ -743,8 +749,20 @@ mod tests {
         .unwrap();
         let c = command(path.to_str().unwrap(), Some("thor"))
             .project()
+            .unwrap()
             .unwrap();
         assert_eq!(c.rubicon.unwrap().wiring["ssr1"], "thor REC");
+    }
+
+    #[test]
+    fn only_a_missing_project_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        let path_str = path.to_str().unwrap();
+        assert!(command(path_str, None).project().unwrap().is_none());
+        std::fs::write(&path, "rubicon: [not, a, map]\n").unwrap();
+        let err = command(path_str, None).project().unwrap_err();
+        assert!(format!("{err:#}").contains(path_str), "{err:#}");
     }
 
     #[test]
