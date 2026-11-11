@@ -256,8 +256,15 @@ impl RubiconCommand {
                     .unwrap_or_else(|| crate::utils::vm::share::resolve_workspace(None))?;
                 let dir = ws.join(".avocado/hub-firmware");
                 std::fs::create_dir_all(&dir)?;
+                // Named by its sha256, and published by rename: with --all,
+                // another board's job may be reading it already, and a
+                // rewrite in place would show it a truncated file.
                 let host = dir.join(format!("{}.bin", fw.sha256));
-                std::fs::write(&host, &fw.bytes)?;
+                if !host.exists() {
+                    let tmp = dir.join(format!(".{}.{}.tmp", fw.sha256, std::process::id()));
+                    std::fs::write(&tmp, &fw.bytes)?;
+                    std::fs::rename(&tmp, &host)?;
+                }
                 let vm = crate::utils::vm::share::translate_to_vm(&host, &ws)?;
                 json!({"address": b.address, "firmware": {
                     "url": vm.to_string_lossy(), "sha256": fw.sha256, "version": fw.version}})
@@ -499,6 +506,13 @@ pub fn mcuboot_version(image: &[u8]) -> Result<String> {
     if le32(0) != Some(0x96f3_b83d) {
         bail!("not an MCUboot image (no image header magic); use the signed .bin");
     }
+    // The version is in bytes 20..28 of the header.
+    if image.len() < 28 {
+        bail!(
+            "truncated MCUboot image ({} bytes, no full header)",
+            image.len()
+        );
+    }
     let rev = u16::from_le_bytes([image[22], image[23]]);
     Ok(format!(
         "{}.{}.{rev}+{}",
@@ -602,6 +616,9 @@ pub(crate) fn sh_quote(s: &str) -> String {
 /// One line of board state, from whichever hub reported it.
 fn state(b: &Board) -> String {
     let i = &b.info;
+    if let Some(why) = i["unknown"].as_str() {
+        return format!("unknown ({why})");
+    }
     if i.is_null() {
         return "unknown (VM not running)".into();
     }
@@ -738,6 +755,8 @@ mod tests {
         img[24..28].copy_from_slice(&83u32.to_le_bytes());
         assert_eq!(mcuboot_version(&img).unwrap(), "0.1.0+83");
         assert!(mcuboot_version(&[0u8; 64]).is_err());
+        // Magic, then nothing: an error, not a panic.
+        assert!(mcuboot_version(&0x96f3_b83du32.to_le_bytes()).is_err());
     }
 
     #[test]
