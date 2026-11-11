@@ -51,7 +51,19 @@ fn unit_path() -> Result<PathBuf> {
 /// PATH), and `path` is the installing shell's PATH so qemu, swtpm and ssh
 /// resolve the same way they do interactively.
 pub fn render_unit(exe: &Path, pid_file: &Path, path: &str) -> String {
-    let exe = exe.display();
+    // systemd syntax, so a path with a space, quote or `%` stays whole: a
+    // quoted word, `%` doubled (a specifier otherwise), and on Exec lines
+    // `$` doubled (a variable otherwise).
+    let quoted = |s: &str| {
+        let s = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%");
+        format!("\"{s}\"")
+    };
+    let exe = quoted(&exe.display().to_string()).replace('$', "$$");
+    let path = quoted(&format!("PATH={path}"));
+    let pid = pid_file.display().to_string().replace('%', "%%");
     format!(
         "[Unit]
 Description=Avocado VM (headless, managed by avocado vm service)
@@ -60,7 +72,7 @@ Description=Avocado VM (headless, managed by avocado vm service)
 Type=forking
 PIDFile={pid}
 Environment=AVOCADO_VM_IDLE_HIBERNATE_SECS=0
-Environment=PATH={path}
+Environment={path}
 ExecStart={exe} vm start
 ExecStop={exe} vm stop
 TimeoutStartSec=600
@@ -71,7 +83,6 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 ",
-        pid = pid_file.display(),
     )
 }
 
@@ -179,10 +190,22 @@ mod tests {
         );
         assert!(u.contains("Type=forking\n"));
         assert!(u.contains("PIDFile=/home/u/.avocado/vm/qemu.pid\n"));
-        assert!(u.contains("ExecStart=/opt/bin/avocado vm start\n"));
-        assert!(u.contains("ExecStop=/opt/bin/avocado vm stop\n"));
+        assert!(u.contains("ExecStart=\"/opt/bin/avocado\" vm start\n"));
+        assert!(u.contains("ExecStop=\"/opt/bin/avocado\" vm stop\n"));
         assert!(u.contains("Environment=AVOCADO_VM_IDLE_HIBERNATE_SECS=0\n"));
-        assert!(u.contains("Environment=PATH=/usr/bin:/bin\n"));
+        assert!(u.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(u.contains("WantedBy=default.target\n"));
+    }
+
+    #[test]
+    fn unit_quotes_paths_with_spaces_and_specifiers() {
+        let u = render_unit(
+            Path::new("/opt/My Tools/avocado"),
+            Path::new("/home/u/100%/qemu.pid"),
+            "/opt/My Tools/bin:/usr/bin",
+        );
+        assert!(u.contains("ExecStart=\"/opt/My Tools/avocado\" vm start\n"));
+        assert!(u.contains("PIDFile=/home/u/100%%/qemu.pid\n"));
+        assert!(u.contains("Environment=\"PATH=/opt/My Tools/bin:/usr/bin\"\n"));
     }
 }
