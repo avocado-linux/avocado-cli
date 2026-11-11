@@ -308,10 +308,14 @@ impl UpdateCommand {
         let under_service = was_running && vm_service_active();
         if was_running {
             println!("avocado vm update: stopping VM…");
+            // A VM that didn't stop may still have the files open: keep
+            // the staging dir for a retry rather than replace them under it.
             if under_service {
-                vm_service("stop").ok();
+                vm_service("stop").context("stopping the VM's service")?;
             } else {
-                crate::utils::vm::lifecycle::stop(false).await.ok();
+                crate::utils::vm::lifecycle::stop(false)
+                    .await
+                    .context("stopping the VM")?;
             }
         }
 

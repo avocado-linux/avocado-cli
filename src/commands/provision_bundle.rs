@@ -266,22 +266,30 @@ BLOB="-size +{small_max}c -o -path runtimes/{runtime}/var-staging/lib/avocado/im
 set -f  # $BLOB holds a find pattern: don't let the shell glob it
 echo "[INFO] Packing provisioning bundle from: $paths"
 : > "$OUT/files.tsv" || exit 1
-find $paths \( $SKIP \) -prune -o -type f \( $BLOB \) -print | LC_ALL=C sort | while IFS= read -r f; do
+# Lists go through files, not pipes: a failing find must fail the pack, not
+# leave a shorter list behind (the shell has no pipefail here).
+find $paths \( $SKIP \) -prune -o -type f \( $BLOB \) -print > "$OUT/blobs.found" || exit 1
+LC_ALL=C sort "$OUT/blobs.found" > "$OUT/blobs.list" || exit 1
+while IFS= read -r f; do
     h=$(sha256sum "$f" | cut -d' ' -f1) || exit 1
     [ -e "$OUT/blobs/$h" ] || cp "$f" "$OUT/blobs/$h" || exit 1
     printf '%s\t%s\t%s\t%s\n' "$h" "$(stat -c %s "$f")" "$(stat -c %a "$f")" "$f" >> "$OUT/files.tsv" || exit 1
-done || exit 1
+done < "$OUT/blobs.list" || exit 1
+rm -f "$OUT/blobs.found" "$OUT/blobs.list"
 # Everything else (small files, symlinks, directories), one archive per
 # top-level path, byte-identical for identical content so each deduplicates.
 : > "$OUT/small.tsv" || exit 1
 for p in $paths; do
-    find "$p" \( $SKIP \) -prune -o -type f \( $BLOB \) -o -print | LC_ALL=C sort > "$OUT/small.list" || exit 1
+    find "$p" \( $SKIP \) -prune -o -type f \( $BLOB \) -o -print > "$OUT/small.found" || exit 1
+    LC_ALL=C sort "$OUT/small.found" > "$OUT/small.list" || exit 1
     tar --no-recursion --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-        -cf - -T "$OUT/small.list" | gzip -n > "$OUT/small.tar.gz" || exit 1
+        -cf "$OUT/small.tar" -T "$OUT/small.list" || exit 1
+    gzip -n -f "$OUT/small.tar" || exit 1
     h=$(sha256sum "$OUT/small.tar.gz" | cut -d' ' -f1) || exit 1
     printf '%s\t%s\t%s\n' "$h" "$(stat -c %s "$OUT/small.tar.gz")" "$p" >> "$OUT/small.tsv" || exit 1
     mv "$OUT/small.tar.gz" "$OUT/blobs/$h" || exit 1
 done
+rm -f "$OUT/small.found" "$OUT/small.list"
 set +f
 "#,
         small_max = LARGE_FILE - 1,

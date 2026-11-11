@@ -112,30 +112,31 @@ pub async fn local_boards() -> Result<Vec<Board>> {
     if list.is_empty() {
         return Ok(vec![]);
     }
+    // Err: why there is no live state for any board.
     let live = if lifecycle::status().await?.running {
         let t = lifecycle::ssh_target_for_running()?;
         hub::agent_request(&t, &json!({"op": "inventory"}))
             .await
-            .ok()
+            .map_err(|e| format!("the hub didn't answer: {e:#}"))
     } else {
-        None
+        Err("VM not running".to_string())
     };
     Ok(list
         .into_iter()
         .map(|r| {
-            let info = live
-                .as_ref()
-                .and_then(|v| {
-                    let mut b = v["inventory"]["rubicons"]
-                        .as_array()?
-                        .iter()
-                        .find(|b| b["address"] == r.address.as_str())
-                        .cloned()?;
-                    // The hub's clock, for how long its queue entries have waited.
-                    b["hub_now"] = v["now"].clone();
-                    Some(b)
-                })
-                .unwrap_or(Value::Null);
+            let info = match &live {
+                Ok(v) => v["inventory"]["rubicons"]
+                    .as_array()
+                    .and_then(|bs| bs.iter().find(|b| b["address"] == r.address.as_str()))
+                    .cloned()
+                    .map(|mut b| {
+                        // The hub's clock, for how long its queue entries have waited.
+                        b["hub_now"] = v["now"].clone();
+                        b
+                    })
+                    .unwrap_or_else(|| json!({"unknown": "the hub doesn't list this board yet"})),
+                Err(why) => json!({"unknown": why}),
+            };
             Board {
                 name: s(&info["name"]),
                 label: r.label,
@@ -331,25 +332,37 @@ pub async fn run_command(
     }
 }
 
+/// Print a Connect command's log lines after `after`, every page of them;
+/// the new `after`.
+async fn print_logs(c: &ConnectClient, base: &str, mut after: i64) -> Result<i64> {
+    loop {
+        let logs = c
+            .json(Method::GET, &format!("{base}/logs?after_seq={after}"), None)
+            .await?;
+        let chunks = logs["data"].as_array().cloned().unwrap_or_default();
+        for chunk in &chunks {
+            for l in chunk["lines"].as_array().into_iter().flatten() {
+                println!("{}", l.as_str().unwrap_or_default());
+            }
+        }
+        match logs["next_after_seq"].as_i64() {
+            Some(n) if n != after && !chunks.is_empty() => after = n,
+            _ => return Ok(after),
+        }
+    }
+}
+
 /// Follow a Connect command to its end; `{status, result}`.
 pub async fn follow_connect(c: &ConnectClient, org: &str, vm: &str, id: &str) -> Result<Value> {
     let base = format!("/api/orgs/{org}/vms/{vm}/commands/{id}");
     let mut after: i64 = -1;
     loop {
-        let logs = c
-            .json(Method::GET, &format!("{base}/logs?after_seq={after}"), None)
-            .await?;
-        for chunk in logs["data"].as_array().into_iter().flatten() {
-            for l in chunk["lines"].as_array().into_iter().flatten() {
-                println!("{}", l.as_str().unwrap_or_default());
-            }
-        }
-        if let Some(n) = logs["next_after_seq"].as_i64() {
-            after = n;
-        }
+        after = print_logs(c, &base, after).await?;
         let state = c.json(Method::GET, &base, None).await?;
         let st = state["data"]["state"].as_str().unwrap_or("");
         if matches!(st, "completed" | "failed" | "expired") {
+            // The job may have logged its last lines after the read above.
+            print_logs(c, &base, after).await?;
             return Ok(json!({"status": st, "result": state["data"]["result"]}));
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -635,6 +648,14 @@ impl RemoteProvision {
                     .await
             }
             Hub::Connect { vm, vm_name } => {
+                // A Connect job carries no per-run env yet: refuse rather
+                // than run the hook without what was asked for.
+                if !job_env.is_empty() {
+                    bail!(
+                        "--env values can't go with a provision through Connect yet; \
+                         run it on the hub's machine (`--via local`), or set them in the project"
+                    );
+                }
                 let (c, org) = connect(self.connect_profile.as_deref(), None)?;
                 print_info(
                     &format!(

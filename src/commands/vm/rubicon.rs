@@ -77,16 +77,17 @@ async fn list_live(list: &[hub::RubiconEntry]) -> Result<()> {
         println!("No Rubicons configured. Add one with `avocado vm rubicon add <address>`.");
         return Ok(());
     }
+    // Err: why there is no live state for any board.
     let live = if lifecycle::status().await?.running {
         let t = lifecycle::ssh_target_for_running()?;
         hub::agent_request(&t, &serde_json::json!({"op": "inventory"}))
             .await
-            .ok()
+            .map_err(|e| format!("the hub didn't answer: {e:#}"))
     } else {
-        None
+        Err("VM not running".to_string())
     };
     for r in list {
-        let board = live.as_ref().and_then(|v| {
+        let board = live.as_ref().ok().and_then(|v| {
             v["inventory"]["rubicons"]
                 .as_array()?
                 .iter()
@@ -99,7 +100,13 @@ async fn list_live(list: &[hub::RubiconEntry]) -> Result<()> {
             .map(|l| format!(" ({l})"))
             .unwrap_or_default();
         match board {
-            None => println!("{}{label}: unknown (VM not running)", r.address),
+            None => println!(
+                "{}{label}: unknown ({})",
+                r.address,
+                live.as_ref()
+                    .err()
+                    .map_or("the hub doesn't list this board yet", |e| e.as_str())
+            ),
             Some(b) => {
                 let state = if b["online"] == true {
                     format!(

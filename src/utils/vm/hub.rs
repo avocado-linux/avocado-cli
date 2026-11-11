@@ -105,16 +105,21 @@ pub async fn push_configure(paths: &VmPaths, target: &SshTarget) -> Result<()> {
 /// The API URL as the guest must use it: QEMU user-mode NAT reaches the
 /// host's loopback at 10.0.2.2.
 pub fn guest_api_url(api_url: &str) -> String {
-    for local in ["://localhost", "://127.0.0.1"] {
-        if let Some(i) = api_url.find(local) {
-            return format!(
-                "{}://10.0.2.2{}",
-                &api_url[..i],
-                &api_url[i + local.len()..]
-            );
-        }
+    // Only a host that is exactly loopback: `localhost.example.com` is not.
+    let Some((scheme, rest)) = api_url.split_once("://") else {
+        return api_url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    };
+    if host != "localhost" && host != "127.0.0.1" {
+        return api_url.to_string();
     }
-    api_url.to_string()
+    let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{scheme}://10.0.2.2{port}{path}")
 }
 
 /// avocado-conn config for a VM: claim with the DMI UUID (stable per
@@ -152,6 +157,12 @@ mod tests {
             guest_api_url("https://connect.peridio.com"),
             "https://connect.peridio.com"
         );
+        // Only an exact loopback host is rewritten.
+        assert_eq!(
+            guest_api_url("http://localhost.example.com/x"),
+            "http://localhost.example.com/x"
+        );
+        assert_eq!(guest_api_url("http://localhost"), "http://10.0.2.2");
     }
 
     #[test]
