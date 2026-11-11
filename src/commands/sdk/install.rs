@@ -1262,6 +1262,8 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             target,
             need_target_dev && target_dev_ok,
             clean_target_sysroot,
+            !target_dev_ok,
+            prev_target_kver,
         );
         if need_target_dev && target_dev_ok {
             // Post-install: query versions and update lock file.
@@ -2421,15 +2423,29 @@ $DNF_SDK_HOST \
 /// unchanged, so no clean) would request them again into the empty sysroot.
 /// Same rule as the rootfs install: a failed reinstall must not leave a stale
 /// package map.
+///
+/// `cleaned` means the wipe was planned, not that it ran: the container can
+/// fail before the `rm -rf`. So when the install failed, the target-sysroot's
+/// kernel pin goes back to `prev_kver`, and the next run sees the change again
+/// and wipes again. Otherwise the old kernel's packages could stay in the
+/// sysroot under an unchanged pin, and nothing would clean them.
 fn merge_target_sysroot_lock(
     final_lock: &mut LockFile,
     target_dev_lock: &LockFile,
     target: &str,
     installed: bool,
     cleaned: bool,
+    install_failed: bool,
+    prev_kver: Option<&str>,
 ) {
     if !(installed || cleaned) {
         return;
+    }
+    if cleaned && install_failed {
+        match prev_kver {
+            Some(prev) => final_lock.set_kernel_version(target, &SysrootType::TargetSysroot, prev),
+            None => final_lock.remove_kernel_version(target, &SysrootType::TargetSysroot),
+        }
     }
     if let Some(target_locks) = target_dev_lock.targets.get(target) {
         let entry = final_lock.targets.entry(target.to_string()).or_default();
@@ -2484,7 +2500,9 @@ mod tests {
     use std::collections::HashMap;
 
     /// A wipe followed by a failed install still saves the cleared section: the
-    /// old kernel's pins must not survive next to the new kernel's pin.
+    /// old kernel's pins must not survive. And the kernel pin goes back to the
+    /// old kernel, so the next run sees the change and wipes again: the wipe may
+    /// never have run.
     #[test]
     fn failed_install_after_wipe_drops_the_old_kernels_pins() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2503,13 +2521,39 @@ mod tests {
         let mut target_dev_lock = final_lock.clone();
         target_dev_lock.clear_target_sysroot(target);
 
-        merge_target_sysroot_lock(&mut final_lock, &target_dev_lock, target, false, true);
+        let mut succeeded = final_lock.clone();
+
+        merge_target_sysroot_lock(
+            &mut final_lock,
+            &target_dev_lock,
+            target,
+            false,
+            true,
+            true,
+            Some("6.18.52-yocto-standard"),
+        );
         final_lock.save(temp_dir.path()).unwrap();
 
         let saved = LockFile::load(temp_dir.path()).unwrap();
         assert_eq!(saved.get_locked_version(target, &ts, old), None);
         assert_eq!(
             saved.get_kernel_version(target, &ts),
+            Some(&"6.18.52-yocto-standard".to_string()),
+            "a failed install must leave the kernel change for the next run to see"
+        );
+
+        // A successful install keeps the new pin.
+        merge_target_sysroot_lock(
+            &mut succeeded,
+            &target_dev_lock,
+            target,
+            true,
+            true,
+            false,
+            Some("6.18.52-yocto-standard"),
+        );
+        assert_eq!(
+            succeeded.get_kernel_version(target, &ts),
             Some(&"6.8.12-l4t".to_string())
         );
     }
