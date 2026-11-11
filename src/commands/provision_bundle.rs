@@ -815,6 +815,11 @@ pub struct SpecBlob {
 
 /// Put blob `sha` into the cache from `src` (URL or local file), verified.
 async fn fetch_blob(src: &str, sha: &str, cache: &Path) -> Result<()> {
+    // The hash names files in the cache: anything but a sha256 (a `../`, a
+    // path) could write or delete outside it, whichever caller passed it.
+    if !is_sha256(sha) {
+        bail!("bundle blob {sha:?} is not a sha256");
+    }
     let dest = cache.join(sha);
     if dest.exists() {
         return Ok(());
@@ -1098,6 +1103,16 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_blob_hash_that_is_not_a_sha256_never_names_a_file() {
+        let cache = tempfile::tempdir().unwrap();
+        let e = fetch_blob("/dev/null", "../../escape", cache.path())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not a sha256"), "{e}");
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
+    }
 
     /// Pack as `assemble` does: only what the target's runtimes need.
     fn pack(cfg: &Path, blobs: &Path) -> (Vec<ExtSourceArchive>, String) {
