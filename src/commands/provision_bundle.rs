@@ -460,10 +460,23 @@ pub fn pack_ext_sources(
     blobs: &Path,
 ) -> Result<(Vec<ExtSourceArchive>, String)> {
     use crate::utils::config::ExtensionSource;
+    use crate::utils::interpolation::{interpolate_config, preprocess_text, AvocadoContext};
 
     let text = std::fs::read_to_string(config_path)?;
-    let base = config_path.parent().unwrap_or(Path::new("."));
-    let found = Config::discover_remote_extensions(&config_path.to_string_lossy(), Some(target))?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
+    // The document as the build resolved it: extension paths, `src_dir` and
+    // the `{{ config.* }}` references in either are read from this.
+    let mut resolved = doc.clone();
+    interpolate_config(&mut resolved, Some(target), None)
+        .with_context(|| format!("interpolate {}", config_path.display()))?;
+    // A relative path source resolves against `src_dir` (itself relative to
+    // the config's directory), else the config's directory.
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let base = match resolved.get("src_dir").and_then(|v| v.as_str()) {
+        Some(src_dir) => config_dir.join(src_dir),
+        None => config_dir.to_path_buf(),
+    };
+    let found = Config::discover_remote_extensions_from_value(&resolved)?;
     // Source path as written -> the bundle-local path it becomes.
     let mut moved: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();
@@ -487,12 +500,11 @@ pub fn pack_ext_sources(
             size: archive.len() as u64,
         });
     }
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
     // `moved` is keyed by the resolved path; the raw text may still template
-    // it (`../extensions/bsp-{{ avocado.target.board }}`), so resolve each
-    // written path the same way before looking it up.
-    let ctx =
-        crate::utils::interpolation::AvocadoContext::from_main_config(&doc, Some(target), None);
+    // it (`../extensions/bsp-{{ avocado.target.board }}`,
+    // `{{ config.ext_root }}/bsp`), so resolve each written path against the
+    // resolved document before looking it up.
+    let ctx = AvocadoContext::from_main_config(&doc, Some(target), None);
     // Pin the board the bundle was built for. It is often chosen by
     // AVOCADO_TARGET_BOARD, which the hub does not have: without this the
     // hub composes the project for its default board, and picks up another
@@ -503,31 +515,26 @@ pub fn pack_ext_sources(
     if let (Some(board), Some(map)) = (ctx.target_board.clone(), doc.as_mapping_mut()) {
         map.insert("default_target_board".into(), board.into());
     }
-    if moved.is_empty() {
-        return Ok((out, serde_yaml::to_string(&doc)?));
-    }
-    let resolve = |p: &str| -> String {
-        let mut v = serde_yaml::Value::String(p.to_string());
-        crate::utils::interpolation::interpolate_config_with_context(&mut v, &ctx)
-            .ok()
-            .and_then(|_| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| p.to_string())
-    };
     if let Some(exts) = doc.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
         for (_, ext) in exts.iter_mut() {
             let Some(src) = ext.get_mut("source").and_then(|s| s.as_mapping_mut()) else {
                 continue;
             };
-            let is_path = src.get("type").and_then(|t| t.as_str()) == Some("path");
-            let to = src
-                .get("path")
-                .and_then(|p| p.as_str())
-                .and_then(|p| moved.get(&resolve(p)))
-                .cloned();
-            if let (true, Some(to)) = (is_path, to) {
-                src.insert("path".into(), to.into());
+            if src.get("type").and_then(|t| t.as_str()) != Some("path") {
+                continue;
+            }
+            let Some(written) = src.get("path").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            if let Some(to) = moved.get(&preprocess_text(written, &resolved, &ctx)?) {
+                src.insert("path".into(), to.clone().into());
             }
         }
+    }
+    // The replay's directory is the project root: the carried copies above
+    // and the lock sit beside its config, wherever `src_dir` pointed here.
+    if let Some(map) = doc.as_mapping_mut() {
+        map.remove("src_dir");
     }
     Ok((out, serde_yaml::to_string(&doc)?))
 }
@@ -1014,6 +1021,52 @@ mod tests {
         assert_eq!(a[0].name, "bsp-b1");
         assert!(yaml.contains(".avocado-bundle/ext/bsp-b1"), "{yaml}");
         assert!(!yaml.contains("../extensions"), "{yaml}");
+    }
+
+    #[test]
+    fn path_sources_resolve_against_src_dir_and_the_replay_drops_it() {
+        // The config sits in runtimes/b1 with `src_dir: ../..` (the repo
+        // root): `path: bsp` is <root>/bsp, not runtimes/b1/bsp.
+        let tmp = tempfile::tempdir().unwrap();
+        let ext = tmp.path().join("bsp");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("avocado.yaml"), "rubicon:\n  run: {}\n").unwrap();
+        let project = tmp.path().join("runtimes/b1");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = project.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "src_dir: ../..\ndefault_target: t\nextensions:\n  bsp:\n    source:\n      type: path\n      path: bsp\n",
+        )
+        .unwrap();
+        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        assert_eq!(a.len(), 1);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(doc.get("src_dir").is_none(), "{yaml}");
+        assert_eq!(
+            doc["extensions"]["bsp"]["source"]["path"].as_str(),
+            Some(".avocado-bundle/ext/bsp")
+        );
+    }
+
+    #[test]
+    fn config_references_in_path_sources_are_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ext = tmp.path().join("extensions/bsp");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("avocado.yaml"), "rubicon:\n  run: {}\n").unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cfg = project.join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            "default_target: t\next_root: ../extensions\nextensions:\n  bsp:\n    source:\n      type: path\n      path: '{{ config.ext_root }}/bsp'\n",
+        )
+        .unwrap();
+        let (a, yaml) = pack_ext_sources(&cfg, "t", &tmp.path().join("blobs")).unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(yaml.contains(".avocado-bundle/ext/bsp"), "{yaml}");
+        assert!(!yaml.contains("ext_root }}/bsp"), "{yaml}");
     }
 
     #[test]
