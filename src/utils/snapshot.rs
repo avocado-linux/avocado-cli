@@ -278,6 +278,46 @@ async fn verify_pin_available(
     }
 }
 
+/// Warning for a pin that no longer applies. When release and channel are
+/// unchanged the URL is the only difference, so say that rather than claiming
+/// the config names a different release/channel.
+fn mismatch_warning(snap: &RepoSnapshot, release: &str, channel: &str, repo_url: &str) -> String {
+    let tail = "Tracking the live channel head; run 'avocado update' to re-pin.";
+    if snap.release == release && snap.channel == channel {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot '{}' for {}/{} on a different feed URL than \
+             the config now names ({}). {tail}",
+            snap.snapshot, release, channel, repo_url
+        )
+    } else {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. {tail}",
+            snap.release, snap.channel, release, channel
+        )
+    }
+}
+
+/// One line naming the pinned and latest snapshots when they differ. Tolerant:
+/// any fetch or parse failure, a feed without snapshots, or an up-to-date pin
+/// yields `None`, so an advisory never fails or slows a pinned rebuild.
+async fn newer_snapshot_notice(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+) -> Option<String> {
+    match fetch_latest(client, repo_url, release, channel, target).await {
+        Ok(LatestResult::Found(latest)) if latest.id != pinned.snapshot => Some(format!(
+            "Pinned to snapshot '{}'; latest for {release}/{channel} is '{}'. \
+             Run 'avocado update' to move the pin.",
+            pinned.snapshot, latest.id
+        )),
+        _ => None,
+    }
+}
+
 /// Resolve the snapshot pin for `target` and, when one applies, expose it via
 /// `AVOCADO_RELEASEVER` so every downstream `get_releasever()` fetches against
 /// the frozen snapshot subtree. Auto-pins (and persists) on first fetch.
@@ -308,16 +348,17 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         PinStatus::Matches => {
             let snap = lock.get_repo_snapshot(target).expect("matched");
             verify_pin_available(&client, &repo_url, snap, target).await?;
+            if let Some(notice) =
+                newer_snapshot_notice(&client, &repo_url, &release, &channel, target, snap).await
+            {
+                print_info(&notice, OutputLevel::Normal);
+            }
             effective_releasever(&snap.release, &snap.channel, &snap.snapshot)
         }
         PinStatus::Mismatch => {
             let snap = lock.get_repo_snapshot(target).expect("mismatch");
             print_info(
-                &format!(
-                    "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. \
-                     Tracking the live channel head; run 'avocado update' to re-pin.",
-                    snap.release, snap.channel, release, channel
-                ),
+                &mismatch_warning(snap, &release, &channel, &repo_url),
                 OutputLevel::Normal,
             );
             return Ok(());
@@ -504,5 +545,98 @@ mod tests {
             repomd_url("https://r.io", "2026", "edge", "qemux86-64", "SNAP"),
             "https://r.io/2026/edge/snapshots/SNAP/target/qemux86-64/repodata/repomd.xml"
         );
+    }
+
+    #[test]
+    fn url_only_change_does_not_claim_release_or_channel_changed() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "edge", "https://mirror.example.com");
+        assert!(msg.contains("different feed URL"), "{msg}");
+        assert!(msg.contains("https://mirror.example.com"), "{msg}");
+        assert!(!msg.contains("config now names 2026/edge"), "{msg}");
+    }
+
+    #[test]
+    fn channel_change_still_names_both_feeds() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "stable", URL);
+        assert!(
+            msg.contains("pinned to snapshot for 2026/edge but config now names 2026/stable"),
+            "{msg}"
+        );
+    }
+
+    /// Serve one canned HTTP response on a loopback port, then return its base URL.
+    fn serve_once(status: &str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn newer_latest_names_pinned_latest_and_update_command() {
+        let url = serve_once("200 OK", r#"{"id":"NEW"}"#);
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await
+        .expect("a differing latest yields a notice");
+        assert!(msg.contains("'OLD'") && msg.contains("'NEW'"), "{msg}");
+        assert!(msg.contains("avocado update"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn latest_equal_to_pin_prints_nothing() {
+        let url = serve_once("200 OK", r#"{"id":"SAME"}"#);
+        let p = snap("2026", "edge", "SAME", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn unreachable_latest_prints_nothing() {
+        // Bind then drop, so the port is closed when the client connects.
+        let url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
     }
 }
