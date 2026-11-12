@@ -563,9 +563,19 @@ impl SdkInstallCommand {
         )?;
 
         // Before the first download. `active_extensions` ignores `enabled`, so an
-        // `enabled: false` extension still needs the extension repository.
+        // `enabled: false` extension with a package `source` still needs the
+        // extension repository; a local one never does.
+        let needs_extension_repo = Config::extensions_need_extension_repo(
+            &composed.merged_value,
+            active_extensions.iter().map(String::as_str),
+        )?;
         config
-            .preflight_feeds_once(&target, &self.config_path, !active_extensions.is_empty())
+            .preflight_feeds_once(
+                &target,
+                &self.config_path,
+                needs_extension_repo,
+                self.runs_on.is_some(),
+            )
             .await?;
 
         print_info("Installing SDK dependencies.", OutputLevel::Normal);

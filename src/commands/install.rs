@@ -205,13 +205,24 @@ impl InstallCommand {
         crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &_target).await?;
 
         // Probe the feeds before the first download. The SDK install step runs
-        // the same hook, which is a no-op once this has passed. `enabled: false`
-        // extensions count: they are fetched regardless of the flag.
-        let needs_extension_repo = !self
-            .find_required_extensions(&composed, &_target)?
-            .is_empty();
+        // the same hook, which is a no-op once this has passed. Only an extension
+        // fetched from the extension repository (a package `source`) needs it, and
+        // `enabled: false` does not exempt one: it is fetched regardless of the flag.
+        let required = self.find_required_extensions(&composed, &_target)?;
+        let needs_extension_repo = Config::extensions_need_extension_repo(
+            _parsed,
+            required.iter().map(|e| {
+                let ExtensionDependency::Local(name) = e;
+                name.as_str()
+            }),
+        )?;
         config
-            .preflight_feeds_once(&_target, &self.config_path, needs_extension_repo)
+            .preflight_feeds_once(
+                &_target,
+                &self.config_path,
+                needs_extension_repo,
+                self.runs_on.is_some(),
+            )
             .await?;
 
         // Compute target runtimes early so we can show a useful start message.

@@ -4524,35 +4524,71 @@ async fn invocation_feeds(
     .cloned()
 }
 
-/// Targets whose feed repositories this process has already probed.
-static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+/// Targets whose feed repositories this process has already probed, and whether
+/// that pass also probed the extension repository.
+static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, bool>>> =
     std::sync::OnceLock::new();
 
 impl Config {
+    /// Whether any of the `active` extensions is fetched from the extension
+    /// repository: one declaring a package `source`. A local extension (no
+    /// `source`, as `avocado init --minimal` keeps) and a git or path source never
+    /// touch that repository, so a feed without one must not be refused for them.
+    /// `enabled: false` does not exempt a sourced extension; it is fetched anyway.
+    ///
+    /// `parsed` must already be interpolated.
+    pub fn extensions_need_extension_repo<'a>(
+        parsed: &serde_yaml::Value,
+        active: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
+        let packages: std::collections::HashSet<String> =
+            Self::discover_remote_extensions_from_value(parsed)?
+                .into_iter()
+                .filter(|(_, source)| matches!(source, ExtensionSource::Package { .. }))
+                .map(|(name, _)| name)
+                .collect();
+        Ok(active.into_iter().any(|name| packages.contains(name)))
+    }
+
     /// Fail before the first download when a feed repository is unreachable.
     ///
     /// `install` and `sdk install` both call this on the way in, and `install`
     /// runs the SDK install, so the probes are keyed by target and run once per
     /// invocation. The lock is held across the probes so two concurrent callers
     /// do not both run them. Only a pass is recorded; a failure ends the command.
+    /// A later call that needs the extension repository after a pass that did not
+    /// probe it runs again, so the second caller is not told yes on the first's
+    /// narrower check.
     /// Resolution is repeated here rather than shared with `materialize_feeds`,
     /// which runs later and needs the mint this check must precede.
+    ///
+    /// With `runs_on` the probes are skipped: dnf runs on the remote runner,
+    /// which may reach feeds this host cannot.
     pub async fn preflight_feeds_once(
         &self,
         target: &str,
         config_path: &str,
         needs_extension_repo: bool,
+        runs_on: bool,
     ) -> Result<()> {
+        if runs_on {
+            crate::utils::output::print_info_stderr(
+                "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
+            );
+            return Ok(());
+        }
         let probed = FEEDS_PROBED.get_or_init(Default::default);
         let mut done = probed.lock().await;
-        if done.contains(target) {
-            return Ok(());
+        if let Some(&ext_probed) = done.get(target) {
+            if ext_probed || !needs_extension_repo {
+                return Ok(());
+            }
         }
         let project_root = self.project_root(config_path);
         let set = crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?;
         crate::utils::feeds::preflight_feeds(self, set.as_ref(), target, needs_extension_repo)
             .await?;
-        done.insert(target.to_string());
+        done.insert(target.to_string(), needs_extension_repo);
         Ok(())
     }
 
@@ -15009,13 +15045,137 @@ mod invocation_feeds_tests {
         ))
         .unwrap();
         let cfg = cfg.to_str().unwrap();
-        c.preflight_feeds_once("probe-once-test", cfg, false)
+        c.preflight_feeds_once("probe-once-test", cfg, false, false)
             .await
             .unwrap();
-        c.preflight_feeds_once("probe-once-test", cfg, false)
+        c.preflight_feeds_once("probe-once-test", cfg, false, false)
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loopback server answering every request with `status`, counting requests.
+    async fn serve_counting(
+        status: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn repo_config(url: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  repo:\n    url: {url}\n"
+        ))
+        .unwrap()
+    }
+
+    const MINIMAL: &str = "extensions:\n  app:\n    version: '1.0.0'\n";
+    const SOURCED: &str = "extensions:\n  app:\n    version: '1.0.0'\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n  git-ext:\n    version: '*'\n    source:\n      type: git\n      url: https://example.com/x.git\n";
+
+    fn needs(yaml: &str, active: &[&str]) -> bool {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        Config::extensions_need_extension_repo(&v, active.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn only_an_active_package_sourced_extension_needs_the_extension_repo() {
+        assert!(
+            !needs(MINIMAL, &["app"]),
+            "a local extension is not fetched"
+        );
+        assert!(needs(SOURCED, &["app", "avocado-ext-dev"]));
+        assert!(!needs(SOURCED, &["app"]), "an inactive sourced extension");
+        assert!(!needs(SOURCED, &["git-ext"]), "a git source skips the repo");
+        assert!(!needs(SOURCED, &[]));
+    }
+
+    #[test]
+    fn enabled_false_does_not_exempt_a_sourced_extension() {
+        let yaml = "runtimes:\n  r:\n    extensions:\n      - avocado-ext-dev:\n          enabled: false\nextensions:\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n";
+        // Activity ignores `enabled`; the helper only sees the active names.
+        assert!(needs(yaml, &["avocado-ext-dev"]));
+    }
+
+    #[tokio::test]
+    async fn minimal_project_against_a_feed_without_an_extension_repo_passes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(MINIMAL, &["app"]);
+        c.preflight_feeds_once(
+            "minimal-no-ext-repo",
+            "/nonexistent/avocado.yaml",
+            need,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sourced_extension_against_a_feed_without_an_extension_repo_fails_naming_it() {
+        let (base, _) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(SOURCED, &["avocado-ext-dev"]);
+        let e = c
+            .preflight_feeds_once(
+                "sourced-no-ext-repo",
+                "/nonexistent/avocado.yaml",
+                need,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'avocado' extension repository"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_later_call_needing_the_extension_repo_still_probes_it() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("ext-key-test", cfg, false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("ext-key-test", cfg, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("extension repository"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runs_on_skips_the_local_probes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        c.preflight_feeds_once("runs-on-test", "/nonexistent/avocado.yaml", true, true)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
 

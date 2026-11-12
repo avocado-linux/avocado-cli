@@ -1622,7 +1622,7 @@ impl Probe<'_> {
             Err(e) => bail!("{}: cannot connect to {} ({e})", self.subject, self.url),
         };
         let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
             bail!(
                 "{}: not found at {} (the feed serves no repository metadata there)",
                 self.subject,
@@ -1630,7 +1630,13 @@ impl Probe<'_> {
             );
         }
         if !status.is_success() {
-            bail!("{}: {} answered {status}", self.subject, self.url);
+            // The feed answered, so it is reachable and may well serve dnf (a probe
+            // rejected by rate limiting or a proxy says nothing about the repo).
+            // Only a definite "no metadata" or "no server" stops the command.
+            crate::utils::output::print_warning_stderr(&format!(
+                "{}: {} answered {status}; continuing, dnf will report it if the feed is unusable",
+                self.subject, self.url
+            ));
         }
         Ok(())
     }
@@ -1657,6 +1663,20 @@ pub async fn preflight_feeds(
     needs_extension_repo: bool,
 ) -> Result<()> {
     for feed in feeds.into_iter().flat_map(|s| s.feeds.iter()) {
+        // An add-on is checked against the channel's index (or the pinned
+        // snapshot) by `check_addons`, whose message names what was mistyped. A
+        // bare metadata probe here would pre-empt it with a less useful one. With
+        // no index to check against, `check_addons` does nothing, so probe.
+        let addon_base = feed
+            .name
+            .strip_suffix(ADDON_SDK_SUFFIX)
+            .unwrap_or(&feed.name);
+        if feeds.is_some_and(|s| {
+            s.addon_index_url.is_some()
+                && s.addons.iter().any(|a| a == &feed.name || a == addon_base)
+        }) {
+            continue;
+        }
         let subject = format!("feed '{}'", feed.name);
         let locator = match feed.kind {
             FeedKind::Path => {
@@ -1694,10 +1714,16 @@ pub async fn preflight_feeds(
     }
     if needs_extension_repo {
         let repo_url = config.effective_repo_url();
-        let root = match config.get_releasever() {
-            Some(rv) => format!("{}/{rv}", repo_url.trim_end_matches('/')),
-            None => repo_url.trim_end_matches('/').to_string(),
+        // Without a releasever the container falls back to the image's
+        // os-release, which this host cannot see; a URL built without one would
+        // 404 on a feed that serves the repository fine.
+        let Some(rv) = config.get_releasever() else {
+            crate::utils::output::print_info_stderr(
+                "skipping the extension repository probe: no releasever is configured, so its URL cannot be known here",
+            );
+            return Ok(());
         };
+        let root = format!("{}/{rv}", repo_url.trim_end_matches('/'));
         let distro_feed = match config.distro.as_ref().and_then(|d| d.repo.as_ref()) {
             Some(DistroRepoRef::Named(n)) => n.as_str(),
             _ => DEFAULT_DISTRO_FEED_NAME,
@@ -3538,5 +3564,88 @@ distro:
         let (base, _) = serve_status("200 OK").await;
         let c = config_with_repo(&base);
         preflight_feeds(&c, None, "t", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gone_feed_fails_like_not_found() {
+        let (base, _) = serve_status("410 Gone").await;
+        let (c, set) = url_feed_set(&base, "");
+        let e = preflight_feeds(&c, Some(&set), "t", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'") && e.contains("not found"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn other_statuses_warn_and_let_dnf_proceed() {
+        for status in [
+            "503 Service Unavailable",
+            "403 Forbidden",
+            "401 Unauthorized",
+            "429 Too Many Requests",
+        ] {
+            let (base, seen) = serve_status(status).await;
+            let (c, set) = url_feed_set(&base, "");
+            preflight_feeds(&c, Some(&set), "t", false)
+                .await
+                .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
+            assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_repository_is_skipped_without_a_releasever() {
+        // Nothing listens and no release/channel is configured: the URL would be
+        // a guess, so it is not probed.
+        let url = closed_port_url().await;
+        let c = load(&format!("repo:\n  url: {url}\n"));
+        if c.get_releasever().is_some() {
+            return; // an ambient AVOCADO_RELEASEVER would supply one
+        }
+        preflight_feeds(&c, None, "t", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn addon_feeds_are_left_to_check_addons_when_the_index_is_known() {
+        // A misspelled add-on would otherwise surface here as a bare "not found at
+        // .../repomd.xml", ahead of check_addons' did-you-mean text.
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = load(&format!(
+            "{BASE}  repo:\n    url: {base}\n  feeds: [ros2-jazy]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        assert!(set.feeds.iter().any(|f| f.name == "ros2-jazy"));
+        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        let idx = index(&[("t", &["target/t-ros2-jazzy", "sdk/t-ros2-jazzy"])]);
+        let e = check_addons_against(&idx, "t", &["ros2-jazy".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("did you mean"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn addon_feeds_are_probed_when_there_is_no_index_to_check_them() {
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = load(&format!(
+            "distro:\n  repo:\n    url: {base}\n  feeds: [ros2-jazzy]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        if set.addon_index_url.is_some() {
+            return; // ambient release/channel supplied an index
+        }
+        let e = preflight_feeds(&c, Some(&set), "t", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'ros2-jazzy'"), "{e}");
+        assert!(!seen.lock().unwrap().is_empty());
     }
 }
