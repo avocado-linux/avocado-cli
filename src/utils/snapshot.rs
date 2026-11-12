@@ -308,7 +308,37 @@ async fn newer_snapshot_notice(
     target: &str,
     pinned: &RepoSnapshot,
 ) -> Option<String> {
-    match fetch_latest(client, repo_url, release, channel, target).await {
+    newer_snapshot_notice_within(
+        client,
+        repo_url,
+        release,
+        channel,
+        target,
+        pinned,
+        NEWER_SNAPSHOT_NOTICE_LIMIT,
+    )
+    .await
+}
+
+/// The notice is advisory, so a slow feed must not hold up a pinned rebuild.
+const NEWER_SNAPSHOT_NOTICE_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn newer_snapshot_notice_within(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let latest = tokio::time::timeout(
+        limit,
+        fetch_latest(client, repo_url, release, channel, target),
+    )
+    .await
+    .ok()?;
+    match latest {
         Ok(LatestResult::Found(latest)) if latest.id != pinned.snapshot => Some(format!(
             "Pinned to snapshot '{}'; latest for {release}/{channel} is '{}'. \
              Run 'avocado update' to move the pin.",
@@ -638,5 +668,31 @@ mod tests {
         )
         .await;
         assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn hung_latest_endpoint_is_abandoned_within_the_limit() {
+        // Accepts the connection and never answers.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let started = std::time::Instant::now();
+        let msg = newer_snapshot_notice_within(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(msg, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "advisory held the command for {:?}",
+            started.elapsed()
+        );
+        drop(l);
     }
 }
