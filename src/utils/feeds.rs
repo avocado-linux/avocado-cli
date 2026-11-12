@@ -1593,6 +1593,14 @@ struct Probe<'a> {
     credential: Option<&'a (String, String)>,
 }
 
+/// Every certificate in the CA file. A bundle may carry several, and dnf
+/// trusts all of them, so the probe must as well.
+fn load_ca_certificates(ca: &Path, subject: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = fs::read(ca).with_context(|| format!("{subject}: reading ca {}", ca.display()))?;
+    reqwest::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("{subject}: parsing ca {}", ca.display()))
+}
+
 impl Probe<'_> {
     /// One client per probe: `ca`, `tls_verify` and the credential differ per feed.
     async fn run(&self) -> Result<()> {
@@ -1601,11 +1609,9 @@ impl Probe<'_> {
             .timeout(std::time::Duration::from_secs(20))
             .user_agent(user_agent());
         if let Some(ca) = &self.ca {
-            let pem = fs::read(ca)
-                .with_context(|| format!("{}: reading ca {}", self.subject, ca.display()))?;
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .with_context(|| format!("{}: parsing ca {}", self.subject, ca.display()))?;
-            builder = builder.add_root_certificate(cert);
+            for cert in load_ca_certificates(ca, &self.subject)? {
+                builder = builder.add_root_certificate(cert);
+            }
         }
         if !self.tls_verify {
             builder = builder.danger_accept_invalid_certs(true);
@@ -3592,6 +3598,21 @@ distro:
                 .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
             assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
         }
+    }
+
+    #[test]
+    fn a_ca_bundle_contributes_every_certificate() {
+        let pem = |name: &str| {
+            rcgen::generate_simple_self_signed(vec![name.to_string()])
+                .unwrap()
+                .cert
+                .pem()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.pem");
+        fs::write(&path, format!("{}{}", pem("one.test"), pem("two.test"))).unwrap();
+        let certs = load_ca_certificates(&path, "feed 'x'").unwrap();
+        assert_eq!(certs.len(), 2);
     }
 
     #[tokio::test]
