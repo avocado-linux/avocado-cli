@@ -6907,9 +6907,18 @@ extensions:
                     Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
                         std::thread::sleep(std::time::Duration::from_millis(10))
                     }
-                    _ => return,
+                    // A nonzero exit is fine (`gone` exits 1); any other spawn
+                    // error fails here rather than inside the test.
+                    status => {
+                        status.unwrap();
+                        return;
+                    }
                 }
             }
+            std::process::Command::new(p)
+                .arg("--probe")
+                .status()
+                .unwrap();
         }
 
         fn container_with_tool(tool: String) -> SdkContainer {
