@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A snapshot pin identity covers the feed URL, and a pinned rebuild
+  mentions newer snapshots.** A recorded pin now remembers the repository URL
+  it came from (trailing slashes ignored), so pointing the config at a mirror
+  or another feed with the same release and channel warns that the pin does not
+  match instead of reusing a snapshot ID that repository never issued. When
+  only the URL changed, the warning names the new feed URL. Lock files written
+  before the URL was recorded still match. A pinned rebuild also prints one
+  line naming the pinned and latest snapshots and pointing at `avocado update`
+  when the channel has moved on; a failed lookup prints nothing.
+
 ### Fixed
 - **A failed run's summary no longer calls the steps it never reached "up to
   date".** After `sdk bootstrap` failed, for example, `sdk packages` and
