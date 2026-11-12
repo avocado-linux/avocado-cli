@@ -393,8 +393,39 @@ pub fn require_dry_run_support(manifest_json: &str, profile: Option<&str>) -> Re
     Ok(())
 }
 
+/// Container-free half of the `--dry-run` gate. Returns the profile name the
+/// run will actually use (`None` means the manifest default) or refuses.
+///
+/// The script reads `AVOCADO_PROVISION_PROFILE` from the effective env, so
+/// that variable wins over `provision_profile`; an empty value counts as
+/// unset, as the scripts' `${VAR:-}` expansion does. A custom stone manifest
+/// (runtime config `stone_manifest` or an `AVOCADO_STONE_MANIFEST` env var) is
+/// refused because the gate can only read the SDK's default manifest, so it
+/// could not verify the manifest the run will really use.
+pub fn dry_run_preflight(
+    env: Option<&std::collections::HashMap<String, String>>,
+    provision_profile: Option<&str>,
+    config_stone_manifest: Option<&str>,
+) -> Result<Option<String>> {
+    let non_empty = |k: &str| env.and_then(|e| e.get(k)).filter(|v| !v.is_empty());
+    if config_stone_manifest.is_some_and(|m| !m.is_empty())
+        || non_empty("AVOCADO_STONE_MANIFEST").is_some()
+    {
+        anyhow::bail!(
+            "--dry-run cannot be verified with a custom stone manifest (AVOCADO_STONE_MANIFEST or \
+             the runtime's `stone_manifest`): support is only checked against the SDK's default \
+             manifest. Run without --dry-run, or use the default manifest."
+        );
+    }
+    Ok(non_empty("AVOCADO_PROVISION_PROFILE").cloned().or_else(|| {
+        provision_profile
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }))
+}
+
 /// Read the stone manifest for `target` from the project's SDK volume and
-/// apply [`require_dry_run_support`]. The manifest read is a read-only `cat`
+/// apply [`require_dry_run_support`].""" The manifest read is a read-only `cat`
 /// in a one-shot container; no provisioning container has started yet.
 pub async fn ensure_dry_run_supported(
     config: &Config,
@@ -719,5 +750,69 @@ mod tests {
     #[test]
     fn an_unparseable_manifest_is_refused() {
         assert!(require_dry_run_support("not json", Some("p")).is_err());
+    }
+    // MARK: --dry-run preflight (effective profile + custom manifest).
+
+    fn env(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn preflight_profile_flag_only() {
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "a")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), Some("a"), None).unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            dry_run_preflight(None, Some("a"), None).unwrap(),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_env_only_is_the_profile_checked() {
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "emmc")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), None, None).unwrap(),
+            Some("emmc".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_env_wins_over_flag_when_they_differ() {
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "emmc")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), Some("sd"), None).unwrap(),
+            Some("emmc".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_neither_falls_back_to_manifest_default() {
+        assert_eq!(dry_run_preflight(None, None, None).unwrap(), None);
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "")]);
+        assert_eq!(dry_run_preflight(Some(&e), None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn preflight_refuses_config_stone_manifest() {
+        let err = dry_run_preflight(None, None, Some("custom.json")).unwrap_err();
+        assert!(format!("{err:#}").contains("custom stone manifest"));
+    }
+
+    #[test]
+    fn preflight_refuses_env_stone_manifest() {
+        let e = env(&[("AVOCADO_STONE_MANIFEST", "/opt/src/m.json")]);
+        assert!(dry_run_preflight(Some(&e), Some("p"), None).is_err());
+    }
+
+    #[test]
+    fn preflight_empty_env_stone_manifest_is_unset() {
+        let e = env(&[("AVOCADO_STONE_MANIFEST", "")]);
+        assert!(dry_run_preflight(Some(&e), Some("p"), None).is_ok());
     }
 }

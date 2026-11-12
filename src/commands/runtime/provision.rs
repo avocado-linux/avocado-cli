@@ -119,11 +119,21 @@ impl RuntimeProvisionCommand {
         // reach here, so this is the single gate. The manifest read is the
         // same one-shot read-only container `provision --list` uses.
         if self.config.dry_run {
+            let config_manifest = config.get_stone_manifest_for_runtime(
+                &self.config.runtime_name,
+                &target_arch,
+                &self.config.config_path,
+            )?;
+            let profile = crate::commands::profiles::dry_run_preflight(
+                self.config.env_vars.as_ref(),
+                self.config.provision_profile.as_deref(),
+                config_manifest.as_deref(),
+            )?;
             crate::commands::profiles::ensure_dry_run_supported(
                 config,
                 &self.config.config_path,
                 &target_arch,
-                self.config.provision_profile.as_deref(),
+                profile.as_deref(),
             )
             .await?;
         }
