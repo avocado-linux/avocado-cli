@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and board BSP remote extensions and keeps only the local application
   extension, so a first build against such a feed does not fail on dependency
   resolution. Plain `avocado init` is unchanged.
+- **`avocado install` and `avocado sdk install` check feeds before
+  downloading.** A feed preflight probes each URL feed's repository metadata
+  (and the extension repository when an extension needs it) from the host
+  before anything is fetched. An unreachable feed or one with no metadata fails
+  fast with an error naming the feed and the reason, instead of a dnf error
+  from inside the container. A path feed is checked on disk. The probes run
+  once per target even though `install` also runs the SDK install, and are
+  skipped with `--runs-on`, where dnf runs on the remote runner.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's
