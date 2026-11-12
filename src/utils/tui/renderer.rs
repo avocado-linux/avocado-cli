@@ -342,8 +342,13 @@ impl TaskRenderer {
 
         // Print final summary — only tasks not already finalized by the
         // render loop (which emits permanent lines for completed tasks).
+        let mut has_earlier_failure = false;
+        let run_failed = state.iter().any(|task| task.status == TaskStatus::Failed);
         let finalized = self.finalized.lock().unwrap();
         for task in state.iter() {
+            if task.status == TaskStatus::Failed {
+                has_earlier_failure = true;
+            }
             if finalized.contains(&task.id) {
                 continue; // Already emitted by render loop
             }
@@ -372,9 +377,22 @@ impl TaskRenderer {
                 TaskStatus::Skipped => {
                     self.emit_line(&format!("\x1b[2m  - {} (skipped)\x1b[0m", task.label));
                 }
+                TaskStatus::Pending if has_earlier_failure => {
+                    self.emit_line(&format!(
+                        "\x1b[2m  - {} (skipped: earlier step failed)\x1b[0m",
+                        task.label
+                    ));
+                }
                 TaskStatus::Pending => {
                     self.emit_line(&format!(
                         "\x1b[2m  \u{2713} {} (up to date)\x1b[0m",
+                        task.label
+                    ));
+                }
+                // Started before the failure stopped the command, in any order.
+                TaskStatus::Running | TaskStatus::WaitingForInput if run_failed => {
+                    self.emit_line(&format!(
+                        "\x1b[2m  - {} (not finished: a step failed)\x1b[0m",
                         task.label
                     ));
                 }
@@ -917,6 +935,130 @@ mod tests {
         r.set_status(&TaskId::TargetDevInstall, TaskStatus::Success);
         let state = r.state.lock().unwrap();
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn test_shutdown_pending_tasks_after_failure_are_skipped() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+        r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Failed);
+
+        r.shutdown();
+
+        let later_lines: Vec<_> = r
+            .get_test_output()
+            .into_iter()
+            .filter(|line| line.contains("sdk packages") || line.contains("rootfs install"))
+            .collect();
+        assert!(
+            later_lines.iter().all(|line| !line.contains('\u{2713}')),
+            "steps that never ran must not have check marks: {later_lines:?}"
+        );
+        assert_eq!(
+            later_lines,
+            [
+                "\x1b[2m  - sdk packages (skipped: earlier step failed)\x1b[0m",
+                "\x1b[2m  - rootfs install (skipped: earlier step failed)\x1b[0m",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shutdown_pending_tasks_before_and_after_failure() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+        r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+        r.set_status(&TaskId::SdkPackages, TaskStatus::Running);
+        r.set_status(&TaskId::SdkPackages, TaskStatus::Failed);
+
+        r.shutdown();
+
+        let pending_lines: Vec<_> = r
+            .get_test_output()
+            .into_iter()
+            .filter(|line| line.contains("sdk bootstrap") || line.contains("rootfs install"))
+            .collect();
+        assert_eq!(
+            pending_lines,
+            [
+                "\x1b[2m  \u{2713} sdk bootstrap (up to date)\x1b[0m",
+                "\x1b[2m  - rootfs install (skipped: earlier step failed)\x1b[0m",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shutdown_unfinished_tasks_after_failure_are_listed() {
+        // `avocado install`: bootstrap succeeds, later steps start, then
+        // feed setup fails and bootstrap is marked failed.
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+        r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkPackages, TaskStatus::Running);
+        r.set_status(&TaskId::RootfsInstall, TaskStatus::WaitingForInput);
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Failed);
+
+        r.shutdown();
+
+        let unfinished: Vec<_> = r
+            .get_test_output()
+            .into_iter()
+            .filter(|line| line.contains("not finished"))
+            .collect();
+        assert_eq!(
+            unfinished,
+            [
+                "\x1b[2m  - sdk packages (not finished: a step failed)\x1b[0m",
+                "\x1b[2m  - rootfs install (not finished: a step failed)\x1b[0m",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shutdown_unfinished_task_before_the_failed_one_is_listed() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkPackages, TaskStatus::Running);
+        r.set_status(&TaskId::SdkPackages, TaskStatus::Failed);
+
+        r.shutdown();
+
+        assert!(r.get_test_output().contains(
+            &"\x1b[2m  - sdk bootstrap (not finished: a step failed)\x1b[0m".to_string()
+        ));
+    }
+
+    #[test]
+    fn test_shutdown_pending_tasks_without_failure_are_up_to_date() {
+        let r = test_renderer();
+        r.register_task(TaskId::SdkInstall, "sdk bootstrap".to_string());
+        r.register_task(TaskId::SdkPackages, "sdk packages".to_string());
+        r.register_task(TaskId::RootfsInstall, "rootfs install".to_string());
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Running);
+        r.set_status(&TaskId::SdkInstall, TaskStatus::Success);
+
+        r.shutdown();
+
+        let later_lines: Vec<_> = r
+            .get_test_output()
+            .into_iter()
+            .filter(|line| line.contains("sdk packages") || line.contains("rootfs install"))
+            .collect();
+        assert_eq!(
+            later_lines,
+            [
+                "\x1b[2m  \u{2713} sdk packages (up to date)\x1b[0m",
+                "\x1b[2m  \u{2713} rootfs install (up to date)\x1b[0m",
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

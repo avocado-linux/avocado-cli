@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A failed run's summary no longer calls the steps it never reached "up to
+  date".** After `sdk bootstrap` failed, for example, `sdk packages` and
+  `rootfs install` printed with a check mark and `(up to date)`. Steps after
+  the first failed one now print `(skipped: earlier step failed)` with no
+  check mark; steps before it keep `(up to date)`. Steps that had started
+  but not finished when a step failed, which printed no line at all, now
+  print `(not finished: a step failed)`.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added
