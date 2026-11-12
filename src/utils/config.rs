@@ -4538,7 +4538,24 @@ async fn invocation_feeds(
 static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, bool>>> =
     std::sync::OnceLock::new();
 
+/// Set once the `--runs-on` preflight skip has been announced, so the
+/// per-extension and per-runtime install tasks do not repeat it.
+static RUNS_ON_SKIP_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Config {
+    /// Print the `--runs-on` skip notice unless `flag` says it already was.
+    /// Returns true when it printed. Takes the flag so a test can use its own.
+    fn preflight_runs_on_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::utils::output::print_info_stderr(
+            "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
+        );
+        true
+    }
+
     /// Whether any of the `active` extensions is fetched from the extension
     /// repository: one declaring a package `source`. A local extension (no
     /// `source`, as `avocado init --minimal` keeps) and a git or path source never
@@ -4581,9 +4598,7 @@ impl Config {
         runs_on: bool,
     ) -> Result<()> {
         if runs_on {
-            crate::utils::output::print_info_stderr(
-                "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
-            );
+            Self::preflight_runs_on_skip_with(&RUNS_ON_SKIP_PRINTED);
             return Ok(());
         }
         let probed = FEEDS_PROBED.get_or_init(Default::default);
@@ -15218,6 +15233,13 @@ mod invocation_feeds_tests {
             .await
             .unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn runs_on_skip_message_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(Config::preflight_runs_on_skip_with(&flag));
+        assert!(!Config::preflight_runs_on_skip_with(&flag));
     }
 }
 
