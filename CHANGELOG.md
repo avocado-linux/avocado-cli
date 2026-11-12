@@ -47,7 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from inside the container. A path feed is checked on disk. The probes run
   once per target even though `install` also runs the SDK install, and are
   skipped with `--runs-on`, where dnf runs on the remote runner. A feed with
-  TLS verification disabled is not probed, and a warning says so.
+  TLS verification disabled is not probed, and a warning says so. `fetch`,
+  `ext fetch`, `ext install`, `runtime install`, `rootfs install` and
+  `initramfs install` run the same check before they download. The
+  dnf passthrough commands (`sdk dnf`, `runtime dnf`, `ext dnf` and `sdk run`)
+  and `update` do not probe feeds. Where a command accepts `--runs-on`, the
+  skip is reported once.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's
