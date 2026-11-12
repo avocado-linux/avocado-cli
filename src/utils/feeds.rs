@@ -1597,8 +1597,14 @@ struct Probe<'a> {
 /// trusts all of them, so the probe must as well.
 fn load_ca_certificates(ca: &Path, subject: &str) -> Result<Vec<reqwest::Certificate>> {
     let pem = fs::read(ca).with_context(|| format!("{subject}: reading ca {}", ca.display()))?;
-    reqwest::Certificate::from_pem_bundle(&pem)
-        .with_context(|| format!("{subject}: parsing ca {}", ca.display()))
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("{subject}: parsing ca {}", ca.display()))?;
+    // An empty or non-PEM (e.g. DER) file parses to no certificates; trusting
+    // nothing extra would quietly fall back to the system roots.
+    if certs.is_empty() {
+        bail!("{subject}: no PEM certificates in ca {}", ca.display());
+    }
+    Ok(certs)
 }
 
 impl Probe<'_> {
@@ -3597,6 +3603,22 @@ distro:
                 .await
                 .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
             assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
+        }
+    }
+
+    #[test]
+    fn a_ca_file_without_pem_certificates_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty.pem", &b""[..]),
+            ("der.crt", &[0x30, 0x82, 0x01, 0x0a][..]),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let e = load_ca_certificates(&path, "feed 'x'")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("feed 'x': no PEM certificates in ca"), "{e}");
         }
     }
 
