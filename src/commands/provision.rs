@@ -254,4 +254,42 @@ mod tests {
         assert_eq!(cmd.config.runtime, "test-runtime");
         assert_eq!(cmd.config.out, Some("output".to_string()));
     }
+
+    #[tokio::test]
+    async fn provision_dry_run_reaches_the_runtime_provision_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+"#,
+        )
+        .unwrap();
+        let cmd = ProvisionCommand::new(ProvisionConfig {
+            runtime: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(format!("{err:#}").contains("stone manifest could not be read"));
+    }
 }

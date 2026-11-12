@@ -113,6 +113,21 @@ impl RuntimeProvisionCommand {
         // Resolve target architecture
         let target_arch = resolve_target_required(self.config.target.as_deref(), config)?;
 
+        // Refuse --dry-run for a profile whose manifest entry does not declare
+        // `config.dry_run: true`, before the ssh probe, stamp check or script
+        // container. Both `avocado provision` and `avocado runtime provision`
+        // reach here, so this is the single gate. The manifest read is the
+        // same one-shot read-only container `provision --list` uses.
+        if self.config.dry_run {
+            crate::commands::profiles::ensure_dry_run_supported(
+                config,
+                &self.config.config_path,
+                &target_arch,
+                self.config.provision_profile.as_deref(),
+            )
+            .await?;
+        }
+
         // Detect remote host architecture if using --runs-on
         // This is needed to check if the SDK is installed for the remote's architecture
         let remote_arch = if let Some(ref runs_on) = self.config.runs_on {
@@ -1682,5 +1697,47 @@ mod tests {
         assert_eq!(cmd.config.runtime_name, "test-runtime");
         assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert_eq!(cmd.config.env_vars, Some(env_vars));
+    }
+
+    // Both `avocado provision` and `avocado runtime provision` must reach the
+    // dry-run gate. With no `.avocado-state` the gate refuses before any
+    // container starts, so this runs without docker.
+    #[tokio::test]
+    async fn runtime_provision_dry_run_is_gated_before_any_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+"#,
+        )
+        .unwrap();
+        let mut cmd = RuntimeProvisionCommand::new(RuntimeProvisionConfig {
+            runtime_name: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            state_file: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(format!("{err:#}").contains("stone manifest could not be read"));
     }
 }

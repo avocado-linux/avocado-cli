@@ -247,7 +247,7 @@ impl ProfilesListCommand {
     /// "file not found" without docker treating the cat failure as a
     /// container exit error (which would yield empty stdout AND a
     /// non-zero exit, indistinguishable from a real read failure).
-    async fn read_stone_manifest(
+    pub(crate) async fn read_stone_manifest(
         container_tool: &str,
         volume_name: &str,
         sdk_image: &str,
@@ -329,6 +329,9 @@ struct ProfileEntry {
     /// they have no field metadata to drive UI.
     #[serde(default)]
     envs: Vec<JsonValue>,
+    /// Profile-level switches. Only `dry_run` is read here.
+    #[serde(default)]
+    config: Option<JsonValue>,
 }
 
 /// Mirrors the stone manifest's `provision.fields.<name>` entries.
@@ -347,6 +350,85 @@ struct ProvisionField {
     required: bool,
     #[serde(default)]
     default: Option<JsonValue>,
+}
+
+/// Refuse `--dry-run` unless the chosen profile declares `config.dry_run: true`.
+///
+/// Only a JSON `true` counts; absent, null, false and non-bool values all mean
+/// the profile's script does not honor `AVOCADO_PROVISION_DRY_RUN`, so running
+/// it would write the target. `profile` of `None` resolves to the manifest's
+/// `runtime.provision_default`. Pure over the manifest text so the gate is
+/// testable without starting a container.
+pub fn require_dry_run_support(manifest_json: &str, profile: Option<&str>) -> Result<()> {
+    let manifest: StoneManifest = serde_json::from_str(manifest_json)
+        .with_context(|| "Failed to parse stone manifest JSON")?;
+    let name = match profile {
+        Some(p) => p.to_string(),
+        None => manifest
+            .runtime
+            .as_ref()
+            .and_then(|r| r.provision_default.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--dry-run needs a provision profile that declares `config.dry_run: true`, \
+                     but none was given and the stone manifest names no default profile"
+                )
+            })?,
+    };
+    let declared = manifest
+        .provision
+        .as_ref()
+        .and_then(|p| p.profiles.get(&name))
+        .and_then(|e| e.config.as_ref())
+        .and_then(|c| c.get("dry_run"))
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    if !declared {
+        anyhow::bail!(
+            "--dry-run is not supported by provision profile '{name}': its stone manifest entry \
+             does not declare `config.dry_run: true`, so its script would write the target. \
+             Run without --dry-run, or pick a profile that declares it."
+        );
+    }
+    Ok(())
+}
+
+/// Read the stone manifest for `target` from the project's SDK volume and
+/// apply [`require_dry_run_support`]. The manifest read is a read-only `cat`
+/// in a one-shot container; no provisioning container has started yet.
+pub async fn ensure_dry_run_supported(
+    config: &Config,
+    config_path: &str,
+    target: &str,
+    profile: Option<&str>,
+) -> Result<()> {
+    let sdk_image = config.get_sdk_image().ok_or_else(|| {
+        anyhow::anyhow!("--dry-run cannot be verified, stone manifest could not be read: avocado.yaml has no `sdk.image` set")
+    })?;
+    let project_dir = Path::new(config_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let volume = VolumeState::load_from_dir(&project_dir)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dry-run cannot be verified, stone manifest could not be read: SDK not yet installed. Run `avocado install` first."
+        )
+    })?;
+    let raw = ProfilesListCommand::read_stone_manifest(
+        &volume.container_tool,
+        &volume.volume_name,
+        sdk_image,
+        target,
+    )
+    .await
+    .context("--dry-run cannot be verified, stone manifest could not be read")?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dry-run cannot be verified, stone manifest could not be read: {}",
+            manifest_missing_reason(target)
+        )
+    })?;
+    require_dry_run_support(&raw, profile)
 }
 
 /// Walk a profile's env-block references and return the field
@@ -563,5 +645,79 @@ mod tests {
         let prov: ProvisionSection = serde_json::from_str(raw).unwrap();
         assert!(resolve_profile_fields(&prov, prov.profiles.get("noop").unwrap()).is_empty());
         assert!(resolve_profile_fields(&prov, prov.profiles.get("weird").unwrap()).is_empty());
+    }
+
+    // MARK: --dry-run support declared by the profile's `config.dry_run`.
+
+    fn manifest_with(profile_body: &str) -> String {
+        format!(
+            r#"{{
+                "runtime": {{ "provision_default": "dflt" }},
+                "provision": {{ "profiles": {{ "p": {profile_body}, "dflt": {{ "script": "d.sh", "config": {{ "dry_run": true }} }} }} }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn dry_run_is_accepted_for_a_profile_declaring_true() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": true } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_ok());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_profile_with_no_config() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_config_without_dry_run() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "other": true } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_profile_declaring_false() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": false } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_null_and_non_bool_declarations() {
+        for v in [r#""true""#, "1", "null", "[true]"] {
+            let m = manifest_with(&format!(
+                r#"{{ "script": "s.sh", "config": {{ "dry_run": {v} }} }}"#
+            ));
+            assert!(require_dry_run_support(&m, Some("p")).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_an_unknown_profile_naming_it() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        let err = require_dry_run_support(&m, Some("nope")).unwrap_err();
+        assert!(format!("{err:#}").contains("nope"));
+    }
+
+    #[test]
+    fn the_refusal_names_the_profile() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": false } }"#);
+        let msg = format!("{:#}", require_dry_run_support(&m, Some("p")).unwrap_err());
+        assert!(msg.contains("'p'"), "{msg}");
+        assert!(msg.contains("--dry-run"), "{msg}");
+    }
+
+    #[test]
+    fn no_profile_given_checks_the_manifest_default() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        assert!(require_dry_run_support(&m, None).is_ok());
+        let no_default =
+            r#"{ "provision": { "profiles": { "p": { "config": { "dry_run": true } } } } }"#;
+        assert!(require_dry_run_support(no_default, None).is_err());
+    }
+
+    #[test]
+    fn an_unparseable_manifest_is_refused() {
+        assert!(require_dry_run_support("not json", Some("p")).is_err());
     }
 }
