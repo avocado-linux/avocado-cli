@@ -63,7 +63,14 @@ pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 /// True if `args` request host networking, in either the `--network=host` /
 /// `--net=host` form or the space-separated `--network host` / `--net host`
 /// form.
+///
+/// Each element is split on spaces first, as the container run does, so a
+/// single `"--network host"` element counts.
 pub fn args_have_host_network(args: &[String]) -> bool {
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| crate::utils::container::SdkContainer::parse_container_arg(a))
+        .collect();
     args.iter().enumerate().any(|(i, a)| {
         a == "--network=host"
             || a == "--net=host"
@@ -1834,6 +1841,20 @@ mod tests {
     fn test_args_have_host_network_space_form() {
         assert!(args_have_host_network(&sv(&["--network", "host"])));
         assert!(args_have_host_network(&sv(&["--net", "host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_single_element_with_a_space() {
+        // Each element is split on spaces before docker sees it.
+        assert!(args_have_host_network(&sv(&["--network host"])));
+        assert!(args_have_host_network(&sv(&["--privileged", "--net host"])));
+        assert!(!args_have_host_network(&sv(&["--network bridge"])));
+    }
+
+    #[test]
+    fn named_feed_loopback_kept_for_a_single_element_network_host() {
+        let set = local_feed_set("", Some("\"--network host\""));
+        assert_eq!(local_baseurl(&set), "http://localhost:8080");
     }
 
     #[test]

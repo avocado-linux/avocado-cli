@@ -4421,7 +4421,7 @@ fi
     }
 
     /// Parse a container argument, splitting on spaces while respecting quotes
-    fn parse_container_arg(arg: &str) -> Vec<String> {
+    pub(crate) fn parse_container_arg(arg: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
@@ -7243,5 +7243,21 @@ extensions:
         // Docker Desktop / VM routing: host networking is not in effect.
         let (rewritten, hn) = url(host, true);
         assert!(rewritten.contains("host.docker.internal") && !hn);
+    }
+
+    #[test]
+    fn single_element_network_host_counts_for_the_distro_feed() {
+        // docker receives `--network` and `host` as two arguments, because
+        // each element is split on spaces before the run.
+        let cfg = RunConfig {
+            repo_url: Some("http://localhost:9000".to_string()),
+            container_args: Some(vec!["--network host".to_string()]),
+            ..Default::default()
+        };
+        assert!(run_config_has_host_network_with(&cfg, false));
+        assert_eq!(
+            distro_repo_url_for_container_with(&cfg, false),
+            "http://localhost:9000"
+        );
     }
 }

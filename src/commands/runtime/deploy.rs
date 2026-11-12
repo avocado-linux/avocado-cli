@@ -1039,6 +1039,14 @@ fn strip_host_network_args(args: &mut Vec<String>) {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // A single `"--network host"` element reaches docker as two arguments.
+        if matches!(
+            a.split_whitespace().collect::<Vec<_>>()[..],
+            ["--network" | "--net", "host"]
+        ) {
+            i += 1;
+            continue;
+        }
         if a == "--network=host" || a == "--net=host" {
             i += 1;
             continue;
@@ -1696,6 +1704,13 @@ mod tests {
         strip_host_network_args(&mut args);
         assert_eq!(args, sv(&["--privileged", "-v", "/x:/y"]));
         assert!(!args_have_host_network(&args));
+    }
+
+    #[test]
+    fn test_strip_host_network_single_element_space_form() {
+        let mut args = vec!["--privileged".to_string(), "--network host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["--privileged".to_string()]);
     }
 
     #[test]
