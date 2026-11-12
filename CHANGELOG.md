@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the URL was recorded still match. A pinned rebuild also prints one
   line naming the pinned and latest snapshots and pointing at `avocado update`
   when the channel has moved on; a failed lookup prints nothing.
+- **`rewrite_loopback` on a package feed.** Setting it to `true` on a
+  `repos:` feed served from `localhost` or `127.0.0.1` maps the loopback host
+  to an address the build container can reach. The CLI detects host networking
+  from the SDK container args: when the container shares the host's loopback,
+  the URL is kept as written. Detection ignores `--network=host` on Docker
+  Desktop and under the avocado VM, where loopback is the VM's own, so the
+  rewrite still applies there. The per-feed key overrides detection, and the
+  distro feed and built-in feeds refuse it.
 
 ### Fixed
 - **A failed run's summary no longer calls the steps it never reached "up to
