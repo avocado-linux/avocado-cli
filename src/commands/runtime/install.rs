@@ -128,6 +128,11 @@ impl RuntimeInstallCommand {
         // Get repo_url and repo_release from config
         let repo_url = config.get_sdk_repo_url();
         let repo_release = config.get_sdk_repo_release();
+        // Probe the feeds before minting any Connect token. This command
+        // disables the `-ext` repository, so it is not probed.
+        config
+            .preflight_feeds_once(&target, &self.config_path, false, self.runs_on.is_some())
+            .await?;
         let feeds = config
             .materialize_feeds(&target, FeedStage::Runtime, &self.config_path)
             .await?;
