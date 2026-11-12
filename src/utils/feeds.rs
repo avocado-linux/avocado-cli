@@ -94,6 +94,48 @@ pub fn host_network_shares_loopback(args: &[String], loopback_isolated: bool) ->
     !loopback_isolated && args_have_host_network(args)
 }
 
+/// Whether the project's `sdk.container_args` request host networking, as
+/// recorded by the last composed-configuration load in this process. `None`
+/// until a load records it.
+#[cfg(not(test))]
+static CONFIG_HOST_NETWORK: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+// Under test the cell is per thread: libtest runs each test on its own
+// thread, and parallel tests must not see each other's recording.
+#[cfg(test)]
+thread_local! {
+    static CONFIG_HOST_NETWORK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the host-networking reading of the project's `sdk.container_args`.
+/// Called from the composed load only, where those arguments are final; a
+/// later load replaces the value. Arguments that reach docker from the command
+/// line are deliberately not part of this reading.
+pub fn record_config_host_network(container_args: &[String]) {
+    let value = Some(args_have_host_network(container_args));
+    #[cfg(not(test))]
+    {
+        *CONFIG_HOST_NETWORK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = value;
+    }
+    #[cfg(test)]
+    CONFIG_HOST_NETWORK.with(|c| c.set(value));
+}
+
+/// The value [`record_config_host_network`] last stored, or `None` when no
+/// composed load has run in this process.
+pub fn recorded_config_host_network() -> Option<bool> {
+    #[cfg(not(test))]
+    {
+        *CONFIG_HOST_NETWORK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(test)]
+    CONFIG_HOST_NETWORK.with(|c| c.get())
+}
+
 /// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
 /// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
 /// user-net address for this machine instead.
@@ -3285,6 +3327,16 @@ distro:
     }
 
     const HOST_GATEWAY_ALIAS_URL: &str = "http://host.docker.internal:8080";
+
+    #[test]
+    fn recorder_stores_the_config_reading_and_the_latest_call_wins() {
+        record_config_host_network(&sv(&["--network=host"]));
+        assert_eq!(recorded_config_host_network(), Some(true));
+        record_config_host_network(&sv(&["--cap-add=NET_ADMIN"]));
+        assert_eq!(recorded_config_host_network(), Some(false));
+        record_config_host_network(&sv(&["--network host"]));
+        assert_eq!(recorded_config_host_network(), Some(true));
+    }
 
     #[test]
     fn host_network_only_shares_loopback_when_in_effect() {

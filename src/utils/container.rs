@@ -880,21 +880,35 @@ pub fn inject_kernel_cmdline(
     Ok(())
 }
 
-/// Host networking as the container will actually see it, from the container
-/// args the run carries (`sdk.container_args` and anything layered on it).
+/// Host networking as the container will actually see it, for the distro
+/// feed's loopback decision. It follows the project's `sdk.container_args`
+/// recorded by the composed load, so an argument that reaches docker only from
+/// the command line neither keeps a loopback URL nor skips the host entry.
+///
+/// Commands that load through `Config::load` alone record nothing; they fall
+/// back to the run's own `container_args`.
 fn run_config_has_host_network(config: &RunConfig) -> bool {
     run_config_has_host_network_with(
         config,
         crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+        crate::utils::feeds::recorded_config_host_network(),
     )
 }
 
-/// [`run_config_has_host_network`] with the environment probe injected.
-fn run_config_has_host_network_with(config: &RunConfig, loopback_isolated: bool) -> bool {
-    crate::utils::feeds::host_network_shares_loopback(
-        config.container_args.as_deref().unwrap_or(&[]),
-        loopback_isolated,
-    )
+/// [`run_config_has_host_network`] with the environment probe and the
+/// recorded config reading injected.
+fn run_config_has_host_network_with(
+    config: &RunConfig,
+    loopback_isolated: bool,
+    recorded: Option<bool>,
+) -> bool {
+    match recorded {
+        Some(host_network) => !loopback_isolated && host_network,
+        None => crate::utils::feeds::host_network_shares_loopback(
+            config.container_args.as_deref().unwrap_or(&[]),
+            loopback_isolated,
+        ),
+    }
 }
 
 /// The distro repository URL the container's `AVOCADO_SDK_REPO_URL` carries.
@@ -905,18 +919,34 @@ fn distro_repo_url_for_container(config: &RunConfig) -> String {
     distro_repo_url_for_container_with(
         config,
         crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+        crate::utils::feeds::recorded_config_host_network(),
     )
 }
 
-/// [`distro_repo_url_for_container`] with the environment probe injected.
-fn distro_repo_url_for_container_with(config: &RunConfig, loopback_isolated: bool) -> String {
+/// [`distro_repo_url_for_container`] with the environment probe and the
+/// recorded config reading injected.
+fn distro_repo_url_for_container_with(
+    config: &RunConfig,
+    loopback_isolated: bool,
+    recorded: Option<bool>,
+) -> String {
     crate::utils::feeds::rewrite_loopback_reported(
         &config
             .repo_url
             .clone()
             .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-        run_config_has_host_network_with(config, loopback_isolated),
+        run_config_has_host_network_with(config, loopback_isolated, recorded),
     )
+}
+
+/// True when the rewritten loopback distro URL needs the host-gateway alias
+/// added as a route.
+fn distro_needs_host_entry(config: &RunConfig, host_network: bool) -> bool {
+    !host_network
+        && config
+            .repo_url
+            .as_deref()
+            .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
 }
 
 /// Configuration for running commands in containers
@@ -2732,12 +2762,7 @@ impl SdkContainer {
         }
         // A loopback distro feed (`distro.repo.url: http://localhost:…`) is
         // rewritten to the host-gateway alias in the env; the alias needs a route.
-        if !run_config_has_host_network(config)
-            && config
-                .repo_url
-                .as_deref()
-                .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
-        {
+        if distro_needs_host_entry(config, run_config_has_host_network(config)) {
             add_hosts.push(crate::utils::feeds::host_gateway_add_host(
                 is_vm_routing_active(),
             ));
@@ -7229,41 +7254,116 @@ extensions:
 
     #[test]
     fn distro_repo_url_follows_host_networking_of_the_run() {
-        let url = |args: Option<Vec<String>>, isolated: bool| {
+        // `recorded` is the reading of `sdk.container_args`; the run's own
+        // `container_args` (which may carry command-line additions) must not
+        // matter once it is recorded.
+        let url = |recorded: Option<bool>, isolated: bool| {
             let cfg = RunConfig {
                 repo_url: Some("http://localhost:9000".to_string()),
-                container_args: args,
+                container_args: Some(vec!["--network=host".to_string()]),
                 ..Default::default()
             };
             (
-                distro_repo_url_for_container_with(&cfg, isolated),
-                run_config_has_host_network_with(&cfg, isolated),
+                distro_repo_url_for_container_with(&cfg, isolated, recorded),
+                run_config_has_host_network_with(&cfg, isolated, recorded),
             )
         };
-        let host = Some(vec!["--network=host".to_string()]);
-        let (rewritten, hn) = url(None, false);
+        let (rewritten, hn) = url(Some(false), false);
         assert!(rewritten.contains("host.docker.internal") && !hn);
-        let (kept, hn) = url(host.clone(), false);
+        let (kept, hn) = url(Some(true), false);
         assert_eq!(kept, "http://localhost:9000");
         assert!(hn);
         // Docker Desktop / VM routing: host networking is not in effect.
-        let (rewritten, hn) = url(host, true);
+        let (rewritten, hn) = url(Some(true), true);
         assert!(rewritten.contains("host.docker.internal") && !hn);
+        // Nothing recorded: fall back to the run's own container args.
+        let (kept, hn) = url(None, false);
+        assert_eq!(kept, "http://localhost:9000");
+        assert!(hn);
     }
 
     #[test]
     fn single_element_network_host_counts_for_the_distro_feed() {
         // docker receives `--network` and `host` as two arguments, because
-        // each element is split on spaces before the run.
+        // each element is split on spaces before the run. Recorded from
+        // `sdk.container_args`, and read through the fallback.
         let cfg = RunConfig {
             repo_url: Some("http://localhost:9000".to_string()),
             container_args: Some(vec!["--network host".to_string()]),
             ..Default::default()
         };
-        assert!(run_config_has_host_network_with(&cfg, false));
+        assert!(run_config_has_host_network_with(&cfg, false, None));
         assert_eq!(
-            distro_repo_url_for_container_with(&cfg, false),
+            distro_repo_url_for_container_with(&cfg, false, None),
             "http://localhost:9000"
         );
+        crate::utils::feeds::record_config_host_network(&["--network host".to_string()]);
+        let recorded = Some(crate::utils::feeds::recorded_config_host_network().unwrap());
+        assert!(run_config_has_host_network_with(
+            &RunConfig::default(),
+            false,
+            recorded
+        ));
+    }
+
+    fn host_entry_config(repo_url: &str, container_args: Option<Vec<String>>) -> RunConfig {
+        RunConfig {
+            container_image: "test-image".to_string(),
+            target: "test-target".to_string(),
+            rm: true,
+            repo_url: Some(repo_url.to_string()),
+            container_args,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn host_entry_follows_the_recorded_host_networking() {
+        let cfg = host_entry_config("http://localhost:9000", None);
+        assert!(distro_needs_host_entry(&cfg, false));
+        assert!(!distro_needs_host_entry(&cfg, true));
+        let remote = host_entry_config("https://repo.example.com", None);
+        assert!(!distro_needs_host_entry(&remote, false));
+    }
+
+    // Serial: `build_container_command` reads the process-level recorded
+    // host-networking value and AVOCADO_SIGNING_KEYS_DIR.
+    #[test]
+    #[serial_test::serial]
+    fn a_loopback_distro_url_gets_the_host_entry_unless_config_host_networking() {
+        use crate::utils::volume::VolumeState;
+        let container = SdkContainer::new();
+        let command = vec!["true".to_string()];
+        let env_vars = HashMap::new();
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
+        let host_entry = "--add-host=host.docker.internal:host-gateway".to_string();
+        let build = |cfg: &RunConfig| {
+            container
+                .build_container_command(cfg, &command, &env_vars, &volume_state)
+                .unwrap()
+        };
+        let isolated = crate::utils::feeds::host_network_is_isolated_from_developer_loopback();
+
+        // Bridge networking: the rewrite needs the route.
+        crate::utils::feeds::record_config_host_network(&[]);
+        let cmd = build(&host_entry_config("http://localhost:9000", None));
+        assert!(cmd.contains(&host_entry), "bridge: {cmd:?}");
+
+        // Command-line-only `--network=host`: absent from sdk.container_args,
+        // so the URL is still rewritten and the argument still reaches docker.
+        let cli_only = host_entry_config(
+            "http://localhost:9000",
+            Some(vec!["--network=host".to_string()]),
+        );
+        let cmd = build(&cli_only);
+        assert!(cmd.contains(&host_entry), "cli-only host: {cmd:?}");
+        assert!(cmd.contains(&"--network=host".to_string()), "{cmd:?}");
+
+        // Config host networking: loopback is shared, no host entry. Docker
+        // Desktop and the VM never share it, so the entry stays there.
+        crate::utils::feeds::record_config_host_network(&["--network=host".to_string()]);
+        let cmd = build(&cli_only);
+        assert_eq!(cmd.contains(&host_entry), isolated, "config host: {cmd:?}");
+        assert!(cmd.contains(&"--network=host".to_string()), "{cmd:?}");
     }
 }

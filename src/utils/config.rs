@@ -2179,6 +2179,15 @@ impl Config {
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
         config.promote_repo_tls_env();
+        // The distro feed's loopback decision follows host networking from
+        // `sdk.container_args` alone. Recorded here, not in `load_from_yaml_str`,
+        // because that path also serves `Config::load` and unit tests that must
+        // not flip a process-wide value.
+        crate::utils::feeds::record_config_host_network(
+            config
+                .get_sdk_container_args()
+                .map_or(&[], |a| a.as_slice()),
+        );
 
         Ok(ComposedConfig {
             config,
@@ -13393,6 +13402,39 @@ runtimes:
         assert!(config
             .var_encrypt_runtimes(Some(&parsed), "jetson-orin-nx")
             .is_empty());
+    }
+
+    #[test]
+    fn composed_load_records_host_networking_and_a_second_load_replaces_it() {
+        let write_and_load = |container_args: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("avocado.yaml");
+            std::fs::write(
+                &path,
+                format!("default_target: qemux86-64\nsdk:\n  image: test\n{container_args}"),
+            )
+            .unwrap();
+            Config::load_composed(&path, Some("qemux86-64")).unwrap();
+            crate::utils::feeds::recorded_config_host_network()
+        };
+        assert_eq!(
+            write_and_load("  container_args:\n    - --network=host\n"),
+            Some(true)
+        );
+        assert_eq!(write_and_load(""), Some(false));
+        // The plain loader must not touch the process-wide value.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container_args:\n    - --network=host\n",
+        )
+        .unwrap();
+        Config::load(&path).unwrap();
+        assert_eq!(
+            crate::utils::feeds::recorded_config_host_network(),
+            Some(false)
+        );
     }
 
     /// `avocado build` and `avocado install` load exclusively through
