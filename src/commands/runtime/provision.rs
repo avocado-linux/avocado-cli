@@ -593,7 +593,9 @@ impl RuntimeProvisionCommand {
         // so no explicit chown is needed for the output directory.
 
         // Copy state file back from container if it exists
-        if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
+        if let (true, Some((ref state_file_path, ref container_state_path))) =
+            (state_copy_applies(self.config.dry_run), &state_file_info)
+        {
             self.copy_state_from_container(
                 &src_dir,
                 state_file_path,
@@ -620,15 +622,12 @@ impl RuntimeProvisionCommand {
         }
 
         print_success(
-            &format!(
-                "Successfully provisioned runtime '{}'",
-                self.config.runtime_name
-            ),
+            &provision_completion_message(&self.config.runtime_name, self.config.dry_run),
             OutputLevel::Normal,
         );
 
-        // Write provision stamp (unless --no-stamps)
-        if !self.config.no_stamps {
+        // Write provision stamp (unless --no-stamps or --dry-run)
+        if provision_stamp_applies(self.config.dry_run, self.config.no_stamps) {
             let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
                 .verbose(self.config.verbose)
                 .with_cli_target_board(self.config.target_board.clone());
@@ -1325,6 +1324,27 @@ fn host_burn_applies(docker_desktop: bool, dry_run: bool) -> bool {
     docker_desktop && !dry_run
 }
 
+/// Whether the container's provision state file is copied over the host's.
+/// A dry run writes nothing, so the host state stays as it was.
+fn state_copy_applies(dry_run: bool) -> bool {
+    !dry_run
+}
+
+/// Whether the runtime is stamped as provisioned. A dry run provisions
+/// nothing, so it must not leave a stamp claiming otherwise.
+fn provision_stamp_applies(dry_run: bool, no_stamps: bool) -> bool {
+    !dry_run && !no_stamps
+}
+
+fn provision_completion_message(runtime_name: &str, dry_run: bool) -> String {
+    if dry_run {
+        "Dry run complete: nothing was written and the runtime was not marked provisioned"
+            .to_string()
+    } else {
+        format!("Successfully provisioned runtime '{runtime_name}'")
+    }
+}
+
 /// Whether the host's mount table can be bound into the provision container.
 ///
 /// Only a local run against a native Docker daemon shares a kernel with the
@@ -1353,6 +1373,33 @@ fn insert_provision_host_mounts_env(env_vars: &mut HashMap<String, String>, boun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_run_does_not_copy_state_back() {
+        assert!(!state_copy_applies(true));
+        assert!(state_copy_applies(false));
+    }
+
+    #[test]
+    fn dry_run_does_not_write_the_provision_stamp() {
+        assert!(!provision_stamp_applies(true, false));
+        assert!(!provision_stamp_applies(true, true));
+        assert!(provision_stamp_applies(false, false));
+        assert!(!provision_stamp_applies(false, true));
+    }
+
+    #[test]
+    fn dry_run_completion_message_says_nothing_was_written() {
+        let msg = provision_completion_message("rt", true);
+        assert_eq!(
+            msg,
+            "Dry run complete: nothing was written and the runtime was not marked provisioned"
+        );
+        assert_eq!(
+            provision_completion_message("rt", false),
+            "Successfully provisioned runtime 'rt'"
+        );
+    }
 
     #[test]
     fn test_new() {

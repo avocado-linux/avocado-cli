@@ -30,7 +30,9 @@ pub fn rewrite_mount_sources(table: &str, resolve: &dyn Fn(&str) -> Option<Strin
     for line in table.lines() {
         match line.split_once(char::is_whitespace) {
             Some((src, rest)) if src.starts_with("/dev/") => {
-                let new_src = resolve(src).unwrap_or_else(|| src.to_string());
+                let new_src = resolve(src)
+                    .map(|n| encode_mount_field(&n))
+                    .unwrap_or_else(|| src.to_string());
                 out.push_str(&new_src);
                 out.push(' ');
                 out.push_str(rest);
@@ -42,8 +44,54 @@ pub fn rewrite_mount_sources(table: &str, resolve: &dyn Fn(&str) -> Option<Strin
     out
 }
 
+/// Decode the octal escapes `/proc/self/mounts` uses in its device field:
+/// `\040` (space), `\011` (tab), `\012` (newline) and `\134` (backslash).
+/// Anything else, including a malformed escape, is left as written.
+fn decode_mount_escapes(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let decoded = match tail.get(1..4) {
+            Some("040") => Some(' '),
+            Some("011") => Some('\t'),
+            Some("012") => Some('\n'),
+            Some("134") => Some('\\'),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Inverse of [`decode_mount_escapes`], so a resolved name stays one field.
+fn encode_mount_field(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            '\\' => out.push_str("\\134"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn resolve_symlink(src: &str) -> Option<String> {
-    std::fs::canonicalize(src)
+    std::fs::canonicalize(decode_mount_escapes(src))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -135,6 +183,64 @@ mod tests {
         assert_eq!(
             rewrite_mount_sources(table, &resolve),
             "/dev/X /dev/sda1 ext4 rw 0 0\n"
+        );
+    }
+
+    #[test]
+    fn decodes_mount_table_octal_escapes() {
+        assert_eq!(
+            decode_mount_escapes(r"/dev/disk/by-label/My\040Card"),
+            "/dev/disk/by-label/My Card"
+        );
+        assert_eq!(decode_mount_escapes(r"a\011b"), "a\tb");
+        assert_eq!(decode_mount_escapes(r"a\134b"), "a\\b");
+        assert_eq!(decode_mount_escapes(r"a\012b"), "a\nb");
+        assert_eq!(decode_mount_escapes("/dev/sda1"), "/dev/sda1");
+    }
+
+    #[test]
+    fn leaves_invalid_escapes_alone() {
+        assert_eq!(decode_mount_escapes(r"a\9zb"), r"a\9zb");
+        assert_eq!(decode_mount_escapes(r"a\04"), r"a\04");
+        assert_eq!(decode_mount_escapes(r"a\"), r"a\");
+        assert_eq!(decode_mount_escapes(r"a\400b"), r"a\400b");
+    }
+
+    #[test]
+    fn encodes_special_characters_back_to_a_valid_field() {
+        assert_eq!(encode_mount_field("/dev/sdb1"), "/dev/sdb1");
+        assert_eq!(encode_mount_field("/dev/a b"), r"/dev/a\040b");
+        assert_eq!(encode_mount_field("/dev/a\tb"), r"/dev/a\011b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_an_escaped_by_label_source_to_the_kernel_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("sdb1");
+        std::fs::write(&node, b"").unwrap();
+        std::os::unix::fs::symlink(&node, dir.path().join("My Card")).unwrap();
+        let escaped = format!("{}/My\\040Card", dir.path().display());
+        let resolved = resolve_symlink(&escaped).expect("escaped source resolves");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&node).unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn unresolvable_escaped_source_keeps_the_original_text() {
+        let table = "/dev/disk/by-label/My\\040Card /mnt vfat rw 0 0\n";
+        assert_eq!(rewrite_mount_sources(table, &resolve_symlink), table);
+    }
+
+    #[test]
+    fn resolved_name_with_a_space_is_written_escaped() {
+        let table = "/dev/x /mnt vfat rw 0 0\n";
+        let resolve = |_: &str| Some("/dev/a b".to_string());
+        assert_eq!(
+            rewrite_mount_sources(table, &resolve),
+            "/dev/a\\040b /mnt vfat rw 0 0\n"
         );
     }
 
