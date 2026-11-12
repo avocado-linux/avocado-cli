@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Desktop and under the avocado VM, where loopback is the VM's own, so the
   rewrite still applies there. The per-feed key overrides detection, and the
   distro feed and built-in feeds refuse it.
+- **`avocado init --minimal` for feeds that lack the default extensions.** The
+  generated project leaves out the `avocado-ext-dev`, `avocado-ext-sshd-dev`
+  and board BSP remote extensions and keeps only the local application
+  extension, so a first build against such a feed does not fail on dependency
+  resolution. Plain `avocado init` is unchanged.
+
+### Changed
+- **New projects require CLI 1.0.0 or later.** The `avocado init` template's
+  `cli_requirement` is now `>=1.0.0` (was `>=0.41.0`). Pre-release builds such
+  as `1.1.0-dev` still satisfy it.
 
 ### Fixed
 - **A failed run's summary no longer calls the steps it never reached "up to
