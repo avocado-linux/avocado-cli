@@ -1034,19 +1034,27 @@ struct MacDeployNet {
 /// takes effect. Handles both the `--network=host` / `--net=host` and
 /// space-separated `--network host` / `--net host` forms. See
 /// [`args_have_host_network`] and `prepare_mac_deploy_net`.
-fn strip_host_network_args(args: &mut Vec<String>) {
+fn strip_host_network_args(args_out: &mut Vec<String>) {
+    let args = std::mem::take(args_out);
+    // Each element reaches docker split on spaces, so an element carrying the
+    // flag among others (`--privileged --network host`) must be split to drop
+    // it. Only such elements are flattened: splitting strips quotes, and an
+    // element like `-e "A=b c"` must reach the run unchanged.
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| {
+            let tokens = SdkContainer::parse_container_arg(a);
+            if tokens.len() > 1 && args_have_host_network(&tokens) {
+                tokens
+            } else {
+                vec![a.clone()]
+            }
+        })
+        .collect::<Vec<_>>();
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        // A single `"--network host"` element reaches docker as two arguments.
-        if matches!(
-            a.split_whitespace().collect::<Vec<_>>()[..],
-            ["--network" | "--net", "host"]
-        ) {
-            i += 1;
-            continue;
-        }
         if a == "--network=host" || a == "--net=host" {
             i += 1;
             continue;
@@ -1060,7 +1068,7 @@ fn strip_host_network_args(args: &mut Vec<String>) {
         out.push(a.clone());
         i += 1;
     }
-    *args = out;
+    *args_out = out;
 }
 
 /// A qemu slirp host-forward opened for the duration of one deploy. Teardown
@@ -1711,6 +1719,26 @@ mod tests {
         let mut args = vec!["--privileged".to_string(), "--network host".to_string()];
         strip_host_network_args(&mut args);
         assert_eq!(args, vec!["--privileged".to_string()]);
+    }
+
+    #[test]
+    fn test_strip_host_network_element_among_other_flags() {
+        let mut args = vec!["--privileged --network host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["--privileged".to_string()]);
+        let mut args = vec![
+            "-v /dev:/dev --net=host".to_string(),
+            "-e \"A=b c\"".to_string(),
+        ];
+        strip_host_network_args(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "-v".to_string(),
+                "/dev:/dev".to_string(),
+                "-e \"A=b c\"".to_string()
+            ]
+        );
     }
 
     #[test]
