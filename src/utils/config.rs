@@ -2179,16 +2179,6 @@ impl Config {
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
         config.promote_repo_tls_env();
-        // The distro feed's loopback decision follows host networking from
-        // `sdk.container_args` alone. Recorded here, not in `load_from_yaml_str`,
-        // because that path also serves `Config::load` and unit tests that must
-        // not flip a process-wide value.
-        crate::utils::feeds::record_config_host_network(
-            config
-                .get_sdk_container_args()
-                .map_or(&[], |a| a.as_slice()),
-        );
-
         Ok(ComposedConfig {
             config,
             merged_value: main_config,
@@ -4557,9 +4547,11 @@ impl Config {
     }
 
     /// Whether any of the `active` extensions is fetched from the extension
-    /// repository: one declaring a package `source`. A local extension (no
-    /// `source`, as `avocado init --minimal` keeps) and a git or path source never
-    /// touch that repository, so a feed without one must not be refused for them.
+    /// repository: one declaring a package `source` without `repo_name`. A local
+    /// extension (no `source`, as `avocado init --minimal` keeps), a git or path
+    /// source, and a package source with `repo_name` (dnf then runs `--repo=<name>`
+    /// and never reads that repository) never touch it, so a feed without one must
+    /// not be refused for them.
     /// `enabled: false` does not exempt a sourced extension; it is fetched anyway.
     ///
     /// `parsed` must already be interpolated.
@@ -4570,7 +4562,15 @@ impl Config {
         let packages: std::collections::HashSet<String> =
             Self::discover_remote_extensions_from_value(parsed)?
                 .into_iter()
-                .filter(|(_, source)| matches!(source, ExtensionSource::Package { .. }))
+                .filter(|(_, source)| {
+                    matches!(
+                        source,
+                        ExtensionSource::Package {
+                            repo_name: None,
+                            ..
+                        }
+                    )
+                })
                 .map(|(name, _)| name)
                 .collect();
         Ok(active.into_iter().any(|name| packages.contains(name)))
@@ -4611,11 +4611,30 @@ impl Config {
             }
         }
         let project_root = self.project_root(config_path);
-        let set = crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?;
+        let container_args = self.feed_container_args(target, config_path);
+        let set = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?;
         crate::utils::feeds::preflight_feeds(self, set.as_ref(), target, needs_extension_repo)
             .await?;
         done.insert(target.to_string(), needs_extension_repo);
         Ok(())
+    }
+
+    /// The project's container arguments as docker receives them for `target`:
+    /// `sdk.<target>.container_args` replacing the base list, variables
+    /// expanded. An unreadable config file falls back to the base list, since
+    /// the loaded `Config` already parsed it once.
+    fn feed_container_args(&self, target: &str, config_path: &str) -> Vec<String> {
+        let args = match self.get_merged_sdk_config(target, config_path) {
+            Ok(merged) => merged.container_args,
+            Err(_) => self.get_sdk_container_args().cloned(),
+        };
+        Self::process_container_args(args.as_ref()).unwrap_or_default()
     }
 
     /// Resolve, record, and materialize the named feeds for one container run.
@@ -4638,8 +4657,14 @@ impl Config {
         // sets `src_dir` would otherwise get its feed document beside the config
         // file while the rest of its build state sits somewhere else.
         let project_root = self.project_root(config_path);
-        let Some(set) =
-            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
+        let container_args = self.feed_container_args(target, config_path);
+        let Some(set) = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?
         else {
             // No named feeds. Still a fact worth recording, because it is the fact
             // that removes a set the lock may still be carrying from a config that
@@ -13422,36 +13447,27 @@ runtimes:
     }
 
     #[test]
-    fn composed_load_records_host_networking_and_a_second_load_replaces_it() {
-        let write_and_load = |container_args: &str| {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("avocado.yaml");
-            std::fs::write(
-                &path,
-                format!("default_target: qemux86-64\nsdk:\n  image: test\n{container_args}"),
-            )
-            .unwrap();
-            Config::load_composed(&path, Some("qemux86-64")).unwrap();
-            crate::utils::feeds::recorded_config_host_network()
-        };
-        assert_eq!(
-            write_and_load("  container_args:\n    - --network=host\n"),
-            Some(true)
-        );
-        assert_eq!(write_and_load(""), Some(false));
-        // The plain loader must not touch the process-wide value.
+    #[serial_test::serial]
+    fn feed_container_args_merge_the_target_section_and_expand_variables() {
+        let prior = std::env::var_os("FEED_ARGS_TEST_NET");
+        std::env::set_var("FEED_ARGS_TEST_NET", "host");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("avocado.yaml");
         std::fs::write(
             &path,
-            "default_target: qemux86-64\nsdk:\n  image: test\n  container_args:\n    - --network=host\n",
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container_args:\n    - --network=${FEED_ARGS_TEST_NET}\n  other-target:\n    container_args:\n      - --net=bridge\n  qemux86-64:\n    container_args:\n      - --cap-add=NET_ADMIN\n",
         )
         .unwrap();
-        Config::load(&path).unwrap();
-        assert_eq!(
-            crate::utils::feeds::recorded_config_host_network(),
-            Some(false)
-        );
+        let path_str = path.to_string_lossy().into_owned();
+        let config = Config::load(&path).unwrap();
+        let base = config.feed_container_args("unlisted-target", &path_str);
+        let targeted = config.feed_container_args("qemux86-64", &path_str);
+        match prior {
+            Some(v) => std::env::set_var("FEED_ARGS_TEST_NET", v),
+            None => std::env::remove_var("FEED_ARGS_TEST_NET"),
+        }
+        assert_eq!(base, vec!["--network=host".to_string()]);
+        assert_eq!(targeted, vec!["--cap-add=NET_ADMIN".to_string()]);
     }
 
     /// `avocado build` and `avocado install` load exclusively through
@@ -15166,6 +15182,12 @@ mod invocation_feeds_tests {
         assert!(!needs(SOURCED, &["app"]), "an inactive sourced extension");
         assert!(!needs(SOURCED, &["git-ext"]), "a git source skips the repo");
         assert!(!needs(SOURCED, &[]));
+    }
+
+    #[test]
+    fn a_package_source_with_repo_name_does_not_need_the_extension_repo() {
+        let yaml = "extensions:\n  vendor-ext:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n      repo_name: vendor\n";
+        assert!(!needs(yaml, &["vendor-ext"]));
     }
 
     #[test]

@@ -94,48 +94,6 @@ pub fn host_network_shares_loopback(args: &[String], loopback_isolated: bool) ->
     !loopback_isolated && args_have_host_network(args)
 }
 
-/// Whether the project's `sdk.container_args` request host networking, as
-/// recorded by the last composed-configuration load in this process. `None`
-/// until a load records it.
-#[cfg(not(test))]
-static CONFIG_HOST_NETWORK: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
-
-// Under test the cell is per thread: libtest runs each test on its own
-// thread, and parallel tests must not see each other's recording.
-#[cfg(test)]
-thread_local! {
-    static CONFIG_HOST_NETWORK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// Record the host-networking reading of the project's `sdk.container_args`.
-/// Called from the composed load only, where those arguments are final; a
-/// later load replaces the value. Arguments that reach docker from the command
-/// line are deliberately not part of this reading.
-pub fn record_config_host_network(container_args: &[String]) {
-    let value = Some(args_have_host_network(container_args));
-    #[cfg(not(test))]
-    {
-        *CONFIG_HOST_NETWORK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = value;
-    }
-    #[cfg(test)]
-    CONFIG_HOST_NETWORK.with(|c| c.set(value));
-}
-
-/// The value [`record_config_host_network`] last stored, or `None` when no
-/// composed load has run in this process.
-pub fn recorded_config_host_network() -> Option<bool> {
-    #[cfg(not(test))]
-    {
-        *CONFIG_HOST_NETWORK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-    #[cfg(test)]
-    CONFIG_HOST_NETWORK.with(|c| c.get())
-}
-
 /// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
 /// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
 /// user-net address for this machine instead.
@@ -518,11 +476,33 @@ impl ResolvedFeedSet {
         config_dir: &Path,
         releasever: Option<&str>,
     ) -> Result<Option<Self>> {
-        Self::resolve_with_loopback_isolated(
+        let args =
+            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        Self::resolve_with_container_args(config, target, config_dir, releasever, &args)
+    }
+
+    /// [`Self::resolve`] with the container arguments docker will receive from
+    /// the project: variables expanded and `sdk.<target>.container_args`
+    /// merged. Production callers use this one; the plain form reads only the
+    /// base `sdk.container_args`.
+    ///
+    /// Command-line `--container-arg`s are not part of it. The resolved set is
+    /// hashed into the stamp and pinned once per target per invocation, and
+    /// install and build must stamp the same baseurl although each command has
+    /// its own command line.
+    pub fn resolve_with_container_args(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        container_args: &[String],
+    ) -> Result<Option<Self>> {
+        Self::resolve_inner(
             config,
             target,
             config_dir,
             releasever,
+            container_args,
             host_network_is_isolated_from_developer_loopback(),
         )
     }
@@ -530,11 +510,32 @@ impl ResolvedFeedSet {
     /// [`Self::resolve`] with the environment probe supplied by the caller:
     /// `loopback_isolated` is true when host networking would not share the
     /// developer machine's loopback (Docker Desktop, the avocado VM).
+    #[cfg(test)]
     fn resolve_with_loopback_isolated(
         config: &Config,
         target: &str,
         config_dir: &Path,
         releasever: Option<&str>,
+        loopback_isolated: bool,
+    ) -> Result<Option<Self>> {
+        let args =
+            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        Self::resolve_inner(
+            config,
+            target,
+            config_dir,
+            releasever,
+            &args,
+            loopback_isolated,
+        )
+    }
+
+    fn resolve_inner(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        container_args: &[String],
         loopback_isolated: bool,
     ) -> Result<Option<Self>> {
         let repos = config.repos.as_ref();
@@ -574,10 +575,7 @@ impl ResolvedFeedSet {
         }
         let empty = HashMap::new();
         let repos = repos.unwrap_or(&empty);
-        let host_network = host_network_shares_loopback(
-            config.get_sdk_container_args().map_or(&[], |a| a),
-            loopback_isolated,
-        );
+        let host_network = host_network_shares_loopback(container_args, loopback_isolated);
 
         // Validate definitions once, independent of enablement — in name order so
         // the first error reported is the same every run.
@@ -3264,6 +3262,47 @@ distro:
             .clone()
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn named_feed_loopback_follows_an_expanded_network_variable() {
+        let prior = std::env::var_os("FEEDS_TEST_NET");
+        std::env::set_var("FEEDS_TEST_NET", "host");
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\nsdk:\n  container_args: [\"--network=${{FEEDS_TEST_NET}}\"]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        match prior {
+            Some(v) => std::env::set_var("FEEDS_TEST_NET", v),
+            None => std::env::remove_var("FEEDS_TEST_NET"),
+        }
+        assert_eq!(local_baseurl(&set), "http://localhost:8080");
+    }
+
+    #[test]
+    fn named_feed_loopback_follows_the_container_args_it_is_given() {
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n"
+        ));
+        let isolated = host_network_is_isolated_from_developer_loopback();
+        let baseurl = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            local_baseurl(
+                &ResolvedFeedSet::resolve_with_container_args(&c, "t", Path::new("."), None, &args)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            baseurl(&["--net=host"]) == "http://localhost:8080",
+            !isolated
+        );
+        assert!(baseurl(&[]).contains("host.docker.internal"));
+        assert!(baseurl(&["--network=bridge"]).contains("host.docker.internal"));
+    }
+
     fn local_feed_set_probed(container_args: Option<&str>, isolated: bool) -> ResolvedFeedSet {
         let sdk = container_args
             .map(|a| format!("sdk:\n  container_args: [{a}]\n"))
@@ -3327,16 +3366,6 @@ distro:
     }
 
     const HOST_GATEWAY_ALIAS_URL: &str = "http://host.docker.internal:8080";
-
-    #[test]
-    fn recorder_stores_the_config_reading_and_the_latest_call_wins() {
-        record_config_host_network(&sv(&["--network=host"]));
-        assert_eq!(recorded_config_host_network(), Some(true));
-        record_config_host_network(&sv(&["--cap-add=NET_ADMIN"]));
-        assert_eq!(recorded_config_host_network(), Some(false));
-        record_config_host_network(&sv(&["--network host"]));
-        assert_eq!(recorded_config_host_network(), Some(true));
-    }
 
     #[test]
     fn host_network_only_shares_loopback_when_in_effect() {

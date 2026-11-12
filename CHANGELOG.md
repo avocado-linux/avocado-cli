@@ -20,20 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rewrite_loopback` on a package feed.** Setting it to `true` on a
   `repos:` feed served from `localhost` or `127.0.0.1` maps the loopback host
   to an address the build container can reach. The CLI detects host networking
-  from the SDK container args: when the container shares the host's loopback,
-  the URL is kept as written. Detection ignores `--network=host` on Docker
-  Desktop and under the avocado VM, where loopback is the VM's own, so the
-  rewrite still applies there. The per-feed key overrides detection, and the
-  distro feed and built-in feeds refuse it. The distro feed's address follows
-  the same detection from `sdk.container_args` alone. In `install`, `build`,
-  `sdk install` and the other commands that compose the configuration,
-  command-line container arguments are not consulted for the rewrite or the
-  host entry, though they still reach the container. A `--network=host` given
-  only on the command line therefore rewrites a loopback distro URL to the
-  host gateway, and a repository server bound only to `127.0.0.1` is not
-  reachable that way; put the argument in `sdk.container_args` to keep the
-  loopback address. Commands that load only the plain configuration
-  (`container dev`, `save` and `vm`) still read the command-line arguments.
+  from the container arguments the run uses: when the container shares the
+  host's loopback, the URL is kept as written. Detection ignores
+  `--network=host` on Docker Desktop and under the avocado VM, where loopback
+  is the VM's own, so the rewrite still applies there. The per-feed key
+  overrides detection, and the distro feed and built-in feeds refuse it. The
+  distro feed's address and the host-gateway entry follow the arguments docker
+  actually receives, so a `--network=host` given only on the command line keeps
+  a loopback distro URL, and a `--container-arg` that replaces the config's
+  arguments drops a `--network=host` set there. Variables in the arguments are
+  expanded and `sdk.<target>.container_args` is honoured. A package feed reads
+  the same arguments from the project configuration, without the command line,
+  so install and build keep stamping the same address.
 - **`avocado init --minimal` for feeds that lack the default extensions.** The
   generated project leaves out the `avocado-ext-dev`, `avocado-ext-sshd-dev`
   and board BSP remote extensions and keeps only the local application
