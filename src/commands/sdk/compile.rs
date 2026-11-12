@@ -1350,6 +1350,40 @@ extensions:
         );
     }
 
+    /// `package_files: ['./src/*.c']` is valid for `ext package`, but the
+    /// digest matches nothing and never moves, so an edit under it would be
+    /// skipped. The section runs and writes no stamp. The same sources listed
+    /// as `src/*.c` skip until an edit.
+    #[test]
+    fn a_glob_the_digest_cannot_match_always_runs() {
+        let dir = skip_project();
+        let root = dir.path();
+        let p = pins("s");
+
+        let yaml = SKIP_YAML.replace("package_files: [src]", "package_files: ['./src/*.c']");
+        let merged: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let batch = batch_with(None, "app-compile");
+        assert_eq!(
+            ext_build_compile(&merged, &["my-ext"])
+                .plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Run(None)
+        );
+
+        let yaml = SKIP_YAML.replace("package_files: [src]", "package_files: ['src/*.c']");
+        let merged: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let cmd = ext_build_compile(&merged, &["my-ext"]);
+        let batch = after_first_build(&cmd, &merged, root);
+        assert_eq!(
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Skip
+        );
+        std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
+        assert!(matches!(
+            cmd.plan_section(&app_section(), Some(&ctx(&merged, root, &batch, &p))),
+            SectionPlan::Run(Some(_))
+        ));
+    }
+
     /// A direct `sdk compile` names no extensions, so it always runs and
     /// writes no stamp.
     #[test]
