@@ -25,9 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Desktop and under the avocado VM, where loopback is the VM's own, so the
   rewrite still applies there. The per-feed key overrides detection, and the
   distro feed and built-in feeds refuse it. The distro feed's address follows
-  the same detection from `sdk.container_args` alone;
+  the same detection from `sdk.container_args` alone. In `install`, `build`,
+  `sdk install` and the other commands that compose the configuration,
   command-line container arguments are not consulted for the rewrite or the
-  host entry (they still reach the container).
+  host entry, though they still reach the container. A `--network=host` given
+  only on the command line therefore rewrites a loopback distro URL to the
+  host gateway, and a repository server bound only to `127.0.0.1` is not
+  reachable that way; put the argument in `sdk.container_args` to keep the
+  loopback address. Commands that load only the plain configuration
+  (`container dev`, `save` and `vm`) still read the command-line arguments.
 - **`avocado init --minimal` for feeds that lack the default extensions.** The
   generated project leaves out the `avocado-ext-dev`, `avocado-ext-sshd-dev`
   and board BSP remote extensions and keeps only the local application
