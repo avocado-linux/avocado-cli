@@ -37,9 +37,17 @@ const TABLE: &[(&str, bool, bool)] = &[
     ("src/commands/update.rs", false, false),
 ];
 
+/// The module's code with comment lines removed, so a needle inside a comment
+/// (a commented-out call, a doc line naming `materialize_feeds`) cannot satisfy
+/// or move the checks below.
 fn source(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]

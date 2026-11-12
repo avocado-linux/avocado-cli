@@ -4578,10 +4578,12 @@ impl Config {
 
     /// Fail before the first download when a feed repository is unreachable.
     ///
-    /// `install` and `sdk install` both call this on the way in, and `install`
-    /// runs the SDK install, so the probes are keyed by target and run once per
-    /// invocation. The lock is held across the probes so two concurrent callers
-    /// do not both run them. Only a pass is recorded; a failure ends the command.
+    /// `install`, `sdk install`, `ext install`, `runtime install`, `rootfs
+    /// install`, `initramfs install`, `fetch` and `ext fetch` call this on the
+    /// way in, and `install` runs several of them, so the probes are keyed by
+    /// target and run once per invocation. The lock is held across the probes so
+    /// two concurrent callers do not both run them. Only a pass is recorded; a
+    /// failure ends the command.
     /// A later call that needs the extension repository after a pass that did not
     /// probe it runs again, so the second caller is not told yes on the first's
     /// narrower check.
