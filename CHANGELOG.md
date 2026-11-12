@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast with an error naming the feed and the reason, instead of a dnf error
   from inside the container. A path feed is checked on disk. The probes run
   once per target even though `install` also runs the SDK install, and are
-  skipped with `--runs-on`, where dnf runs on the remote runner.
+  skipped with `--runs-on`, where dnf runs on the remote runner. A feed with
+  TLS verification disabled is not probed, and a warning says so.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's

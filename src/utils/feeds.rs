@@ -1610,6 +1610,16 @@ fn load_ca_certificates(ca: &Path, subject: &str) -> Result<Vec<reqwest::Certifi
 impl Probe<'_> {
     /// One client per probe: `ca`, `tls_verify` and the credential differ per feed.
     async fn run(&self) -> Result<()> {
+        // The probe never disables certificate verification. A feed that opts
+        // out of it is left to dnf, which honours the setting.
+        if !self.tls_verify {
+            crate::utils::output::print_warning_stderr(&format!(
+                "{}: not probed because TLS verification is disabled for it; \
+                 dnf will report it if the feed is unusable",
+                self.subject
+            ));
+            return Ok(());
+        }
         let mut builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(20))
@@ -1618,9 +1628,6 @@ impl Probe<'_> {
             for cert in load_ca_certificates(ca, &self.subject)? {
                 builder = builder.add_root_certificate(cert);
             }
-        }
-        if !self.tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
         }
         let client = builder
             .build()
@@ -3604,6 +3611,40 @@ distro:
                 .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
             assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
         }
+    }
+
+    fn probe_for(url: &str, tls_verify: bool) -> Probe<'static> {
+        Probe {
+            subject: "feed 'x'".to_string(),
+            url: format!("{url}/repodata/repomd.xml"),
+            ca: None,
+            tls_verify,
+            credential: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feed_with_tls_verification_disabled_is_not_probed() {
+        // A 404 would fail a probe that connected.
+        let (base, seen) = serve_status("404 Not Found").await;
+        probe_for(&base, false).run().await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
+    }
+
+    #[tokio::test]
+    async fn a_verifying_probe_that_cannot_trust_the_server_fails_naming_the_feed() {
+        // A plain-HTTP listener answering a TLS client: the handshake cannot
+        // verify anything, and verification stays on.
+        let (base, _seen) = serve_status("200 OK").await;
+        let e = probe_for(&base.replace("http://", "https://"), true)
+            .run()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("feed 'x'") && e.contains("cannot connect"),
+            "{e}"
+        );
     }
 
     #[test]
