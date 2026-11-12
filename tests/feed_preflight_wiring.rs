@@ -24,6 +24,8 @@ const MINT: &str = "materialize_feeds";
 const TABLE: &[(&str, bool, bool)] = &[
     ("src/commands/ext/install.rs", true, true),
     ("src/commands/runtime/install.rs", true, true),
+    ("src/commands/rootfs/install.rs", true, true),
+    ("src/commands/initramfs/install.rs", true, true),
     ("src/commands/install.rs", true, false),
     ("src/commands/sdk/install.rs", true, false),
     ("src/commands/sdk/dnf.rs", false, false),
