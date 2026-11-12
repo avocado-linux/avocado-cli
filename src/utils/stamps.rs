@@ -9384,8 +9384,20 @@ extensions:
                     .unwrap();
             declared_sources_are_hashable(&v["extensions"]["my-ext"], root)
         };
-        assert!(!hashable("package_files: ['./src/*.c']"));
-        assert!(!hashable("package_files: ['src/*.c', 'src/*.h']"));
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/lib.c"), "int lib;\n").unwrap();
+        let absolute = format!("package_files: ['{}/src/*.c']", root.display());
+        for files in [
+            "package_files: ['./src/*.c']",
+            "package_files: ['src/*/']",
+            "package_files: ['src//*.c']",
+            "package_files: ['../shared/*.c']",
+            "package_files: ['src/*.c', 'src/*.h']",
+            absolute.as_str(),
+        ] {
+            assert!(!hashable(files), "{files}");
+        }
         assert!(hashable("package_files: ['src/*.c']"));
         assert!(hashable("package_files: ['./src']"));
     }
