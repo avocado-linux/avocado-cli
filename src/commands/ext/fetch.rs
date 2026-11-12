@@ -196,6 +196,17 @@ impl ExtFetchCommand {
         let lock_exists = LockFile::get_path(&lock_src_dir).exists()
             || LockFile::legacy_path(&lock_src_dir).exists();
 
+        // Probe the feeds before the first download. Only a package-sourced
+        // extension is fetched from the extension repository.
+        config
+            .preflight_feeds_once(
+                &target,
+                &self.config_path,
+                needs_extension_repo(&extensions_to_fetch),
+                self.runs_on.is_some(),
+            )
+            .await?;
+
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
             target.clone(),
@@ -822,6 +833,14 @@ fn locked_source_change(
     ))
 }
 
+/// True when any extension to fetch has a package `source`, the only kind
+/// fetched from the extension repository.
+fn needs_extension_repo(extensions: &[(String, ExtensionSource)]) -> bool {
+    extensions
+        .iter()
+        .any(|(_, source)| matches!(source, ExtensionSource::Package { .. }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +872,34 @@ mod tests {
                 include: None,
             },
         )
+    }
+
+    #[test]
+    fn needs_extension_repo_true_for_a_package_source() {
+        let set = vec![
+            (
+                "local-path".to_string(),
+                ExtensionSource::Path {
+                    path: "../x".to_string(),
+                    include: None,
+                },
+            ),
+            package("pkg"),
+        ];
+        assert!(needs_extension_repo(&set));
+    }
+
+    #[test]
+    fn needs_extension_repo_false_without_a_package_source() {
+        let set = vec![(
+            "local-path".to_string(),
+            ExtensionSource::Path {
+                path: "../x".to_string(),
+                include: None,
+            },
+        )];
+        assert!(!needs_extension_repo(&set));
+        assert!(!needs_extension_repo(&[]));
     }
 
     fn entry(version: Option<&str>, implied: bool) -> ExtensionSourceLock {

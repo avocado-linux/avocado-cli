@@ -28,6 +28,8 @@ const TABLE: &[(&str, bool, bool)] = &[
     ("src/commands/initramfs/install.rs", true, true),
     ("src/commands/install.rs", true, false),
     ("src/commands/sdk/install.rs", true, false),
+    ("src/commands/fetch.rs", true, true),
+    ("src/commands/ext/fetch.rs", true, true),
     ("src/commands/sdk/dnf.rs", false, false),
     ("src/commands/runtime/dnf.rs", false, false),
     ("src/commands/ext/dnf.rs", false, false),

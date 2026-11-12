@@ -91,6 +91,12 @@ impl FetchCommand {
         crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target_arch)
             .await?;
 
+        // Probe the feeds before the first dnf or download work. `fetch`
+        // refreshes metadata only and has no `--runs-on`.
+        config
+            .preflight_feeds_once(&target_arch, &self.config_path, false, false)
+            .await?;
+
         // Get container configuration from interpolated config
         let container_image = config
             .get_sdk_image()
