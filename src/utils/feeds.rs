@@ -2617,7 +2617,9 @@ distro:
     /// the distro feed: both halves, target and SDK, off the distro feed's base
     /// URL and releasever, in the listed position and in that order.
     #[test]
+    #[serial_test::serial]
     fn undefined_feed_name_is_a_distro_addon_with_both_halves() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  repo:\n    url: https://feed.example/\n  feeds: [ros2-jazzy]\n"
         ));
@@ -2659,7 +2661,9 @@ distro:
     /// carry the distro feed's TLS settings, and the index is the channel's even
     /// under a snapshot pin.
     #[test]
+    #[serial_test::serial]
     fn addon_halves_are_placed_and_inherit_distro_tls() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  repo:\n    url: https://feed.example/\n    tls_verify: false\n  feeds: [ros2-jazzy]\n"
         ));
@@ -2847,7 +2851,9 @@ distro:
     /// must follow it, not the process env, or install-time and build-time hash
     /// different strings for the same config.
     #[test]
+    #[serial_test::serial]
     fn explicit_releasever_drives_every_expansion() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v.example/$releasever\n"
         ));
@@ -3107,7 +3113,9 @@ distro:
     }
 
     #[test]
+    #[serial_test::serial]
     fn per_feed_release_overrides_distro_and_literal_stays_when_unresolvable() {
+        clear_release_env();
         let c = load(&format!("{BASE}  feeds: [old]\nrepos:\n  old:\n    url: https://o/$releasever\n    release: 2024\n    channel: edge\n"));
         let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
             .unwrap()
@@ -3686,6 +3694,10 @@ distro:
             "AVOCADO_SDK_REPO_RELEASE",
             "AVOCADO_DISTRO_RELEASE",
             "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_REPO_URL",
+            "AVOCADO_SDK_REPO_URL",
+            "AVOCADO_REPO_INSECURE",
+            "AVOCADO_REPO_CA",
         ] {
             std::env::remove_var(var);
         }

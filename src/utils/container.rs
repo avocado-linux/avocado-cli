@@ -7184,13 +7184,16 @@ extensions:
         }
 
         #[test]
+        #[serial_test::serial]
         fn shutdown_removes_a_foreground_run_in_progress() {
             let dir = tempfile::tempdir().unwrap();
             let tool = stub_tool(dir.path());
             let run = ForegroundRun::register(Some("avocado-run-shutdown-t"), true);
             SessionContainers::shutdown(&tool);
             drop(run);
-            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_else(|e| {
+                panic!("stub tool log missing in {}: {e}", dir.path().display())
+            });
             assert!(
                 log.contains("rm -f avocado-run-shutdown-t"),
                 "tool calls: {log}"
@@ -7203,13 +7206,16 @@ extensions:
         }
 
         #[test]
+        #[serial_test::serial]
         fn shutdown_stops_a_foreground_run_started_without_rm() {
             let dir = tempfile::tempdir().unwrap();
             let tool = stub_tool(dir.path());
             let run = ForegroundRun::register(Some("avocado-run-keep-t"), false);
             SessionContainers::shutdown(&tool);
             drop(run);
-            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_else(|e| {
+                panic!("stub tool log missing in {}: {e}", dir.path().display())
+            });
             assert!(
                 log.contains("stop -t 2 avocado-run-keep-t"),
                 "tool calls: {log}"
