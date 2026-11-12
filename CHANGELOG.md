@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **An HTTP 429 from a package repository is now reported as one.** dnf
+  reports a repository's `429 Too Many Requests` as "No more mirrors to
+  try", which reads as a broken repository. When a run fails, the CLI now
+  checks once whether the repository is answering 429 and, if it is, says so
+  with how long to wait. Resolving the latest snapshot reports a 429 the
+  same way instead of as a bare HTTP error.
 - **A failed run's summary no longer calls the steps it never reached "up to
   date".** After `sdk bootstrap` failed, for example, `sdk packages` and
   `rootfs install` printed with a check mark and `(up to date)`. Steps after

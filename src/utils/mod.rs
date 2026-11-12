@@ -10,6 +10,7 @@ pub mod ext_deps;
 pub mod ext_fetch;
 pub mod ext_source_reader;
 pub mod ext_version_source;
+pub mod feed_limit;
 pub mod feeds;
 pub mod git_worktree;
 #[cfg(all(test, unix))]
