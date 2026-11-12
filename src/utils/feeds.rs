@@ -3615,15 +3615,27 @@ distro:
         assert_eq!(certs.len(), 2);
     }
 
+    /// The release and channel env vars are process-wide; this module is
+    /// `#[serial]`, so clearing them here cannot race another test.
+    fn clear_release_env() {
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
     #[tokio::test]
     async fn extension_repository_is_skipped_without_a_releasever() {
         // Nothing listens and no release/channel is configured: the URL would be
         // a guess, so it is not probed.
         let url = closed_port_url().await;
+        clear_release_env();
         let c = load(&format!("repo:\n  url: {url}\n"));
-        if c.get_releasever().is_some() {
-            return; // an ambient AVOCADO_RELEASEVER would supply one
-        }
+        assert_eq!(c.get_releasever(), None);
         preflight_feeds(&c, None, "t", true).await.unwrap();
     }
 
@@ -3651,6 +3663,7 @@ distro:
 
     #[tokio::test]
     async fn addon_feeds_are_probed_when_there_is_no_index_to_check_them() {
+        clear_release_env();
         let (base, seen) = serve_status("404 Not Found").await;
         let c = load(&format!(
             "distro:\n  repo:\n    url: {base}\n  feeds: [ros2-jazzy]\n"
@@ -3659,9 +3672,7 @@ distro:
             ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
                 .unwrap()
                 .unwrap();
-        if set.addon_index_url.is_some() {
-            return; // ambient release/channel supplied an index
-        }
+        assert_eq!(set.addon_index_url, None);
         let e = preflight_feeds(&c, Some(&set), "t", false)
             .await
             .unwrap_err()
