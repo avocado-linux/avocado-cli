@@ -61,6 +61,7 @@ a credential scoped to the job.**
 | Case | Today |
 | --- | --- |
 | Path source | Carried (bundle field `ext_sources`) |
+| Stone include path in the project | Carried (bundle field `src_includes`) |
 | Public git source | Fetched by the hub |
 | Private git source | Not yet: carry the build site's checkout |
 | Public package feed | Fetched by the hub |

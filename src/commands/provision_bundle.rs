@@ -101,6 +101,15 @@ pub struct ExtSourceArchive {
     pub size: u64,
 }
 
+/// A stone include directory in the project, as a tar.gz.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SrcInclude {
+    /// Relative to the project dir (`/opt/src` in the container).
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct SmallArchive {
     pub root: String,
@@ -136,6 +145,11 @@ pub struct BundleMeta {
     /// avocado.yaml points them at `.avocado-bundle/ext/<name>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ext_sources: Vec<ExtSourceArchive>,
+    /// Stone include directories in the project, unpacked at the same path
+    /// in the replay's directory, so `AVOCADO_STONE_INCLUDE_PATHS` resolves
+    /// there unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub src_includes: Vec<SrcInclude>,
 }
 
 /// The Rubicon side of a bundle, resolved from the composed config at pack
@@ -218,6 +232,10 @@ impl BundleMeta {
                 sha256: a.sha256.clone(),
                 size: a.size,
             }))
+            .chain(self.src_includes.iter().map(|a| BlobRef {
+                sha256: a.sha256.clone(),
+                size: a.size,
+            }))
         {
             if seen.insert(b.sha256.clone()) {
                 out.push(b);
@@ -227,11 +245,14 @@ impl BundleMeta {
     }
 
     /// The blobs a replay fetches: all of them to provision; only the
-    /// extension sources (what `sdk install` reads) to run a command.
+    /// sources it unpacks before `sdk install` to run a command.
     pub fn blobs_for(&self, exec: bool) -> Vec<BlobRef> {
         let mut b = self.blobs();
         if exec {
-            b.retain(|b| self.ext_sources.iter().any(|a| a.sha256 == b.sha256));
+            b.retain(|b| {
+                self.ext_sources.iter().any(|a| a.sha256 == b.sha256)
+                    || self.src_includes.iter().any(|a| a.sha256 == b.sha256)
+            });
         }
         b
     }
@@ -252,12 +273,15 @@ pub fn pack_tail(runtime: &str, target: &str) -> String {
 P="$AVOCADO_PREFIX"
 cd "$P" || exit 1
 paths="output/runtimes/{runtime}/stone runtimes/{runtime}/var-staging"
+srcinc=""
 IFS=':'
 for inc in $AVOCADO_STONE_INCLUDE_PATHS; do
     [ -n "$inc" ] || continue
     case "$inc" in
         "$P"/sdk/*) ;;  # installed by `avocado sdk install` on the provisioning host
         "$P"/*) [ -e "$inc" ] && paths="$paths ${{inc#"$P"/}}" ;;
+        # In the project: carried as a directory archive (`src_includes`).
+        /opt/src/*) [ -e "$inc" ] && srcinc="$srcinc ${{inc#/opt/src/}}" ;;
         *) echo "[ERROR] stone include path $inc is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
     esac
 done
@@ -279,6 +303,7 @@ fi
 OUT=/opt/src/{stage}
 rm -rf "$OUT" && mkdir -p "$OUT/blobs" || exit 1
 echo "$paths" > "$OUT/paths" || exit 1
+echo "$srcinc" > "$OUT/src_includes" || exit 1
 # The stone manifest names the default provision profile (for the bundle's
 # Rubicon run profiles); not bundled itself when it comes with the SDK.
 m="${{AVOCADO_STONE_MANIFEST:-$AVOCADO_SDK_PREFIX/stone/stone-{target}.json}}"
@@ -445,6 +470,11 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         &required_extensions(p.composed, p.target)?,
         &stage.join("blobs"),
     )?;
+    let src_includes = pack_src_includes(
+        p.src_dir,
+        &std::fs::read_to_string(stage.join("src_includes"))?,
+        &stage.join("blobs"),
+    )?;
     let meta = BundleMeta {
         format: FORMAT,
         target: p.target.into(),
@@ -469,6 +499,7 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
                 .and_then(|m| crate::commands::profiles::stone_default_profile(&m)),
         )?,
         ext_sources,
+        src_includes,
     };
     let dir = if out.is_dir() {
         out.join(format!("{}-{}.bundle", p.runtime, p.target))
@@ -631,6 +662,35 @@ pub fn pack_ext_sources(
     Ok((out, serde_yaml::to_string(&doc)?))
 }
 
+/// Archive each stone include directory the pack found in the project
+/// (`list`: paths relative to `src_dir`) into `blobs`.
+fn pack_src_includes(src_dir: &Path, list: &str, blobs: &Path) -> Result<Vec<SrcInclude>> {
+    let mut out = Vec::new();
+    for rel in list.split_whitespace() {
+        let rel = rel.trim_end_matches('/');
+        if !src_include_rel(rel) {
+            bail!("stone include path /opt/src/{rel} is not a plain path in the project; it cannot be bundled");
+        }
+        let archive = tar_dir(&src_dir.join(rel))
+            .with_context(|| format!("archive stone include path {rel}"))?;
+        let sha256 = hex_sha256(&archive);
+        std::fs::create_dir_all(blobs)?;
+        std::fs::write(blobs.join(&sha256), &archive)?;
+        out.push(SrcInclude {
+            path: rel.into(),
+            sha256,
+            size: archive.len() as u64,
+        });
+    }
+    Ok(out)
+}
+
+/// A project-relative include dir a replay may replace: no `.`/`..`, not
+/// the bundle's own work dir.
+fn src_include_rel(p: &str) -> bool {
+    safe_rel(p) && p.split('/').next() != Some(WORK_DIR)
+}
+
 /// Pin the board the bundle was built for. It is often chosen by
 /// `AVOCADO_TARGET_BOARD` or `--target-board`, which the hub does not have:
 /// without this the hub composes the project for another board, and picks
@@ -716,7 +776,8 @@ fn plain_name(n: &str) -> bool {
 }
 
 /// Unpack the bundle's path-sourced extensions where its avocado.yaml
-/// expects them (`<cwd>/.avocado-bundle/ext/<name>`), before `sdk install`.
+/// expects them (`<cwd>/.avocado-bundle/ext/<name>`), and its project stone
+/// include dirs at their own paths, before `sdk install`.
 fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()> {
     for a in &meta.ext_sources {
         if !plain_name(&a.name) || !is_sha256(&a.sha256) {
@@ -729,6 +790,18 @@ fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()>
         tar::Archive::new(flate2::read::GzDecoder::new(f))
             .unpack(&dir)
             .with_context(|| format!("unpack extension '{}'", a.name))?;
+    }
+    for a in &meta.src_includes {
+        if !src_include_rel(&a.path) || !is_sha256(&a.sha256) {
+            bail!("bundle stone include {:?} is not valid", a.path);
+        }
+        let dir = cwd.join(&a.path);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let f = std::fs::File::open(cache.join(&a.sha256))?;
+        tar::Archive::new(flate2::read::GzDecoder::new(f))
+            .unpack(&dir)
+            .with_context(|| format!("unpack stone include '{}'", a.path))?;
     }
     Ok(())
 }
@@ -1427,6 +1500,7 @@ mod tests {
             cli_version: String::new(),
             rubicon: None,
             ext_sources: a,
+            src_includes: vec![],
         };
         assert!(meta
             .blobs()
@@ -1439,6 +1513,41 @@ mod tests {
         assert!(got.join("avocado.yaml").is_file());
         assert!(got.join("stone/x.json").is_file());
         assert!(!got.join(".git").exists(), "repo metadata stays home");
+    }
+
+    #[test]
+    fn project_stone_includes_travel_and_unpack_at_the_same_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("carrier/stone/dtb")).unwrap();
+        std::fs::write(proj.join("carrier/stone/dtb/u-boot.dtb"), "dtb").unwrap();
+        let blobs = tmp.path().join("blobs");
+        let inc = pack_src_includes(&proj, " carrier/stone/\n", &blobs).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].path, "carrier/stone");
+        for bad in ["../x", "a/../b", "./x", ".avocado-bundle/x", "/etc"] {
+            assert!(
+                pack_src_includes(&proj, bad, &blobs).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let mut m = meta("x86_64");
+        m.src_includes = inc;
+        assert!(m
+            .blobs_for(true)
+            .iter()
+            .any(|b| b.sha256 == m.src_includes[0].sha256));
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(hub.join("carrier/stone/stale")).unwrap();
+        unpack_ext_sources(&m, &hub, &blobs).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(hub.join("carrier/stone/dtb/u-boot.dtb")).unwrap(),
+            "dtb"
+        );
+        assert!(
+            !hub.join("carrier/stone/stale").exists(),
+            "replaced, not merged"
+        );
     }
 
     #[test]
@@ -1583,6 +1692,7 @@ provision:
             cli_version: String::new(),
             rubicon: None,
             ext_sources: vec![],
+            src_includes: vec![],
         }
     }
 
