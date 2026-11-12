@@ -267,6 +267,13 @@ impl BundleMeta {
 /// images). Stages `files.tsv` (large files by sha256), `blobs/`, and the
 /// small-files archive under /opt/src/`stage_dir`. Fails closed: the runtime
 /// shell has no `set -e`.
+/// Archives a small-files list. `--xattrs` makes it pax, and pax records
+/// each entry's atime and ctime (and the default header name, the PID):
+/// drop them, or a copy of the same tree never hashes the same.
+const SMALL_TAR: &str = "tar --no-recursion --sort=name --mtime=@0 --numeric-owner \\
+    --xattrs --xattrs-include='*' \\
+    --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime";
+
 pub fn pack_tail(runtime: &str, target: &str) -> String {
     format!(
         r#"
@@ -338,9 +345,7 @@ for p in $paths; do
     LC_ALL=C sort "$OUT/small.found" > "$OUT/small.list" || exit 1
     # Owners and xattrs kept: var-staging carries service-owned directories
     # and docker layers (overlay `trusted.*` markers, file capabilities).
-    tar --no-recursion --sort=name --mtime=@0 --numeric-owner \
-        --xattrs --xattrs-include='*' \
-        -cf "$OUT/small.tar" -T "$OUT/small.list" || exit 1
+    {small_tar} -cf "$OUT/small.tar" -T "$OUT/small.list" || exit 1
     gzip -n -f "$OUT/small.tar" || exit 1
     h=$(sha256sum "$OUT/small.tar.gz" | cut -d' ' -f1) || exit 1
     printf '%s\t%s\t%s\n' "$h" "$(stat -c %s "$OUT/small.tar.gz")" "$p" >> "$OUT/small.tsv" || exit 1
@@ -350,6 +355,7 @@ rm -f "$OUT/small.found" "$OUT/small.list"
 set +f
 "#,
         small_max = LARGE_FILE - 1,
+        small_tar = SMALL_TAR,
         stage = stage_dir(runtime, target),
     )
 }
@@ -1778,6 +1784,39 @@ provision:
             .status()
             .unwrap();
         assert!(st.success());
+    }
+
+    /// A small-files archive depends on content only: var-staging is a fresh
+    /// copy every build, so its atime and ctime always differ.
+    #[test]
+    fn small_files_archive_ignores_atime_and_ctime() {
+        let dir = std::env::temp_dir().join(format!("bundle-pax-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        std::fs::write(dir.join("t/f"), "x").unwrap();
+        let hash = || {
+            let out = std::process::Command::new("sh")
+                .current_dir(&dir)
+                .args([
+                    "-c",
+                    &format!("find t > list && {SMALL_TAR} -cf - -T list | sha256sum"),
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let a = hash();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // chmod there and back: same content and mode, new ctime.
+        let st = std::process::Command::new("sh")
+            .current_dir(&dir)
+            .args(["-c", "cat t/f >/dev/null && chmod 600 t/f && chmod 644 t/f"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert_eq!(a, hash());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The pack's split must be exact: every regular file is large xor small.
