@@ -601,7 +601,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - **`cryptoki` 0.12.1 for RUSTSEC-2026-0286** (out-of-bounds read decoding
-  `CKA_ALLOWED_MECHANISMS`). Lockfile bump only. (#278)
+  the PKCS#11 allowed-mechanisms attribute). Lockfile bump only. (#278)
 - **The extension source symlink guard is armed on the default config path.**
   `ExtSourceReader` requires a resolved symlink to stay under the extension
   root, because a `type: git` tree is third-party content. With the empty
@@ -1195,7 +1195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land in the runtime manifest (`root_hash`, with the tree stored as
   `<image_id>.verity`); the rootfs root hash goes into the boot FIT as
   `avocado,roothash` and the tree into the machine's per-slot hash partition.
-  Requires `veritysetup` in the SDK and `CONFIG_DM_VERITY` on the target.
+  Requires `veritysetup` in the SDK and the dm-verity kernel option on the target.
   Provisioning carries everything; `avocado deploy` and `avocado connect
   upload` refuse a runtime with verity extensions until they publish the
   trees too.
@@ -1326,7 +1326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warns and the field is left off, so a server that does not read it yet
   (ENG-2284) sees today's request unchanged. If the server refuses the call
   in a way that means this body was refused, the upload retries once without
-  it — gated on the status, via a new `HttpStatus` error type, rather than on
+  it — gated on the status, via a new HTTP status error type, rather than on
   message text. That is `400` and `413`, not any 4xx: the likeliest refusal is
   `413 Payload Too Large`, since ~400 packages of SPDX is megabytes into a body
   that is otherwise kilobytes, while `401`, `403`, `409`, `422` and `429` are

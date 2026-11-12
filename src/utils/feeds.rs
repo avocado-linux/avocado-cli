@@ -726,7 +726,7 @@ impl ResolvedFeedSet {
                 // Connect provides it" is more use than "password is missing".
                 // Minting is skipped for a feed that already has a credential, so
                 // an `org:` feed carrying one would keep its `connect://<org>/...`
-                // placeholder baseurl and dnf would fail to resolve it.
+                // stand-in baseurl and dnf would fail to resolve it.
                 bail!(
                     "repos.{name}: an `org:` feed gets its credential from Connect; \
                      remove `username`/`password` (they are for feeds Connect knows \
@@ -1004,7 +1004,7 @@ impl ResolvedFeedSet {
                     .unwrap_or_else(|| "2026".to_string());
                 let branch = def.channel.clone().unwrap_or_else(|| "main".to_string());
                 let path = format!("{rel}/orgs/{org}/{branch}/target/{target}");
-                // A placeholder host, replaced with the minted `feed_url` at
+                // A stand-in host, replaced with the minted `feed_url` at
                 // materialize time. Recording it rather than the real URL keeps the
                 // canonical document stable across builds and keeps a server-side
                 // URL change out of the stamp hash — the org is the input, the host
@@ -1223,7 +1223,7 @@ impl ResolvedFeedSet {
     /// Deliberately **not** part of `resolve`. The token changes on every mint, so
     /// letting it near the stamp hash or the canonical document would invalidate
     /// every cached sysroot once per build. `resolve` records `connect:<org>` as
-    /// the credential identity and a `connect://` placeholder as the URL; this
+    /// the credential identity and a `connect://` stand-in as the URL; this
     /// fills in the real host and the secret, in memory, for the life of one
     /// invocation. The canonical document is written before this runs.
     ///
@@ -1352,7 +1352,7 @@ impl ResolvedFeedSet {
             // a baseurl pointing at the feed ROOT rather than the org's subtree —
             // dnf would then read someone else's metadata, or nothing, and report
             // it as a broken feed. A Connect feed reaching this point without its
-            // placeholder is a logic error in resolve, not a user mistake.
+            // stand-in is a logic error in resolve, not a user mistake.
             let prefix = format!("connect://{org}/");
             let path = feed
                 .baseurl
@@ -2140,7 +2140,7 @@ distro:
         }
     }
 
-    /// An `org:` feed resolves without contacting anything: a placeholder URL that
+    /// An `org:` feed resolves without contacting anything: a stand-in URL that
     /// shows the layout, and the org as the credential identity. Both are stable
     /// across builds, which is what keeps a per-build token out of the stamp hash.
     #[test]
@@ -2202,7 +2202,7 @@ distro:
     }
 
     /// An `org:` feed with its own credential would skip minting and keep the
-    /// `connect://` placeholder as its baseurl, so dnf would fail to resolve a
+    /// `connect://` stand-in as its baseurl, so dnf would fail to resolve a
     /// config that looks perfectly reasonable.
     #[test]
     fn an_org_feed_cannot_carry_its_own_credential() {
@@ -3052,7 +3052,7 @@ distro:
             ));
             assert!(e.contains("base URL") && e.contains(var), "{e}");
         }
-        // And a named feed still requires the placeholder, so the two rules do
+        // And a named feed still requires the stand-in, so the two rules do
         // not quietly contradict each other.
         let named = load(
             "distro:\n  release: 2026\n  channel: next\n  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever\n",
