@@ -210,7 +210,7 @@ enum Commands {
         name: Option<String>,
         /// Omit the default remote extensions (avocado-ext-dev,
         /// avocado-ext-sshd-dev, the board BSP) from the generated config
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reference")]
         minimal: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -5448,6 +5448,15 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    #[test]
+    fn init_minimal_conflicts_with_reference() {
+        let err = Cli::try_parse_from(["avocado", "init", "--minimal", "--reference", "x"])
+            .err()
+            .expect("--minimal has no effect on a reference project");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["avocado", "init", "--minimal"]).is_ok());
     }
 
     #[test]
