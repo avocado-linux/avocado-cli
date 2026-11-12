@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the URL is kept as written. Detection ignores `--network=host` on Docker
   Desktop and under the avocado VM, where loopback is the VM's own, so the
   rewrite still applies there. The per-feed key overrides detection, and the
-  distro feed and built-in feeds refuse it.
+  distro feed and built-in feeds refuse it. The distro feed's address follows
+  the same detection from `sdk.container_args` alone;
+  command-line container arguments are not consulted for the rewrite or the
+  host entry (they still reach the container).
 - **`avocado init --minimal` for feeds that lack the default extensions.** The
   generated project leaves out the `avocado-ext-dev`, `avocado-ext-sshd-dev`
   and board BSP remote extensions and keeps only the local application
