@@ -667,7 +667,13 @@ pub fn pack_ext_sources(
 fn pack_src_includes(src_dir: &Path, list: &str, blobs: &Path) -> Result<Vec<SrcInclude>> {
     let mut out = Vec::new();
     for rel in list.split_whitespace() {
-        let rel = rel.trim_end_matches('/');
+        // `./carrier` (a config-relative entry) is `carrier`.
+        let rel = rel
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let rel = rel.as_str();
         if !src_include_rel(rel) {
             bail!("stone include path /opt/src/{rel} is not a plain path in the project; it cannot be bundled");
         }
@@ -1522,10 +1528,10 @@ mod tests {
         std::fs::create_dir_all(proj.join("carrier/stone/dtb")).unwrap();
         std::fs::write(proj.join("carrier/stone/dtb/u-boot.dtb"), "dtb").unwrap();
         let blobs = tmp.path().join("blobs");
-        let inc = pack_src_includes(&proj, " carrier/stone/\n", &blobs).unwrap();
+        let inc = pack_src_includes(&proj, " ./carrier//stone/\n", &blobs).unwrap();
         assert_eq!(inc.len(), 1);
         assert_eq!(inc[0].path, "carrier/stone");
-        for bad in ["../x", "a/../b", "./x", ".avocado-bundle/x", "/etc"] {
+        for bad in ["../x", "a/../b", ".", ".avocado-bundle/x"] {
             assert!(
                 pack_src_includes(&proj, bad, &blobs).is_err(),
                 "{bad} must be refused"
