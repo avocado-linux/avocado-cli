@@ -6879,7 +6879,7 @@ extensions:
             std::fs::write(
                 &tool,
                 format!(
-                    "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
+                    "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
                     log = dir.join("log").display(),
                     pid = dir.join("pid").display(),
                 ),
@@ -6890,7 +6890,35 @@ extensions:
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            runnable(&tool);
             tool.display().to_string()
+        }
+
+        /// Wait until the script just written at `p` can be executed. Another
+        /// test thread that forked while it was open for writing holds a copy
+        /// until that child execs, and an exec meanwhile fails with ETXTBSY.
+        /// The code under test reads a failed spawn as "never called" or "not
+        /// running", so the race would fail the test without saying why.
+        /// Once one run gets through, nothing still holds the file open.
+        fn runnable(p: &Path) {
+            const ETXTBSY: i32 = 26;
+            for _ in 0..100 {
+                match std::process::Command::new(p).arg("--probe").status() {
+                    Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    // A nonzero exit is fine (`gone` exits 1); any other spawn
+                    // error fails here rather than inside the test.
+                    status => {
+                        status.unwrap();
+                        return;
+                    }
+                }
+            }
+            std::process::Command::new(p)
+                .arg("--probe")
+                .status()
+                .unwrap();
         }
 
         fn container_with_tool(tool: String) -> SdkContainer {
@@ -6908,6 +6936,7 @@ extensions:
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            runnable(&p);
             p.display().to_string()
         }
 
