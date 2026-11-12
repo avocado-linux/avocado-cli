@@ -1737,8 +1737,9 @@ pub fn sdk_compile_inputs_are_complete(
 
 /// Whether an extension declares the sources it is built from in a way the
 /// hash can follow: a non-empty `package_files` list under a content root the
-/// host can read, with no symlink among the paths it selects, and with neither
-/// `package_files` nor `source` set again under an override.
+/// host can read, with no symlink among the paths it selects, no glob that
+/// matches nothing, and with neither `package_files` nor `source` set again
+/// under an override.
 ///
 /// - A host that cannot see the source (a git- or package-sourced extension)
 ///   cannot hash a byte of it.
@@ -1760,7 +1761,7 @@ pub fn declared_sources_are_hashable(ext: &serde_yaml::Value, project_root: &Pat
         return false;
     };
     let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-    !patterns.is_empty() && !package_files_select_a_symlink(&root, &patterns)
+    !patterns.is_empty() && !package_files_hide_an_edit(&root, &patterns)
 }
 
 /// Whether the build reads from the same tree the hash reads.
@@ -2635,12 +2636,18 @@ fn declares_sources_in_override(ext: &serde_yaml::Value) -> bool {
     ext.as_mapping().is_some_and(|m| m.values().any(declares))
 }
 
-/// Whether any path a `package_files` list selects is a symlink or holds one.
-/// Literal entries are checked as they are, and globs are expanded the way
-/// [`package_files_digest`] expands them. A path that cannot be read counts
-/// as a symlink: the answer must fail toward "no skip". A missing one does
-/// not, because the digest already fails on it.
-fn package_files_select_a_symlink(root: &Path, patterns: &[&str]) -> bool {
+/// Whether a `package_files` list could hide an edit from
+/// [`package_files_digest`]: a path it selects is a symlink or holds one, or a
+/// glob matches nothing. Literal entries are checked as they are, and globs
+/// are expanded the way the digest expands them. A path that cannot be read
+/// counts as a symlink: the answer must fail toward "no skip". A missing
+/// literal does not, because the digest already fails on it.
+///
+/// A glob with no match records only `(no match)`, which never moves. Some
+/// patterns never match here while `ext package` expands them fine in bash
+/// (`./src/*.c`: the walk yields `src/main.c`), so an edit under them would
+/// skip and ship the old build.
+fn package_files_hide_an_edit(root: &Path, patterns: &[&str]) -> bool {
     let is_glob = |p: &str| p.contains(['*', '?', '[']);
     let mut selected: Vec<std::path::PathBuf> = patterns
         .iter()
@@ -2688,6 +2695,7 @@ fn package_files_select_a_symlink(root: &Path, patterns: &[&str]) -> bool {
         }
     }
     if !globs.is_empty() {
+        let mut matched = vec![false; globs.len()];
         for entry in walkdir::WalkDir::new(root) {
             let Ok(entry) = entry else { return true };
             let Some(rel) = entry
@@ -2698,9 +2706,22 @@ fn package_files_select_a_symlink(root: &Path, patterns: &[&str]) -> bool {
             else {
                 continue;
             };
-            if !rel.is_empty() && globs.iter().any(|g| g.is_match(rel)) {
+            if rel.is_empty() {
+                continue;
+            }
+            let mut hit = false;
+            for (glob, seen) in globs.iter().zip(matched.iter_mut()) {
+                if glob.is_match(rel) {
+                    *seen = true;
+                    hit = true;
+                }
+            }
+            if hit {
                 selected.push(entry.path().to_path_buf());
             }
+        }
+        if matched.contains(&false) {
+            return true;
         }
     }
     selected
@@ -9348,6 +9369,25 @@ extensions:
             &with("package_files: ['vendor/src/*.c']")["extensions"]["my-ext"],
             root
         ));
+    }
+
+    /// A glob that matches nothing records `(no match)`, which never moves.
+    /// `./src/*.c` is one: bash expands it for `ext package`, but the walk
+    /// yields `src/main.c` and globset keeps the `./`.
+    #[test]
+    fn a_glob_that_matches_nothing_is_not_hashable() {
+        let dir = compile_project();
+        let root = dir.path();
+        let hashable = |files: &str| {
+            let v: serde_yaml::Value =
+                serde_yaml::from_str(&COMPILE_SECTION_YAML.replace("package_files: [src]", files))
+                    .unwrap();
+            declared_sources_are_hashable(&v["extensions"]["my-ext"], root)
+        };
+        assert!(!hashable("package_files: ['./src/*.c']"));
+        assert!(!hashable("package_files: ['src/*.c', 'src/*.h']"));
+        assert!(hashable("package_files: ['src/*.c']"));
+        assert!(hashable("package_files: ['./src']"));
     }
 
     #[test]

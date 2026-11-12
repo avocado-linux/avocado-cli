@@ -46,22 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extensions: without a list of sources, an edit to a source file would not
   move the hash. A section always compiles, as before, when an extension
   that names it has no `package_files`, when a `package_files` path or glob
-  directory is or holds a symlink, when `sdk.container_args` holds anything
-  other than `--privileged`, `--network=host`, `-v /dev:/dev`,
-  `-v /sys:/sys` and env flags with a value (`-e CFLAGS=-O2`), when there is no lock file, or when the CLI runs from a
-  directory other than the project and there is no `src_dir`. With `-v`,
-  the build says how to get the skip when `package_files` is missing.
-  `avocado sdk compile` always runs, and `--no-stamps`, `ext clean` and
-  `sdk clean <section>` remove the section stamp.
+  directory is or holds a symlink, when a glob matches nothing (such as
+  `./src/*.c`), when `sdk.container_args` holds anything other than
+  `--privileged`, `--network=host`, `-v /dev:/dev`, `-v /sys:/sys` and env
+  flags with a value (`-e CFLAGS=-O2`), when there is no lock file, or when
+  the CLI runs from a directory other than the project and there is no
+  `src_dir`. With `-v`, the build says how to get the skip when
+  `package_files` is missing. `avocado sdk compile` always runs, and
+  `--no-stamps`, `ext clean` and `sdk clean <section>` remove the section
+  stamp.
 - **`ext build` no longer skips over inputs it cannot hash.** An extension
-  with a package that has both `compile` and `install` is always rebuilt, and
-  its compile step decides whether the compile can be skipped. The
-  `ext build` hash does not read the SDK image, the lock pins or the host
-  state the container args pass, so its skip could ship a binary built
-  against an old library. An extension with a `post_build` hook is rebuilt
-  when a `package_files` path or glob directory is or holds a symlink, when
-  an override sets `package_files` or `source`, or when the CLI runs from a
-  directory other than the project and there is no `src_dir`.
+  with a package that has both `compile` and `install` is always rebuilt,
+  and its compile step decides whether the compile can be skipped. The `ext
+  build` hash does not read the SDK image, the lock pins or the host state
+  the container args pass, so its skip could ship a binary built against an
+  old library. An extension with a `post_build` hook is rebuilt when a
+  `package_files` path or glob directory is or holds a symlink, when a glob
+  matches nothing, when an override sets `package_files` or `source`, or
+  when the CLI runs from a directory other than the project and there is no
+  `src_dir`.
 
 ## [1.1.0] - 2026-11-11
 
