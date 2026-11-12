@@ -24,6 +24,8 @@ pub struct RuntimeProvisionConfig {
     pub config_path: String,
     pub verbose: bool,
     pub force: bool,
+    /// Run the provision script without writing the target
+    pub dry_run: bool,
     pub target: Option<String>,
     /// Target board override for `{{ avocado.target.board }}`
     pub target_board: Option<String>,
@@ -443,6 +445,7 @@ impl RuntimeProvisionCommand {
         };
 
         insert_provision_force_env(&mut env_vars, self.config.force);
+        insert_provision_dry_run_env(&mut env_vars, self.config.dry_run);
 
         // Held until the run ends: dropping it deletes the private copy.
         let host_mounts = if host_mounts_export_applies(
@@ -579,11 +582,16 @@ impl RuntimeProvisionCommand {
 
         // On Docker Desktop, check if the provisioning script produced a result file
         // requesting host-side action (e.g., burning to removable storage).
-        if is_docker_desktop() {
+        if host_burn_applies(is_docker_desktop(), self.config.dry_run) {
             if let Some(ref out_path) = provision_out_path {
                 let host_out_dir = src_dir.join(out_path);
                 self.handle_provision_result(&host_out_dir)?;
             }
+        } else if is_docker_desktop() {
+            print_info(
+                "Dry run: skipping the host-side SD card burn.",
+                OutputLevel::Normal,
+            );
         }
 
         print_success(
@@ -1272,6 +1280,26 @@ fn insert_provision_force_env(env_vars: &mut HashMap<String, String>, force: boo
     );
 }
 
+/// Tell the provision script this is a dry run.
+///
+/// Inserted after the user's `--env` values so `--env
+/// AVOCADO_PROVISION_DRY_RUN=0` cannot turn a dry run into a real write.
+/// Without the flag nothing is exported here and a user's own value is left
+/// as it was.
+fn insert_provision_dry_run_env(env_vars: &mut HashMap<String, String>, dry_run: bool) {
+    if dry_run {
+        env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), "1".to_string());
+    }
+}
+
+/// Whether the host-side burn of a produced disk image runs.
+///
+/// Only Docker Desktop defers the write to the host, and a dry run must not
+/// write the removable disk.
+fn host_burn_applies(docker_desktop: bool, dry_run: bool) -> bool {
+    docker_desktop && !dry_run
+}
+
 /// Whether the host's mount table can be bound into the provision container.
 ///
 /// Only a local run against a native Docker daemon shares a kernel with the
@@ -1308,6 +1336,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1339,6 +1368,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1369,6 +1399,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1429,6 +1460,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1453,6 +1485,63 @@ mod tests {
         assert_eq!(cmd.config.out, None);
         assert_eq!(cmd.config.container_args, container_args);
         assert_eq!(cmd.config.dnf_args, dnf_args);
+    }
+
+    #[test]
+    fn provision_dry_run_env_is_1_when_dry_run_is_set() {
+        let mut env_vars = HashMap::new();
+        insert_provision_dry_run_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_DRY_RUN")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_flag_overrides_a_user_env_value() {
+        for user in ["0", "", "false", "anything"] {
+            let mut env_vars = HashMap::new();
+            env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), user.to_string());
+            insert_provision_dry_run_env(&mut env_vars, true);
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_PROVISION_DRY_RUN")
+                    .map(String::as_str),
+                Some("1"),
+                "--env AVOCADO_PROVISION_DRY_RUN={user:?} must not defeat --dry-run"
+            );
+        }
+    }
+
+    #[test]
+    fn provision_dry_run_env_is_not_exported_without_the_flag() {
+        let mut env_vars = HashMap::new();
+        insert_provision_dry_run_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_DRY_RUN"));
+        assert!(env_vars.is_empty());
+    }
+
+    #[test]
+    fn provision_dry_run_env_without_the_flag_leaves_a_user_value_alone() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), "0".to_string());
+        insert_provision_dry_run_env(&mut env_vars, false);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_DRY_RUN")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn host_burn_runs_on_docker_desktop_only_outside_a_dry_run() {
+        assert!(host_burn_applies(true, false));
+        assert!(!host_burn_applies(true, true));
+        assert!(!host_burn_applies(false, false));
+        assert!(!host_burn_applies(false, true));
     }
 
     #[test]
@@ -1574,6 +1663,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
