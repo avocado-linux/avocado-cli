@@ -15,6 +15,7 @@ pub mod git_worktree;
 #[cfg(all(test, unix))]
 pub(crate) mod gnu_test_tools;
 pub mod host_copy;
+pub mod host_mounts;
 pub mod image_signing;
 pub mod install_method;
 pub mod interactivity;

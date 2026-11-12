@@ -444,6 +444,18 @@ impl RuntimeProvisionCommand {
 
         insert_provision_force_env(&mut env_vars, self.config.force);
 
+        // Held until the run ends: dropping it deletes the private copy.
+        let host_mounts = if host_mounts_export_applies(
+            is_docker_desktop(),
+            self.config.runs_on.is_some(),
+            crate::utils::container::is_vm_routing_active(),
+        ) {
+            crate::utils::host_mounts::HostMountsCopy::take()
+        } else {
+            None
+        };
+        insert_provision_host_mounts_env(&mut env_vars, host_mounts.is_some());
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -509,10 +521,17 @@ impl RuntimeProvisionCommand {
             source_environment: true,
             interactive: !self.config.force,
             env_vars,
-            container_args: config.merge_provision_container_args(
-                self.config.provision_profile.as_deref(),
-                self.config.container_args.as_ref(),
-            ),
+            container_args: {
+                let mut args = config.merge_provision_container_args(
+                    self.config.provision_profile.as_deref(),
+                    self.config.container_args.as_ref(),
+                );
+                if let Some(copy) = &host_mounts {
+                    args.get_or_insert_with(Vec::new)
+                        .extend(["-v".to_string(), copy.bind_arg()]);
+                }
+                args
+            },
             dnf_args: self.config.dnf_args.clone(),
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
@@ -1253,6 +1272,31 @@ fn insert_provision_force_env(env_vars: &mut HashMap<String, String>, force: boo
     );
 }
 
+/// Whether the host's mount table can be bound into the provision container.
+///
+/// Only a local run against a native Docker daemon shares a kernel with the
+/// disk being written. Docker Desktop (macOS) and the avocado-vm run the
+/// container in a VM, and `--runs-on` runs it on another machine, so the local
+/// table would describe the wrong host.
+fn host_mounts_export_applies(docker_desktop: bool, runs_on: bool, vm_routing: bool) -> bool {
+    !docker_desktop && !runs_on && !vm_routing
+}
+
+/// Point the provision library at the bound host mount table.
+///
+/// Removes any `--env` value first so a caller cannot redirect the check at a
+/// file of their choosing, or keep it set when no table was bound. Inserted
+/// after the user's env, like the force export.
+fn insert_provision_host_mounts_env(env_vars: &mut HashMap<String, String>, bound: bool) {
+    env_vars.remove(crate::utils::host_mounts::ENV_VAR);
+    if bound {
+        env_vars.insert(
+            crate::utils::host_mounts::ENV_VAR.to_string(),
+            crate::utils::host_mounts::CONTAINER_PATH.to_string(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1442,6 +1486,78 @@ mod tests {
             env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn host_mounts_env_points_at_the_fixed_container_path_when_bound() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_HOST_MOUNTS")
+                .map(String::as_str),
+            Some("/run/avocado-provision/host-mounts")
+        );
+    }
+
+    #[test]
+    fn host_mounts_env_replaces_a_value_passed_with_env() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "AVOCADO_PROVISION_HOST_MOUNTS".to_string(),
+            "/tmp/forged".to_string(),
+        );
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_HOST_MOUNTS")
+                .map(String::as_str),
+            Some("/run/avocado-provision/host-mounts")
+        );
+    }
+
+    #[test]
+    fn host_mounts_env_is_stripped_when_not_bound_even_if_env_names_it() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "AVOCADO_PROVISION_HOST_MOUNTS".to_string(),
+            "/tmp/forged".to_string(),
+        );
+        insert_provision_host_mounts_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
+    }
+
+    #[test]
+    fn host_mounts_env_is_left_unset_when_not_bound() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
+    }
+
+    #[test]
+    fn host_mounts_are_exported_only_for_a_local_native_docker_run() {
+        assert!(host_mounts_export_applies(false, false, false));
+        assert!(
+            !host_mounts_export_applies(true, false, false),
+            "docker desktop / macOS"
+        );
+        assert!(!host_mounts_export_applies(false, true, false), "--runs-on");
+        assert!(
+            !host_mounts_export_applies(false, false, true),
+            "VM routing"
+        );
+    }
+
+    #[test]
+    fn host_mounts_export_leaves_the_force_export_intact() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        insert_provision_force_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
+            Some("1")
+        );
+        assert!(env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
     }
 
     #[test]
