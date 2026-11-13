@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Release override notice.** When `AVOCADO_RELEASEVER` is exported in a
+  project that has a locked pin, avocado prints
+  `pin ignored: AVOCADO_RELEASEVER is set to <value>; the locked pin <pin> is not used`
+  once per run. The override still wins. See docs/releasever.md.
 - **`--offline` flag and `AVOCADO_OFFLINE`.** The avocado process opens no
   network connection: it skips the latest-snapshot pointer lookup, the pin
   HEAD check and the feed preflight, and uses the locked pin, printing it
