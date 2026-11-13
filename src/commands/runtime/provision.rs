@@ -552,10 +552,11 @@ impl RuntimeProvisionCommand {
             interactive: !self.config.force,
             env_vars,
             container_args: {
-                let mut args = config.merge_provision_container_args(
-                    self.config.provision_profile.as_deref(),
-                    self.config.container_args.as_ref(),
-                );
+                let mut args =
+                    strip_cli_owned_provision_env(config.merge_provision_container_args(
+                        self.config.provision_profile.as_deref(),
+                        self.config.container_args.as_ref(),
+                    ));
                 if let Some(copy) = &host_mounts {
                     args.get_or_insert_with(Vec::new)
                         .extend(["-v".to_string(), copy.bind_arg()]);
@@ -1326,6 +1327,20 @@ fn host_burn_applies(docker_desktop: bool, dry_run: bool) -> bool {
     docker_desktop && !dry_run
 }
 
+/// Drop container-arg settings of the env vars the CLI sets for the provision
+/// script. Container args come after the generated `-e` flags in every run
+/// path, so a later `-e` would win: a profile other than the one the dry-run
+/// gate checked, a dry run switched off, or a host mount table the CLI did not
+/// bind.
+fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String>> {
+    const KEYS: [&str; 3] = [
+        "AVOCADO_PROVISION_PROFILE",
+        "AVOCADO_PROVISION_DRY_RUN",
+        "AVOCADO_PROVISION_HOST_MOUNTS",
+    ];
+    args.map(|a| crate::utils::container::strip_env_args(&a, &KEYS))
+}
+
 /// Whether the container's provision state file is copied over the host's.
 /// A dry run writes nothing, so the host state stays as it was.
 fn state_copy_applies(dry_run: bool) -> bool {
@@ -1798,6 +1813,30 @@ runtimes:
         });
         let err = cmd.execute().await.unwrap_err();
         assert!(format!("{err:#}").contains("stone manifest could not be read"));
+    }
+
+    // Container args land after the generated `-e` flags, so a later `-e`
+    // would replace a value the CLI set, and AVOCADO_PROVISION_PROFILE there
+    // would run a profile the dry-run gate never checked.
+    #[test]
+    fn container_args_cannot_override_cli_owned_provision_env() {
+        let args = vec![
+            "-e AVOCADO_PROVISION_PROFILE=emmc".to_string(),
+            "--env=AVOCADO_PROVISION_DRY_RUN=0".to_string(),
+            "-e".to_string(),
+            "AVOCADO_PROVISION_HOST_MOUNTS=/tmp/m".to_string(),
+            "-e AVOCADO_DEVICE_ID=d1".to_string(),
+            "--privileged".to_string(),
+        ];
+        assert_eq!(
+            strip_cli_owned_provision_env(Some(args)),
+            Some(vec![
+                "-e".to_string(),
+                "AVOCADO_DEVICE_ID=d1".to_string(),
+                "--privileged".to_string()
+            ])
+        );
+        assert_eq!(strip_cli_owned_provision_env(None), None);
     }
 
     // A runtime's `stone_include_paths` puts a project dir ahead of the staged
