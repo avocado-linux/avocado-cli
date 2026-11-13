@@ -62,9 +62,9 @@ avocado provision <runtime> --profile sd \
   --env AVOCADO_PROVISION_DEVICE=/dev/sdX
 ```
 
-To run every guard without writing anything, add `--dry-run` (added by this
-change; needs an avocado-cli release that carries it, and a profile that declares
-`dry_run: true` in its manifest config).
+To run every guard without writing anything, add `--dry-run`. It needs a
+profile that declares `dry_run: true` in its manifest config, and a runtime
+with no stone include paths.
 
 USB profiles (`uuu-emmc`, `ums`, `usb`) talk to the board over USB from inside
 the SDK container, so they need `--privileged` in `sdk.container_args` in
@@ -76,9 +76,10 @@ sdk:
     - --privileged
 ```
 
-On a host, the container cannot see the host mount table, so the mounted-device
-check only warns. A CLI release that carries this change binds a read-only copy
-of the table in (`AVOCADO_PROVISION_HOST_MOUNTS`) so the check sees host mounts.
+On native Linux the CLI binds a read-only copy of the host mount table into the
+container (`AVOCADO_PROVISION_HOST_MOUNTS`), so the mounted-device check sees
+host mounts. On Docker Desktop, in the avocado-vm and with `--runs-on` the table
+is not bound, and the check only warns.
 
 Four things that will stop you:
 
