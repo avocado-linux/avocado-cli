@@ -7,6 +7,7 @@ pub mod deploy;
 pub mod device_reclaim;
 pub mod devices;
 pub mod ext;
+pub mod hub;
 pub mod init;
 pub mod keys;
 pub mod orgs;
