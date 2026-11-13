@@ -1008,12 +1008,34 @@ pub struct RubiconConfig {
     /// contribute it with their run profiles; the project wins per pin.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wiring: BTreeMap<String, String>,
+    /// Buses on the Rubicon's logic-analyzer channels, by name
+    /// (`i2c-gp: { protocol: i2c, sda: la12, scl: la13 }`). The hub sets
+    /// those channels as plain inputs (no pull) so they don't load the bus;
+    /// every other channel keeps its pull-down. Extensions contribute them
+    /// like the wiring; the project wins per bus.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub analyzer: BTreeMap<String, RubiconBus>,
     /// What this CLI can't read, set aside at load (see
     /// [`set_aside_unknown_rubicon`]): `rubicon.run.<name>` or
     /// `provision.<profile>.rubicon` → the step or key it doesn't know.
     /// Using one fails; loading a config that merely has one doesn't.
     #[serde(skip)]
     pub unsupported: BTreeMap<String, String>,
+}
+
+/// A bus on the logic-analyzer channels: its protocol and which channel
+/// (`la0`..`la15`) carries each of its signals.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RubiconBus {
+    pub protocol: String,
+    #[serde(flatten)]
+    pub signals: BTreeMap<String, String>,
+}
+
+/// The logic-analyzer channel a signal name means: `la0`..`la15`.
+fn la_channel(s: &str) -> Option<u32> {
+    let n: u32 = s.strip_prefix("la")?.parse().ok()?;
+    (n < 16 && s == format!("la{n}")).then_some(n)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -3325,8 +3347,9 @@ impl Config {
         // Rubicon run profiles always merge, by name, main first: they are
         // inert until a provision profile names one, and a project replaces
         // an extension's run profile by defining the same name. The wiring
-        // that goes with them merges the same way, per pin.
-        for (key, external_run) in ["run", "wiring"].into_iter().filter_map(|k| {
+        // that goes with them merges the same way, per pin, and the
+        // analyzer's buses per bus.
+        for (key, external_run) in ["run", "wiring", "analyzer"].into_iter().filter_map(|k| {
             Some((
                 k,
                 external_config
@@ -4284,6 +4307,17 @@ impl Config {
     /// them. Runs on the composed config, where extensions' run profiles are
     /// merged in; step names and shapes are already checked by serde.
     pub fn validate_rubicon(&self) -> Result<()> {
+        let mut used = BTreeMap::new();
+        for (bus, b) in self.rubicon.iter().flat_map(|r| &r.analyzer) {
+            for (sig, ch) in &b.signals {
+                let n = la_channel(ch).with_context(|| {
+                    format!("rubicon.analyzer.{bus}.{sig}: {ch:?} is not a channel (la0..la15)")
+                })?;
+                if let Some(other) = used.insert(n, format!("{bus}.{sig}")) {
+                    anyhow::bail!("rubicon.analyzer: {ch} is both {other} and {bus}.{sig}");
+                }
+            }
+        }
         let wiring = self.rubicon.as_ref().map(|r| &r.wiring);
         if let Some(pin) = wiring
             .into_iter()
@@ -16207,6 +16241,38 @@ provision:
         );
         let profiles = c.provision_profiles.as_ref().unwrap();
         assert!(profiles.contains_key("usb") && profiles.contains_key("tegraflash"));
+    }
+
+    #[test]
+    fn analyzer_buses_merge_per_bus_and_channels_are_checked() {
+        let c = merge(
+            "rubicon:\n  analyzer:\n    i2c-gp: { protocol: i2c, sda: la2, scl: la3 }\n",
+            "rubicon:\n  analyzer:\n    i2c-gp: { protocol: i2c, sda: la12, scl: la13 }\n    \
+             pm: { protocol: i2c, sda: la14, scl: la15 }\n",
+        );
+        let a = &c.rubicon.as_ref().unwrap().analyzer;
+        assert_eq!(
+            a["i2c-gp"].signals["sda"], "la2",
+            "the project wins per bus"
+        );
+        assert_eq!(
+            (a["pm"].protocol.as_str(), a["pm"].signals["scl"].as_str()),
+            ("i2c", "la15")
+        );
+        c.validate_rubicon().unwrap();
+        for (yaml, want) in [
+            ("{ b: { protocol: i2c, sda: la16 } }", "not a channel"),
+            ("{ b: { protocol: i2c, sda: la01 } }", "not a channel"),
+            (
+                "{ b: { protocol: i2c, sda: la1, scl: la1 } }",
+                "la1 is both",
+            ),
+        ] {
+            let bad: Config =
+                serde_yaml::from_str(&format!("rubicon:\n  analyzer: {yaml}\n")).unwrap();
+            let e = format!("{:#}", bad.validate_rubicon().unwrap_err());
+            assert!(e.contains(want), "{yaml}: {e}");
+        }
     }
 
     #[test]

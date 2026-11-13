@@ -2419,6 +2419,25 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "analyzer": {
+          "type": "object",
+          "description": "Buses on the Rubicon's logic-analyzer channels, by name (i2c-gp: { protocol: i2c, sda: la12, scl: la13 }). The hub sets those channels as plain inputs (no pull) so they don't load the bus; every other channel keeps its pull-down. Extensions contribute them; the project wins per bus.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["protocol"],
+            "properties": {
+              "protocol": {
+                "type": "string",
+                "description": "The bus protocol (i2c, spi, uart...)."
+              }
+            },
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^la([0-9]|1[0-5])$",
+              "description": "The channel carrying this signal."
+            }
+          }
         }
       },
       "additionalProperties": false
