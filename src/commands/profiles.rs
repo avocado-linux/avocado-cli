@@ -396,9 +396,12 @@ pub fn require_dry_run_support(manifest_json: &str, profile: Option<&str>) -> Re
 /// Container-free half of the `--dry-run` gate. Returns the profile name the
 /// run will actually use (`None` means the manifest default) or refuses.
 ///
-/// The script reads `AVOCADO_PROVISION_PROFILE` from the effective env, so
-/// that variable wins over `provision_profile`; an empty value counts as
-/// unset, as the scripts' `${VAR:-}` expansion does.
+/// The script reads `AVOCADO_PROVISION_PROFILE` from the effective env.
+/// `build_env_vars` in `main.rs` writes `--profile` into that env after
+/// parsing `--env`, so `--profile` wins and the two match whenever it is
+/// given; an `--env` value only decides the profile when no `--profile` is
+/// given. An empty value counts as unset, as the scripts' `${VAR:-}`
+/// expansion does.
 ///
 /// Stone include paths (`stone_include_paths` on the runtime or one of its
 /// extensions, or an `AVOCADO_STONE_INCLUDE_PATHS` env var) are refused: the
@@ -810,15 +813,6 @@ mod tests {
         let e = env(&[("AVOCADO_PROVISION_PROFILE", "emmc")]);
         assert_eq!(
             dry_run_preflight(Some(&e), None, None).unwrap(),
-            Some("emmc".to_string())
-        );
-    }
-
-    #[test]
-    fn preflight_env_wins_over_flag_when_they_differ() {
-        let e = env(&[("AVOCADO_PROVISION_PROFILE", "emmc")]);
-        assert_eq!(
-            dry_run_preflight(Some(&e), Some("sd"), None).unwrap(),
             Some("emmc".to_string())
         );
     }
