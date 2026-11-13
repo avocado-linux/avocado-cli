@@ -25,6 +25,7 @@ pub mod kernel_resolver;
 pub mod kernel_version;
 pub mod lockfile;
 pub mod nfs_server;
+pub mod offline;
 pub mod output;
 pub mod output_format;
 pub mod overlay_preprocess;

@@ -123,6 +123,10 @@ struct Cli {
     /// (Equivalent to `AVOCADO_VM_AUTO_START=0`.)
     #[arg(long, global = true)]
     no_vm_auto_start: bool,
+
+    /// Make no snapshot or feed preflight request; use the locked pin (equivalent to `AVOCADO_OFFLINE=1`)
+    #[arg(long, global = true)]
+    offline: bool,
 }
 
 #[derive(Subcommand)]
@@ -2226,11 +2230,15 @@ async fn main() -> Result<()> {
         std::env::set_var("AVOCADO_NO_TUI", "1");
     }
 
-    let skip_update_check = matches!(
-        cli.command,
-        Commands::Upgrade { .. } | Commands::Completion { .. }
-    );
-    let update_handle = if !skip_update_check {
+    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+
+    let update_handle = if should_check_for_updates(
+        utils::offline::is_offline(),
+        matches!(
+            cli.command,
+            Commands::Upgrade { .. } | Commands::Completion { .. }
+        ),
+    ) {
         Some(tokio::spawn(utils::update_check::check_for_update()))
     } else {
         None
@@ -5313,9 +5321,23 @@ enum HitlCommands {
     },
 }
 
+/// Whether to spawn the background GitHub release check. `--offline` must not
+/// touch the network, and `upgrade`/`completion` have no use for the notice.
+fn should_check_for_updates(offline: bool, cmd_is_upgrade_or_completion: bool) -> bool {
+    !offline && !cmd_is_upgrade_or_completion
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_skips_the_update_check() {
+        assert!(!should_check_for_updates(true, false));
+        assert!(!should_check_for_updates(false, true));
+        assert!(!should_check_for_updates(true, true));
+        assert!(should_check_for_updates(false, false));
+    }
 
     #[test]
     fn test_parse_env_vars() {
