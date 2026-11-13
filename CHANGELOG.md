@@ -106,8 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the target base (rootfs, initramfs and the platform SDK packages) and the
   project's own additions. Another project whose inputs match reuses them
   instead of installing, and gets the lock pins of what it reused. Layers are
-  shared only when the feed is pinned to a snapshot and the project has no
-  `repos:` of its own. Files are stored once by content; each project keeps
+  shared when the feed is pinned to a snapshot and every enabled `repos:`
+  feed is a `path:` feed (see docs/layer-sharing.md). Files are stored once
+  by content; each project keeps
   its private paths (extension and runtime outputs, build stamps) out of
   shared layers. Needs rootful docker that can run `--privileged` and Linux
   6.5+ (layers mount file-backed on 6.12+, through loop devices below); a
