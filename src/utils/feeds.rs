@@ -1704,7 +1704,8 @@ impl Probe<'_> {
 /// Fail before the first download when a feed repository is unreachable,
 /// naming the feed.
 ///
-/// Probes the metadata index of each URL feed in `feeds`, and the extension
+/// Probes the metadata index of each `http(s)` URL feed in `feeds` whose
+/// locator has no `$` variable left for dnf to expand, and the extension
 /// repository (`<repo url>/<releasever>/target/<target>-ext`, through the distro
 /// feed's TLS settings) only when `needs_extension_repo`. The caller decides
 /// that from the runtime extensions it will fetch, `enabled: false` ones
@@ -1761,6 +1762,13 @@ pub async fn preflight_feeds(
             }
             FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
         };
+        // dnf expands what is left of `$releasever`/`$basearch` inside the
+        // container and reads `file://` itself; the host can check neither.
+        if !(locator.starts_with("http://") || locator.starts_with("https://"))
+            || locator.contains('$')
+        {
+            continue;
+        }
         Probe {
             subject,
             url: format!("{}/repodata/repomd.xml", locator.trim_end_matches('/')),
@@ -3796,6 +3804,39 @@ distro:
     }
 
     #[tokio::test]
+    async fn a_locator_dnf_still_has_to_expand_is_left_to_dnf() {
+        // dnf substitutes `$releasever` and `$basearch` inside the container; the
+        // literal URL would 404 here on a feed that serves dnf fine.
+        clear_release_env();
+        let (base, seen) = serve_status("404 Not Found").await;
+        for url in [format!("{base}/$releasever"), format!("{base}/$basearch")] {
+            let c = load(&format!(
+                "distro:\n  feeds: [v]\nrepos:\n  v:\n    url: {url}\n"
+            ));
+            let set = ResolvedFeedSet::resolve_with_loopback_isolated(
+                &c,
+                "t",
+                Path::new("."),
+                None,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            preflight_feeds(&c, Some(&set), "t", false)
+                .await
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
+    }
+
+    #[tokio::test]
+    async fn a_file_url_feed_is_left_to_dnf() {
+        // reqwest cannot fetch `file://`; dnf reads it from inside the container.
+        let (c, set) = url_feed_set("file:///nonexistent", "");
+        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn addon_feeds_are_left_to_check_addons_when_the_index_is_known() {
         // A misspelled add-on would otherwise surface here as a bare "not found at
         // .../repomd.xml", ahead of check_addons' did-you-mean text.
@@ -3818,7 +3859,9 @@ distro:
     }
 
     #[tokio::test]
-    async fn addon_feeds_are_probed_when_there_is_no_index_to_check_them() {
+    async fn addon_feeds_without_an_index_are_left_to_dnf() {
+        // No index means no releasever, so the add-on's URL still carries the
+        // literal `$releasever` that only dnf can expand.
         clear_release_env();
         let (base, seen) = serve_status("404 Not Found").await;
         let c = load(&format!(
@@ -3829,11 +3872,16 @@ distro:
                 .unwrap()
                 .unwrap();
         assert_eq!(set.addon_index_url, None);
-        let e = preflight_feeds(&c, Some(&set), "t", false)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("feed 'ros2-jazzy'"), "{e}");
-        assert!(!seen.lock().unwrap().is_empty());
+        let addon: Vec<_> = set
+            .feeds
+            .iter()
+            .filter(|f| f.name.starts_with("ros2-jazzy"))
+            .collect();
+        assert!(!addon.is_empty());
+        assert!(addon
+            .iter()
+            .all(|f| f.configured_locator.contains("$releasever")));
+        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
     }
 }
