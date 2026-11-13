@@ -404,9 +404,10 @@ impl RubiconCommand {
             .as_ref()
             .map(|r| r.wiring.clone())
             .unwrap_or_default();
+        let analyzer = config.rubicon.as_ref().map(|r| r.analyzer.clone());
         let console = config.rubicon.as_ref().and_then(|r| r.console.clone());
         let params = json!({"address": b.address, "name": profile, "steps": steps,
-                            "wiring": wiring, "console": console});
+                            "wiring": wiring, "analyzer": analyzer, "console": console});
         let r =
             remote::run_command(&b, "rubicon_run", params, self.connect_profile.as_deref()).await?;
         remote::report(&r, &format!("{profile} on {}", b.describe()))?;
