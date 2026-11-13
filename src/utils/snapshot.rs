@@ -378,9 +378,57 @@ fn announce_offline_pin(
     true
 }
 
+/// What avocado itself last exported to `AVOCADO_RELEASEVER` in this process.
+/// Exporter and consumer share a process, so a value differing from this one
+/// was set by the user.
+static EXPORTED_RELEASEVER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Set once the offline "no pin, custom feed" line has been printed.
 static OFFLINE_UNPINNED_PRINTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the "pin ignored" line has been printed.
+static PIN_IGNORED_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn set_exported_record(value: Option<String>) {
+    *EXPORTED_RELEASEVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = value;
+}
+
+/// The notice for a user-set `AVOCADO_RELEASEVER` that shadows a locked pin.
+/// `None` when the variable is unset, equals avocado's own export, or no
+/// locked pin applies to this config.
+fn pin_ignored_notice(config: &Config, src_dir: &Path, target: &str) -> Option<String> {
+    let value = env::var("AVOCADO_RELEASEVER").ok()?;
+    let own = EXPORTED_RELEASEVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if own.as_deref() == Some(value.as_str()) {
+        return None;
+    }
+    let release = config.get_distro_release()?;
+    let channel = config.get_distro_channel()?;
+    let repo_url = config.effective_repo_url();
+    let lock = LockFile::load(src_dir).ok()?;
+    let snap = lock.get_repo_snapshot(target);
+    if !matches!(
+        pin_status(snap, &release, &channel, &repo_url),
+        PinStatus::Matches
+    ) {
+        return None;
+    }
+    let snap = snap?;
+    let pin = effective_releasever(&snap.release, &snap.channel, &snap.snapshot);
+    if value == pin {
+        return None;
+    }
+    Some(format!(
+        "pin ignored: AVOCADO_RELEASEVER is set to {value}; the locked pin {pin} is not used"
+    ))
+}
 
 /// Resolve the snapshot pin for `target` and, when one applies, expose it via
 /// `AVOCADO_RELEASEVER` so every downstream `get_releasever()` fetches against
@@ -390,6 +438,11 @@ static OFFLINE_UNPINNED_PRINTED: std::sync::atomic::AtomicBool =
 /// in-process install task graph (children see the parent's env and no-op).
 pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) -> Result<()> {
     if releasever_is_overridden(config) {
+        if let Some(msg) = pin_ignored_notice(config, src_dir, target) {
+            if !PIN_IGNORED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                print_info(&msg, OutputLevel::Normal);
+            }
+        }
         return Ok(());
     }
     let (Some(release), Some(channel)) = (config.get_distro_release(), config.get_distro_channel())
@@ -477,6 +530,7 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         }
     };
 
+    set_exported_record(Some(effective.clone()));
     env::set_var("AVOCADO_RELEASEVER", effective);
     Ok(())
 }
@@ -881,6 +935,136 @@ mod tests {
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "offline made a request"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn release_equal_to_pin_prints_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(msg, None);
+    }
+
+    /// Lock with a pin for `qemux86-64` in a fresh dir.
+    fn pinned_dir(url: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = LockFile::load(dir.path()).unwrap();
+        lock.set_repo_snapshot("qemux86-64", snap("2026", "edge", "PINNED", Some(url)));
+        lock.save(dir.path()).unwrap();
+        dir
+    }
+
+    fn reset_notice_state() {
+        env::remove_var("AVOCADO_RELEASEVER");
+        env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+        set_exported_record(None);
+        PIN_IGNORED_PRINTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn user_releasever_prints_pin_ignored_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(
+            msg.as_deref(),
+            Some(
+                "pin ignored: AVOCADO_RELEASEVER is set to custom/rel; the locked pin \
+                 2026/edge/snapshots/PINNED is not used"
+            )
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn own_export_prints_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        set_exported_record(Some("2026/edge/snapshots/PINNED".into()));
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        set_exported_record(None);
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn no_pin_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn override_release_unchanged_by_notice() {
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            // First iteration fires the notice, second finds it already printed.
+            reset_notice_state();
+            env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+            resolve_and_apply(&config, dir.path(), "qemux86-64")
+                .await
+                .expect("override never refuses");
+            seen.push(env::var("AVOCADO_RELEASEVER").unwrap());
+        }
+        // Same call again with the once-guard already set: no notice path.
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        resolve_and_apply(&config, dir.path(), "qemux86-64")
+            .await
+            .unwrap();
+        seen.push(env::var("AVOCADO_RELEASEVER").unwrap());
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert!(PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(seen.iter().all(|r| r == "custom/rel"), "{seen:?}");
+    }
+
+    /// The pin avocado exports itself must be recorded, or the next command in
+    /// the same process would read it back as a user override.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn own_pin_export_is_not_reported_as_override() {
+        reset_notice_state();
+        let (_listener, url) = silent_listener();
+        let dir = pinned_dir(&url);
+        let config = offline_config(&url);
+        crate::utils::offline::set_offline(true);
+        let res = resolve_and_apply(&config, dir.path(), "qemux86-64").await;
+        crate::utils::offline::set_offline(false);
+        res.unwrap();
+        let exported = env::var("AVOCADO_RELEASEVER").ok();
+        // Shift the pin so only the export record, not value == pin, can
+        // silence the notice.
+        let mut lock = LockFile::load(dir.path()).unwrap();
+        lock.set_repo_snapshot("qemux86-64", snap("2026", "edge", "NEWER", Some(&url)));
+        lock.save(dir.path()).unwrap();
+        let msg = pin_ignored_notice(&config, dir.path(), "qemux86-64");
+        reset_notice_state();
+        assert_eq!(exported.as_deref(), Some("2026/edge/snapshots/PINNED"));
+        assert_eq!(msg, None);
     }
 
     #[test]
