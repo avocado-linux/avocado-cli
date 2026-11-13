@@ -1160,7 +1160,7 @@ impl ResolvedFeedSet {
     /// cannot be read the check is skipped with a warning and dnf reports whatever
     /// is really missing.
     pub async fn check_addons(&self, client: &reqwest::Client) -> Result<()> {
-        if self.addons.is_empty() {
+        if self.addons.is_empty() || crate::utils::offline::is_offline() {
             return Ok(());
         }
         let Some(url) = self.addon_index_url.clone() else {
@@ -1256,6 +1256,26 @@ impl ResolvedFeedSet {
             .any(|f| f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none())
         {
             return Ok(self.minted_tier);
+        }
+        // A token is short-lived and minted over HTTPS, so nothing recorded can
+        // stand in for it. Fail before any socket opens, naming the feed.
+        if crate::utils::offline::is_offline() {
+            let names: Vec<&str> = self
+                .feeds
+                .iter()
+                .filter(|f| {
+                    f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
+                })
+                .map(|f| f.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "--offline cannot mint the Connect feed token for {}; run without --offline or disable the feed for this stage",
+                names
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         let profiles = crate::commands::connect::client::load_config()
             .ok()
@@ -3466,6 +3486,7 @@ distro:
     }
 
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn connect_feed_stores_the_rewrite_decision() {
         let mk = |extra: &str| {
             let c = load(&format!(
@@ -3505,6 +3526,26 @@ distro:
                 feed.baseurl
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn offline_refuses_to_mint_a_connect_token() {
+        let c = load(&format!(
+            "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: acme\n"
+        ));
+        let mut set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        crate::utils::offline::set_offline(true);
+        let res = set.resolve_connect_credentials(FeedStage::Ext).await;
+        crate::utils::offline::set_offline(false);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("acme"), "{err}");
+        // Nothing was minted, so the feed still has no credential.
+        assert!(set.feeds.iter().all(|f| f.credential.is_none()));
     }
 
     #[test]
@@ -3934,5 +3975,28 @@ distro:
             .await
             .unwrap();
         assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn offline_skips_addon_checks() {
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = load(&format!(
+            "{BASE}  repo:\n    url: {base}\n  feeds: [ros2-jazzy]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        assert!(set.addon_index_url.is_some());
+        crate::utils::offline::set_offline(true);
+        let res = set.check_addons(&reqwest::Client::new()).await;
+        crate::utils::offline::set_offline(false);
+        res.unwrap();
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "offline sent requests: {:?}",
+            seen.lock().unwrap()
+        );
     }
 }
