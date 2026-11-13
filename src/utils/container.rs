@@ -647,6 +647,33 @@ pub fn get_container_platform(sdk_arch: Option<&str>) -> Result<String> {
     }
 }
 
+/// A hub job's USB view: the avocado-vm agent sets `AVOCADO_USB_VIEW` to a
+/// directory holding only the job's board's USB buses (`dev/`) and their
+/// `/sys/bus/usb/devices` entries (`sys/`), so the job's tools cannot reach
+/// another board on the same hub. Mounted over the container's; nothing
+/// anywhere else. A set but incomplete view is an error, not a silent fallback
+/// to the hub's whole `/dev` and `/sys`, which would expose every board.
+fn usb_view_args() -> Result<Vec<String>> {
+    usb_view_args_for(std::env::var("AVOCADO_USB_VIEW").ok().as_deref())
+}
+
+fn usb_view_args_for(dir: Option<&str>) -> Result<Vec<String>> {
+    let Some(d) = dir else {
+        return Ok(Vec::new());
+    };
+    for sub in ["dev", "sys"] {
+        if !Path::new(d).join(sub).is_dir() {
+            anyhow::bail!("AVOCADO_USB_VIEW={d} has no {sub}/ directory; refusing to run without the USB view");
+        }
+    }
+    Ok(vec![
+        "-v".to_string(),
+        format!("{d}/dev:/dev/bus/usb"),
+        "-v".to_string(),
+        format!("{d}/sys:/sys/bus/usb/devices"),
+    ])
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
@@ -2802,6 +2829,7 @@ impl SdkContainer {
 
         // Add additional container arguments if provided
         container_cmd.extend(extra_args);
+        container_cmd.extend(usb_view_args()?);
 
         // Add the container image
         container_cmd.push(config.container_image.to_string());
@@ -3362,6 +3390,7 @@ impl SdkContainer {
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
         }
+        extra_args.extend(usb_view_args()?);
 
         Ok((full_command, env_vars, extra_args))
     }
@@ -4741,6 +4770,27 @@ mod tests {
             assert!(result.is_err(), "the volume lookup must fail");
             assert_eq!(calls() - before, 1);
         }
+    }
+
+    #[test]
+    fn a_usb_view_mounts_over_the_containers_usb_only_when_set_and_rejects_a_broken_one() {
+        assert!(usb_view_args_for(None).unwrap().is_empty());
+        assert!(usb_view_args_for(Some("/nonexistent/view")).is_err());
+        let d = std::env::temp_dir().join(format!("usb-view-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("dev")).unwrap();
+        assert!(usb_view_args_for(d.to_str()).is_err(), "sys/ missing");
+        std::fs::create_dir_all(d.join("sys")).unwrap();
+        let d = d.to_str().unwrap();
+        assert_eq!(
+            usb_view_args_for(Some(d)).unwrap(),
+            vec![
+                "-v".to_string(),
+                format!("{d}/dev:/dev/bus/usb"),
+                "-v".to_string(),
+                format!("{d}/sys:/sys/bus/usb/devices"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.

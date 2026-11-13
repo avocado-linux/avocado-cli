@@ -44,17 +44,30 @@ pub struct ProvisionConfig {
 /// Implementation of the 'provision' command that calls through to runtime provision.
 pub struct ProvisionCommand {
     config: ProvisionConfig,
+    pack: Option<std::path::PathBuf>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
 
 impl ProvisionCommand {
+    /// The caller's `--env` values, for a remote provision to send with the
+    /// job (a pack leaves them out of the bundle).
+    pub fn env_vars(&self) -> Option<&HashMap<String, String>> {
+        self.config.env_vars.as_ref()
+    }
+
     /// Create a new ProvisionCommand instance
     pub fn new(config: ProvisionConfig) -> Self {
         Self {
             config,
+            pack: None,
             composed_config: None,
         }
+    }
+
+    pub fn with_pack(mut self, out: Option<std::path::PathBuf>) -> Self {
+        self.pack = out;
+        self
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -111,7 +124,8 @@ impl ProvisionCommand {
                 sdk_arch: self.config.sdk_arch.clone(),
             },
         )
-        .with_composed_config(composed);
+        .with_composed_config(composed)
+        .with_pack(self.pack.clone());
 
         runtime_provision_cmd.execute().await
     }

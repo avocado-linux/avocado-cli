@@ -224,6 +224,45 @@ impl VmPaths {
     pub fn dtb_cache_dir(&self) -> PathBuf {
         self.root.join("dtb")
     }
+    /// Stable per-install identity, passed to QEMU as `-uuid` so the
+    /// guest's DMI `product_uuid` (what avocado-conn claims with) survives
+    /// image updates, `vm reset` and `vm rebuild`. Never in
+    /// `cleanup_transient`.
+    pub fn instance_id_file(&self) -> PathBuf {
+        self.root.join("instance-id")
+    }
+}
+
+/// Read the VM's instance id, creating it on first use. A file that does not
+/// hold a UUID is an error rather than silently replaced: the id is the VM's
+/// identity in Connect, so changing it would orphan the claimed record.
+pub fn instance_id(paths: &VmPaths) -> Result<String> {
+    let p = paths.instance_id_file();
+    match std::fs::read_to_string(&p) {
+        Ok(raw) => {
+            let id = raw.trim();
+            uuid::Uuid::parse_str(id)
+                .map(|u| u.hyphenated().to_string())
+                .with_context(|| format!("{} does not hold a UUID", p.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            paths.ensure()?;
+            let id = uuid::Uuid::new_v4().hyphenated().to_string();
+            // Publish a fully written file without clobbering: a concurrent
+            // first use that wins the race keeps its id, and we read it back.
+            let mut tmp = tempfile::NamedTempFile::new_in(&paths.root).with_context(|| {
+                format!("failed to create temp file in {}", paths.root.display())
+            })?;
+            use std::io::Write as _;
+            writeln!(tmp, "{id}").with_context(|| format!("failed to write {}", p.display()))?;
+            match tmp.persist_noclobber(&p) {
+                Ok(_) => Ok(id),
+                Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => instance_id(paths),
+                Err(e) => Err(e.error).with_context(|| format!("failed to write {}", p.display())),
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", p.display())),
+    }
 }
 
 /// Find the user's home directory. Wraps the `directories` crate so callers
@@ -333,6 +372,40 @@ mod tests {
         assert!(read_ssh_port(&paths).unwrap().is_none());
         write_ssh_port(&paths, 51234).unwrap();
         assert_eq!(read_ssh_port(&paths).unwrap(), Some(51234));
+    }
+
+    #[test]
+    fn instance_id_is_created_once_and_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path());
+        let first = instance_id(&paths).unwrap();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(instance_id(&paths).unwrap(), first);
+        // Survives the transient cleanup every stop runs.
+        cleanup_transient(&paths);
+        assert_eq!(instance_id(&paths).unwrap(), first);
+    }
+
+    #[test]
+    fn instance_id_concurrent_first_use_agrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path());
+        let ids: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| instance_id(&paths).unwrap()))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(instance_id(&paths).unwrap(), ids[0]);
+    }
+
+    #[test]
+    fn instance_id_rejects_garbage_instead_of_replacing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path());
+        std::fs::write(paths.instance_id_file(), "not-a-uuid\n").unwrap();
+        assert!(instance_id(&paths).is_err());
     }
 
     #[test]

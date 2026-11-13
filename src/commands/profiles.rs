@@ -146,11 +146,14 @@ impl ProfilesListCommand {
         // `provision.fields`.
         let provision = manifest.provision.as_ref();
 
+        let rubicon = rubicon_refs(config, &self.config_path, self.target.as_deref());
+
         if self.output.is_json() {
             emit_json_object(&json!({
                 "available": true,
                 "target": target,
                 "default": default,
+                "rubicon": rubicon,
                 "profiles": profiles.iter().map(|(name, p)| {
                     let fields = provision
                         .map(|prov| resolve_profile_fields(prov, p))
@@ -205,6 +208,18 @@ impl ProfilesListCommand {
                         println!("        supply with: --env {var}=<value>");
                     }
                 }
+            }
+        }
+        if let Some(refs) = rubicon.as_object().filter(|r| !r.is_empty()) {
+            println!("Rubicon run profiles (provision --rubicon):");
+            for (profile, r) in refs {
+                let side = |w: &str| {
+                    r[w]["name"]
+                        .as_str()
+                        .map(|n| format!("{w} {n} ({})", r[w]["from"].as_str().unwrap_or("?")))
+                };
+                let parts: Vec<String> = ["before", "after"].into_iter().filter_map(side).collect();
+                println!("  {profile}: {}", parts.join(", "));
             }
         }
 
@@ -300,6 +315,57 @@ impl ProfilesListCommand {
 struct StoneManifest {
     runtime: Option<RuntimeSection>,
     provision: Option<ProvisionSection>,
+}
+
+/// Each provision profile's Rubicon run profiles, and whether each run
+/// profile is the project's own or comes from an extension. The project's
+/// names are interpolated for `target` as the composed config's are, so
+/// `boot-check-{{ avocado.target }}` is its own once it reads `boot-check-jetson`.
+fn rubicon_refs(config: &Config, config_path: &str, target: Option<&str>) -> JsonValue {
+    let own: BTreeSet<String> = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+        .and_then(|mut v| {
+            crate::utils::interpolation::interpolate_config(&mut v, target, None).ok()?;
+            v.get("rubicon")?.get("run")?.as_mapping().map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let refs = config
+        .provision_profiles
+        .iter()
+        .flatten()
+        .filter_map(|(name, p)| {
+            let r = p.rubicon.as_ref()?;
+            let side = |n: &Option<String>| {
+                n.as_ref().map(|n| {
+                    let from = if own.contains(n) {
+                        "project"
+                    } else {
+                        "extension"
+                    };
+                    json!({"name": n, "from": from})
+                })
+            };
+            Some((
+                name.clone(),
+                json!({"before": side(&r.before), "after": side(&r.after)}),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    JsonValue::Object(refs)
+}
+
+/// The profile stone runs when `--profile` is not given
+/// (`runtime.provision_default` in the stone manifest).
+pub fn stone_default_profile(manifest_json: &str) -> Option<String> {
+    serde_json::from_str::<StoneManifest>(manifest_json)
+        .ok()?
+        .runtime?
+        .provision_default
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +484,45 @@ fn extract_placeholders(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn rubicon_refs_say_where_each_run_profile_comes_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        // The project overrides `boot-check`; `enter` came from a BSP.
+        std::fs::write(&path, "rubicon:\n  run:\n    boot-check: []\n").unwrap();
+        let composed: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    enter: []\n    boot-check: []\n\
+             provision:\n  tegraflash:\n    rubicon: { before: enter, after: boot-check }\n  usb: {}\n",
+        )
+        .unwrap();
+        let r = rubicon_refs(&composed, path.to_str().unwrap(), None);
+        assert_eq!(
+            r,
+            json!({"tegraflash": {
+                "before": {"name": "enter", "from": "extension"},
+                "after": {"name": "boot-check", "from": "project"},
+            }})
+        );
+    }
+
+    #[test]
+    fn a_templated_project_run_profile_is_still_the_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "rubicon:\n  run:\n    \"boot-check-{{ avocado.target }}\": []\n",
+        )
+        .unwrap();
+        let composed: Config = serde_yaml::from_str(
+            "rubicon:\n  run:\n    boot-check-jetson: []\n\
+             provision:\n  p:\n    rubicon: { after: boot-check-jetson }\n",
+        )
+        .unwrap();
+        let r = rubicon_refs(&composed, path.to_str().unwrap(), Some("jetson"));
+        assert_eq!(r["p"]["after"]["from"], "project");
+    }
 
     /// The command under test — only `target` matters for resolution.
     fn cmd(target: Option<&str>) -> ProfilesListCommand {

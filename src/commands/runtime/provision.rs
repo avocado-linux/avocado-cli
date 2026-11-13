@@ -19,6 +19,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Where a provision profile's state file sits in the SDK volume while the
+/// hook runs (`$AVOCADO_PROVISION_STATE`).
+pub fn container_state_path(target_arch: &str, runtime: &str) -> String {
+    format!("/opt/_avocado/{target_arch}/output/runtimes/{runtime}/provision-state.state")
+}
+
 pub struct RuntimeProvisionConfig {
     pub runtime_name: String,
     pub config_path: String,
@@ -47,6 +53,8 @@ pub struct RuntimeProvisionConfig {
 
 pub struct RuntimeProvisionCommand {
     config: RuntimeProvisionConfig,
+    /// `--pack`: write a provisionable bundle here instead of running the hook.
+    pack: Option<PathBuf>,
     #[cfg(unix)]
     signing_service: Option<SigningService>,
     /// Pre-composed configuration to avoid reloading
@@ -57,10 +65,18 @@ impl RuntimeProvisionCommand {
     pub fn new(config: RuntimeProvisionConfig) -> Self {
         Self {
             config,
+            pack: None,
             #[cfg(unix)]
             signing_service: None,
             composed_config: None,
         }
+    }
+
+    /// Pack a provisionable bundle (see `provision_bundle`) instead of
+    /// running the provisioning hook.
+    pub fn with_pack(mut self, out: Option<PathBuf>) -> Self {
+        self.pack = out;
+        self
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -81,6 +97,9 @@ impl RuntimeProvisionCommand {
         };
         let config = &composed.config;
         let parsed = &composed.merged_value;
+        if self.pack.is_some() {
+            crate::commands::provision_bundle::check_unsigned(config, &self.config.runtime_name)?;
+        }
 
         // Get SDK configuration from interpolated config
         let container_image = config
@@ -429,10 +448,8 @@ impl RuntimeProvisionCommand {
                 .state_file
                 .clone()
                 .unwrap_or_else(|| config.get_provision_state_file(profile));
-            let container_state_path = format!(
-                "/opt/_avocado/{}/output/runtimes/{}/provision-state.state",
-                target_arch, self.config.runtime_name
-            );
+            let container_state_path =
+                container_state_path(&target_arch, &self.config.runtime_name);
             env_vars.insert(
                 "AVOCADO_PROVISION_STATE".to_string(),
                 container_state_path.clone(),
@@ -442,6 +459,14 @@ impl RuntimeProvisionCommand {
             None
         };
 
+        // What the hook needs on another machine: the derived env, not the
+        // caller's own --env values (per-device or secret ones must not
+        // ride along into a bundle that Connect stores and replays).
+        let mut env_snapshot = env_vars.clone();
+        for k in self.config.env_vars.iter().flat_map(|m| m.keys()) {
+            env_snapshot.remove(k);
+        }
+        crate::commands::provision_bundle::carry_feed(&mut env_snapshot, config.get_repo_url());
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -481,19 +506,45 @@ impl RuntimeProvisionCommand {
         // provisioning tail, and it is provisioning's to run.
         // Bound above, before the kernel cmdline export.
         let merged_runtime = merged_runtime.clone().unwrap_or_default();
-        let var_section = crate::commands::runtime::var_image::render_var_image(
-            &crate::commands::runtime::var_image::VarImageContext {
-                runtime_name: &self.config.runtime_name,
-                target_arch: &target_arch,
-                config,
-                parsed,
-                merged_runtime: &merged_runtime,
-                ext_list: &resolved_extensions,
-            },
-        )?;
+        let var_ctx = crate::commands::runtime::var_image::VarImageContext {
+            runtime_name: &self.config.runtime_name,
+            target_arch: &target_arch,
+            config,
+            parsed,
+            merged_runtime: &merged_runtime,
+            ext_list: &resolved_extensions,
+        };
+        let var_section = crate::commands::runtime::var_image::render_var_image(&var_ctx)?;
+        // --pack: what a bundle replays after restoring its files. Built by
+        // the same function as the script below, minus Docker priming
+        // (var-staging is captured after priming).
+        let replay_script = match self.pack {
+            Some(_) => Some(self.create_provision_script(
+                &target_arch,
+                &crate::commands::runtime::var_image::render_var_image_from_staging(&var_ctx)?,
+            )?),
+            None => None,
+        };
 
         // Create provision script
-        let provision_script = self.create_provision_script(&target_arch, &var_section)?;
+        let mut provision_script = self.create_provision_script(&target_arch, &var_section)?;
+        if self.pack.is_some() {
+            let hook = crate::commands::provision_bundle::hook_call(
+                &self.config.runtime_name,
+                &target_arch,
+            );
+            anyhow::ensure!(
+                provision_script.contains(&hook),
+                "provision script has no hook call to replace"
+            );
+            provision_script = provision_script.replace(
+                &hook,
+                &crate::commands::provision_bundle::pack_tail(
+                    &self.config.runtime_name,
+                    &target_arch,
+                ),
+            );
+        }
 
         if self.config.verbose {
             print_info("Executing provision script.", OutputLevel::Normal);
@@ -538,6 +589,22 @@ impl RuntimeProvisionCommand {
 
         if !provision_result {
             return Err(anyhow::anyhow!("Failed to provision runtime"));
+        }
+
+        if let (Some(out), Some(provision_script)) = (&self.pack, replay_script) {
+            crate::commands::provision_bundle::assemble(
+                out,
+                crate::commands::provision_bundle::PackInputs {
+                    src_dir: &src_dir,
+                    config_path: std::path::Path::new(&self.config.config_path),
+                    target: &target_arch,
+                    runtime: &self.config.runtime_name,
+                    env: &env_snapshot,
+                    provision_script,
+                    composed: &composed,
+                },
+            )?;
+            return Ok(());
         }
 
         // Note: File ownership is automatically handled by bindfs permission translation,
@@ -776,12 +843,13 @@ if [ -d "$(dirname "$PROVISION_VAR_DST")" ]; then
         || {{ echo -e "\033[91m[ERROR]\033[0m could not refresh $PROVISION_VAR_DST" >&2; exit 1; }}
 fi
 
-echo -e "\033[94m[INFO]\033[0m Running SDK lifecycle hook 'avocado-provision' for '{name}'."
-avocado-provision-{target_arch} {name}
-"#,
+{hook}"#,
             var_section = var_section,
             name = self.config.runtime_name,
-            target_arch = target_arch,
+            hook = crate::commands::provision_bundle::hook_call(
+                &self.config.runtime_name,
+                target_arch
+            ),
         );
 
         Ok(script)

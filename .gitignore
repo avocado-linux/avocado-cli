@@ -62,3 +62,4 @@ docs/_build/
 # python bytecode from the local-feeds rig
 __pycache__/
 *.pyc
+/target-install/

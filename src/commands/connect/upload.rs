@@ -28,7 +28,7 @@ const LEGACY_SBOM_MESSAGE: &str = "SBOMs not uploaded: this Connect does not acc
 
 const SBOM_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
+pub(crate) const PART_SIZE: u64 = 52_428_800; // 50 MiB, matching API's @part_size
 
 /// Progress line for the upload flow. In `--output json` mode (which the
 /// desktop uses), `print_info` is suppressed, so emit an `output` event the
@@ -48,6 +48,7 @@ const PHASE_DISCOVER: &str = "discover";
 const PHASE_CREATE: &str = "create-runtime";
 const PHASE_UPLOAD: &str = "upload-artifacts";
 const PHASE_FINALIZE: &str = "finalize";
+const PHASE_PROVISIONING: &str = "provisioning";
 
 /// Run one phase of the upload, emitting `running` → `success`/`failed` step
 /// events around it (and a `step_error` with the reason on failure) so the
@@ -127,6 +128,8 @@ pub struct ConnectUploadCommand {
     pub no_sbom: bool,
     pub profile: Option<String>,
     pub publish: bool,
+    /// Pack the provisioning assets and attach them to the runtime.
+    pub provisionable: bool,
     pub deploy_cohort: Option<String>,
     pub deploy_name: Option<String>,
     pub deploy_tags: Vec<String>,
@@ -191,6 +194,19 @@ impl ConnectUploadCommand {
         // 2. Load project config (needed for prerequisite checks and content key detection)
         let project_config =
             load_config(&self.config_path).context("Failed to load avocado.yaml")?;
+
+        if self.provisionable {
+            // The pack runs in the SDK volume, which --file bypasses.
+            if self.file.is_some() {
+                anyhow::bail!("--provisionable can't be used with --file");
+            }
+            // Its SDK container output isn't routed through JSON events.
+            if self.output.is_json() {
+                anyhow::bail!("--provisionable can't be used with --output json");
+            }
+            // Before anything is uploaded: a pack refuses a signing runtime.
+            crate::commands::provision_bundle::check_unsigned(&project_config, &self.runtime)?;
+        }
 
         if self.file.is_some() {
             self.warn_sbom_skipped(if self.no_sbom { "no_sbom" } else { "file" });
@@ -318,6 +334,9 @@ impl ConnectUploadCommand {
         emit_task_registered(PHASE_CREATE, "Create runtime");
         emit_task_registered(PHASE_UPLOAD, "Upload artifacts");
         emit_task_registered(PHASE_FINALIZE, "Finalize");
+        if self.provisionable {
+            emit_task_registered(PHASE_PROVISIONING, "Attach provisioning assets");
+        }
 
         // Validate prerequisites (runtime has been built)
         let target = resolve_target_required(self.target.as_deref(), project_config)?;
@@ -401,22 +420,100 @@ impl ConnectUploadCommand {
             emit_step(PHASE_FINALIZE, "skipped");
             self.handle_draft_status(connect, &runtime, num_artifacts)
                 .await?;
-            return Ok(());
+        } else {
+            // Phase C: Stream artifacts from Docker volume and upload with progress
+            let completed_parts = run_phase(
+                PHASE_UPLOAD,
+                self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
+            )
+            .await?;
+
+            // Phase D: Complete and finalize
+            run_phase(
+                PHASE_FINALIZE,
+                self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts),
+            )
+            .await?;
         }
 
-        // Phase C: Stream artifacts from Docker volume and upload with progress
-        let completed_parts = run_phase(
-            PHASE_UPLOAD,
-            self.upload_in_container(project_config, connect, &runtime.artifacts, &discovery),
-        )
-        .await?;
+        // Phase E (opt-in): make the runtime provisionable. After the
+        // runtime's images, so the bundle references them instead of
+        // re-sending them.
+        if self.provisionable {
+            run_phase(
+                PHASE_PROVISIONING,
+                self.attach_provisioning(connect, project_config, &target, &runtime),
+            )
+            .await?;
+            // The status complete() returned isn't kept: a draft is what
+            // publish/deploy start from either way.
+            self.release(connect, &runtime.id, &runtime.version, "draft")
+                .await?;
+        }
+        Ok(())
+    }
 
-        // Phase D: Complete and finalize
-        run_phase(
-            PHASE_FINALIZE,
-            self.complete_and_finalize(connect, &runtime, completed_parts, num_artifacts),
+    /// Pack the provisioning assets (`avocado provision --pack`) and upload
+    /// them as a bundle linked to `runtime`.
+    async fn attach_provisioning(
+        &self,
+        connect: &ConnectClient,
+        project_config: &Config,
+        target: &str,
+        runtime: &client::RuntimeCreateData,
+    ) -> Result<()> {
+        let src_dir = project_config
+            .get_resolved_src_dir(&self.config_path)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        let out = src_dir.join(".avocado/connect-bundle");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out)?;
+        progress("Packing provisioning assets...", OutputLevel::Normal);
+        crate::commands::provision::ProvisionCommand::new(
+            crate::commands::provision::ProvisionConfig {
+                runtime: self.runtime.clone(),
+                config_path: self.config_path.clone(),
+                verbose: false,
+                force: true,
+                target: Some(target.to_string()),
+                target_board: None,
+                provision_profile: None,
+                env_vars: None,
+                out: None,
+                container_args: None,
+                dnf_args: None,
+                no_stamps: false,
+                runs_on: None,
+                nfs_port: None,
+                sdk_arch: None,
+            },
         )
+        .with_pack(Some(out.clone()))
+        .execute()
         .await
+        .context("packing the provisioning assets failed (the runtime itself was uploaded)")?;
+        let bundle_dir = out.join(format!("{}-{target}.bundle", self.runtime));
+        let result = super::hub::upload_bundle(
+            connect,
+            &self.org,
+            &bundle_dir,
+            &format!("{} {}", self.runtime, runtime.version),
+            serde_json::json!({"runtime_id": runtime.id, "project_id": self.project}),
+        )
+        .await;
+        // ponytail: the pack copies every large file out of the volume, even
+        // ones Connect already has; stream only the missing ones if this
+        // local copy ever matters.
+        let _ = std::fs::remove_dir_all(&out);
+        result.context(
+            "uploading the provisioning assets failed (the runtime itself was uploaded)",
+        )?;
+        print_success(
+            &format!("Runtime {} is provisionable", runtime.version),
+            OutputLevel::Normal,
+        );
+        Ok(())
     }
 
     /// Create a runtime via the Connect API. Returns the runtime data and
@@ -673,10 +770,27 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
+        if !self.provisionable {
+            self.release(connect, &runtime.id, &runtime.version, &runtime.status)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Publish (`--publish`) and deploy (`--deploy-cohort`) an uploaded
+    /// runtime. With `--provisionable` this runs after the bundle is
+    /// attached, so a failed attach leaves a draft rather than a release.
+    async fn release(
+        &self,
+        connect: &ConnectClient,
+        runtime_id: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<()> {
         let final_status = if self.publish {
             progress("Publishing runtime...", OutputLevel::Normal);
             let published = connect
-                .publish_runtime(&self.org, &self.project, &runtime.id)
+                .publish_runtime(&self.org, &self.project, runtime_id)
                 .await?;
             print_success(
                 &format!(
@@ -687,14 +801,14 @@ impl ConnectUploadCommand {
             );
             published.status
         } else {
-            runtime.status.clone()
+            status.to_string()
         };
 
         if is_json_output_active() {
             emit_json_event(&serde_json::json!({
                 "event": "complete",
-                "runtime_id": runtime.id,
-                "version": runtime.version,
+                "runtime_id": runtime_id,
+                "version": version,
                 "status": final_status,
             }));
         }
@@ -704,8 +818,8 @@ impl ConnectUploadCommand {
                 client: connect,
                 org: &self.org,
                 project: &self.project,
-                runtime_id: &runtime.id,
-                runtime_version: &runtime.version,
+                runtime_id,
+                runtime_version: version,
                 cohort_id,
                 name: self.deploy_name.as_deref(),
                 description: self.description.as_deref(),
@@ -755,48 +869,10 @@ impl ConnectUploadCommand {
             OutputLevel::Normal,
         );
 
-        let final_status = if self.publish {
-            progress("Publishing runtime...", OutputLevel::Normal);
-            let published = connect
-                .publish_runtime(&self.org, &self.project, &runtime.id)
+        if !self.provisionable {
+            self.release(connect, &runtime.id, &result.version, &result.status)
                 .await?;
-            print_success(
-                &format!(
-                    "Runtime {} published (status: {})",
-                    published.version, published.status
-                ),
-                OutputLevel::Normal,
-            );
-            published.status
-        } else {
-            result.status.clone()
-        };
-
-        if is_json_output_active() {
-            emit_json_event(&serde_json::json!({
-                "event": "complete",
-                "runtime_id": runtime.id,
-                "version": result.version,
-                "status": final_status,
-            }));
         }
-
-        if let Some(ref cohort_id) = self.deploy_cohort {
-            super::deploy::deploy_after_upload(&super::deploy::DeployAfterUploadParams {
-                client: connect,
-                org: &self.org,
-                project: &self.project,
-                runtime_id: &runtime.id,
-                runtime_version: &result.version,
-                cohort_id,
-                name: self.deploy_name.as_deref(),
-                description: self.description.as_deref(),
-                tags: &self.deploy_tags,
-                activate: self.deploy_activate,
-            })
-            .await?;
-        }
-
         Ok(())
     }
 
@@ -1274,7 +1350,7 @@ fn discover_artifacts(dir: &Path, manifest: &serde_json::Value) -> Result<Vec<Ar
 
 /// Compute whole-file SHA-256 (hex) and per-part SHA-256 checksums (base64) in one pass.
 /// Parts are PART_SIZE (50 MiB) aligned, matching the API's multipart part size.
-fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
+pub(crate) fn compute_sha256_with_parts(path: &Path) -> Result<(String, Vec<String>)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut whole_hasher = Sha256::new();
@@ -1782,6 +1858,7 @@ mod tests {
             no_sbom: true,
             profile: None,
             publish: false,
+            provisionable: false,
             deploy_cohort: None,
             deploy_name: None,
             deploy_tags: vec![],
