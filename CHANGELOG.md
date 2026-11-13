@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Optional `provides`, `epoch` and scriptlet keys in `sdk.compile.<section>.package`.**
+  `provides` adds one `Provides:` line per entry, `epoch` sets `Epoch:`, and
+  `pre_install`, `post_install`, `pre_uninstall` and `post_uninstall` emit
+  `%pre`, `%post`, `%preun` and `%postun`. A `%` is escaped so rpm reads it
+  literally. See `docs/sdk-package.md`.
 - **A snapshot pin identity covers the feed URL, and a pinned rebuild
   mentions newer snapshots.** A recorded pin now remembers the repository URL
   it came from (trailing slashes ignored), so pointing the config at a mirror
