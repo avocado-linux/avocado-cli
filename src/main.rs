@@ -237,6 +237,11 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Local RPM feed tooling.
+    Feed {
+        #[command(subcommand)]
+        command: FeedCommands,
+    },
     /// Clean the avocado project by removing docker volumes and state files
     Clean {
         /// Directory to clean (defaults to current directory)
@@ -1405,6 +1410,15 @@ enum ConnectClaimTokensCommands {
         /// Profile name (defaults to the active default profile)
         #[arg(long)]
         profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeedCommands {
+    /// Write repodata/ for a directory of RPMs by running the host createrepo_c.
+    Index {
+        /// Directory of RPMs to index
+        dir: std::path::PathBuf,
     },
 }
 
@@ -3443,6 +3457,9 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Commands::Feed { command } => match command {
+            FeedCommands::Index { dir } => commands::feed::index::run(&dir),
+        },
         Commands::Container { command } => match command {
             ContainerCommands::Dev { command } => match command {
                 ContainerDevCommands::Up => DevUpCommand.execute().await,
@@ -5310,6 +5327,18 @@ enum HitlCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feed_index_parses_directory() {
+        let cli = Cli::try_parse_from(["avocado", "feed", "index", "/srv/rpms"]).unwrap();
+        match cli.command {
+            Commands::Feed {
+                command: FeedCommands::Index { dir },
+            } => assert_eq!(dir, std::path::PathBuf::from("/srv/rpms")),
+            _ => panic!("expected feed index"),
+        }
+        assert!(Cli::try_parse_from(["avocado", "feed", "index"]).is_err());
+    }
 
     #[test]
     fn test_parse_env_vars() {

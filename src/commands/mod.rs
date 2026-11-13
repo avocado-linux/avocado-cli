@@ -5,6 +5,7 @@ pub mod config_validate;
 pub mod connect;
 pub mod container;
 pub mod ext;
+pub mod feed;
 pub mod fetch;
 pub mod hitl;
 pub mod init;
