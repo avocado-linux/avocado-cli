@@ -1163,6 +1163,19 @@ impl ResolvedFeedSet {
     /// the drop-`stages` rule lives here, next to the struct whose field order
     /// defines it (fast-rebuilds/plan.md §4.0).
     pub fn stage_projection_json(&self, stage: FeedStage) -> Result<String> {
+        self.projection_json(stage, false)
+    }
+
+    /// The stage projection with each content-addressed feed (a `path:` feed that has a
+    /// `content_digest`) identified by that digest alone: its `baseurl` (a mount path
+    /// that does not move when the RPMs do) and `source` are dropped. This is what the
+    /// layer key hashes, so a changed directory changes the key and the same content
+    /// at another path shares it. The stamp hash keeps the full projection.
+    fn layer_key_projection_json(&self, stage: FeedStage) -> Result<String> {
+        self.projection_json(stage, true)
+    }
+
+    fn projection_json(&self, stage: FeedStage, content_addressed: bool) -> Result<String> {
         let mut v = serde_json::to_value(self).context("serializing feed set")?;
         let stage_name = stage.to_string();
         if let Some(feeds) = v.get_mut("feeds").and_then(|f| f.as_array_mut()) {
@@ -1200,6 +1213,10 @@ impl ResolvedFeedSet {
             for f in feeds.iter_mut() {
                 if let Some(o) = f.as_object_mut() {
                     o.remove("stages");
+                    if content_addressed && o.contains_key("content_digest") {
+                        o.remove("baseurl");
+                        o.remove("source");
+                    }
                 }
             }
         }
@@ -1694,7 +1711,7 @@ impl ResolvedFeedSet {
 
         let fingerprint = {
             use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(self.stage_projection_json(stage)?.as_bytes());
+            let digest = Sha256::digest(self.layer_key_projection_json(stage)?.as_bytes());
             digest.iter().map(|b| format!("{b:02x}")).collect()
         };
         Ok(FeedMaterialization {
@@ -3143,6 +3160,43 @@ distro:
             "new repodata in the same directory must change the projection"
         );
         assert!(a1.contains("\"source\": \"./a\"") && a1.contains("\"content_digest\""));
+    }
+
+    /// The layer key hashes the materialization fingerprint. A path feed's
+    /// identity there is its repodata, not where it lives: changed RPMs must
+    /// change the key, and the same content at another path must not.
+    #[test]
+    fn changed_path_feed_changes_layer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (d, body) in [("a", "one"), ("b", "two"), ("c", "one")] {
+            fs::create_dir_all(dir.path().join(d).join("repodata")).unwrap();
+            fs::write(
+                dir.path().join(d).join("repodata/repomd.xml"),
+                format!("<repomd>{body}</repomd>"),
+            )
+            .unwrap();
+        }
+        let key = |p: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [local]\nrepos:\n  local:\n    path: ./{p}\n"
+            ));
+            ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+                .unwrap()
+                .unwrap()
+                .materialize(FeedStage::Rootfs)
+                .unwrap()
+                .fingerprint
+        };
+        assert_ne!(
+            key("a"),
+            key("b"),
+            "different repomd.xml digests must change the key"
+        );
+        assert_eq!(
+            key("a"),
+            key("c"),
+            "the same repodata at another path must give the same key"
+        );
     }
 
     #[test]
