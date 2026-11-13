@@ -834,10 +834,20 @@ impl SdkInstallCommand {
                 .get_or_create_volume(&container_helper.cwd)
                 .await?;
                 let project = config.project_root(&self.config_path);
+                let lock = LockFile::load(&project)?;
+                let releasever = std::env::var("AVOCADO_RELEASEVER").ok();
+                let snapshot_pinned = crate::utils::stacks::snapshot_pin_holds(
+                    lock.get_repo_snapshot(&target),
+                    releasever.as_deref(),
+                );
+                let custom_feeds =
+                    crate::utils::feeds::ResolvedFeedSet::resolve(config, &target, &project, None)?
+                        .map(|set| crate::utils::stacks::CustomFeedPins::from_feeds(&set.feeds))
+                        .unwrap_or_default();
                 let shareable = crate::utils::stacks::shareable(
-                    LockFile::load(&project)?.get_repo_snapshot(&target),
-                    std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
-                    config.repos.as_ref().is_some_and(|r| !r.is_empty()),
+                    lock.get_repo_snapshot(&target),
+                    releasever.as_deref(),
+                    &custom_feeds,
                 );
                 // The volume's own source path (absolute, the one the volume reaper trusts),
                 // not the config-relative project root: `avocado stack prune` judges the view
@@ -852,8 +862,10 @@ impl SdkInstallCommand {
                 )?;
                 if !shareable {
                     print_info(
-                        "Stacks: the feed is not pinned to a snapshot (or the project declares \
-                         its own repos), so this project's layers are not shared.",
+                        &crate::utils::stacks::private_layers_notice(
+                            snapshot_pinned,
+                            &custom_feeds,
+                        ),
                         OutputLevel::Normal,
                     );
                 }
@@ -3119,7 +3131,8 @@ runtimes:
             "repos",
             KeyRole::Unread(
                 "definitions only: distro.feeds enables them (keyed); declaring any makes the \
-                 project's layers private (stacks::shareable)",
+                 project's layers private unless every enabled feed has a content identity \
+                 (stacks::shareable)",
             ),
         ),
         ("rootfs", KeyRole::Section),

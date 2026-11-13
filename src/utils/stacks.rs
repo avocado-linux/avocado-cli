@@ -722,22 +722,81 @@ pub fn key_of(inputs: &Value) -> String {
     crate::utils::signing_keys::hex::encode(&Sha256::digest(inputs.to_string().as_bytes()))
 }
 
+/// Whether every enabled custom feed (`url:`, `path:`, `org:`) has a recorded content
+/// identity. Today only a `path:` feed has one (the digest of its `repodata/repomd.xml`);
+/// a `url:` or `org:` feed can change under the same name, so it has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomFeedPins {
+    /// Name of the first enabled custom feed with no content identity.
+    pub first_unpinned: Option<String>,
+}
+
+impl CustomFeedPins {
+    /// From `(feed name, has a content identity)` pairs, one per custom feed.
+    pub fn from_pins<'a>(pins: impl IntoIterator<Item = (&'a str, bool)>) -> Self {
+        Self {
+            first_unpinned: pins
+                .into_iter()
+                .find(|(_, pinned)| !pinned)
+                .map(|(name, _)| name.to_string()),
+        }
+    }
+
+    /// From a resolved feed set: the distro feed and built-in re-scopes are not custom
+    /// feeds (the distro feed is covered by the snapshot pin).
+    pub fn from_feeds(feeds: &[crate::utils::feeds::ResolvedFeed]) -> Self {
+        use crate::utils::feeds::FeedKind;
+        Self::from_pins(
+            feeds
+                .iter()
+                .filter(|f| matches!(f.kind, FeedKind::Url | FeedKind::Path | FeedKind::Connect))
+                .map(|f| (f.name.as_str(), f.content_digest.is_some())),
+        )
+    }
+
+    pub fn all_pinned(&self) -> bool {
+        self.first_unpinned.is_none()
+    }
+}
+
+/// The distro feed is pinned to a snapshot and the releasever in force is exactly that
+/// snapshot (not a user override naming a moving channel).
+pub fn snapshot_pin_holds(
+    snapshot: Option<&crate::utils::lockfile::RepoSnapshot>,
+    releasever: Option<&str>,
+) -> bool {
+    let Some(s) = snapshot else { return false };
+    releasever
+        == Some(
+            crate::utils::snapshot::effective_releasever(&s.release, &s.channel, &s.snapshot)
+                .as_str(),
+        )
+}
+
 /// Whether a key may be shared with other projects: only when every package source is
-/// immutable, i.e. the lock pins the distro feed to a snapshot, the releasever in force is
-/// exactly that snapshot (not a user override naming a moving channel), and the project
-/// declares no `repos:` of its own (URLs and paths that can change under the same name).
+/// immutable, i.e. the snapshot pin holds for the distro feed and every enabled custom
+/// feed has a recorded content identity (URLs and paths without one can change under the
+/// same name).
 pub fn shareable(
     snapshot: Option<&crate::utils::lockfile::RepoSnapshot>,
     releasever: Option<&str>,
-    has_custom_repos: bool,
+    custom_feeds: &CustomFeedPins,
 ) -> bool {
-    let Some(s) = snapshot else { return false };
-    !has_custom_repos
-        && releasever
-            == Some(
-                crate::utils::snapshot::effective_releasever(&s.release, &s.channel, &s.snapshot)
-                    .as_str(),
-            )
+    snapshot_pin_holds(snapshot, releasever) && custom_feeds.all_pinned()
+}
+
+/// The notice printed when a project's layers are not shared. A snapshot-pin failure keeps
+/// the generic wording; otherwise the unpinned custom feed is named.
+pub fn private_layers_notice(snapshot_pinned: bool, custom_feeds: &CustomFeedPins) -> String {
+    match (&custom_feeds.first_unpinned, snapshot_pinned) {
+        (Some(name), true) => format!(
+            "Stacks: the feed '{name}' has no recorded content identity (only a path: feed \
+             has one), so this project's layers are not shared."
+        ),
+        _ => "Stacks: the feed is not pinned to a snapshot (or the project declares \
+              its own repos), so this project's layers are not shared."
+            .to_string(),
+    }
 }
 
 /// Whether the view already holds `key`'s tree: it is on that layer, or on one built on top
@@ -1291,13 +1350,51 @@ mod tests {
     fn only_snapshot_pinned_feeds_are_shareable() {
         let s = snap();
         let pinned = crate::utils::snapshot::effective_releasever("2026", "edge", "20261027-1");
-        assert!(shareable(Some(&s), Some(&pinned), false));
+        let none = CustomFeedPins::default();
+        assert!(shareable(Some(&s), Some(&pinned), &none));
         // A moving channel exported by hand, or no pin at all.
-        assert!(!shareable(Some(&s), Some("2026/edge"), false));
-        assert!(!shareable(None, Some(&pinned), false));
-        assert!(!shareable(Some(&s), None, false));
-        // Project feeds (URLs, paths) can change under the same name.
-        assert!(!shareable(Some(&s), Some(&pinned), true));
+        assert!(!shareable(Some(&s), Some("2026/edge"), &none));
+        assert!(!shareable(None, Some(&pinned), &none));
+        assert!(!shareable(Some(&s), None, &none));
+        // A custom feed with no content identity can change under the same name.
+        let unpinned = CustomFeedPins::from_pins([("mirror", false)]);
+        assert!(!shareable(Some(&s), Some(&pinned), &unpinned));
+    }
+
+    #[test]
+    fn unpinned_feed_is_not_shared() {
+        let s = snap();
+        let pinned = crate::utils::snapshot::effective_releasever("2026", "edge", "20261027-1");
+        let feeds = CustomFeedPins::from_pins([("local", true), ("mirror", false)]);
+        assert!(!feeds.all_pinned());
+        assert!(!shareable(Some(&s), Some(&pinned), &feeds));
+    }
+
+    #[test]
+    fn all_pinned_feeds_share() {
+        let s = snap();
+        let pinned = crate::utils::snapshot::effective_releasever("2026", "edge", "20261027-1");
+        let feeds = CustomFeedPins::from_pins([("a", true), ("b", true)]);
+        assert!(shareable(Some(&s), Some(&pinned), &feeds));
+        assert!(shareable(
+            Some(&s),
+            Some(&pinned),
+            &CustomFeedPins::from_pins([])
+        ));
+        // Pinned feeds do not rescue a missing snapshot pin.
+        assert!(!shareable(None, Some(&pinned), &feeds));
+    }
+
+    #[test]
+    fn notice_names_the_first_unpinned_feed() {
+        let feeds =
+            CustomFeedPins::from_pins([("local", true), ("mirror", false), ("other", false)]);
+        let n = private_layers_notice(true, &feeds);
+        assert!(n.contains("'mirror'") && !n.contains("other"), "{n}");
+        // No snapshot pin: the generic wording stays, whatever the feeds are.
+        let n = private_layers_notice(false, &feeds);
+        assert!(n.contains("not pinned to a snapshot"), "{n}");
+        assert!(!n.contains("mirror"), "{n}");
     }
 
     #[test]
