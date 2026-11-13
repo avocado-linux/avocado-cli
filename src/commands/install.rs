@@ -220,6 +220,7 @@ impl InstallCommand {
             .preflight_feeds_once(
                 &_target,
                 &self.config_path,
+                crate::utils::feeds::FeedStage::ALL,
                 needs_extension_repo,
                 self.runs_on.is_some(),
             )

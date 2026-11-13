@@ -214,6 +214,7 @@ impl ExtFetchCommand {
             .preflight_feeds_once(
                 &target,
                 &self.config_path,
+                &[crate::utils::feeds::FeedStage::Ext],
                 needs_extension_repo(
                     &extensions_to_fetch,
                     installed_and_kept,
@@ -482,6 +483,7 @@ impl ExtFetchCommand {
                         .preflight_feeds_once(
                             &target,
                             &self.config_path,
+                            &[crate::utils::feeds::FeedStage::Ext],
                             true,
                             self.runs_on.is_some(),
                         )

@@ -94,7 +94,13 @@ impl FetchCommand {
         // Probe the feeds before the first dnf or download work. `fetch`
         // refreshes metadata only and has no `--runs-on`.
         config
-            .preflight_feeds_once(&target_arch, &self.config_path, false, false)
+            .preflight_feeds_once(
+                &target_arch,
+                &self.config_path,
+                &[crate::utils::feeds::FeedStage::Ext],
+                false,
+                false,
+            )
             .await?;
 
         // Get container configuration from interpolated config

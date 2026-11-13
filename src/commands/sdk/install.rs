@@ -573,6 +573,12 @@ impl SdkInstallCommand {
             .preflight_feeds_once(
                 &target,
                 &self.config_path,
+                &[
+                    FeedStage::Sdk,
+                    FeedStage::SdkTarget,
+                    FeedStage::Rootfs,
+                    FeedStage::Initramfs,
+                ],
                 needs_extension_repo,
                 self.runs_on.is_some(),
             )

@@ -190,6 +190,16 @@ pub enum FeedStage {
 }
 
 impl FeedStage {
+    /// Every stage, for a caller (`install`) that runs all of them.
+    pub const ALL: &'static [FeedStage] = &[
+        FeedStage::Sdk,
+        FeedStage::SdkTarget,
+        FeedStage::Rootfs,
+        FeedStage::Runtime,
+        FeedStage::Ext,
+        FeedStage::Initramfs,
+    ];
+
     /// `sdk`-stage feeds land in the host reposdir (seen by the bootstrap and
     /// combined dnf confs); every other stage's dnf reads the target reposdir.
     fn is_host(self) -> bool {
@@ -1704,8 +1714,9 @@ impl Probe<'_> {
 /// Fail before the first download when a feed repository is unreachable,
 /// naming the feed.
 ///
-/// Probes the metadata index of each `http(s)` URL feed in `feeds` whose
-/// locator has no `$` variable left for dnf to expand, and the extension
+/// Probes the metadata index of each `http(s)` URL feed in `feeds` that applies
+/// to one of `stages` and whose locator has no `$` variable left for dnf to
+/// expand, and the extension
 /// repository (`<repo url>/<releasever>/target/<target>-ext`, through the distro
 /// feed's TLS settings) only when `needs_extension_repo`. The caller decides
 /// that from the runtime extensions it will fetch, `enabled: false` ones
@@ -1720,9 +1731,15 @@ pub async fn preflight_feeds(
     config: &Config,
     feeds: Option<&ResolvedFeedSet>,
     target: &str,
+    stages: &[FeedStage],
     needs_extension_repo: bool,
 ) -> Result<()> {
     for feed in feeds.into_iter().flat_map(|s| s.feeds.iter()) {
+        // A feed scoped away from every stage the caller will run never reaches
+        // its dnf, so its reachability cannot matter to this command.
+        if !stages.iter().any(|&s| feed.applies_to(s)) {
+            continue;
+        }
         // An add-on is checked against the channel's index (or the pinned
         // snapshot) by `check_addons`, whose message names what was mistyped. A
         // bare metadata probe here would pre-empt it with a less useful one. With
@@ -3570,7 +3587,7 @@ distro:
     #[tokio::test]
     async fn unreachable_feed_fails_naming_feed() {
         let (c, set) = url_feed_set(&closed_port_url().await, "");
-        let e = preflight_feeds(&c, Some(&set), "t", false)
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
             .await
             .unwrap_err()
             .to_string();
@@ -3582,7 +3599,7 @@ distro:
     async fn feed_without_metadata_fails_naming_feed_and_status() {
         let (base, _) = serve_status("404 Not Found").await;
         let (c, set) = url_feed_set(&base, "");
-        let e = preflight_feeds(&c, Some(&set), "t", false)
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
             .await
             .unwrap_err()
             .to_string();
@@ -3601,7 +3618,9 @@ distro:
             .feeds
             .iter()
             .any(|f| f.baseurl.contains(HOST_GATEWAY_ALIAS)));
-        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(
@@ -3615,7 +3634,9 @@ distro:
     async fn feed_credential_reaches_the_probe() {
         let (base, seen) = serve_status("200 OK").await;
         let (c, set) = url_feed_set(&base, "    username: u\n    password: p\n");
-        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
         let head = seen.lock().unwrap()[0].to_ascii_lowercase();
         // base64("u:p")
         assert!(head.contains("authorization: basic dtpw"), "{head}");
@@ -3633,7 +3654,7 @@ distro:
                 .unwrap()
         };
         std::fs::create_dir_all(dir.path().join("feed")).unwrap();
-        let e = preflight_feeds(&c, Some(&resolve()), "t", false)
+        let e = preflight_feeds(&c, Some(&resolve()), "t", FeedStage::ALL, false)
             .await
             .unwrap_err()
             .to_string();
@@ -3641,7 +3662,7 @@ distro:
 
         std::fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
         std::fs::write(dir.path().join("feed/repodata/repomd.xml"), "<repomd/>").unwrap();
-        preflight_feeds(&c, Some(&resolve()), "t", false)
+        preflight_feeds(&c, Some(&resolve()), "t", FeedStage::ALL, false)
             .await
             .unwrap();
     }
@@ -3654,7 +3675,7 @@ distro:
     async fn missing_extension_repository_fails_naming_feed_and_repository() {
         let (base, seen) = serve_status("404 Not Found").await;
         let c = config_with_repo(&base);
-        let e = preflight_feeds(&c, None, "t", true)
+        let e = preflight_feeds(&c, None, "t", FeedStage::ALL, true)
             .await
             .unwrap_err()
             .to_string();
@@ -3672,21 +3693,25 @@ distro:
         // Nothing listens: a probe would fail. A minimal project against a feed
         // with no extension repository must still succeed.
         let c = config_with_repo(&closed_port_url().await);
-        preflight_feeds(&c, None, "t", false).await.unwrap();
+        preflight_feeds(&c, None, "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn reachable_extension_repository_passes() {
         let (base, _) = serve_status("200 OK").await;
         let c = config_with_repo(&base);
-        preflight_feeds(&c, None, "t", true).await.unwrap();
+        preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn gone_feed_fails_like_not_found() {
         let (base, _) = serve_status("410 Gone").await;
         let (c, set) = url_feed_set(&base, "");
-        let e = preflight_feeds(&c, Some(&set), "t", false)
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
             .await
             .unwrap_err()
             .to_string();
@@ -3703,7 +3728,7 @@ distro:
         ] {
             let (base, seen) = serve_status(status).await;
             let (c, set) = url_feed_set(&base, "");
-            preflight_feeds(&c, Some(&set), "t", false)
+            preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
                 .await
                 .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
             assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
@@ -3800,7 +3825,9 @@ distro:
         clear_release_env();
         let c = load(&format!("repo:\n  url: {url}\n"));
         assert_eq!(c.get_releasever(), None);
-        preflight_feeds(&c, None, "t", true).await.unwrap();
+        preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3822,7 +3849,7 @@ distro:
             )
             .unwrap()
             .unwrap();
-            preflight_feeds(&c, Some(&set), "t", false)
+            preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
                 .await
                 .unwrap_or_else(|e| panic!("{url}: {e}"));
         }
@@ -3833,7 +3860,27 @@ distro:
     async fn a_file_url_feed_is_left_to_dnf() {
         // reqwest cannot fetch `file://`; dnf reads it from inside the container.
         let (c, set) = url_feed_set("file:///nonexistent", "");
-        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_feed_scoped_to_another_stage_is_not_probed() {
+        // Nothing listens: an SDK-only feed must not stop a rootfs install,
+        // whose dnf never sees it, but must still stop an SDK install.
+        let (c, set) = url_feed_set(&closed_port_url().await, "    stages: [sdk]\n");
+        preflight_feeds(&c, Some(&set), "t", &[FeedStage::Rootfs], false)
+            .await
+            .unwrap();
+        let e = preflight_feeds(&c, Some(&set), "t", &[FeedStage::Sdk], false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("feed 'local'") && e.contains("cannot connect"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
@@ -3849,7 +3896,9 @@ distro:
                 .unwrap()
                 .unwrap();
         assert!(set.feeds.iter().any(|f| f.name == "ros2-jazy"));
-        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
         assert!(seen.lock().unwrap().is_empty());
         let idx = index(&[("t", &["target/t-ros2-jazzy", "sdk/t-ros2-jazzy"])]);
         let e = check_addons_against(&idx, "t", &["ros2-jazy".to_string()])
@@ -3881,7 +3930,9 @@ distro:
         assert!(addon
             .iter()
             .all(|f| f.configured_locator.contains("$releasever")));
-        preflight_feeds(&c, Some(&set), "t", false).await.unwrap();
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
         assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
     }
 }

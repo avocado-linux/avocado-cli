@@ -117,7 +117,13 @@ impl InitramfsInstallCommand {
         let repo_release = config.get_sdk_repo_release();
         // Probe the feeds before minting any Connect token.
         config
-            .preflight_feeds_once(&target, &self.config_path, false, self.runs_on.is_some())
+            .preflight_feeds_once(
+                &target,
+                &self.config_path,
+                &[FeedStage::Initramfs],
+                false,
+                self.runs_on.is_some(),
+            )
             .await?;
         let feeds = config
             .materialize_feeds(&target, FeedStage::Initramfs, &self.config_path)

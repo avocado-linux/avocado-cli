@@ -4523,9 +4523,15 @@ async fn invocation_feeds(
     .cloned()
 }
 
-/// Targets whose feed repositories this process has already probed, and whether
-/// that pass also probed the extension repository.
-static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, bool>>> =
+/// The stages whose feeds one target's probes covered, and whether they covered
+/// the extension repository too.
+type FeedsProbed = (
+    std::collections::BTreeSet<crate::utils::feeds::FeedStage>,
+    bool,
+);
+
+/// Targets whose feed repositories this process has already probed.
+static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedsProbed>>> =
     std::sync::OnceLock::new();
 
 /// Set once the `--runs-on` preflight skip has been announced, so the
@@ -4584,8 +4590,9 @@ impl Config {
     /// target and run once per invocation. The lock is held across the probes so
     /// two concurrent callers do not both run them. Only a pass is recorded; a
     /// failure ends the command.
-    /// A later call that needs the extension repository after a pass that did not
-    /// probe it runs again, so the second caller is not told yes on the first's
+    /// Only feeds that apply to one of `stages` are probed. A later call that
+    /// names a stage, or needs the extension repository, which no earlier pass
+    /// covered runs again, so the second caller is not told yes on the first's
     /// narrower check.
     /// Resolution is repeated here rather than shared with `materialize_feeds`,
     /// which runs later and needs the mint this check must precede.
@@ -4596,6 +4603,7 @@ impl Config {
         &self,
         target: &str,
         config_path: &str,
+        stages: &[crate::utils::feeds::FeedStage],
         needs_extension_repo: bool,
         runs_on: bool,
     ) -> Result<()> {
@@ -4605,8 +4613,10 @@ impl Config {
         }
         let probed = FEEDS_PROBED.get_or_init(Default::default);
         let mut done = probed.lock().await;
-        if let Some(&ext_probed) = done.get(target) {
-            if ext_probed || !needs_extension_repo {
+        if let Some((stages_probed, ext_probed)) = done.get(target) {
+            if stages.iter().all(|s| stages_probed.contains(s))
+                && (*ext_probed || !needs_extension_repo)
+            {
                 return Ok(());
             }
         }
@@ -4619,9 +4629,17 @@ impl Config {
             None,
             &container_args,
         )?;
-        crate::utils::feeds::preflight_feeds(self, set.as_ref(), target, needs_extension_repo)
-            .await?;
-        done.insert(target.to_string(), needs_extension_repo);
+        crate::utils::feeds::preflight_feeds(
+            self,
+            set.as_ref(),
+            target,
+            stages,
+            needs_extension_repo,
+        )
+        .await?;
+        let entry = done.entry(target.to_string()).or_default();
+        entry.0.extend(stages.iter().copied());
+        entry.1 |= needs_extension_repo;
         Ok(())
     }
 
@@ -15003,6 +15021,7 @@ mod kernel_cmdline_tests {
 #[cfg(test)]
 mod invocation_feeds_tests {
     use super::*;
+    use crate::utils::feeds::FeedStage;
 
     /// The feeds dir is a docker bind source, so under the avocado-vm it must sit
     /// in the VM workspace, outside the project. Elsewhere it stays in `$TMPDIR`.
@@ -15120,10 +15139,10 @@ mod invocation_feeds_tests {
         ))
         .unwrap();
         let cfg = cfg.to_str().unwrap();
-        c.preflight_feeds_once("probe-once-test", cfg, false, false)
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
             .await
             .unwrap();
-        c.preflight_feeds_once("probe-once-test", cfg, false, false)
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -15205,6 +15224,7 @@ mod invocation_feeds_tests {
         c.preflight_feeds_once(
             "minimal-no-ext-repo",
             "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
             need,
             false,
         )
@@ -15222,6 +15242,7 @@ mod invocation_feeds_tests {
             .preflight_feeds_once(
                 "sourced-no-ext-repo",
                 "/nonexistent/avocado.yaml",
+                FeedStage::ALL,
                 need,
                 false,
             )
@@ -15236,12 +15257,12 @@ mod invocation_feeds_tests {
         let (base, hits) = serve_counting("404 Not Found").await;
         let c = repo_config(&base);
         let cfg = "/nonexistent/avocado.yaml";
-        c.preflight_feeds_once("ext-key-test", cfg, false, false)
+        c.preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, false, false)
             .await
             .unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         let e = c
-            .preflight_feeds_once("ext-key-test", cfg, true, false)
+            .preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, true, false)
             .await
             .unwrap_err()
             .to_string();
@@ -15250,12 +15271,39 @@ mod invocation_feeds_tests {
     }
 
     #[tokio::test]
+    async fn a_later_call_for_another_stage_still_probes_its_feeds() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [sdkonly]\nrepos:\n  sdkonly:\n    url: {base}/feed\n    stages: [sdk]\n"
+        ))
+        .unwrap();
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Rootfs], false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Sdk], false, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'sdkonly'"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn runs_on_skips_the_local_probes() {
         let (base, hits) = serve_counting("404 Not Found").await;
         let c = repo_config(&base);
-        c.preflight_feeds_once("runs-on-test", "/nonexistent/avocado.yaml", true, true)
-            .await
-            .unwrap();
+        c.preflight_feeds_once(
+            "runs-on-test",
+            "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

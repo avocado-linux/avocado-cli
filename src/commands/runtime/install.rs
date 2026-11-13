@@ -131,7 +131,13 @@ impl RuntimeInstallCommand {
         // Probe the feeds before minting any Connect token. This command
         // disables the `-ext` repository, so it is not probed.
         config
-            .preflight_feeds_once(&target, &self.config_path, false, self.runs_on.is_some())
+            .preflight_feeds_once(
+                &target,
+                &self.config_path,
+                &[FeedStage::Runtime],
+                false,
+                self.runs_on.is_some(),
+            )
             .await?;
         let feeds = config
             .materialize_feeds(&target, FeedStage::Runtime, &self.config_path)
