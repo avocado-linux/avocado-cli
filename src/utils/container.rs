@@ -1432,6 +1432,44 @@ fn take_git_config_args_with(
     (!values.is_empty()).then(|| values.join(" "))
 }
 
+/// Remove every env flag setting one of `keys` from raw container args, in any
+/// form [`docker_env_flag`] reads, including a bare `-e K` that would pass the
+/// host's value. Raw args may hold a flag and its operand in one string, so
+/// they are split as `build_container_command` splits them. With no match the
+/// args come back unchanged; otherwise as split tokens, a token with a space
+/// re-quoted so the later split keeps it whole.
+pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
+    let tokens: Vec<String> = args
+        .iter()
+        .flat_map(|a| SdkContainer::parse_container_arg(a))
+        .collect();
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Some((used, operand)) = docker_env_flag(&tokens, i) {
+            let key = operand.split_once('=').map_or(operand, |(k, _)| k);
+            if keys.contains(&key) {
+                i += used;
+                continue;
+            }
+        }
+        kept.push(tokens[i].clone());
+        i += 1;
+    }
+    if kept.len() == tokens.len() {
+        return args.to_vec();
+    }
+    kept.into_iter()
+        .map(|t| {
+            if t.contains(' ') {
+                format!("\"{t}\"")
+            } else {
+                t
+            }
+        })
+        .collect()
+}
+
 /// The env flag at `args[i]`, in any form docker accepts: `-e X`, `--env X`,
 /// `-eX`, `-e=X`, `--env=X`. Returns how many args it takes and its operand,
 /// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
@@ -4644,6 +4682,58 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every docker env-flag form that sets a stripped key is removed, whether
+    /// the flag and its operand arrive as one container arg or two.
+    #[test]
+    fn strip_env_args_removes_every_form_of_a_listed_key() {
+        for form in [
+            &["-e K=1"][..],
+            &["-e", "K=1"],
+            &["--env K=1"],
+            &["--env", "K=1"],
+            &["--env=K=1"],
+            &["-e=K=1"],
+            &["-eK=1"],
+            &["-e K"],
+            &["--env=K"],
+        ] {
+            let mut args = strings(form);
+            args.push("--privileged".to_string());
+            assert_eq!(strip_env_args(&args, &["K"]), ["--privileged"], "{form:?}");
+        }
+    }
+
+    #[test]
+    fn strip_env_args_keeps_other_keys_and_a_longer_name() {
+        let args = strings(&["-e K_OTHER=1", "--env=J=2"]);
+        assert_eq!(strip_env_args(&args, &["K"]), args);
+    }
+
+    /// When nothing matches, the args come back unchanged, quoting included,
+    /// so the remote paths that do not re-split them see the same argv.
+    #[test]
+    fn strip_env_args_without_a_match_returns_args_verbatim() {
+        let args = strings(&["-v \"/a b:/c\"", "--privileged"]);
+        assert_eq!(strip_env_args(&args, &["K"]), args);
+    }
+
+    /// A kept value with a space must survive the re-split that
+    /// `build_container_command` applies to every container arg.
+    #[test]
+    fn strip_env_args_keeps_a_spaced_value_intact_after_a_strip() {
+        let args = strings(&["-e K=1 -e \"J=a b\""]);
+        let kept = strip_env_args(&args, &["K"]);
+        let resplit: Vec<String> = kept
+            .iter()
+            .flat_map(|a| SdkContainer::parse_container_arg(a))
+            .collect();
+        assert_eq!(resplit, ["-e", "J=a b"]);
+    }
 
     /// Every container start site must check the avocado-vm workspace mount
     /// first. If Avocado.app starts QEMU, or the share is unmounted, the

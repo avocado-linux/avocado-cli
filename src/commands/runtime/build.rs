@@ -3044,7 +3044,6 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
     /// - `AVOCADO_RUNTIME_BUILD_DIR`: `/opt/_avocado/<target>/runtimes/<runtime>` —
     ///   the runtime build dir the script can inspect or post-process.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn run_post_build(
         &self,
         script_path: &str,

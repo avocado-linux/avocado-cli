@@ -54,6 +54,9 @@ fi
 - `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified). File ownership automatically fixed to calling user.
 - `$AVOCADO_PROVISION_STATE` - Path to state file for persisting state between provision runs (if `--provision-profile` specified). See State File section below.
 - `$AVOCADO_PROVISION_FORCE` - `1` if `--force` was passed, `0` otherwise (always set). `--force` runs without a terminal, so scripts use this to tell an operator-confirmed run from an unattended one.
+- `$AVOCADO_PROVISION_DRY_RUN` - `1` runs every guard and writes nothing; set by `--dry-run`. Profiles without `dry_run: true` in their manifest config refuse it, as do runtimes with stone include paths set.
+- `$AVOCADO_PROVISION_HOST_MOUNTS` - Path of a read-only copy of the host mount table bound into the container on native Linux, so the mount check sees host mounts. Not set on Docker Desktop, in the avocado-vm or with `--runs-on`, where the check only warns.
+- `$AVOCADO_PROVISION_FWUP_TASK` - `complete` (default) or `upgrade` (`fwup -u`); only on profiles that allow it.
 - `$AVOCADO_STONE_INCLUDE_PATHS` - Stone include paths (if configured)
 - `$AVOCADO_STONE_MANIFEST` - Stone manifest path (if configured)
 

@@ -118,6 +118,9 @@ The following environment variables are available in provision and build scripts
 - `AVOCADO_PROVISION_OUT`: Output directory path in the container (if `--out` flag is specified). Files written here will have their ownership automatically fixed to match the calling user.
 - `AVOCADO_PROVISION_STATE`: Path to a state file for persisting data between provision runs (if `--provision-profile` is specified). See [State File Management](#state-file-management) section below.
 - `AVOCADO_PROVISION_FORCE`: `1` when `--force` was passed, `0` otherwise. Always set. With `--force` the container runs without a terminal, so a script that asks the operator to confirm a destructive step can read this variable to tell "the operator already confirmed" from "nobody confirmed". Treat `0` with no terminal as unconfirmed and refuse the destructive step.
+- `AVOCADO_PROVISION_DRY_RUN`: `1` runs every guard and writes nothing. Set by `avocado provision --dry-run`. Profiles that do not declare `dry_run: true` in their manifest config refuse it, and so does a runtime with stone include paths set.
+- `AVOCADO_PROVISION_HOST_MOUNTS`: Path of a read-only copy of the host mount table that the CLI binds into the container on native Linux. It lets a profile's mount check see host mounts. On Docker Desktop, in the avocado-vm and with `--runs-on` it is not set, and the check can only warn.
+- `AVOCADO_PROVISION_FWUP_TASK`: `complete` (default) or `upgrade` (`fwup -u`, writes only the inactive A/B slot). Honoured only by profiles that allow it. Pass it with `--env AVOCADO_PROVISION_FWUP_TASK=upgrade`.
 - `AVOCADO_STONE_INCLUDE_PATHS`: Stone include paths (if configured for the runtime)
 - `AVOCADO_STONE_MANIFEST`: Stone manifest path (if configured for the runtime)
 

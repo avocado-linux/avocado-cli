@@ -17,6 +17,8 @@ pub struct ProvisionConfig {
     pub verbose: bool,
     /// Skip prompts, except the confirmation before a raw SD card write
     pub force: bool,
+    /// Run the provision script without writing the target
+    pub dry_run: bool,
     /// Global target architecture
     pub target: Option<String>,
     /// Target board override for `{{ avocado.target.board }}`
@@ -97,6 +99,7 @@ impl ProvisionCommand {
                 config_path: self.config.config_path.clone(),
                 verbose: self.config.verbose,
                 force: self.config.force,
+                dry_run: self.config.dry_run,
                 target: self.config.target.clone(),
                 target_board: self.config.target_board.clone(),
                 provision_profile: self.config.provision_profile.clone(),
@@ -131,6 +134,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: true,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -148,6 +152,7 @@ mod tests {
         assert_eq!(cmd.config.runtime, "my-runtime");
         assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert!(cmd.config.verbose);
+        assert!(!cmd.config.dry_run);
         assert!(!cmd.config.force);
         assert_eq!(cmd.config.target, Some("x86_64".to_string()));
         assert_eq!(cmd.config.env_vars, Some(env_vars));
@@ -166,6 +171,7 @@ mod tests {
             config_path: "config.toml".to_string(),
             verbose: false,
             force: true,
+            dry_run: false,
             target: None,
             target_board: None,
             provision_profile: None,
@@ -204,6 +210,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: None,
             target_board: None,
             provision_profile: Some("production".to_string()),
@@ -229,6 +236,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: None,
             target_board: None,
             provision_profile: None,
@@ -245,5 +253,43 @@ mod tests {
 
         assert_eq!(cmd.config.runtime, "test-runtime");
         assert_eq!(cmd.config.out, Some("output".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provision_dry_run_reaches_the_runtime_provision_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+"#,
+        )
+        .unwrap();
+        let cmd = ProvisionCommand::new(ProvisionConfig {
+            runtime: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(format!("{err:#}").contains("stone manifest could not be read"));
     }
 }

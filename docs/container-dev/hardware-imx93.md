@@ -58,8 +58,28 @@ bakar bitbake avocado-stone \
 stone provision -i <build>/tmp/deploy/stone --partition-size var=536870912
 
 # 3. write the card
-scripts/avocado-flash -m avocado-imx93-frdm sd /dev/sdX
+avocado provision <runtime> --profile sd \
+  --env AVOCADO_PROVISION_DEVICE=/dev/sdX
 ```
+
+To run every guard without writing anything, add `--dry-run`. It needs a
+profile that declares `dry_run: true` in its manifest config, and a runtime
+with no stone include paths.
+
+USB profiles (`uuu-emmc`, `ums`, `usb`) talk to the board over USB from inside
+the SDK container, so they need `--privileged` in `sdk.container_args` in
+`avocado.yaml`:
+
+```yaml
+sdk:
+  container_args:
+    - --privileged
+```
+
+On native Linux the CLI binds a read-only copy of the host mount table into the
+container (`AVOCADO_PROVISION_HOST_MOUNTS`), so the mounted-device check sees
+host mounts. On Docker Desktop, in the avocado-vm and with `--runs-on` the table
+is not bound, and the check only warns.
 
 Four things that will stop you:
 
@@ -81,8 +101,8 @@ archive only needs a floor.
 build has one under
 `tmp/work/*/avocado-stone/*/recipe-sysroot-native/usr/bin/fwup`; it needs that
 sysroot's `usr/lib` on `LD_LIBRARY_PATH` to resolve `libconfuse.so.2`. Put a
-wrapper on `PATH`. (`avocado-flash` resolves the native tool itself and needs no
-wrapper.)
+wrapper on `PATH`. (`avocado provision` runs fwup inside the SDK container and
+needs no wrapper.)
 
 **A build alone does not give you a device you can log into.** A raw Yocto image
 is the OS and nothing else: `root` is locked (`root:*:` in `/etc/shadow`), there
@@ -94,13 +114,16 @@ your own build.
 
 ### Updating a board without losing its extensions
 
-`avocado-flash` defaults to fwup's `complete` task, which rewrites the whole
-medium **including `/var`** - so it discards the extensions, app data and device
-identity already on a provisioned card. To put a new OS onto a working board,
-write only the inactive A/B slot instead:
+`avocado provision` runs fwup's `complete` task by default, which rewrites the
+whole medium **including `/var`** - so it discards the extensions, app data and
+device identity already on a provisioned card. To put a new OS onto a working
+board, write only the inactive A/B slot instead (profiles that allow it accept
+`AVOCADO_PROVISION_FWUP_TASK=upgrade`, which runs `fwup -u`):
 
 ```bash
-scripts/avocado-flash -m avocado-imx93-frdm --task upgrade sd /dev/sdX
+avocado provision <runtime> --profile sd \
+  --env AVOCADO_PROVISION_DEVICE=/dev/sdX \
+  --env AVOCADO_PROVISION_FWUP_TASK=upgrade
 ```
 
 fwup picks `upgrade.a` or `upgrade.b` from `avocado_boot_slot` in the u-boot

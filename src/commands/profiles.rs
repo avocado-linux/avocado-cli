@@ -247,7 +247,7 @@ impl ProfilesListCommand {
     /// "file not found" without docker treating the cat failure as a
     /// container exit error (which would yield empty stdout AND a
     /// non-zero exit, indistinguishable from a real read failure).
-    async fn read_stone_manifest(
+    pub(crate) async fn read_stone_manifest(
         container_tool: &str,
         volume_name: &str,
         sdk_image: &str,
@@ -329,6 +329,9 @@ struct ProfileEntry {
     /// they have no field metadata to drive UI.
     #[serde(default)]
     envs: Vec<JsonValue>,
+    /// Profile-level switches. Only `dry_run` is read here.
+    #[serde(default)]
+    config: Option<JsonValue>,
 }
 
 /// Mirrors the stone manifest's `provision.fields.<name>` entries.
@@ -347,6 +350,151 @@ struct ProvisionField {
     required: bool,
     #[serde(default)]
     default: Option<JsonValue>,
+}
+
+/// Refuse `--dry-run` unless the chosen profile declares `config.dry_run: true`.
+///
+/// Only a JSON `true` counts; absent, null, false and non-bool values all mean
+/// the profile's script does not honor `AVOCADO_PROVISION_DRY_RUN`, so running
+/// it would write the target. `profile` of `None` resolves to the manifest's
+/// `runtime.provision_default`. Pure over the manifest text so the gate is
+/// testable without starting a container.
+pub fn require_dry_run_support(manifest_json: &str, profile: Option<&str>) -> Result<()> {
+    let manifest: StoneManifest = serde_json::from_str(manifest_json)
+        .with_context(|| "Failed to parse stone manifest JSON")?;
+    let name = match profile {
+        Some(p) => p.to_string(),
+        None => manifest
+            .runtime
+            .as_ref()
+            .and_then(|r| r.provision_default.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--dry-run needs a provision profile that declares `config.dry_run: true`, \
+                     but none was given and the stone manifest names no default profile"
+                )
+            })?,
+    };
+    let declared = manifest
+        .provision
+        .as_ref()
+        .and_then(|p| p.profiles.get(&name))
+        .and_then(|e| e.config.as_ref())
+        .and_then(|c| c.get("dry_run"))
+        .and_then(JsonValue::as_bool)
+        == Some(true);
+    if !declared {
+        anyhow::bail!(
+            "--dry-run is not supported by provision profile '{name}': its stone manifest entry \
+             does not declare `config.dry_run: true`, so its script would write the target. \
+             Run without --dry-run, or pick a profile that declares it."
+        );
+    }
+    Ok(())
+}
+
+/// Container-free half of the `--dry-run` gate. Returns the profile name the
+/// run will actually use (`None` means the manifest default) or refuses.
+///
+/// The script reads `AVOCADO_PROVISION_PROFILE` from the effective env.
+/// `build_env_vars` in `main.rs` writes `--profile` into that env after
+/// parsing `--env`, so `--profile` wins and the two match whenever it is
+/// given; an `--env` value only decides the profile when no `--profile` is
+/// given. An empty value counts as unset, as the scripts' `${VAR:-}`
+/// expansion does.
+///
+/// Stone include paths (`stone_include_paths` on the runtime or one of its
+/// extensions, or an `AVOCADO_STONE_INCLUDE_PATHS` env var) are refused: the
+/// provision hook puts them ahead of the staged stone dir in
+/// `stone provision -i`, and stone takes the first `manifest.json` and profile
+/// script it finds, so the gate could approve the staged manifest while a
+/// project-supplied one or its script runs.
+pub fn dry_run_preflight(
+    env: Option<&std::collections::HashMap<String, String>>,
+    provision_profile: Option<&str>,
+    config_stone_include_paths: Option<&str>,
+) -> Result<Option<String>> {
+    let non_empty = |k: &str| env.and_then(|e| e.get(k)).filter(|v| !v.is_empty());
+    if config_stone_include_paths.is_some_and(|p| !p.is_empty())
+        || non_empty("AVOCADO_STONE_INCLUDE_PATHS").is_some()
+    {
+        anyhow::bail!(
+            "--dry-run cannot be verified with stone include paths set (AVOCADO_STONE_INCLUDE_PATHS \
+             or `stone_include_paths` on the runtime or one of its extensions): stone provision \
+             searches them before the \
+             staged stone dir, so a manifest or profile script there would run unchecked. Run \
+             without --dry-run, or drop the include paths."
+        );
+    }
+    Ok(non_empty("AVOCADO_PROVISION_PROFILE").cloned().or_else(|| {
+        provision_profile
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }))
+}
+
+/// The `manifest.json` that `stone provision` loads for `runtime` when no
+/// stone include paths are set: the copy `stone create` staged at build time,
+/// which already reflects a custom `stone_manifest`. The SDK's
+/// `stone-<target>.json` is only the build-time input, and can be newer than
+/// the staged copy after an SDK upgrade without a rebuild.
+pub fn staged_stone_manifest_path(target: &str, runtime: &str) -> String {
+    format!("/opt/_avocado/{target}/output/runtimes/{runtime}/stone/manifest.json")
+}
+
+/// Read the staged stone manifest for `runtime` from the project's SDK volume
+/// and apply [`require_dry_run_support`]. The manifest read is a read-only
+/// `cat` in a one-shot container; no provisioning container has started yet.
+pub async fn ensure_dry_run_supported(
+    config: &Config,
+    config_path: &str,
+    target: &str,
+    runtime: &str,
+    profile: Option<&str>,
+) -> Result<()> {
+    let sdk_image = config.get_sdk_image().ok_or_else(|| {
+        anyhow::anyhow!("--dry-run cannot be verified, stone manifest could not be read: avocado.yaml has no `sdk.image` set")
+    })?;
+    let project_dir = Path::new(config_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let volume = VolumeState::load_from_dir(&project_dir)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dry-run cannot be verified, stone manifest could not be read: SDK not yet installed. Run `avocado install` first."
+        )
+    })?;
+    let path = staged_stone_manifest_path(target, runtime);
+    // The path goes in as `$1`, not spliced into the script, so a runtime name
+    // never reaches the shell as code.
+    let out = crate::utils::container::SessionContainers::volume_exec(
+        &volume.container_tool,
+        &format!("{}:/opt/_avocado:ro", volume.volume_name),
+        sdk_image,
+        &[
+            "/bin/sh",
+            "-c",
+            "if [ -f \"$1\" ]; then cat \"$1\"; else echo __AVOCADO_NO_STONE__; fi",
+            "sh",
+            &path,
+        ],
+    )
+    .context("--dry-run cannot be verified, stone manifest could not be read")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "--dry-run cannot be verified, stone manifest could not be read: docker exited {}: {stderr}",
+            out.status
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.contains("__AVOCADO_NO_STONE__") {
+        anyhow::bail!(
+            "--dry-run cannot be verified, stone manifest could not be read: no staged manifest at \
+             {path}. Run `avocado build` for runtime '{runtime}' first."
+        );
+    }
+    require_dry_run_support(&raw, profile)
 }
 
 /// Walk a profile's env-block references and return the field
@@ -563,5 +711,165 @@ mod tests {
         let prov: ProvisionSection = serde_json::from_str(raw).unwrap();
         assert!(resolve_profile_fields(&prov, prov.profiles.get("noop").unwrap()).is_empty());
         assert!(resolve_profile_fields(&prov, prov.profiles.get("weird").unwrap()).is_empty());
+    }
+
+    // MARK: --dry-run support declared by the profile's `config.dry_run`.
+
+    fn manifest_with(profile_body: &str) -> String {
+        format!(
+            r#"{{
+                "runtime": {{ "provision_default": "dflt" }},
+                "provision": {{ "profiles": {{ "p": {profile_body}, "dflt": {{ "script": "d.sh", "config": {{ "dry_run": true }} }} }} }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn dry_run_is_accepted_for_a_profile_declaring_true() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": true } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_ok());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_profile_with_no_config() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_config_without_dry_run() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "other": true } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_a_profile_declaring_false() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": false } }"#);
+        assert!(require_dry_run_support(&m, Some("p")).is_err());
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_null_and_non_bool_declarations() {
+        for v in [r#""true""#, "1", "null", "[true]"] {
+            let m = manifest_with(&format!(
+                r#"{{ "script": "s.sh", "config": {{ "dry_run": {v} }} }}"#
+            ));
+            assert!(require_dry_run_support(&m, Some("p")).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn dry_run_is_refused_for_an_unknown_profile_naming_it() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        let err = require_dry_run_support(&m, Some("nope")).unwrap_err();
+        assert!(format!("{err:#}").contains("nope"));
+    }
+
+    #[test]
+    fn the_refusal_names_the_profile() {
+        let m = manifest_with(r#"{ "script": "s.sh", "config": { "dry_run": false } }"#);
+        let msg = format!("{:#}", require_dry_run_support(&m, Some("p")).unwrap_err());
+        assert!(msg.contains("'p'"), "{msg}");
+        assert!(msg.contains("--dry-run"), "{msg}");
+    }
+
+    #[test]
+    fn no_profile_given_checks_the_manifest_default() {
+        let m = manifest_with(r#"{ "script": "s.sh" }"#);
+        assert!(require_dry_run_support(&m, None).is_ok());
+        let no_default =
+            r#"{ "provision": { "profiles": { "p": { "config": { "dry_run": true } } } } }"#;
+        assert!(require_dry_run_support(no_default, None).is_err());
+    }
+
+    #[test]
+    fn an_unparseable_manifest_is_refused() {
+        assert!(require_dry_run_support("not json", Some("p")).is_err());
+    }
+    // MARK: --dry-run preflight (effective profile + custom manifest).
+
+    fn env(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn preflight_profile_flag_only() {
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "a")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), Some("a"), None).unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            dry_run_preflight(None, Some("a"), None).unwrap(),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_env_only_is_the_profile_checked() {
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "emmc")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), None, None).unwrap(),
+            Some("emmc".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_neither_falls_back_to_manifest_default() {
+        assert_eq!(dry_run_preflight(None, None, None).unwrap(), None);
+        let e = env(&[("AVOCADO_PROVISION_PROFILE", "")]);
+        assert_eq!(dry_run_preflight(Some(&e), None, None).unwrap(), None);
+    }
+
+    // The gate reads the staged copy `stone create` wrote at build time, which
+    // already reflects a custom manifest, so a custom manifest is no longer a
+    // reason to refuse.
+    #[test]
+    fn preflight_accepts_a_custom_stone_manifest() {
+        let e = env(&[("AVOCADO_STONE_MANIFEST", "/opt/src/m.json")]);
+        assert_eq!(
+            dry_run_preflight(Some(&e), Some("p"), None).unwrap(),
+            Some("p".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_config_stone_include_paths() {
+        let err = dry_run_preflight(None, Some("p"), Some("/opt/src/stone")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_env_stone_include_paths() {
+        let e = env(&[("AVOCADO_STONE_INCLUDE_PATHS", "/opt/src/stone")]);
+        let err = dry_run_preflight(Some(&e), Some("p"), None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_empty_stone_include_paths_are_unset() {
+        let e = env(&[("AVOCADO_STONE_INCLUDE_PATHS", "")]);
+        assert!(dry_run_preflight(Some(&e), Some("p"), Some("")).is_ok());
+    }
+
+    // `avocado-provision-<machine>` passes this dir as the last `-i` to
+    // `stone provision`, which loads the first `manifest.json` across its -i
+    // dirs. With no include paths it is the only dir, so this is the file the
+    // run loads.
+    #[test]
+    fn staged_manifest_is_the_runtime_stone_dir_provision_reads() {
+        assert_eq!(
+            staged_stone_manifest_path("imx93-frdm", "dev"),
+            "/opt/_avocado/imx93-frdm/output/runtimes/dev/stone/manifest.json"
+        );
     }
 }

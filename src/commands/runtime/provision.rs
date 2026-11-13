@@ -24,6 +24,8 @@ pub struct RuntimeProvisionConfig {
     pub config_path: String,
     pub verbose: bool,
     pub force: bool,
+    /// Run the provision script without writing the target
+    pub dry_run: bool,
     pub target: Option<String>,
     /// Target board override for `{{ avocado.target.board }}`
     pub target_board: Option<String>,
@@ -110,6 +112,33 @@ impl RuntimeProvisionCommand {
 
         // Resolve target architecture
         let target_arch = resolve_target_required(self.config.target.as_deref(), config)?;
+
+        // Refuse --dry-run for a profile whose manifest entry does not declare
+        // `config.dry_run: true`, before the ssh probe, stamp check or script
+        // container. Both `avocado provision` and `avocado runtime provision`
+        // reach here, so this is the single gate. It reads the runtime's
+        // staged stone manifest, the file `stone provision` loads, in a
+        // one-shot read-only container.
+        if self.config.dry_run {
+            let config_include_paths = config.get_stone_include_paths_for_runtime(
+                &self.config.runtime_name,
+                &target_arch,
+                &self.config.config_path,
+            )?;
+            let profile = crate::commands::profiles::dry_run_preflight(
+                self.config.env_vars.as_ref(),
+                self.config.provision_profile.as_deref(),
+                config_include_paths.as_deref(),
+            )?;
+            crate::commands::profiles::ensure_dry_run_supported(
+                config,
+                &self.config.config_path,
+                &target_arch,
+                &self.config.runtime_name,
+                profile.as_deref(),
+            )
+            .await?;
+        }
 
         // Detect remote host architecture if using --runs-on
         // This is needed to check if the SDK is installed for the remote's architecture
@@ -443,6 +472,19 @@ impl RuntimeProvisionCommand {
         };
 
         insert_provision_force_env(&mut env_vars, self.config.force);
+        insert_provision_dry_run_env(&mut env_vars, self.config.dry_run);
+
+        // Held until the run ends: dropping it deletes the private copy.
+        let host_mounts = if host_mounts_export_applies(
+            is_docker_desktop(),
+            self.config.runs_on.is_some(),
+            crate::utils::container::is_vm_routing_active(),
+        ) {
+            crate::utils::host_mounts::HostMountsCopy::take()
+        } else {
+            None
+        };
+        insert_provision_host_mounts_env(&mut env_vars, host_mounts.is_some());
 
         let env_vars = if env_vars.is_empty() {
             None
@@ -509,10 +551,18 @@ impl RuntimeProvisionCommand {
             source_environment: true,
             interactive: !self.config.force,
             env_vars,
-            container_args: config.merge_provision_container_args(
-                self.config.provision_profile.as_deref(),
-                self.config.container_args.as_ref(),
-            ),
+            container_args: {
+                let mut args =
+                    strip_cli_owned_provision_env(config.merge_provision_container_args(
+                        self.config.provision_profile.as_deref(),
+                        self.config.container_args.as_ref(),
+                    ));
+                if let Some(copy) = &host_mounts {
+                    args.get_or_insert_with(Vec::new)
+                        .extend(["-v".to_string(), copy.bind_arg()]);
+                }
+                args
+            },
             dnf_args: self.config.dnf_args.clone(),
             runs_on: self.config.runs_on.clone(),
             nfs_port: self.config.nfs_port,
@@ -546,7 +596,9 @@ impl RuntimeProvisionCommand {
         // so no explicit chown is needed for the output directory.
 
         // Copy state file back from container if it exists
-        if let Some((ref state_file_path, ref container_state_path)) = state_file_info {
+        if let (true, Some((ref state_file_path, ref container_state_path))) =
+            (state_copy_applies(self.config.dry_run), &state_file_info)
+        {
             self.copy_state_from_container(
                 &src_dir,
                 state_file_path,
@@ -560,23 +612,25 @@ impl RuntimeProvisionCommand {
 
         // On Docker Desktop, check if the provisioning script produced a result file
         // requesting host-side action (e.g., burning to removable storage).
-        if is_docker_desktop() {
+        if host_burn_applies(is_docker_desktop(), self.config.dry_run) {
             if let Some(ref out_path) = provision_out_path {
                 let host_out_dir = src_dir.join(out_path);
                 self.handle_provision_result(&host_out_dir)?;
             }
+        } else if is_docker_desktop() {
+            print_info(
+                "Dry run: skipping the host-side SD card burn.",
+                OutputLevel::Normal,
+            );
         }
 
         print_success(
-            &format!(
-                "Successfully provisioned runtime '{}'",
-                self.config.runtime_name
-            ),
+            &provision_completion_message(&self.config.runtime_name, self.config.dry_run),
             OutputLevel::Normal,
         );
 
-        // Write provision stamp (unless --no-stamps)
-        if !self.config.no_stamps {
+        // Write provision stamp (unless --no-stamps or --dry-run)
+        if provision_stamp_applies(self.config.dry_run, self.config.no_stamps) {
             let container_helper = SdkContainer::from_config(&self.config.config_path, config)?
                 .verbose(self.config.verbose)
                 .with_cli_target_board(self.config.target_board.clone());
@@ -1253,9 +1307,116 @@ fn insert_provision_force_env(env_vars: &mut HashMap<String, String>, force: boo
     );
 }
 
+/// Tell the provision script this is a dry run.
+///
+/// Inserted after the user's `--env` values so `--env
+/// AVOCADO_PROVISION_DRY_RUN=0` cannot turn a dry run into a real write.
+/// Without the flag nothing is exported here and a user's own value is left
+/// as it was.
+fn insert_provision_dry_run_env(env_vars: &mut HashMap<String, String>, dry_run: bool) {
+    if dry_run {
+        env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), "1".to_string());
+    }
+}
+
+/// Whether the host-side burn of a produced disk image runs.
+///
+/// Only Docker Desktop defers the write to the host, and a dry run must not
+/// write the removable disk.
+fn host_burn_applies(docker_desktop: bool, dry_run: bool) -> bool {
+    docker_desktop && !dry_run
+}
+
+/// Drop container-arg settings of the env vars the CLI sets for the provision
+/// script. Container args come after the generated `-e` flags in every run
+/// path, so a later `-e` would win: a profile other than the one the dry-run
+/// gate checked, a dry run switched off, or a host mount table the CLI did not
+/// bind.
+fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String>> {
+    const KEYS: [&str; 3] = [
+        "AVOCADO_PROVISION_PROFILE",
+        "AVOCADO_PROVISION_DRY_RUN",
+        "AVOCADO_PROVISION_HOST_MOUNTS",
+    ];
+    args.map(|a| crate::utils::container::strip_env_args(&a, &KEYS))
+}
+
+/// Whether the container's provision state file is copied over the host's.
+/// A dry run writes nothing, so the host state stays as it was.
+fn state_copy_applies(dry_run: bool) -> bool {
+    !dry_run
+}
+
+/// Whether the runtime is stamped as provisioned. A dry run provisions
+/// nothing, so it must not leave a stamp claiming otherwise.
+fn provision_stamp_applies(dry_run: bool, no_stamps: bool) -> bool {
+    !dry_run && !no_stamps
+}
+
+fn provision_completion_message(runtime_name: &str, dry_run: bool) -> String {
+    if dry_run {
+        "Dry run complete: nothing was written and the runtime was not marked provisioned"
+            .to_string()
+    } else {
+        format!("Successfully provisioned runtime '{runtime_name}'")
+    }
+}
+
+/// Whether the host's mount table can be bound into the provision container.
+///
+/// Only a local run against a native Docker daemon shares a kernel with the
+/// disk being written. Docker Desktop (macOS) and the avocado-vm run the
+/// container in a VM, and `--runs-on` runs it on another machine, so the local
+/// table would describe the wrong host.
+fn host_mounts_export_applies(docker_desktop: bool, runs_on: bool, vm_routing: bool) -> bool {
+    !docker_desktop && !runs_on && !vm_routing
+}
+
+/// Point the provision library at the bound host mount table.
+///
+/// Removes any `--env` value first so a caller cannot redirect the check at a
+/// file of their choosing, or keep it set when no table was bound. Inserted
+/// after the user's env, like the force export.
+fn insert_provision_host_mounts_env(env_vars: &mut HashMap<String, String>, bound: bool) {
+    env_vars.remove(crate::utils::host_mounts::ENV_VAR);
+    if bound {
+        env_vars.insert(
+            crate::utils::host_mounts::ENV_VAR.to_string(),
+            crate::utils::host_mounts::CONTAINER_PATH.to_string(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_run_does_not_copy_state_back() {
+        assert!(!state_copy_applies(true));
+        assert!(state_copy_applies(false));
+    }
+
+    #[test]
+    fn dry_run_does_not_write_the_provision_stamp() {
+        assert!(!provision_stamp_applies(true, false));
+        assert!(!provision_stamp_applies(true, true));
+        assert!(provision_stamp_applies(false, false));
+        assert!(!provision_stamp_applies(false, true));
+    }
+
+    #[test]
+    fn dry_run_completion_message_says_nothing_was_written() {
+        let msg = provision_completion_message("rt", true);
+        assert_eq!(
+            msg,
+            "Dry run complete: nothing was written and the runtime was not marked provisioned"
+        );
+        assert_eq!(
+            provision_completion_message("rt", false),
+            "Successfully provisioned runtime 'rt'"
+        );
+    }
 
     #[test]
     fn test_new() {
@@ -1264,6 +1425,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1295,6 +1457,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1325,6 +1488,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1385,6 +1549,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1409,6 +1574,63 @@ mod tests {
         assert_eq!(cmd.config.out, None);
         assert_eq!(cmd.config.container_args, container_args);
         assert_eq!(cmd.config.dnf_args, dnf_args);
+    }
+
+    #[test]
+    fn provision_dry_run_env_is_1_when_dry_run_is_set() {
+        let mut env_vars = HashMap::new();
+        insert_provision_dry_run_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_DRY_RUN")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_flag_overrides_a_user_env_value() {
+        for user in ["0", "", "false", "anything"] {
+            let mut env_vars = HashMap::new();
+            env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), user.to_string());
+            insert_provision_dry_run_env(&mut env_vars, true);
+            assert_eq!(
+                env_vars
+                    .get("AVOCADO_PROVISION_DRY_RUN")
+                    .map(String::as_str),
+                Some("1"),
+                "--env AVOCADO_PROVISION_DRY_RUN={user:?} must not defeat --dry-run"
+            );
+        }
+    }
+
+    #[test]
+    fn provision_dry_run_env_is_not_exported_without_the_flag() {
+        let mut env_vars = HashMap::new();
+        insert_provision_dry_run_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_DRY_RUN"));
+        assert!(env_vars.is_empty());
+    }
+
+    #[test]
+    fn provision_dry_run_env_without_the_flag_leaves_a_user_value_alone() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("AVOCADO_PROVISION_DRY_RUN".to_string(), "0".to_string());
+        insert_provision_dry_run_env(&mut env_vars, false);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_DRY_RUN")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn host_burn_runs_on_docker_desktop_only_outside_a_dry_run() {
+        assert!(host_burn_applies(true, false));
+        assert!(!host_burn_applies(true, true));
+        assert!(!host_burn_applies(false, false));
+        assert!(!host_burn_applies(false, true));
     }
 
     #[test]
@@ -1445,6 +1667,78 @@ mod tests {
     }
 
     #[test]
+    fn host_mounts_env_points_at_the_fixed_container_path_when_bound() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_HOST_MOUNTS")
+                .map(String::as_str),
+            Some("/run/avocado-provision/host-mounts")
+        );
+    }
+
+    #[test]
+    fn host_mounts_env_replaces_a_value_passed_with_env() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "AVOCADO_PROVISION_HOST_MOUNTS".to_string(),
+            "/tmp/forged".to_string(),
+        );
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars
+                .get("AVOCADO_PROVISION_HOST_MOUNTS")
+                .map(String::as_str),
+            Some("/run/avocado-provision/host-mounts")
+        );
+    }
+
+    #[test]
+    fn host_mounts_env_is_stripped_when_not_bound_even_if_env_names_it() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "AVOCADO_PROVISION_HOST_MOUNTS".to_string(),
+            "/tmp/forged".to_string(),
+        );
+        insert_provision_host_mounts_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
+    }
+
+    #[test]
+    fn host_mounts_env_is_left_unset_when_not_bound() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, false);
+        assert!(!env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
+    }
+
+    #[test]
+    fn host_mounts_are_exported_only_for_a_local_native_docker_run() {
+        assert!(host_mounts_export_applies(false, false, false));
+        assert!(
+            !host_mounts_export_applies(true, false, false),
+            "docker desktop / macOS"
+        );
+        assert!(!host_mounts_export_applies(false, true, false), "--runs-on");
+        assert!(
+            !host_mounts_export_applies(false, false, true),
+            "VM routing"
+        );
+    }
+
+    #[test]
+    fn host_mounts_export_leaves_the_force_export_intact() {
+        let mut env_vars = HashMap::new();
+        insert_provision_host_mounts_env(&mut env_vars, true);
+        insert_provision_force_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
+            Some("1")
+        );
+        assert!(env_vars.contains_key("AVOCADO_PROVISION_HOST_MOUNTS"));
+    }
+
+    #[test]
     fn test_new_with_env_vars() {
         let mut env_vars = HashMap::new();
         env_vars.insert("AVOCADO_DEVICE_ID".to_string(), "device123".to_string());
@@ -1458,6 +1752,7 @@ mod tests {
             config_path: "avocado.yaml".to_string(),
             verbose: false,
             force: false,
+            dry_run: false,
             target: Some("x86_64".to_string()),
             target_board: None,
             provision_profile: None,
@@ -1476,5 +1771,118 @@ mod tests {
         assert_eq!(cmd.config.runtime_name, "test-runtime");
         assert_eq!(cmd.config.config_path, "avocado.yaml");
         assert_eq!(cmd.config.env_vars, Some(env_vars));
+    }
+
+    // Both `avocado provision` and `avocado runtime provision` must reach the
+    // dry-run gate. With no `.avocado-state` the gate refuses before any
+    // container starts, so this runs without docker.
+    #[tokio::test]
+    async fn runtime_provision_dry_run_is_gated_before_any_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+"#,
+        )
+        .unwrap();
+        let mut cmd = RuntimeProvisionCommand::new(RuntimeProvisionConfig {
+            runtime_name: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            state_file: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(format!("{err:#}").contains("stone manifest could not be read"));
+    }
+
+    // Container args land after the generated `-e` flags, so a later `-e`
+    // would replace a value the CLI set, and AVOCADO_PROVISION_PROFILE there
+    // would run a profile the dry-run gate never checked.
+    #[test]
+    fn container_args_cannot_override_cli_owned_provision_env() {
+        let args = vec![
+            "-e AVOCADO_PROVISION_PROFILE=emmc".to_string(),
+            "--env=AVOCADO_PROVISION_DRY_RUN=0".to_string(),
+            "-e".to_string(),
+            "AVOCADO_PROVISION_HOST_MOUNTS=/tmp/m".to_string(),
+            "-e AVOCADO_DEVICE_ID=d1".to_string(),
+            "--privileged".to_string(),
+        ];
+        assert_eq!(
+            strip_cli_owned_provision_env(Some(args)),
+            Some(vec![
+                "-e".to_string(),
+                "AVOCADO_DEVICE_ID=d1".to_string(),
+                "--privileged".to_string()
+            ])
+        );
+        assert_eq!(strip_cli_owned_provision_env(None), None);
+    }
+
+    // A runtime's `stone_include_paths` puts a project dir ahead of the staged
+    // manifest in `stone provision -i`, so the gate must refuse from config
+    // alone, before it reads anything.
+    #[tokio::test]
+    async fn runtime_provision_dry_run_refuses_config_stone_include_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+    stone_include_paths:
+      - stone
+"#,
+        )
+        .unwrap();
+        let mut cmd = RuntimeProvisionCommand::new(RuntimeProvisionConfig {
+            runtime_name: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            state_file: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
     }
 }
