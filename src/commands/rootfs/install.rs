@@ -820,6 +820,14 @@ fn contract_outputs() -> StampOutputs {
     }
 }
 
+/// Whether a sysroot's kernel pin moved, so it has to be cleaned before the
+/// install. No previous pin counts: `avocado update`, `unlock` and
+/// `clean --unlock` clear the pins but leave the sysroots, so the old kernel's
+/// packages can still be there; on a first install the clean is a no-op.
+pub(crate) fn kernel_pin_moved(prev: Option<&str>, new: Option<&str>) -> bool {
+    new.is_some_and(|new| prev != Some(new))
+}
+
 /// Whether the sysroot has to be rebuilt from empty before it can be stamped
 /// with the current scriptlet contract. dnf does not rerun the scriptlets of
 /// packages that are already installed, so a sysroot installed under an older
@@ -1126,11 +1134,9 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // install is additive-only, so anything that makes the *existing*
     // sysroot contents wrong — rather than merely incomplete — needs a wipe
     // first. Two things qualify, and both resolve to the same single clean.
-    let kernel_pin_change = resolved_kver.as_deref().and_then(|new_kver| {
-        prev_pinned_kver
-            .filter(|prev| prev != new_kver)
-            .map(|prev| (prev, new_kver))
-    });
+    let kernel_pin_change = resolved_kver
+        .as_deref()
+        .filter(|new_kver| kernel_pin_moved(prev_pinned_kver.as_deref(), Some(new_kver)));
     let removed_packages = if kernel_pin_change.is_some() {
         // Moot: the whole package map is about to be cleared below.
         Vec::new()
@@ -1158,17 +1164,20 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         );
     }
 
-    if let Some((prev, new_kver)) = kernel_pin_change {
+    if let Some(new_kver) = kernel_pin_change {
         // A plain re-install would land the new kernel-image and module
         // packagegroup *alongside* the prior pin's packages, leaving
         // /lib/modules/<old-kver>/, the old kernel-image and stale module
-        // packages behind.
-        print_info(
-            &format!(
-                "{label}: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
-            ),
-            OutputLevel::Normal,
-        );
+        // packages behind. With no previous pin there is nothing to report:
+        // a first install, or a lock that `update`/`unlock` cleared.
+        if let Some(prev) = &prev_pinned_kver {
+            print_info(
+                &format!(
+                    "{label}: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                ),
+                OutputLevel::Normal,
+            );
+        }
 
         // Wipe the package state for this sysroot so a failed re-install
         // can't leave a stale package map pointing at a now-empty sysroot.
@@ -1782,6 +1791,7 @@ impl RootfsInstallCommand {
 
 #[cfg(test)]
 mod tests {
+    use super::kernel_pin_moved;
     use super::{
         build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
         incomplete_install_reason, parse_probe_output, render_overlay_snippet,
@@ -1790,6 +1800,20 @@ mod tests {
     use crate::utils::lockfile::{LockFile, SysrootType};
     use crate::utils::stamps::{Stamp, StampOutputs};
     use std::collections::{HashMap, HashSet};
+
+    /// A sysroot is cleaned when its kernel pin moves, including from no pin:
+    /// `update` and `unlock` clear the pins over an existing sysroot.
+    #[test]
+    fn kernel_pin_moves_from_none_too() {
+        assert!(kernel_pin_moved(
+            Some("6.18.52-yocto-standard"),
+            Some("6.8.12-l4t")
+        ));
+        assert!(kernel_pin_moved(None, Some("6.8.12-l4t")));
+        assert!(!kernel_pin_moved(Some("6.8.12-l4t"), Some("6.8.12-l4t")));
+        assert!(!kernel_pin_moved(Some("6.8.12-l4t"), None));
+        assert!(!kernel_pin_moved(None, None));
+    }
 
     fn install_stamp(contract: Option<&str>) -> Stamp {
         Stamp::rootfs_install(

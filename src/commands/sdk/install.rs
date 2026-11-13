@@ -6,9 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::commands::rootfs::clean::clean_sysroot_command;
 use crate::commands::rootfs::install::{
-    detect_sysroot_package_removals, install_sysroot, SysrootInstallParams,
+    detect_sysroot_package_removals, install_sysroot, kernel_pin_moved, SysrootInstallParams,
 };
 use crate::utils::{
     config::{find_active_compile_sections, find_active_extensions, ComposedConfig, Config},
@@ -798,20 +797,27 @@ impl SdkInstallCommand {
         // wipe the sysroot and drop its lock pins before the install.
         let target_sysroot_base_pkg = "avocado-sdk-target-sysroot";
         let mut target_dev_lock = lock_file.clone();
-        let target_kver_change = target_sysroot_kernel_change(
-            prev_target_kver,
-            lock_file
-                .get_kernel_version(target, &SysrootType::TargetSysroot)
-                .map(String::as_str),
-        );
+        // The pin only moves when a target-sysroot install succeeds (see
+        // `merge_target_sysroot_lock`), so with nothing to install there is
+        // nothing to clean: the change is still there when an install runs.
+        let new_target_kver = lock_file
+            .get_kernel_version(target, &SysrootType::TargetSysroot)
+            .map(String::as_str);
+        let target_kver_changed =
+            need_target_dev && kernel_pin_moved(prev_target_kver, new_target_kver);
         let mut clean_target_sysroot = false;
-        if let Some((prev, new_kver)) = &target_kver_change {
-            print_info(
-                &format!(
-                    "target-sysroot: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
-                ),
-                OutputLevel::Normal,
-            );
+        if target_kver_changed {
+            // No previous pin is a first install, or a lock that `update` or
+            // `unlock` cleared over an existing sysroot: clean either way (a
+            // no-op on a first install), but only report a real change.
+            if let (Some(prev), Some(new_kver)) = (prev_target_kver, new_target_kver) {
+                print_info(
+                    &format!(
+                        "target-sysroot: kernel pin changed ({prev} -> {new_kver}); cleaning sysroot for fresh install"
+                    ),
+                    OutputLevel::Normal,
+                );
+            }
             target_dev_lock.clear_target_sysroot(target);
             clean_target_sysroot = true;
         }
@@ -828,7 +834,7 @@ impl SdkInstallCommand {
             all_compile_package_names.sort();
             all_compile_package_names.dedup();
 
-            if target_kver_change.is_none() {
+            if !target_kver_changed {
                 // The lock records the compile dependencies and the base package.
                 let effective: HashSet<String> = all_compile_package_names
                     .iter()
@@ -913,7 +919,7 @@ impl SdkInstallCommand {
             };
 
             let wipe = if clean_target_sysroot {
-                clean_sysroot_command(TARGET_SYSROOT_DIR)
+                target_sysroot_wipe_command()
             } else {
                 String::new()
             };
@@ -938,14 +944,6 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             Some((
                 command,
                 all_compile_package_names,
-                target_sysroot_base_pkg.to_string(),
-            ))
-        } else if clean_target_sysroot {
-            // Nothing to install this run, but the old kernel's sysroot must
-            // not be there when a later run needs it: by then the pin matches.
-            Some((
-                clean_sysroot_command(TARGET_SYSROOT_DIR),
-                Vec::new(),
                 target_sysroot_base_pkg.to_string(),
             ))
         } else {
@@ -1255,17 +1253,15 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             }
         }
         // Merge target-dev lock
-        let target_dev_ok = target_dev_result.is_ok();
+        let target_dev_installed = need_target_dev && target_dev_result.is_ok();
         merge_target_sysroot_lock(
             &mut final_lock,
             &target_dev_lock,
             target,
-            need_target_dev && target_dev_ok,
-            clean_target_sysroot,
-            !target_dev_ok,
+            target_dev_installed,
             prev_target_kver,
         );
-        if need_target_dev && target_dev_ok {
+        if target_dev_installed {
             // Post-install: query versions and update lock file.
             if let Some((_, ref all_compile_package_names, ref base_pkg)) = target_dev_command {
                 print_success(
@@ -2416,36 +2412,27 @@ $DNF_SDK_HOST \
 }
 
 /// Carry the target-sysroot section of the install's lock into the one that is
-/// saved: after a successful install, and after any wipe whatever the install
-/// did. A wipe drops the old kernel's pins while the resolver has already
-/// recorded the new kernel; saving one without the other would leave the old
-/// kernel's versions pinned against the new kernel, and the next run (pin
-/// unchanged, so no clean) would request them again into the empty sysroot.
-/// Same rule as the rootfs install: a failed reinstall must not leave a stale
-/// package map.
+/// saved, but only after a successful install. Otherwise the disk section stays
+/// and the kernel pin goes back to `prev_kver`, so both clean triggers fire
+/// again on the next run: a compile dependency removed from the config is still
+/// in the lock, and the kernel change is still a change. Either way the wipe
+/// may never have run (the container can fail before the `rm -rf`).
 ///
-/// `cleaned` means the wipe was planned, not that it ran: the container can
-/// fail before the `rm -rf`. So when the install failed, the target-sysroot's
-/// kernel pin goes back to `prev_kver`, and the next run sees the change again
-/// and wipes again. Otherwise the old kernel's packages could stay in the
-/// sysroot under an unchanged pin, and nothing would clean them.
+/// The pin also stays put when nothing was installed: a project with no
+/// target-sysroot this run cleans it when one is next installed.
 fn merge_target_sysroot_lock(
     final_lock: &mut LockFile,
     target_dev_lock: &LockFile,
     target: &str,
     installed: bool,
-    cleaned: bool,
-    install_failed: bool,
     prev_kver: Option<&str>,
 ) {
-    if !(installed || cleaned) {
-        return;
-    }
-    if cleaned && install_failed {
+    if !installed {
         match prev_kver {
             Some(prev) => final_lock.set_kernel_version(target, &SysrootType::TargetSysroot, prev),
             None => final_lock.remove_kernel_version(target, &SysrootType::TargetSysroot),
         }
+        return;
     }
     if let Some(target_locks) = target_dev_lock.targets.get(target) {
         let entry = final_lock.targets.entry(target.to_string()).or_default();
@@ -2461,13 +2448,16 @@ fn merge_target_sysroot_lock(
 /// The target-sysroot, relative to `$AVOCADO_PREFIX`.
 const TARGET_SYSROOT_DIR: &str = "sdk/target-sysroot";
 
-/// The (previous, new) kernel pin when the target-sysroot's changed. A first
-/// install (no previous pin) is not a change.
-fn target_sysroot_kernel_change(prev: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
-    match (prev, new) {
-        (Some(prev), Some(new)) if prev != new => Some((prev.to_string(), new.to_string())),
-        _ => None,
-    }
+/// Empty the target-sysroot before a fresh install, and drop the compile-deps
+/// stamps with it: their inputs do not cover the kernel, so after a wipe and a
+/// failed install they would still read current over an empty sysroot and
+/// `avocado build` would compile against it. Fails the run if the sysroot
+/// cannot be removed, since dnf would then install beside the old contents.
+fn target_sysroot_wipe_command() -> String {
+    format!(
+        r#"rm -rf "$AVOCADO_PREFIX/{TARGET_SYSROOT_DIR}" || exit 1
+rm -f "$AVOCADO_PREFIX"/.stamps/sdk/*/compile-deps.stamp || exit 1"#
+    )
 }
 
 /// The dnf pass that makes an existing SDK sysroot follow the feed after
@@ -2499,28 +2489,28 @@ mod tests {
     use serde_yaml::Value;
     use std::collections::HashMap;
 
-    /// A wipe followed by a failed install still saves the cleared section: the
-    /// old kernel's pins must not survive. And the kernel pin goes back to the
-    /// old kernel, so the next run sees the change and wipes again: the wipe may
-    /// never have run.
+    /// A failed install keeps the disk section and the old kernel pin, so both
+    /// clean triggers fire again on the next run: the wipe may never have run.
+    /// Covers the removed compile dependency, which the kernel pin alone would
+    /// not bring back.
     #[test]
-    fn failed_install_after_wipe_drops_the_old_kernels_pins() {
+    fn failed_install_keeps_both_clean_triggers() {
         let temp_dir = tempfile::tempdir().unwrap();
         let target = "jetson-agx-thor";
         let ts = SysrootType::TargetSysroot;
-        let old = "kernel-devsrc-6.18.52-yocto-standard";
+        let dropped = "libfoo-dev";
 
         let mut on_disk = LockFile::new();
-        on_disk.set_locked_version(target, &ts, old, "6.18.52-r0");
+        on_disk.set_locked_version(target, &ts, dropped, "1.0-r0");
         on_disk.set_kernel_version(target, &ts, "6.18.52-yocto-standard");
         on_disk.save(temp_dir.path()).unwrap();
 
-        // The resolver has re-pinned the kernel; the install's lock was wiped.
+        // The resolver re-pinned the kernel and the dependency left the
+        // config: the install's lock is cleaned.
         let mut final_lock = LockFile::load(temp_dir.path()).unwrap();
         final_lock.set_kernel_version(target, &ts, "6.8.12-l4t");
         let mut target_dev_lock = final_lock.clone();
         target_dev_lock.clear_target_sysroot(target);
-
         let mut succeeded = final_lock.clone();
 
         merge_target_sysroot_lock(
@@ -2528,57 +2518,89 @@ mod tests {
             &target_dev_lock,
             target,
             false,
-            true,
-            true,
             Some("6.18.52-yocto-standard"),
         );
         final_lock.save(temp_dir.path()).unwrap();
-
         let saved = LockFile::load(temp_dir.path()).unwrap();
-        assert_eq!(saved.get_locked_version(target, &ts, old), None);
+        assert_eq!(
+            saved.get_locked_version(target, &ts, dropped),
+            Some(&"1.0-r0".to_string()),
+            "the removed dependency must still be found on the next run"
+        );
         assert_eq!(
             saved.get_kernel_version(target, &ts),
             Some(&"6.18.52-yocto-standard".to_string()),
-            "a failed install must leave the kernel change for the next run to see"
+            "the kernel change must still be seen on the next run"
         );
 
-        // A successful install keeps the new pin.
+        // A successful install takes the cleaned section and the new pin.
         merge_target_sysroot_lock(
             &mut succeeded,
             &target_dev_lock,
             target,
             true,
-            true,
-            false,
             Some("6.18.52-yocto-standard"),
         );
+        succeeded.save(temp_dir.path()).unwrap();
+        let saved = LockFile::load(temp_dir.path()).unwrap();
+        assert_eq!(saved.get_locked_version(target, &ts, dropped), None);
         assert_eq!(
-            succeeded.get_kernel_version(target, &ts),
+            saved.get_kernel_version(target, &ts),
             Some(&"6.8.12-l4t".to_string())
         );
     }
 
-    /// The target-sysroot is cleaned only when its kernel pin moves: not on a
-    /// first install, and not when it stays put.
+    /// With no target-sysroot to install, the pin does not move, so the change
+    /// is cleaned when one is next installed. No previous pin stays none.
     #[test]
-    fn target_sysroot_cleans_only_on_a_kernel_pin_change() {
-        assert_eq!(
-            target_sysroot_kernel_change(Some("6.18.52-yocto-standard"), Some("6.8.12-l4t")),
-            Some((
-                "6.18.52-yocto-standard".to_string(),
-                "6.8.12-l4t".to_string()
-            ))
-        );
-        assert_eq!(
-            target_sysroot_kernel_change(Some("6.8.12"), Some("6.8.12")),
-            None
-        );
-        assert_eq!(target_sysroot_kernel_change(None, Some("6.8.12")), None);
-        assert_eq!(target_sysroot_kernel_change(Some("6.8.12"), None), None);
-        // The wipe is the same command `avocado rootfs clean` runs, aimed at
-        // the target-sysroot.
-        assert!(clean_sysroot_command(TARGET_SYSROOT_DIR)
-            .contains(r#"rm -rf "$AVOCADO_PREFIX/sdk/target-sysroot""#));
+    fn no_install_leaves_the_kernel_pin() {
+        let target = "jetson-agx-thor";
+        let ts = SysrootType::TargetSysroot;
+        for prev in [Some("6.18.52-yocto-standard"), None] {
+            let mut final_lock = LockFile::new();
+            final_lock.set_kernel_version(target, &ts, "6.8.12-l4t");
+            let target_dev_lock = final_lock.clone();
+            merge_target_sysroot_lock(&mut final_lock, &target_dev_lock, target, false, prev);
+            assert_eq!(
+                final_lock
+                    .get_kernel_version(target, &ts)
+                    .map(String::as_str),
+                prev
+            );
+        }
+    }
+
+    /// The wipe empties the target-sysroot and drops the compile-deps stamps,
+    /// which do not cover the kernel; other stamps stay.
+    #[cfg(unix)]
+    #[test]
+    fn target_sysroot_wipe_drops_the_compile_deps_stamp() {
+        let prefix = tempfile::tempdir().unwrap();
+        let p = prefix.path();
+        std::fs::create_dir_all(p.join("sdk/target-sysroot/usr/src/kernel")).unwrap();
+        std::fs::create_dir_all(p.join(".stamps/sdk/x86_64")).unwrap();
+        std::fs::write(p.join(".stamps/sdk/x86_64/compile-deps.stamp"), "{}").unwrap();
+        std::fs::write(p.join(".stamps/sdk/x86_64/install.stamp"), "{}").unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(target_sysroot_wipe_command())
+            .env("AVOCADO_PREFIX", p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!p.join("sdk/target-sysroot").exists());
+        assert!(!p.join(".stamps/sdk/x86_64/compile-deps.stamp").exists());
+        assert!(p.join(".stamps/sdk/x86_64/install.stamp").exists());
+
+        // A first install: nothing there, still succeeds.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(target_sysroot_wipe_command())
+            .env("AVOCADO_PREFIX", p)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     /// Write `body` to `dir/name` as an executable script.
