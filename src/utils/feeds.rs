@@ -120,6 +120,12 @@ pub fn user_agent_for(key_id: Option<&str>, tier: Option<u32>) -> String {
     }
 }
 
+/// Whether feed requests carry a Connect key id: logged in, or
+/// `AVOCADO_CONNECT_TOKEN` set. Decides which bucket the edge counts them in.
+pub fn is_identified() -> bool {
+    feed_key_id().is_some()
+}
+
 fn feed_key_id() -> Option<String> {
     let token = match std::env::var("AVOCADO_CONNECT_TOKEN") {
         Ok(t) if !t.is_empty() => t,

@@ -198,6 +198,15 @@ async fn fetch_latest(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(LatestResult::Unsupported);
     }
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!(
+            "{}",
+            crate::utils::feed_limit::rate_limit_message(
+                crate::utils::feed_limit::retry_after_secs(resp.headers()),
+                crate::utils::feeds::is_identified(),
+            )
+        );
+    }
     let resp = resp
         .error_for_status()
         .with_context(|| format!("Snapshot pointer request failed: {url}"))?;
@@ -454,6 +463,20 @@ pub async fn resolve_and_apply_for(config: &Config, config_path: &str, target: &
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn rate_limited_pointer_explains_instead_of_a_bare_http_error() {
+        let url = crate::utils::feed_limit::serve(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+        );
+        let client = reqwest::Client::new();
+        let err = match fetch_latest(&client, &url, "2026", "edge", "qemux86-64").await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a 429 must not resolve a snapshot"),
+        };
+        assert!(err.contains("HTTP 429"), "{err}");
+        assert!(err.contains("30 s"), "{err}");
+    }
 
     /// Snapshot resolution reaches the feed without going through
     /// `ResolvedFeedSet`, so it needs its own copy of the no-credentials-in-the-URL

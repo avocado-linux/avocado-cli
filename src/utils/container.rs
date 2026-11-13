@@ -2050,8 +2050,22 @@ impl SdkContainer {
         .context("Failed to setup remote execution context")
     }
 
-    /// Run a command in the container
+    /// Run a command in the container. A failed run is checked once against
+    /// the feed's rate limit, because dnf reports a 429 as "No more mirrors
+    /// to try" and gives no hint that waiting or logging in would fix it.
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
+        let repo_url = config
+            .repo_url
+            .clone()
+            .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string());
+        let ok = self.run_in_container_once(config).await?;
+        if !ok {
+            crate::utils::feed_limit::explain_if_rate_limited(&repo_url).await;
+        }
+        Ok(ok)
+    }
+
+    async fn run_in_container_once(&self, config: RunConfig) -> Result<bool> {
         // Check if we should run on a remote host
         if let Some(ref runs_on) = config.runs_on {
             return self.run_in_container_remote(&config, runs_on).await;
