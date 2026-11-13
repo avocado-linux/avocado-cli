@@ -425,7 +425,7 @@ pub fn dry_run_preflight(
 }
 
 /// Read the stone manifest for `target` from the project's SDK volume and
-/// apply [`require_dry_run_support`].""" The manifest read is a read-only `cat`
+/// apply [`require_dry_run_support`]. The manifest read is a read-only `cat`
 /// in a one-shot container; no provisioning container has started yet.
 pub async fn ensure_dry_run_supported(
     config: &Config,
