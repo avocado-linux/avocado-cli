@@ -398,23 +398,29 @@ pub fn require_dry_run_support(manifest_json: &str, profile: Option<&str>) -> Re
 ///
 /// The script reads `AVOCADO_PROVISION_PROFILE` from the effective env, so
 /// that variable wins over `provision_profile`; an empty value counts as
-/// unset, as the scripts' `${VAR:-}` expansion does. A custom stone manifest
-/// (runtime config `stone_manifest` or an `AVOCADO_STONE_MANIFEST` env var) is
-/// refused because the gate can only read the SDK's default manifest, so it
-/// could not verify the manifest the run will really use.
+/// unset, as the scripts' `${VAR:-}` expansion does.
+///
+/// Stone include paths (`stone_include_paths` on the runtime or one of its
+/// extensions, or an `AVOCADO_STONE_INCLUDE_PATHS` env var) are refused: the
+/// provision hook puts them ahead of the staged stone dir in
+/// `stone provision -i`, and stone takes the first `manifest.json` and profile
+/// script it finds, so the gate could approve the staged manifest while a
+/// project-supplied one or its script runs.
 pub fn dry_run_preflight(
     env: Option<&std::collections::HashMap<String, String>>,
     provision_profile: Option<&str>,
-    config_stone_manifest: Option<&str>,
+    config_stone_include_paths: Option<&str>,
 ) -> Result<Option<String>> {
     let non_empty = |k: &str| env.and_then(|e| e.get(k)).filter(|v| !v.is_empty());
-    if config_stone_manifest.is_some_and(|m| !m.is_empty())
-        || non_empty("AVOCADO_STONE_MANIFEST").is_some()
+    if config_stone_include_paths.is_some_and(|p| !p.is_empty())
+        || non_empty("AVOCADO_STONE_INCLUDE_PATHS").is_some()
     {
         anyhow::bail!(
-            "--dry-run cannot be verified with a custom stone manifest (AVOCADO_STONE_MANIFEST or \
-             the runtime's `stone_manifest`): support is only checked against the SDK's default \
-             manifest. Run without --dry-run, or use the default manifest."
+            "--dry-run cannot be verified with stone include paths set (AVOCADO_STONE_INCLUDE_PATHS \
+             or `stone_include_paths` on the runtime or one of its extensions): stone provision \
+             searches them before the \
+             staged stone dir, so a manifest or profile script there would run unchecked. Run \
+             without --dry-run, or drop the include paths."
         );
     }
     Ok(non_empty("AVOCADO_PROVISION_PROFILE").cloned().or_else(|| {
@@ -424,13 +430,23 @@ pub fn dry_run_preflight(
     }))
 }
 
-/// Read the stone manifest for `target` from the project's SDK volume and
-/// apply [`require_dry_run_support`]. The manifest read is a read-only `cat`
-/// in a one-shot container; no provisioning container has started yet.
+/// The `manifest.json` that `stone provision` loads for `runtime` when no
+/// stone include paths are set: the copy `stone create` staged at build time,
+/// which already reflects a custom `stone_manifest`. The SDK's
+/// `stone-<target>.json` is only the build-time input, and can be newer than
+/// the staged copy after an SDK upgrade without a rebuild.
+pub fn staged_stone_manifest_path(target: &str, runtime: &str) -> String {
+    format!("/opt/_avocado/{target}/output/runtimes/{runtime}/stone/manifest.json")
+}
+
+/// Read the staged stone manifest for `runtime` from the project's SDK volume
+/// and apply [`require_dry_run_support`]. The manifest read is a read-only
+/// `cat` in a one-shot container; no provisioning container has started yet.
 pub async fn ensure_dry_run_supported(
     config: &Config,
     config_path: &str,
     target: &str,
+    runtime: &str,
     profile: Option<&str>,
 ) -> Result<()> {
     let sdk_image = config.get_sdk_image().ok_or_else(|| {
@@ -445,20 +461,36 @@ pub async fn ensure_dry_run_supported(
             "--dry-run cannot be verified, stone manifest could not be read: SDK not yet installed. Run `avocado install` first."
         )
     })?;
-    let raw = ProfilesListCommand::read_stone_manifest(
+    let path = staged_stone_manifest_path(target, runtime);
+    // The path goes in as `$1`, not spliced into the script, so a runtime name
+    // never reaches the shell as code.
+    let out = crate::utils::container::SessionContainers::volume_exec(
         &volume.container_tool,
-        &volume.volume_name,
+        &format!("{}:/opt/_avocado:ro", volume.volume_name),
         sdk_image,
-        target,
+        &[
+            "/bin/sh",
+            "-c",
+            "if [ -f \"$1\" ]; then cat \"$1\"; else echo __AVOCADO_NO_STONE__; fi",
+            "sh",
+            &path,
+        ],
     )
-    .await
-    .context("--dry-run cannot be verified, stone manifest could not be read")?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "--dry-run cannot be verified, stone manifest could not be read: {}",
-            manifest_missing_reason(target)
-        )
-    })?;
+    .context("--dry-run cannot be verified, stone manifest could not be read")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "--dry-run cannot be verified, stone manifest could not be read: docker exited {}: {stderr}",
+            out.status
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.contains("__AVOCADO_NO_STONE__") {
+        anyhow::bail!(
+            "--dry-run cannot be verified, stone manifest could not be read: no staged manifest at \
+             {path}. Run `avocado build` for runtime '{runtime}' first."
+        );
+    }
     require_dry_run_support(&raw, profile)
 }
 
@@ -798,21 +830,52 @@ mod tests {
         assert_eq!(dry_run_preflight(Some(&e), None, None).unwrap(), None);
     }
 
+    // The gate reads the staged copy `stone create` wrote at build time, which
+    // already reflects a custom manifest, so a custom manifest is no longer a
+    // reason to refuse.
     #[test]
-    fn preflight_refuses_config_stone_manifest() {
-        let err = dry_run_preflight(None, None, Some("custom.json")).unwrap_err();
-        assert!(format!("{err:#}").contains("custom stone manifest"));
-    }
-
-    #[test]
-    fn preflight_refuses_env_stone_manifest() {
+    fn preflight_accepts_a_custom_stone_manifest() {
         let e = env(&[("AVOCADO_STONE_MANIFEST", "/opt/src/m.json")]);
-        assert!(dry_run_preflight(Some(&e), Some("p"), None).is_err());
+        assert_eq!(
+            dry_run_preflight(Some(&e), Some("p"), None).unwrap(),
+            Some("p".to_string())
+        );
     }
 
     #[test]
-    fn preflight_empty_env_stone_manifest_is_unset() {
-        let e = env(&[("AVOCADO_STONE_MANIFEST", "")]);
-        assert!(dry_run_preflight(Some(&e), Some("p"), None).is_ok());
+    fn preflight_refuses_config_stone_include_paths() {
+        let err = dry_run_preflight(None, Some("p"), Some("/opt/src/stone")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_env_stone_include_paths() {
+        let e = env(&[("AVOCADO_STONE_INCLUDE_PATHS", "/opt/src/stone")]);
+        let err = dry_run_preflight(Some(&e), Some("p"), None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn preflight_empty_stone_include_paths_are_unset() {
+        let e = env(&[("AVOCADO_STONE_INCLUDE_PATHS", "")]);
+        assert!(dry_run_preflight(Some(&e), Some("p"), Some("")).is_ok());
+    }
+
+    // `avocado-provision-<machine>` passes this dir as the last `-i` to
+    // `stone provision`, which loads the first `manifest.json` across its -i
+    // dirs. With no include paths it is the only dir, so this is the file the
+    // run loads.
+    #[test]
+    fn staged_manifest_is_the_runtime_stone_dir_provision_reads() {
+        assert_eq!(
+            staged_stone_manifest_path("imx93-frdm", "dev"),
+            "/opt/_avocado/imx93-frdm/output/runtimes/dev/stone/manifest.json"
+        );
     }
 }

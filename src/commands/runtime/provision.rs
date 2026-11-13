@@ -116,10 +116,11 @@ impl RuntimeProvisionCommand {
         // Refuse --dry-run for a profile whose manifest entry does not declare
         // `config.dry_run: true`, before the ssh probe, stamp check or script
         // container. Both `avocado provision` and `avocado runtime provision`
-        // reach here, so this is the single gate. The manifest read is the
-        // same one-shot read-only container `provision --list` uses.
+        // reach here, so this is the single gate. It reads the runtime's
+        // staged stone manifest, the file `stone provision` loads, in a
+        // one-shot read-only container.
         if self.config.dry_run {
-            let config_manifest = config.get_stone_manifest_for_runtime(
+            let config_include_paths = config.get_stone_include_paths_for_runtime(
                 &self.config.runtime_name,
                 &target_arch,
                 &self.config.config_path,
@@ -127,12 +128,13 @@ impl RuntimeProvisionCommand {
             let profile = crate::commands::profiles::dry_run_preflight(
                 self.config.env_vars.as_ref(),
                 self.config.provision_profile.as_deref(),
-                config_manifest.as_deref(),
+                config_include_paths.as_deref(),
             )?;
             crate::commands::profiles::ensure_dry_run_supported(
                 config,
                 &self.config.config_path,
                 &target_arch,
+                &self.config.runtime_name,
                 profile.as_deref(),
             )
             .await?;
@@ -1796,5 +1798,52 @@ runtimes:
         });
         let err = cmd.execute().await.unwrap_err();
         assert!(format!("{err:#}").contains("stone manifest could not be read"));
+    }
+
+    // A runtime's `stone_include_paths` puts a project dir ahead of the staged
+    // manifest in `stone provision -i`, so the gate must refuse from config
+    // alone, before it reads anything.
+    #[tokio::test]
+    async fn runtime_provision_dry_run_refuses_config_stone_include_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            r#"
+default_target: qemux86-64
+sdk:
+  image: example/sdk:latest
+runtimes:
+  rt:
+    target: qemux86-64
+    stone_include_paths:
+      - stone
+"#,
+        )
+        .unwrap();
+        let mut cmd = RuntimeProvisionCommand::new(RuntimeProvisionConfig {
+            runtime_name: "rt".to_string(),
+            config_path: cfg.to_str().unwrap().to_string(),
+            verbose: false,
+            force: false,
+            dry_run: true,
+            target: Some("qemux86-64".to_string()),
+            target_board: None,
+            provision_profile: Some("p".to_string()),
+            env_vars: None,
+            out: None,
+            container_args: None,
+            dnf_args: None,
+            state_file: None,
+            no_stamps: false,
+            runs_on: None,
+            nfs_port: None,
+            sdk_arch: None,
+        });
+        let err = cmd.execute().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
     }
 }
