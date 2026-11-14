@@ -66,8 +66,23 @@ fn use_builtin(tool: &str) -> bool {
         && std::env::var_os(USE_CLI_ENV).is_none()
         // bollard is built without its TLS and ssh transports.
         && std::env::var_os("DOCKER_TLS_VERIFY").is_none()
-        && !std::env::var("DOCKER_HOST")
-            .is_ok_and(|h| h.starts_with("ssh://") || h.starts_with("https://"))
+        && reachable(
+            std::env::var("DOCKER_HOST").ok().as_deref(),
+            context_host,
+        )
+}
+
+/// Whether the daemon is one this can talk to: bollard is built without its
+/// TLS and ssh transports. The context is read only without `DOCKER_HOST`.
+fn reachable(docker_host: Option<&str>, context: impl FnOnce() -> Option<String>) -> bool {
+    match docker_host {
+        Some(host) => !(host.starts_with("ssh://") || host.starts_with("https://")),
+        // A context's TLS settings live beside its endpoint, so only trust
+        // the local sockets it can name.
+        None => {
+            context().is_none_or(|host| host.starts_with("unix://") || host.starts_with("npipe://"))
+        }
+    }
 }
 
 /// The program to spawn for `tool`, and the argument that must lead its argv.
@@ -755,7 +770,13 @@ fn registry_credentials(image: &str) -> Option<DockerCredentials> {
     let first = image.split('/').next().unwrap_or_default();
     let named =
         image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
-    let server = if named {
+    // `docker login` files Docker Hub under its v1 index URL, however the
+    // image spells the registry.
+    let hub = matches!(
+        first,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    );
+    let server = if named && !hub {
         first
     } else {
         "https://index.docker.io/v1/"
@@ -814,6 +835,50 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn remote_and_tls_daemons_stay_on_the_docker_cli() {
+        let none = || None;
+        let ctx = |host: &str| {
+            let host = host.to_string();
+            move || Some(host)
+        };
+        assert!(reachable(None, none));
+        assert!(reachable(Some("unix:///run/docker.sock"), ctx("ssh://far")));
+        assert!(reachable(Some("tcp://10.0.0.2:2375"), none));
+        assert!(!reachable(Some("ssh://user@far"), none));
+        assert!(reachable(
+            None,
+            ctx("unix:///home/u/.docker/run/docker.sock")
+        ));
+        assert!(!reachable(None, ctx("ssh://user@far")));
+        assert!(!reachable(None, ctx("tcp://far:2376")));
+    }
+
+    #[test]
+    fn docker_hub_logins_are_found_however_the_image_names_the_hub() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = base64::engine::general_purpose::STANDARD.encode("hubuser:pw");
+        std::fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"auths":{{"https://index.docker.io/v1/":{{"auth":"{auth}"}},"ghcr.io":{{"auth":"{auth}"}}}}}}"#),
+        )
+        .unwrap();
+        std::env::set_var("DOCKER_CONFIG", dir.path());
+        for image in [
+            "busybox",
+            "avocadolinux/sdk:2026",
+            "docker.io/avocadolinux/sdk:2026",
+            "index.docker.io/library/busybox",
+            "ghcr.io/org/img",
+        ] {
+            let found = registry_credentials(image).unwrap_or_else(|| panic!("{image}"));
+            assert_eq!(found.username.as_deref(), Some("hubuser"), "{image}");
+        }
+        assert!(registry_credentials("quay.io/org/img").is_none());
+        std::env::remove_var("DOCKER_CONFIG");
     }
 
     #[test]
