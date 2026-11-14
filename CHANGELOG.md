@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check mark; steps before it keep `(up to date)`. Steps that had started
   but not finished when a step failed, which printed no line at all, now
   print `(not finished: a step failed)`.
+- **Build volumes survive Docker daemon changes.** Commands refuse when the
+  volume recorded in `.avocado-state` is missing from the current daemon,
+  instead of silently starting over in an empty volume. The error says the
+  volume was either deleted (for example by `avocado vm reset` or a Docker
+  data purge) or is on a different daemon, names the daemon (the avocado-vm
+  under VM routing), and points at `avocado clean` to start the project over.
+  `avocado vm reset` and `avocado vm rebuild --reset-data` print the same
+  `avocado clean` advice. Cleanup removes a volume whose project's state file
+  names a different volume only when that volume exists on the same daemon,
+  so a volume that may belong to another daemon is kept.
+- **`avocado load --force` removes the volume it replaces.** It used to leave
+  the previous build volume on disk.
 
 ## [1.1.0] - 2026-11-11
 

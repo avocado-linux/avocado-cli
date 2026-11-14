@@ -22,7 +22,7 @@ pub struct VolumeState {
     pub container_tool: String,
 }
 
-/// What `volume rm` says about a volume that does not exist. Docker prints
+/// What `volume rm` or `volume inspect` says about a volume that does not exist. Docker prints
 /// `get <name>: no such volume` (older daemons: `No such volume: <name>`),
 /// podman prints `no volume with name "<name>" found: no such volume`.
 fn volume_already_gone(stderr: &str) -> bool {
@@ -106,15 +106,23 @@ impl VolumeState {
     }
 }
 
-/// Decide whether an `avo-<uuid>` volume is abandoned, based solely on
-/// on-disk state (no container calls), given the `avocado.source_path`
-/// label recorded on the volume when it was created.
+/// Decide whether an `avo-<uuid>` volume is abandoned, given the
+/// `avocado.source_path` label recorded on the volume when it was created.
 ///
 /// Returns `Some(reason)` when the volume is a stale leftover safe to
-/// reap, or `None` when it is still bound to a live project. The checks
-/// mirror the ones `avocado prune` applies so both paths agree on what
-/// "abandoned" means.
-pub fn avo_abandonment_reason(volume_name: &str, source_path: Option<&str>) -> Option<String> {
+/// reap, or `None` when it is still bound to a live project. Shared by the
+/// init-time reaper and `avocado prune` so both agree on what "abandoned"
+/// means.
+///
+/// When the project's state file names a different volume, this one is
+/// stale only if that volume exists on the daemon `container_tool` talks
+/// to. If it is not here it can be on another daemon, so this one is kept;
+/// any other inspect failure keeps it too.
+pub async fn avo_abandonment_reason(
+    container_tool: &str,
+    volume_name: &str,
+    source_path: Option<&str>,
+) -> Option<String> {
     let source_path = match source_path {
         Some(path) => path,
         None => return Some("no source_path label found".to_string()),
@@ -132,13 +140,53 @@ pub fn avo_abandonment_reason(volume_name: &str, source_path: Option<&str>) -> O
 
     match VolumeState::load_from_dir(source_dir) {
         Ok(Some(state)) if state.volume_name == volume_name => None,
-        Ok(Some(state)) => Some(format!(
-            ".avocado-state links to '{}', not this volume",
-            state.volume_name
-        )),
+        Ok(Some(state)) => match volume_exists_on(container_tool, &state.volume_name).await {
+            Ok(true) => Some(format!(
+                ".avocado-state links to '{}', not this volume",
+                state.volume_name
+            )),
+            Ok(false) | Err(_) => None,
+        },
         Ok(None) => Some(format!("could not read .avocado-state in '{source_path}'")),
         Err(e) => Some(format!("error reading .avocado-state: {e}")),
     }
+}
+
+/// Whether `volume_name` exists on the daemon `container_tool` talks to.
+async fn volume_exists_on(container_tool: &str, volume_name: &str) -> Result<bool> {
+    let output = AsyncCommand::new(container_tool)
+        .args(["volume", "inspect", volume_name])
+        .output()
+        .await
+        .with_context(|| "Failed to check if volume exists")?;
+
+    inspect_outcome(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stderr),
+        volume_name,
+    )
+}
+
+/// The daemon a missing volume was looked for in, as the user knows it.
+/// Under VM routing the CLI set `DOCKER_HOST` itself, so its socket path
+/// means nothing to the user.
+fn daemon_description(docker_host: Option<String>, vm_routing: bool) -> String {
+    if vm_routing {
+        return "the avocado-vm".to_string();
+    }
+    match docker_host {
+        Some(host) => format!("the docker daemon at DOCKER_HOST={host}"),
+        None => "the local docker daemon".to_string(),
+    }
+}
+
+fn missing_volume_message(volume_name: &str, daemon: &str) -> String {
+    format!(
+        "Build volume '{volume_name}' recorded in .avocado-state was not found in {daemon}. \
+         Either it was deleted (for example by `avocado vm reset` or a Docker data purge), \
+         or it is on a different docker daemon. Run `avocado clean` to start this project \
+         over, or switch back to the daemon that has the volume."
+    )
 }
 
 /// Docker volume manager for Avocado operations
@@ -169,15 +217,12 @@ impl VolumeManager {
                     );
                 }
                 return Ok(existing_state);
-            } else if self.verbose {
-                print_info(
-                    &format!(
-                        "Volume {} no longer exists, creating new one",
-                        existing_state.volume_name
-                    ),
-                    OutputLevel::Normal,
-                );
             }
+            let daemon = daemon_description(
+                std::env::var_os("DOCKER_HOST").map(|host| host.to_string_lossy().into_owned()),
+                crate::utils::container::is_vm_routing_active(),
+            );
+            anyhow::bail!(missing_volume_message(&existing_state.volume_name, &daemon));
         }
 
         // We're about to mint a fresh volume for this project. That's the
@@ -197,18 +242,20 @@ impl VolumeManager {
         // Create new volume state
         let state = VolumeState::new(source_dir.to_path_buf(), self.container_tool.clone());
 
-        // Persist the state file BEFORE creating the docker volume. This
-        // closes a cross-process race: a concurrent reap in another project
-        // must never observe this volume after `docker volume create` but
-        // before its `.avocado-state` exists, which would classify it as
-        // abandoned and delete it mid-mint. Writing state first means the
-        // volume is never visible without its state pointer. `volume_exists`
-        // already tolerates a state file pointing at a not-yet-created
-        // volume, so a failed create is simply superseded on the next call.
+        // Record state before creation so a concurrent reaper cannot see an
+        // unreferenced volume. On create failure, roll back only state that
+        // still names this volume.
         state.save_to_dir(source_dir)?;
 
         // Create the docker volume with metadata
-        self.create_volume(&state).await?;
+        if let Err(error) = self.create_volume(&state).await {
+            if let Ok(Some(recorded)) = VolumeState::load_from_dir(source_dir) {
+                if recorded.volume_name == state.volume_name {
+                    let _ = fs::remove_file(source_dir.join(".avocado-state"));
+                }
+            }
+            return Err(error);
+        }
 
         if self.verbose {
             print_info(
@@ -242,7 +289,9 @@ impl VolumeManager {
                 Ok(source_path) => source_path,
                 Err(_) => continue,
             };
-            if let Some(reason) = avo_abandonment_reason(&name, source_path.as_deref()) {
+            if let Some(reason) =
+                avo_abandonment_reason(&self.container_tool, &name, source_path.as_deref()).await
+            {
                 if self.remove_volume(&name).await.is_ok() {
                     if self.verbose {
                         print_info(
@@ -308,13 +357,7 @@ impl VolumeManager {
 
     /// Check if a docker volume exists
     async fn volume_exists(&self, volume_name: &str) -> Result<bool> {
-        let output = AsyncCommand::new(&self.container_tool)
-            .args(["volume", "inspect", volume_name])
-            .output()
-            .await
-            .with_context(|| "Failed to check if volume exists")?;
-
-        Ok(output.status.success())
+        volume_exists_on(&self.container_tool, volume_name).await
     }
 
     /// Create a docker volume with metadata
@@ -658,8 +701,51 @@ pub struct VolumeInfo {
     pub labels: Option<HashMap<String, String>>,
 }
 
+/// A failed inspect means "missing" only when the tool says so; an unreachable
+/// daemon must not be reported as a missing volume (that error advises `avocado clean`).
+fn inspect_outcome(success: bool, stderr: &str, volume_name: &str) -> Result<bool> {
+    if success {
+        return Ok(true);
+    }
+    if volume_already_gone(stderr) {
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "Could not inspect build volume '{}': {}",
+        volume_name,
+        stderr.trim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn inspect_outcome_separates_missing_volume_from_daemon_errors() {
+        assert!(inspect_outcome(true, "", "avo-x").unwrap());
+        for missing in [
+            "Error response from daemon: get avo-x: no such volume",
+            "Error: no such volume avo-x",
+            "Error: No such volume: avo-x",
+        ] {
+            assert!(
+                !inspect_outcome(false, missing, "avo-x").unwrap(),
+                "{missing}"
+            );
+        }
+        let err = inspect_outcome(
+            false,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            "avo-x",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Could not inspect build volume 'avo-x'"),
+            "{err}"
+        );
+        assert!(err.contains("Is the docker daemon running?"), "{err}");
+    }
     use super::*;
     use tempfile::TempDir;
 
@@ -702,8 +788,208 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_abandonment_reason_active_when_state_matches() {
+    /// Refuse a recorded volume the daemon does not have. The message names
+    /// both causes (deleted, or on another daemon) and the daemon as the user
+    /// knows it, and the state file is left alone.
+    #[cfg(unix)]
+    async fn assert_missing_volume_is_refused(docker_host: Option<&str>, daemon: &str) -> String {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        tool.volume_is_gone();
+        let manager = tool.manager();
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        let state_file = project.path().join(".avocado-state");
+        let original = fs::read(&state_file).unwrap();
+
+        let previous_host = std::env::var_os("DOCKER_HOST");
+        match docker_host {
+            Some(host) => std::env::set_var("DOCKER_HOST", host),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        let result = manager.get_or_create_volume(project.path()).await;
+        match previous_host {
+            Some(host) => std::env::set_var("DOCKER_HOST", host),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+
+        assert!(
+            result.is_err(),
+            "missing recorded volume was replaced: {result:?}"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&state.volume_name), "{error}");
+        assert!(
+            error.contains(&format!("not found in {daemon}.")),
+            "{error}"
+        );
+        assert!(error.contains("it was deleted"), "{error}");
+        assert!(error.contains("`avocado vm reset`"), "{error}");
+        assert!(error.contains("on a different docker daemon"), "{error}");
+        assert!(error.contains("Run `avocado clean`"), "{error}");
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        let calls = fs::read_to_string(tool.dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls,
+            format!("--version\nvolume inspect {}\n", state.volume_name)
+        );
+        error
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn missing_recorded_volume_is_refused_on_local_daemon() {
+        assert_missing_volume_is_refused(None, "the local docker daemon").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn missing_recorded_volume_is_refused_on_docker_host() {
+        let host = "unix:///test/avocado/docker.sock";
+        assert_missing_volume_is_refused(
+            Some(host),
+            &format!("the docker daemon at DOCKER_HOST={host}"),
+        )
+        .await;
+    }
+
+    /// Under VM routing the CLI set `DOCKER_HOST` to its own socket, which
+    /// the user never chose: name the avocado-vm instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn missing_recorded_volume_under_vm_routing_names_the_avocado_vm() {
+        let socket = crate::utils::vm::state::VmPaths::resolve()
+            .unwrap()
+            .docker_socket();
+        let host = format!("unix://{}", socket.display());
+        let error = assert_missing_volume_is_refused(Some(&host), "the avocado-vm").await;
+        assert!(!error.contains(&host), "{error}");
+        assert!(!error.contains("DOCKER_HOST"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_volume_state_mints_and_records_a_volume() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let manager = tool.manager();
+
+        let state = manager.get_or_create_volume(project.path()).await.unwrap();
+
+        let recorded = VolumeState::load_from_dir(project.path()).unwrap().unwrap();
+        assert!(state.volume_name.starts_with("avo-"));
+        assert_eq!(recorded.volume_name, state.volume_name);
+        assert_eq!(recorded.source_path, project.path().to_string_lossy());
+        assert_eq!(recorded.container_tool, manager.container_tool);
+        let calls = fs::read_to_string(tool.dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls,
+            format!(
+                "--version\nvolume ls --format {{{{.Name}}}}\nvolume create --label avocado.source_path={} {}\n",
+                state.source_path, state.volume_name
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_volume_create_rolls_back_state_and_allows_retry() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        tool.fail_next_create();
+        let manager = tool.manager();
+
+        let error = manager
+            .get_or_create_volume(project.path())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .starts_with("Failed to create volume avo-"));
+        assert!(error.to_string().ends_with("daemon unavailable\n"));
+        assert!(!project.path().join(".avocado-state").exists());
+
+        let state = manager.get_or_create_volume(project.path()).await.unwrap();
+
+        let recorded = VolumeState::load_from_dir(project.path()).unwrap().unwrap();
+        assert_eq!(recorded.volume_name, state.volume_name);
+        let calls = fs::read_to_string(tool.dir.path().join("calls")).unwrap();
+        let created: Vec<_> = calls
+            .lines()
+            .filter(|line| line.starts_with("volume create "))
+            .map(|line| line.split_whitespace().last().unwrap())
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_ne!(created[0], created[1]);
+        assert_eq!(created[1], state.volume_name);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_volume_create_keeps_replaced_state() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        tool.fail_next_create();
+        let replacement = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        let replacement_bytes = serde_json::to_vec(&replacement).unwrap();
+        fs::write(
+            tool.dir.path().join("replacement_state"),
+            &replacement_bytes,
+        )
+        .unwrap();
+
+        let error = tool
+            .manager()
+            .get_or_create_volume(project.path())
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .starts_with("Failed to create volume avo-"));
+        assert!(error.to_string().ends_with("daemon unavailable\n"));
+        assert_eq!(
+            fs::read(project.path().join(".avocado-state")).unwrap(),
+            replacement_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_volume_state_is_reused_without_creating_a_volume() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        let original = fs::read(project.path().join(".avocado-state")).unwrap();
+
+        let reused = tool
+            .manager()
+            .get_or_create_volume(project.path())
+            .await
+            .unwrap();
+
+        assert_eq!(reused.volume_name, state.volume_name);
+        assert_eq!(
+            fs::read(project.path().join(".avocado-state")).unwrap(),
+            original
+        );
+        let calls = fs::read_to_string(tool.dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls,
+            format!("--version\nvolume inspect {}\n", state.volume_name)
+        );
+    }
+
+    /// A tool path that cannot run: these cases decide without a call.
+    const NO_TOOL: &str = "/nonexistent/avocado/docker";
+
+    #[tokio::test]
+    async fn test_abandonment_reason_active_when_state_matches() {
         // A volume whose recorded source directory still holds a
         // .avocado-state file pointing back at it is live: no reason.
         let temp_dir = TempDir::new().unwrap();
@@ -711,44 +997,163 @@ mod tests {
         state.save_to_dir(temp_dir.path()).unwrap();
 
         assert_eq!(
-            avo_abandonment_reason(&state.volume_name, Some(&state.source_path)),
+            avo_abandonment_reason(NO_TOOL, &state.volume_name, Some(&state.source_path)).await,
             None
         );
     }
 
-    #[test]
-    fn test_abandonment_reason_no_source_path_label() {
-        let reason = avo_abandonment_reason("avo-x", None).unwrap();
+    #[tokio::test]
+    async fn test_abandonment_reason_no_source_path_label() {
+        let reason = avo_abandonment_reason(NO_TOOL, "avo-x", None)
+            .await
+            .unwrap();
         assert!(reason.contains("no source_path label"));
     }
 
-    #[test]
-    fn test_abandonment_reason_missing_source_dir() {
+    #[tokio::test]
+    async fn test_abandonment_reason_missing_source_dir() {
         let reason =
-            avo_abandonment_reason("avo-x", Some("/nonexistent/avocado/project/xyz")).unwrap();
+            avo_abandonment_reason(NO_TOOL, "avo-x", Some("/nonexistent/avocado/project/xyz"))
+                .await
+                .unwrap();
         assert!(reason.contains("does not exist"));
     }
 
-    #[test]
-    fn test_abandonment_reason_no_state_file() {
+    #[tokio::test]
+    async fn test_abandonment_reason_no_state_file() {
         // Source dir exists but carries no .avocado-state: abandoned.
         let temp_dir = TempDir::new().unwrap();
         let reason =
-            avo_abandonment_reason("avo-x", Some(temp_dir.path().to_str().unwrap())).unwrap();
+            avo_abandonment_reason(NO_TOOL, "avo-x", Some(temp_dir.path().to_str().unwrap()))
+                .await
+                .unwrap();
         assert!(reason.contains("no .avocado-state"));
     }
 
-    #[test]
-    fn test_abandonment_reason_state_points_elsewhere() {
-        // The state file links to a different volume name, so this
-        // volume is a stale leftover safe to reap.
+    #[tokio::test]
+    async fn test_abandonment_reason_invalid_state_file() {
         let temp_dir = TempDir::new().unwrap();
-        let state = VolumeState::new(temp_dir.path().to_path_buf(), "docker".to_string());
-        state.save_to_dir(temp_dir.path()).unwrap();
+        fs::write(temp_dir.path().join(".avocado-state"), "invalid json").unwrap();
 
         let reason =
-            avo_abandonment_reason("avo-different-uuid", Some(&state.source_path)).unwrap();
-        assert!(reason.contains("not this volume"));
+            avo_abandonment_reason(NO_TOOL, "avo-x", Some(temp_dir.path().to_str().unwrap()))
+                .await
+                .unwrap();
+        assert!(reason.contains("error reading .avocado-state"));
+    }
+
+    /// `load --force` and similar leave the old volume behind on the same
+    /// daemon. The state file names a volume that exists here, so the old
+    /// one is stale.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_replaced_on_the_same_daemon_is_abandoned() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        let manager = tool.manager();
+
+        let reason =
+            avo_abandonment_reason(&manager.container_tool, "avo-old", Some(&state.source_path))
+                .await;
+
+        let reason = reason.expect("a replaced volume on this daemon must be abandoned");
+        assert!(reason.contains(&state.volume_name), "{reason}");
+        assert!(tool
+            .calls()
+            .contains(&format!("volume inspect {}\n", state.volume_name)));
+    }
+
+    /// The state file names a volume this daemon does not have. It can be on
+    /// another daemon, so this volume may be the one a switch back needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_is_kept_when_the_recorded_volume_is_not_on_this_daemon() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        tool.missing_volume(&state.volume_name);
+        let manager = tool.manager();
+
+        assert_eq!(
+            avo_abandonment_reason(&manager.container_tool, "avo-old", Some(&state.source_path))
+                .await,
+            None
+        );
+    }
+
+    /// A failed inspect of the recorded volume says nothing about it: keep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_is_kept_when_the_recorded_volume_cannot_be_inspected() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        tool.inspect_fails(&state.volume_name);
+        let manager = tool.manager();
+
+        assert_eq!(
+            avo_abandonment_reason(&manager.container_tool, "avo-old", Some(&state.source_path))
+                .await,
+            None
+        );
+    }
+
+    /// The init-time reaper removes a volume its project replaced on this
+    /// daemon, and keeps the replacement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_removes_a_volume_replaced_on_the_same_daemon() {
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(project.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(project.path()).unwrap();
+        tool.listed_volume("avo-old", &state.source_path);
+        tool.listed_volume(&state.volume_name, &state.source_path);
+
+        let reaped = tool.manager().reap_abandoned_avo_volumes().await;
+
+        assert_eq!(reaped, vec!["avo-old".to_string()]);
+        let calls = tool.calls();
+        assert!(calls.contains("volume rm avo-old\n"), "{calls}");
+        assert!(
+            !calls.contains(&format!("volume rm {}", state.volume_name)),
+            "{calls}"
+        );
+    }
+
+    /// A failed inspect of another project's recorded volume keeps that
+    /// project's other volume and does not stop a new project's volume
+    /// from being created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_inspect_failure_keeps_the_volume_and_does_not_block_creation() {
+        let other = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let tool = FakeTool::new(&[], &[], 0);
+        let state = VolumeState::new(other.path().to_path_buf(), "docker".to_string());
+        state.save_to_dir(other.path()).unwrap();
+        tool.listed_volume("avo-old", &state.source_path);
+        tool.inspect_fails(&state.volume_name);
+
+        let created = tool
+            .manager()
+            .get_or_create_volume(project.path())
+            .await
+            .unwrap();
+
+        let calls = tool.calls();
+        assert!(!calls.contains("volume rm"), "{calls}");
+        assert!(
+            calls.contains(&format!(
+                "volume create --label avocado.source_path={} {}",
+                created.source_path, created.volume_name
+            )),
+            "{calls}"
+        );
     }
 
     /// `clean -f` on a project whose recorded volume is already gone must
@@ -808,6 +1213,22 @@ mod tests {
                 r#"#!/bin/sh
 echo "$*" >> "{d}/calls"
 case "$*" in
+  "volume create"*)
+    if [ -e "{d}/fail_create" ]; then
+      rm "{d}/fail_create"
+      if [ -e "{d}/replacement_state" ]; then
+        cp "{d}/replacement_state" "${{4#avocado.source_path=}}/.avocado-state"
+      fi
+      echo "daemon unavailable" >&2
+      exit 1
+    fi
+    exit 0 ;;
+  "volume ls"*) cat "{d}/volumes" 2>/dev/null; exit 0 ;;
+  "volume inspect"*)
+    if [ -e "{d}/inspect_error/$3" ]; then echo "Cannot connect to the Docker daemon at unix:///test/docker.sock. Is the docker daemon running?" >&2; exit 1; fi
+    if [ -e "{d}/gone" ] || [ -e "{d}/missing/$3" ]; then echo "Error response from daemon: get $3: no such volume" >&2; exit 1; fi
+    if [ -e "{d}/labels/$3" ]; then cat "{d}/labels/$3"; fi
+    exit 0 ;;
   *"name=avocado-explorer-"*) cat "{d}/explorers"; exit 0 ;;
   ps*)
     cat "{d}/holders"
@@ -847,6 +1268,46 @@ exit 0
 
         fn volume_is_gone(&self) {
             fs::write(self.dir.path().join("gone"), "").unwrap();
+        }
+
+        /// List `name` in `volume ls`, labeled with `source_path` as
+        /// `volume create` would.
+        fn listed_volume(&self, name: &str, source_path: &str) {
+            let mut volumes =
+                fs::read_to_string(self.dir.path().join("volumes")).unwrap_or_default();
+            volumes.push_str(&format!("{name}\n"));
+            fs::write(self.dir.path().join("volumes"), volumes).unwrap();
+            let labels = self.dir.path().join("labels");
+            fs::create_dir_all(&labels).unwrap();
+            let info = serde_json::json!([{
+                "Name": name,
+                "Driver": "local",
+                "Mountpoint": format!("/var/lib/docker/volumes/{name}/_data"),
+                "Labels": {"avocado.source_path": source_path},
+            }]);
+            fs::write(labels.join(name), info.to_string()).unwrap();
+        }
+
+        /// `volume inspect <name>` says "no such volume".
+        fn missing_volume(&self, name: &str) {
+            let dir = self.dir.path().join("missing");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), "").unwrap();
+        }
+
+        /// `volume inspect <name>` fails as if the daemon were unreachable.
+        fn inspect_fails(&self, name: &str) {
+            let dir = self.dir.path().join("inspect_error");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), "").unwrap();
+        }
+
+        fn calls(&self) -> String {
+            fs::read_to_string(self.dir.path().join("calls")).unwrap_or_default()
+        }
+
+        fn fail_next_create(&self) {
+            fs::write(self.dir.path().join("fail_create"), "").unwrap();
         }
 
         fn volume_rm_calls(&self) -> usize {

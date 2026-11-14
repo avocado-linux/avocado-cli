@@ -52,6 +52,7 @@ impl RebuildCommand {
         let _ = std::fs::write(paths.artifact_dir_file(), vm_source.display().to_string());
 
         if self.reset_data {
+            let mut removed_any = false;
             for (label, path) in [
                 ("data.qcow2", paths.data_disk()),
                 ("var.btrfs", paths.var_disk()),
@@ -64,7 +65,11 @@ impl RebuildCommand {
                         ),
                         OutputLevel::Normal,
                     );
+                    removed_any = true;
                 }
+            }
+            if removed_any {
+                print_info(super::BUILD_VOLUMES_DELETED_NOTE, OutputLevel::Normal);
             }
         }
 
