@@ -122,6 +122,7 @@ mv "$overlay_list.tmp" "$overlay_list"
 /// or not the config sets `<section>.overlay`, so the files a removed overlay
 /// placed are pruned on the next install.
 fn render_overlay_snippet(
+    config: &Config,
     parsed: Option<&serde_yaml::Value>,
     sysroot_type: &SysrootType,
     src_dir: &Path,
@@ -129,14 +130,16 @@ fn render_overlay_snippet(
     target_board: Option<&str>,
     sysroot_dir: &str,
 ) -> Result<String> {
-    let overlay_value = parsed.and_then(|parsed| {
-        let key = match sysroot_type {
-            SysrootType::Rootfs => "rootfs",
-            SysrootType::Initramfs => "initramfs",
-            _ => return None,
-        };
-        parsed.get(key)?.get("overlay").cloned()
-    });
+    let overlay_value = match (sysroot_type, parsed) {
+        (SysrootType::Rootfs, Some(parsed)) => config
+            .resolve_rootfs(parsed, target, None)?
+            .and_then(|rootfs| rootfs.node.get("overlay").cloned()),
+        (SysrootType::Initramfs, Some(parsed)) => parsed
+            .get("initramfs")
+            .and_then(|i| i.get("overlay"))
+            .cloned(),
+        _ => None,
+    };
     let (Some(v), Some(parsed)) = (overlay_value, parsed) else {
         return Ok(build_overlay_script(None, sysroot_dir));
     };
@@ -631,11 +634,11 @@ pub fn sysroot_packages(
     sysroot_type: &SysrootType,
     target: &str,
     parsed: Option<&serde_yaml::Value>,
-) -> Option<HashMap<String, serde_yaml::Value>> {
+) -> Result<Option<HashMap<String, serde_yaml::Value>>> {
     match sysroot_type {
-        SysrootType::Rootfs => Some(config.get_rootfs_packages(parsed, target)),
-        SysrootType::Initramfs => Some(config.get_initramfs_packages(parsed, target)),
-        _ => None,
+        SysrootType::Rootfs => Ok(Some(config.get_rootfs_packages(parsed, target)?)),
+        SysrootType::Initramfs => Ok(Some(config.get_initramfs_packages(parsed, target))),
+        _ => Ok(None),
     }
 }
 
@@ -679,7 +682,13 @@ pub fn compute_sysroot_install_inputs(
     )?
     .map(|set| set.stage_projection_json(stage))
     .transpose()?;
+    let rootfs = if matches!(ctx.sysroot_type, SysrootType::Rootfs) {
+        ctx.config.resolve_rootfs(ctx.parsed, ctx.target, None)?
+    } else {
+        None
+    };
     let resolved = SysrootStampInputs {
+        image_section: rootfs.as_ref().map(|r| &r.node),
         packages,
         repo_url: ctx.repo_url,
         repo_release: ctx.repo_release,
@@ -936,7 +945,8 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
         &params.sysroot_type,
         params.target,
         params.parsed,
-    ) else {
+    )?
+    else {
         unreachable!("sysroot_type was narrowed to rootfs/initramfs above")
     };
 
@@ -1273,6 +1283,7 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // the same container invocation immediately after DNF finishes. Rendered
     // even without an overlay, so files a removed overlay placed are pruned.
     let overlay_snippet = render_overlay_snippet(
+        params.config,
         params.parsed,
         &params.sysroot_type,
         params.src_dir,
@@ -1790,6 +1801,314 @@ mod tests {
     use crate::utils::lockfile::{LockFile, SysrootType};
     use crate::utils::stamps::{Stamp, StampOutputs};
     use std::collections::{HashMap, HashSet};
+
+    fn rootfs_node(
+        config: &crate::utils::config::Config,
+        parsed: &serde_yaml::Value,
+        target: &str,
+    ) -> Option<serde_yaml::Value> {
+        config
+            .resolve_rootfs(parsed, target, None)
+            .unwrap()
+            .map(|r| r.node)
+    }
+
+    fn rootfs_inputs(
+        parsed: &serde_yaml::Value,
+        root: &std::path::Path,
+        target: &str,
+    ) -> crate::utils::stamps::StampInputs {
+        let config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let packages = super::sysroot_packages(&config, &SysrootType::Rootfs, target, Some(parsed))
+            .unwrap()
+            .unwrap();
+        super::compute_sysroot_install_inputs(
+            &super::SysrootStampContext {
+                sysroot_type: &SysrootType::Rootfs,
+                config: &config,
+                parsed,
+                src_dir: root,
+                target,
+                target_board: None,
+                repo_url: None,
+                repo_release: None,
+                dnf_args: None,
+                lock_file: &LockFile::new(),
+            },
+            &packages,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn regression_named_rootfs_overlay_and_hook() {
+        use crate::utils::config::{get_post_install, Config};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("overlay")).unwrap();
+        std::fs::write(tmp.path().join("overlay/probe"), "original").unwrap();
+        std::fs::write(tmp.path().join("hook.sh"), "echo original").unwrap();
+        let flat: serde_yaml::Value =
+            serde_yaml::from_str("rootfs: {overlay: overlay, post_install: hook.sh}").unwrap();
+        let expected = rootfs_inputs(&flat, tmp.path(), "qemux86-64");
+        for (name, multiple) in [("default", false), ("custom", false), ("default", true)] {
+            let mut parsed = flat.clone();
+            parsed["rootfs"] = serde_yaml::from_str(&format!(
+                "{name}: {{overlay: overlay, post_install: hook.sh}}"
+            ))
+            .unwrap();
+            if multiple {
+                parsed["rootfs"]["other"] =
+                    serde_yaml::from_str("{overlay: unused, post_install: unused.sh}").unwrap();
+            }
+            let script = render_overlay_snippet(
+                &serde_yaml::from_value(parsed.clone()).unwrap(),
+                Some(&parsed),
+                &SysrootType::Rootfs,
+                tmp.path(),
+                "qemux86-64",
+                None,
+                "rootfs",
+            )
+            .unwrap();
+            assert!(script.contains("Applying overlay 'overlay'"), "{script}");
+            let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+            let section = rootfs_node(&config, &parsed, "qemux86-64");
+            assert_eq!(
+                get_post_install(section.as_ref()).as_deref(),
+                Some("hook.sh")
+            );
+            let before = rootfs_inputs(&parsed, tmp.path(), "qemux86-64");
+            assert_eq!(before, expected, "equivalent shapes must hash identically");
+            std::fs::write(tmp.path().join("overlay/probe"), "edited").unwrap();
+            assert_ne!(before, rootfs_inputs(&parsed, tmp.path(), "qemux86-64"));
+            std::fs::write(tmp.path().join("overlay/probe"), "original").unwrap();
+            std::fs::rename(tmp.path().join("overlay"), tmp.path().join("renamed")).unwrap();
+            parsed["rootfs"][name]["overlay"] = "renamed".into();
+            assert_ne!(before, rootfs_inputs(&parsed, tmp.path(), "qemux86-64"));
+            std::fs::rename(tmp.path().join("renamed"), tmp.path().join("overlay")).unwrap();
+            parsed["rootfs"][name]["overlay"] = "overlay".into();
+            std::fs::write(tmp.path().join("hook.sh"), "echo edited").unwrap();
+            assert_ne!(before, rootfs_inputs(&parsed, tmp.path(), "qemux86-64"));
+            std::fs::write(tmp.path().join("hook.sh"), "echo original").unwrap();
+        }
+    }
+
+    #[test]
+    fn regression_rootfs_target_override_install_and_hash() {
+        use crate::utils::config::Config;
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["base", "selected"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("probe"), "original").unwrap();
+        }
+        for hook in ["base.sh", "selected.sh"] {
+            std::fs::write(tmp.path().join(hook), "echo original").unwrap();
+        }
+        let flat: serde_yaml::Value = serde_yaml::from_str(
+            "rootfs:\n  packages: {base: '*'}\n  overlay: base\n  post_install: base.sh\n  target-qemux86-64:\n    packages: {extra: '*'}\n    overlay: selected\n    post_install: selected.sh\n",
+        )
+        .unwrap();
+        for named in [false, true] {
+            let mut parsed = flat.clone();
+            if named {
+                parsed["rootfs"] = serde_yaml::from_str("default: {}").unwrap();
+                parsed["rootfs"]["default"] = flat["rootfs"].clone();
+            }
+            let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+            let packages =
+                super::sysroot_packages(&config, &SysrootType::Rootfs, "qemux86-64", Some(&parsed))
+                    .unwrap()
+                    .unwrap();
+            assert!(packages.contains_key("base"));
+            assert!(
+                packages.contains_key("extra"),
+                "target packages must be installed"
+            );
+            let script = render_overlay_snippet(
+                &serde_yaml::from_value(parsed.clone()).unwrap(),
+                Some(&parsed),
+                &SysrootType::Rootfs,
+                tmp.path(),
+                "qemux86-64",
+                None,
+                "rootfs",
+            )
+            .unwrap();
+            assert!(script.contains("Applying overlay 'selected'"), "{script}");
+            let selected = rootfs_inputs(&parsed, tmp.path(), "qemux86-64");
+            let other = rootfs_inputs(&parsed, tmp.path(), "qemuarm64");
+            let resolved = rootfs_node(&config, &parsed, "qemux86-64").unwrap();
+            assert_eq!(
+                crate::utils::config::get_post_install(Some(&resolved)).as_deref(),
+                Some("selected.sh")
+            );
+            let mut explicit = parsed.clone();
+            explicit["rootfs"] = resolved;
+            assert_eq!(selected, rootfs_inputs(&explicit, tmp.path(), "qemux86-64"));
+            std::fs::write(tmp.path().join("selected/probe"), "edited").unwrap();
+            assert_ne!(selected, rootfs_inputs(&parsed, tmp.path(), "qemux86-64"));
+            assert_eq!(other, rootfs_inputs(&parsed, tmp.path(), "qemuarm64"));
+            std::fs::write(tmp.path().join("selected/probe"), "original").unwrap();
+            std::fs::write(tmp.path().join("selected.sh"), "echo edited").unwrap();
+            assert_ne!(selected, rootfs_inputs(&parsed, tmp.path(), "qemux86-64"));
+            assert_eq!(other, rootfs_inputs(&parsed, tmp.path(), "qemuarm64"));
+            std::fs::write(tmp.path().join("selected.sh"), "echo original").unwrap();
+        }
+    }
+
+    fn rootfs_packages(yaml: &str, target: &str) -> HashMap<String, serde_yaml::Value> {
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let config = serde_yaml::from_value(parsed.clone()).unwrap();
+        super::sysroot_packages(&config, &SysrootType::Rootfs, target, Some(&parsed))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn regression_rootfs_packages_alias_merges_with_target_override() {
+        for (base, over) in [("dependencies", "packages"), ("packages", "dependencies")] {
+            let flat = format!(
+                "rootfs:\n  {base}: {{base: '*'}}\n  target-qemux86-64:\n    {over}: {{extra: '*'}}\n"
+            );
+            let named = format!(
+                "rootfs:\n  default:\n    {base}: {{base: '*'}}\n    target-qemux86-64:\n      {over}: {{extra: '*'}}\n"
+            );
+            for yaml in [flat, named] {
+                let packages = rootfs_packages(&yaml, "qemux86-64");
+                assert!(packages.contains_key("base"), "{yaml}");
+                assert!(packages.contains_key("extra"), "{yaml}");
+                assert!(!rootfs_packages(&yaml, "qemuarm64").contains_key("extra"));
+            }
+        }
+    }
+
+    #[test]
+    fn null_rootfs_installs_default_packages() {
+        for yaml in ["rootfs:\n", "rootfs: null\n"] {
+            let packages = rootfs_packages(yaml, "qemux86-64");
+            assert_eq!(packages.len(), 1, "{yaml}");
+            assert!(packages.contains_key("avocado-pkg-rootfs"), "{yaml}");
+        }
+    }
+
+    /// A `target-<name>:` block beside named entries applies over the
+    /// selected entry; the entry's own `target-<name>:` block applies last.
+    #[test]
+    fn regression_rootfs_target_block_beside_named_entries() {
+        use crate::utils::config::{get_post_install, Config};
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["base", "qemu"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        let yaml = "rootfs:\n  default:\n    packages: {base: '*'}\n    overlay: base\n    post_install: base.sh\n  other:\n    packages: {unused: '*'}\n  target-qemux86-64:\n    packages: {extra: '*'}\n    overlay: qemu\n    post_install: qemu.sh\n";
+        let with_entry_override = yaml.replace(
+            "    post_install: base.sh\n",
+            "    post_install: base.sh\n    target-qemux86-64:\n      post_install: entry.sh\n",
+        );
+        for (yaml, hook) in [
+            (yaml.to_string(), "qemu.sh"),
+            (with_entry_override, "entry.sh"),
+        ] {
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+            let section = rootfs_node(&config, &parsed, "qemux86-64");
+            assert_eq!(get_post_install(section.as_ref()).as_deref(), Some(hook));
+            let packages = rootfs_packages(&yaml, "qemux86-64");
+            assert!(packages.contains_key("base") && packages.contains_key("extra"));
+            assert!(!packages.contains_key("unused"));
+            let script = render_overlay_snippet(
+                &config,
+                Some(&parsed),
+                &SysrootType::Rootfs,
+                tmp.path(),
+                "qemux86-64",
+                None,
+                "rootfs",
+            )
+            .unwrap();
+            assert!(script.contains("Applying overlay 'qemu'"), "{script}");
+            let other = rootfs_node(&config, &parsed, "qemuarm64");
+            assert_eq!(get_post_install(other.as_ref()).as_deref(), Some("base.sh"));
+            assert!(!rootfs_packages(&yaml, "qemuarm64").contains_key("extra"));
+        }
+    }
+
+    /// A lone entry not named `default` stays the selected entry when a
+    /// `target-<name>:` block sits beside it, as it is without that block.
+    #[test]
+    fn regression_rootfs_lone_named_entry_beside_target_block() {
+        let lone = "rootfs:\n  custom:\n    packages: {foo: '*'}\n";
+        let yaml = format!("{lone}  target-qemux86-64:\n    packages: {{extra: '*'}}\n");
+        let packages = rootfs_packages(&yaml, "qemux86-64");
+        assert!(packages.contains_key("foo") && packages.contains_key("extra"));
+        assert_eq!(
+            rootfs_packages(&yaml, "qemuarm64"),
+            rootfs_packages(lone, "qemuarm64")
+        );
+    }
+
+    /// A long-form `overlay` in a target block replaces the base's whole,
+    /// so it does not inherit the base's `mode`.
+    #[test]
+    fn regression_rootfs_target_overlay_replaces_long_form() {
+        let flat = "rootfs:\n  overlay: {dir: base, mode: opaque}\n  target-qemux86-64:\n    overlay: {dir: board}\n";
+        let named = "rootfs:\n  default:\n    overlay: {dir: base, mode: opaque}\n    target-qemux86-64:\n      overlay: {dir: board}\n";
+        let beside = "rootfs:\n  default:\n    overlay: {dir: base, mode: opaque}\n  target-qemux86-64:\n    overlay: {dir: board}\n";
+        for yaml in [flat, named, beside] {
+            let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let script = render_overlay_snippet(
+                &serde_yaml::from_value(parsed.clone()).unwrap(),
+                Some(&parsed),
+                &SysrootType::Rootfs,
+                std::path::Path::new("."),
+                "qemux86-64",
+                None,
+                "rootfs",
+            )
+            .unwrap();
+            assert!(
+                script.contains("Applying overlay 'board' to rootfs sysroot (merge mode)"),
+                "{yaml}\n{script}"
+            );
+        }
+    }
+
+    /// For a flat `rootfs:` block the install stamp keeps main's bytes: the
+    /// raw section's overlay, hook and permissions, and the typed packages.
+    #[test]
+    fn flat_rootfs_install_hash_is_unchanged() {
+        use crate::utils::stamps::{compute_rootfs_input_hash, SysrootStampInputs};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("overlay")).unwrap();
+        std::fs::write(tmp.path().join("overlay/probe"), "x").unwrap();
+        std::fs::write(tmp.path().join("hook.sh"), "echo hook").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(
+            "rootfs:\n  dependencies: {base: '*'}\n  overlay: {dir: overlay, mode: opaque}\n  post_install: hook.sh\n  permissions: {users: {app: {uid: 1000}}}\n  kernel-6.6: {post_install: kernel.sh}\n  target-qemuarm64: {post_install: arm.sh}\n",
+        )
+        .unwrap();
+        let config: crate::utils::config::Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let packages: HashMap<String, serde_yaml::Value> =
+            HashMap::from([("base".to_string(), "*".into())]);
+        let lock = LockFile::new();
+        let main = compute_rootfs_input_hash(
+            &parsed,
+            tmp.path(),
+            None,
+            &SysrootStampInputs {
+                image_section: None,
+                packages: &packages,
+                repo_url: None,
+                repo_release: None,
+                disable_weak_dependencies: config.get_sdk_disable_weak_dependencies(),
+                dnf_args: None,
+                locked_packages: lock.get_sysroot_versions("qemux86-64", &SysrootType::Rootfs),
+                feed_projection: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rootfs_inputs(&parsed, tmp.path(), "qemux86-64"), main);
+    }
 
     fn install_stamp(contract: Option<&str>) -> Stamp {
         Stamp::rootfs_install(
@@ -2580,6 +2899,7 @@ mod tests {
         let parsed: serde_yaml::Value =
             serde_yaml::from_str("rootfs:\n  packages:\n    avocado-rootfs: '*'\n").unwrap();
         let script = render_overlay_snippet(
+            &serde_yaml::from_value(parsed.clone()).unwrap(),
             Some(&parsed),
             &SysrootType::Rootfs,
             root,
@@ -2601,6 +2921,7 @@ mod tests {
         let parsed: serde_yaml::Value =
             serde_yaml::from_str("initramfs:\n  overlay: overlays/initramfs\n").unwrap();
         let script = render_overlay_snippet(
+            &serde_yaml::from_value(parsed.clone()).unwrap(),
             Some(&parsed),
             &SysrootType::Initramfs,
             std::path::Path::new("."),

@@ -215,8 +215,8 @@
     },
     "rootfs": {
       "title": "Root filesystem",
-      "$ref": "#/definitions/imageSection",
-      "description": "Root filesystem image configuration. Either one configuration, which becomes the implicit 'default', or a map of named configurations. When no 'packages' are set, installs 'avocado-pkg-rootfs'. In the named-map form only the 'default' (or sole) entry is built, and its 'overlay', 'post_install' and 'image' are not read."
+      "$ref": "#/definitions/rootfsSection",
+      "description": "Root filesystem image configuration. Either one configuration, which becomes the implicit 'default', or a map of named configurations. When no 'packages' are set, installs 'avocado-pkg-rootfs'. In the named-map form, install reads the 'default' (or sole) entry, and a runtime's image step reads the entry its 'rootfs: <name>' names, else that same entry. A 'target-<name>:' block beside the named entries applies over the selected entry, and the entry's own 'target-<name>:' block applies over both."
     },
     "initramfs": {
       "title": "Initramfs",
@@ -1363,7 +1363,7 @@
     "imageConfig": {
       "title": "Image configuration",
       "type": "object",
-      "description": "A rootfs or initramfs image configuration.",
+      "description": "An initramfs image configuration.",
       "properties": {
         "packages": {
           "$ref": "#/definitions/packages",
@@ -1426,6 +1426,75 @@
           "description": "Named image configurations.",
           "additionalProperties": {
             "$ref": "#/definitions/namedImageConfig"
+          }
+        }
+      ]
+    },
+    "rootfsConfig": {
+      "title": "Root filesystem configuration",
+      "type": "object",
+      "description": "A rootfs image configuration.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "image": {
+          "$ref": "#/definitions/imageConfig/properties/image"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        },
+        "source": {
+          "$ref": "#/definitions/imageConfig/properties/source"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride",
+          "description": "Per-target override, applied over this block when building for that target."
+        },
+        "^kernel-.+$": {
+          "type": "object",
+          "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+          "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+        }
+      },
+      "additionalProperties": false,
+      "x-avocado-target-overrides": true
+    },
+    "rootfsSection": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/rootfsConfig"
+        },
+        {
+          "type": "object",
+          "description": "Named rootfs configurations.",
+          "patternProperties": {
+            "^target-.+$": {
+              "$ref": "#/definitions/rootfsTargetOverride",
+              "description": "Per-target override, applied over the selected entry."
+            },
+            "^kernel-.+$": {
+              "type": "object",
+              "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+              "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+            }
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/namedRootfsConfig"
           }
         }
       ]
@@ -2296,6 +2365,40 @@
       },
       "additionalProperties": false
     },
+    "rootfsTargetOverride": {
+      "title": "Rootfs per-target override",
+      "type": "object",
+      "description": "Settings applied over the enclosing rootfs block, or over the selected named entry, when building for that target. 'packages' and 'image' merge key by key with the base; 'overlay', 'permissions', 'post_install' and 'filesystem' replace the base's value.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "image": {
+          "$ref": "#/definitions/imageOptions"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride"
+        }
+      },
+      "additionalProperties": false
+    },
     "kernelEntry": {
       "title": "Kernel entry",
       "type": "object",
@@ -2337,7 +2440,7 @@
     "namedImageConfig": {
       "title": "Named image entry",
       "type": "object",
-      "description": "A named rootfs or initramfs entry. Only the 'default' (or sole) entry is built, and 'overlay', 'post_install', 'image' and 'source' are read only in the single-entry form.",
+      "description": "A named initramfs entry. Only the 'default' (or sole) entry is built, and 'overlay', 'post_install', 'image' and 'source' are read only in the single-entry form.",
       "properties": {
         "packages": {
           "$ref": "#/definitions/imageConfig/properties/packages"
@@ -2353,6 +2456,47 @@
         }
       },
       "additionalProperties": false
+    },
+    "namedRootfsConfig": {
+      "title": "Named rootfs entry",
+      "type": "object",
+      "description": "A named rootfs entry. Install reads the 'default' (or sole) entry; a runtime's image step reads the entry its 'rootfs: <name>' names, else that one. 'source' is read only in the single-entry form.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "image": {
+          "$ref": "#/definitions/imageConfig/properties/image"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride",
+          "description": "Per-target override, applied over this entry and over a 'target-<name>:' block beside the entries."
+        },
+        "^kernel-.+$": {
+          "type": "object",
+          "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+          "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+        }
+      },
+      "additionalProperties": false,
+      "x-avocado-target-overrides": true
     },
     "runtimeImageRef": {
       "title": "Runtime image block",

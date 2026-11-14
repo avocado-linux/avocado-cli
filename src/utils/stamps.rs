@@ -1984,9 +1984,11 @@ pub fn compute_ext_image_input_hash(
 
 /// Compute input hash for **rootfs image** / **initramfs image**.
 ///
-/// `section` is `"rootfs"` / `"initramfs"`; `resolved_section` is what
-/// `Config::resolve_image_section` returns for the build target — never the
-/// raw node, so a `target-<name>:` override reaches the hash. `config` is the
+/// `section` is `"rootfs"` / `"initramfs"`; `resolved_section` is the node
+/// the image step reads (`Config::resolve_rootfs`'s for rootfs,
+/// `Config::resolve_image_section`'s for initramfs), never the raw node, so a
+/// `target-<name>:` override reaches the hash and the hook is read from the
+/// same node as everything else. `config` is the
 /// merged config the build reads (`parsed`); `runtime_name` is set on the
 /// `runtime build` path, which inlines both image steps. Folded:
 ///
@@ -2456,6 +2458,9 @@ fn package_files_digest(root: &Path, patterns: &[&str]) -> Result<String> {
 /// section from one that spells out the default meta-package, and says
 /// nothing about a snapshot bump or a hand-edited `avocado.lock`.
 pub struct SysrootStampInputs<'a> {
+    /// The node `Config::resolve_rootfs` returns; `None` reads `<section>`
+    /// from the config as is.
+    pub image_section: Option<&'a serde_yaml::Value>,
     /// Effective package map — `Config::get_{rootfs,initramfs}_packages`.
     pub packages: &'a std::collections::HashMap<String, serde_yaml::Value>,
     /// `sdk.repo_url`: a feed switch must invalidate.
@@ -2554,7 +2559,7 @@ fn compute_sysroot_install_input_hash(
         packages_for_hash(resolved.packages),
     );
 
-    if let Some(sysroot) = config.get(section) {
+    if let Some(sysroot) = resolved.image_section.or_else(|| config.get(section)) {
         if let Some(overlay) = sysroot.get("overlay") {
             hash_data.insert(
                 serde_yaml::Value::String(format!("{section}.overlay")),
@@ -3672,6 +3677,7 @@ mod tests {
         packages: &std::collections::HashMap<String, serde_yaml::Value>,
     ) -> SysrootStampInputs<'_> {
         SysrootStampInputs {
+            image_section: None,
             packages,
             repo_url: None,
             repo_release: None,

@@ -49,6 +49,12 @@ pub(crate) fn config_file_dir(config_path: &Path) -> &Path {
 /// Mixing forms (some keys are field names, some are not) is a hard error —
 /// it almost always indicates a typo and silently dropping unknown keys
 /// would produce confusing partial-singleton state.
+///
+/// `override_keys_are_entries` decides what a `target-*` / `kernel-*` key
+/// beside named entries is. `kernel:` names entries that way (`kernel-lts`),
+/// so there they are entries. `rootfs:` passes `false`: there they are
+/// override blocks, never entries, so they are neither counted toward a lone
+/// entry nor selectable by a runtime ref.
 mod named_or_single_deserializer {
     use serde::de::{self, Deserializer};
     use serde::Deserialize;
@@ -58,6 +64,7 @@ mod named_or_single_deserializer {
         deserializer: D,
         field_names: &[&str],
         kind_label: &str,
+        override_keys_are_entries: bool,
     ) -> Result<Option<HashMap<String, T>>, D::Error>
     where
         D: Deserializer<'de>,
@@ -83,13 +90,22 @@ mod named_or_single_deserializer {
             .filter_map(|(k, _)| k.as_str())
             .filter(|s| known.contains(s))
             .count();
+        let is_override_key =
+            |k: &serde_yaml::Value| k.as_str().is_some_and(super::is_override_key);
 
         if field_key_count == 0 {
-            // Named-map form: none of the top-level keys are config fields, so
-            // every key is an entry name — including names that happen to start
-            // with `target-`/`kernel-` (e.g. a `kernel: { kernel-lts: ... }` map
-            // referenced elsewhere by name). Don't treat those as overrides here;
-            // that reserved-prefix handling only applies inside singleton form.
+            // Named-map form: none of the top-level keys are config fields.
+            // Override blocks beside the entries are resolved later on the raw
+            // composed value, like the singleton form's.
+            if !override_keys_are_entries && mapping.keys().any(is_override_key) {
+                mapping.retain(|k, _| !is_override_key(k));
+                if mapping.is_empty() {
+                    // Override blocks alone: one block with no base fields.
+                    let single: T = serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+                        .map_err(de::Error::custom)?;
+                    return Ok(Some(HashMap::from([("default".to_string(), single)])));
+                }
+            }
             let named: HashMap<String, T> =
                 serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
                     .map_err(de::Error::custom)?;
@@ -102,11 +118,6 @@ mod named_or_single_deserializer {
         // count as unknown singleton fields and falsely trip the mixed-form
         // guard below. Probe first so the common override-free config skips the
         // mutation entirely.
-        let is_override_key = |k: &serde_yaml::Value| {
-            k.as_str()
-                .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
-                .unwrap_or(false)
-        };
         if mapping.keys().any(is_override_key) {
             mapping.retain(|k, _| !is_override_key(k));
         }
@@ -150,6 +161,13 @@ fn format_unresolved_ref_error<T>(
             names.join(", ")
         })
         .unwrap_or_default();
+    if field == "rootfs" && is_override_key(ref_name) {
+        return format!(
+            "runtime '{runtime_name}' references rootfs '{ref_name}', which is a per-target \
+             override block under `rootfs:`, not a rootfs entry; reference an entry instead. \
+             Available: {available}"
+        );
+    }
     if available.is_empty() {
         format!(
             "runtime '{runtime_name}' references {field} '{ref_name}', but no top-level \
@@ -168,12 +186,16 @@ fn format_unresolved_ref_error<T>(
 /// where the deserializer happened to produce a non-`default`-keyed entry —
 /// rare, but lets old fixture-style configs round-trip cleanly).
 fn get_default_or_singleton<T>(map: Option<&HashMap<String, T>>) -> Option<&T> {
+    get_default_or_singleton_entry(map).map(|(_, value)| value)
+}
+
+fn get_default_or_singleton_entry<T>(map: Option<&HashMap<String, T>>) -> Option<(&String, &T)> {
     let map = map?;
-    if let Some(value) = map.get("default") {
-        return Some(value);
+    if let Some(entry) = map.get_key_value("default") {
+        return Some(entry);
     }
     if map.len() == 1 {
-        return map.values().next();
+        return map.iter().next();
     }
     None
 }
@@ -195,6 +217,7 @@ where
         // KernelConfig".
         KERNEL_CONFIG_FIELDS,
         "kernel",
+        true,
     )
 }
 
@@ -211,6 +234,141 @@ pub const KERNEL_CONFIG_FIELDS: &[&str] = &[
     "cmdline_extra",
 ];
 
+/// Every field of `ImageConfig`, by name: what tells one anonymous `rootfs:`
+/// or `initramfs:` block from a map of named entries.
+const IMAGE_CONFIG_FIELDS: &[&str] = &[
+    "packages",
+    "dependencies",
+    "filesystem",
+    "overlay",
+    "image",
+    "post_install",
+    "permissions",
+];
+
+/// A `target-<name>:` / `kernel-<spec>:` override block key.
+fn is_override_key(key: &str) -> bool {
+    key.starts_with("target-") || key.starts_with("kernel-")
+}
+
+/// Keys a rootfs override replaces whole instead of merging into: a long-form
+/// `overlay` must not inherit the base's `mode`, nor an inline `permissions`
+/// profile the base's users.
+const ROOTFS_REPLACED_KEYS: &[&str] = &["overlay", "permissions"];
+
+/// Whether one block under an image section spells its package map
+/// `dependencies` and another `packages`.
+fn mixes_packages_spellings(value: &serde_yaml::Value) -> bool {
+    fn walk(value: &serde_yaml::Value, seen: &mut (bool, bool)) {
+        let Some(map) = value.as_mapping() else {
+            return;
+        };
+        for (key, child) in map {
+            match key.as_str() {
+                Some("dependencies") => seen.0 = true,
+                Some("packages") => seen.1 = true,
+                Some(k) if !IMAGE_CONFIG_FIELDS.contains(&k) => walk(child, seen),
+                _ => {}
+            }
+        }
+    }
+    let mut seen = (false, false);
+    walk(value, &mut seen);
+    seen.0 && seen.1
+}
+
+/// Rename the `dependencies` alias to `packages` in an image block and in
+/// every entry or override block under it, so a base and a target override
+/// that spell it differently merge as one package map rather than
+/// deserializing as a duplicate field.
+fn normalize_packages_alias(value: &mut serde_yaml::Value) {
+    let Some(map) = value.as_mapping_mut() else {
+        return;
+    };
+    if let Some(deps) = map.remove("dependencies") {
+        let merged = match (deps, map.remove("packages")) {
+            (serde_yaml::Value::Mapping(mut deps), Some(serde_yaml::Value::Mapping(packages))) => {
+                deps.extend(packages);
+                serde_yaml::Value::Mapping(deps)
+            }
+            (deps, packages) => packages.unwrap_or(deps),
+        };
+        map.insert("packages".into(), merged);
+    }
+    for (key, child) in map.iter_mut() {
+        if key
+            .as_str()
+            .is_some_and(|k| !IMAGE_CONFIG_FIELDS.contains(&k))
+        {
+            normalize_packages_alias(child);
+        }
+    }
+}
+
+/// The named-entry form of a `rootfs:` mapping, by the deserializer's rule:
+/// no config-field key, and at least one key that is not an override block.
+fn rootfs_is_named_form(map: &serde_yaml::Mapping) -> bool {
+    let keys = || map.keys().filter_map(|k| k.as_str());
+    !keys().any(|k| IMAGE_CONFIG_FIELDS.contains(&k)) && keys().any(|k| !is_override_key(k))
+}
+
+/// `kernel-<spec>:` blocks [`Config::resolve_rootfs`] never applies: on the
+/// section itself, and on the selected entry.
+fn rootfs_kernel_override_paths(raw: &serde_yaml::Value, selected: Option<&str>) -> Vec<String> {
+    let keys = |node: Option<&serde_yaml::Value>, prefix: String| {
+        node.and_then(|n| n.as_mapping())
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| k.as_str())
+            .filter(|k| k.starts_with("kernel-"))
+            .map(move |k| format!("{prefix}.{k}"))
+            .collect::<Vec<_>>()
+    };
+    let mut paths = keys(Some(raw), "rootfs".to_string());
+    if let Some(name) = selected {
+        paths.extend(keys(raw.get(name), format!("rootfs.{name}")));
+    }
+    paths
+}
+
+fn warn_ignored_rootfs_kernel_overrides(raw: &serde_yaml::Value, selected: Option<&str>) {
+    // Every rootfs reader resolves, so once per process.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let paths = rootfs_kernel_override_paths(raw, selected);
+    if paths.is_empty() {
+        return;
+    }
+    WARNED.call_once(|| {
+        print_warning(
+            &format!(
+                "`kernel-<spec>:` overrides in `rootfs:` are ignored (the kernel version isn't \
+                 known when the rootfs is resolved); only `target-<name>:` overrides are \
+                 honored: {}",
+                paths.join(", ")
+            ),
+            OutputLevel::Normal,
+        )
+    });
+}
+
+/// The rootfs a build reads; see [`Config::resolve_rootfs`].
+#[derive(Debug, Clone)]
+pub struct ResolvedRootfs {
+    /// The selected entry with its overrides applied: what install and the
+    /// image step read, and what the image stamp hashes.
+    pub node: serde_yaml::Value,
+    /// `node`, typed, except that a runtime's inline `rootfs:` block supplies
+    /// `permissions`.
+    pub config: ImageConfig,
+}
+
+/// The rootfs image filesystem: `erofs-lz4` when unset or without a rootfs.
+pub fn rootfs_filesystem(rootfs: Option<&ResolvedRootfs>) -> String {
+    rootfs
+        .and_then(|r| r.config.filesystem.clone())
+        .unwrap_or_else(|| "erofs-lz4".to_string())
+}
+
 /// Custom deserializer for top-level `rootfs:` field.
 fn deserialize_rootfs_map<'de, D>(
     deserializer: D,
@@ -218,19 +376,7 @@ fn deserialize_rootfs_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(
-        deserializer,
-        &[
-            "packages",
-            "dependencies",
-            "filesystem",
-            "overlay",
-            "image",
-            "post_install",
-            "permissions",
-        ],
-        "rootfs",
-    )
+    named_or_single_deserializer::deserialize(deserializer, IMAGE_CONFIG_FIELDS, "rootfs", false)
 }
 
 /// Custom deserializer for top-level `initramfs:` field.
@@ -240,19 +386,7 @@ fn deserialize_initramfs_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(
-        deserializer,
-        &[
-            "packages",
-            "dependencies",
-            "filesystem",
-            "overlay",
-            "image",
-            "post_install",
-            "permissions",
-        ],
-        "initramfs",
-    )
+    named_or_single_deserializer::deserialize(deserializer, IMAGE_CONFIG_FIELDS, "initramfs", true)
 }
 
 /// Custom deserializer for top-level `permissions:` field. Accepts either a
@@ -265,7 +399,12 @@ fn deserialize_permissions_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(deserializer, &["users", "groups"], "permissions")
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["users", "groups"],
+        "permissions",
+        true,
+    )
 }
 
 /// Custom deserializer module for container_args
@@ -1837,7 +1976,11 @@ impl Config {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.rootfs.as_ref()? {
             ImageRef::Inline(c) => Some(c.as_ref()),
-            ImageRef::Named(name) => self.rootfs.as_ref()?.get(name),
+            ImageRef::Named(_) => self
+                .select_rootfs_entry(Some(runtime_name))
+                .ok()
+                .flatten()
+                .map(|(_, c)| c),
         }
     }
 
@@ -3359,6 +3502,105 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
+    /// [`Self::merge_values`], except a `replaced` key the override sets
+    /// replaces the base's value whole instead of merging into it.
+    fn merge_override(
+        &self,
+        mut base: serde_yaml::Value,
+        over: serde_yaml::Value,
+        replaced: &[&str],
+    ) -> serde_yaml::Value {
+        if let (Some(base_map), Some(over_map)) = (base.as_mapping_mut(), over.as_mapping()) {
+            for key in replaced {
+                if over_map.contains_key(*key) {
+                    base_map.remove(*key);
+                }
+            }
+        }
+        self.merge_values(base, over)
+    }
+
+    /// The one place a rootfs entry is chosen: the entry `runtime` names with
+    /// `rootfs: <name>`, else the `default` entry, else the only one. A flat
+    /// `rootfs:` block is the implicit `default`. `None` when no entry is
+    /// selectable; an unresolved runtime ref is an error.
+    fn select_rootfs_entry(&self, runtime: Option<&str>) -> Result<Option<(&str, &ImageConfig)>> {
+        let entry = match runtime.zip(self.runtime_rootfs_ref(runtime)) {
+            Some((rt, ImageRef::Named(name))) => Some(
+                self.rootfs
+                    .as_ref()
+                    .and_then(|m| m.get_key_value(name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(format_unresolved_ref_error(
+                            rt,
+                            "rootfs",
+                            name,
+                            self.rootfs.as_ref(),
+                        ))
+                    })?,
+            ),
+            _ => get_default_or_singleton_entry(self.rootfs.as_ref()),
+        };
+        Ok(entry.map(|(name, config)| (name.as_str(), config)))
+    }
+
+    fn runtime_rootfs_ref(&self, runtime: Option<&str>) -> Option<&ImageRef> {
+        self.runtimes.as_ref()?.get(runtime?)?.rootfs.as_ref()
+    }
+
+    /// The rootfs `runtime` builds for `target` (the default or only entry
+    /// when `runtime` is `None` or names no entry). Every rootfs reader goes
+    /// through this, so install, the image step and both stamps agree on the
+    /// entry and on its overrides. `None` when there is no `rootfs:` section.
+    ///
+    /// Precedence, lowest first: the entry, a `target-<name>:` block beside
+    /// the named entries, the entry's own `target-<name>:` block. Package maps
+    /// and `image:` blocks merge key by key; `overlay`, `permissions` and
+    /// scalar fields replace. The `dependencies` alias is folded into `packages` only when
+    /// the section spells it both ways, so a flat section hashes as before.
+    pub fn resolve_rootfs(
+        &self,
+        composed: &serde_yaml::Value,
+        target: &str,
+        runtime: Option<&str>,
+    ) -> Result<Option<ResolvedRootfs>> {
+        let mut raw = match composed.get("rootfs") {
+            None | Some(serde_yaml::Value::Null) => return Ok(None),
+            Some(raw) => raw.clone(),
+        };
+        if mixes_packages_spellings(&raw) {
+            normalize_packages_alias(&mut raw);
+        }
+        let selected = self.select_rootfs_entry(runtime)?.map(|(name, _)| name);
+        warn_ignored_rootfs_kernel_overrides(&raw, selected);
+        let node = match raw.as_mapping_mut() {
+            Some(map) if rootfs_is_named_form(map) => {
+                let entry = selected
+                    .and_then(|name| map.get(name).cloned())
+                    .filter(|entry| !entry.is_null())
+                    .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+                map.retain(|k, _| k.as_str().is_some_and(is_override_key));
+                let enclosing = self.resolve_overrides_replacing(
+                    raw,
+                    target,
+                    None,
+                    "rootfs",
+                    ROOTFS_REPLACED_KEYS,
+                );
+                self.merge_override(entry, enclosing, ROOTFS_REPLACED_KEYS)
+            }
+            _ => raw,
+        };
+        let node =
+            self.resolve_overrides_replacing(node, target, None, "rootfs", ROOTFS_REPLACED_KEYS);
+        let mut config: ImageConfig = serde_yaml::from_value(node.clone())
+            .context("Failed to read the resolved rootfs configuration")?;
+        if let Some(ImageRef::Inline(inline)) = self.runtime_rootfs_ref(runtime) {
+            config.permissions = inline.permissions.clone();
+        }
+        Ok(Some(ResolvedRootfs { node, config }))
+    }
+
     /// Pull a top-level image section (`rootfs` / `initramfs` / `kernel`) out of
     /// a composed value and fold in its `target-<name>:` overrides for `target`.
     ///
@@ -3430,6 +3672,19 @@ impl Config {
         current_target: &str,
         resolved_kver: Option<&str>,
         section_path: &str,
+    ) -> serde_yaml::Value {
+        self.resolve_overrides_replacing(value, current_target, resolved_kver, section_path, &[])
+    }
+
+    /// [`Self::resolve_overrides_in_value`], with `replaced` keys taken whole
+    /// from a matched block (see [`Self::merge_override`]).
+    fn resolve_overrides_replacing(
+        &self,
+        value: serde_yaml::Value,
+        current_target: &str,
+        resolved_kver: Option<&str>,
+        section_path: &str,
+        replaced: &[&str],
     ) -> serde_yaml::Value {
         let mut map = match value {
             serde_yaml::Value::Mapping(m) => m,
@@ -3507,23 +3762,29 @@ impl Config {
         }
 
         let mut merged = serde_yaml::Value::Mapping(map);
+        let resolve = |v| {
+            self.resolve_overrides_replacing(
+                v,
+                current_target,
+                resolved_kver,
+                section_path,
+                replaced,
+            )
+        };
         if let Some(v) = legacy_target_match {
             // Recurse so override keys nested inside the target block (e.g.
             // kernel-<spec>:) resolve against the same target + kernel instead
             // of leaking through as literal keys.
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         if let Some(v) = target_match {
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         for v in kernel_matches {
             // Same recursion as the target blocks above: a matched kernel block
             // may nest its own override keys (target-<name>:, or a narrower
             // kernel-<spec>:), which must resolve rather than leak.
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         merged
     }
@@ -3840,15 +4101,11 @@ impl Config {
                 None
             }
         });
-        let rootfs_ref = self.rootfs.as_ref().and_then(|m| {
-            if m.contains_key("default") {
-                Some(ImageRef::Named("default".to_string()))
-            } else if m.len() == 1 {
-                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
-            } else {
-                None
-            }
-        });
+        let rootfs_ref = self
+            .select_rootfs_entry(None)
+            .ok()
+            .flatten()
+            .map(|(name, _)| ImageRef::Named(name.to_string()));
         let initramfs_ref = self.initramfs.as_ref().and_then(|m| {
             if m.contains_key("default") {
                 Some(ImageRef::Named("default".to_string()))
@@ -4688,7 +4945,10 @@ impl Config {
     /// `default`, or — when only one entry exists — that single entry).
     /// Returns `None` when no rootfs is defined.
     pub fn rootfs_default(&self) -> Option<&ImageConfig> {
-        get_default_or_singleton(self.rootfs.as_ref())
+        self.select_rootfs_entry(None)
+            .ok()
+            .flatten()
+            .map(|(_, c)| c)
     }
 
     /// Get the default initramfs definition from top-level config.
@@ -4711,8 +4971,14 @@ impl Config {
         &self,
         parsed: Option<&serde_yaml::Value>,
         target: &str,
-    ) -> HashMap<String, serde_yaml::Value> {
-        let mut packages = match self.rootfs_default().and_then(|r| r.packages.clone()) {
+    ) -> Result<HashMap<String, serde_yaml::Value>> {
+        let declared = match parsed {
+            Some(parsed) => self
+                .resolve_rootfs(parsed, target, None)?
+                .and_then(|r| r.config.packages),
+            None => self.rootfs_default().and_then(|r| r.packages.clone()),
+        };
+        let mut packages = match declared {
             Some(packages) => packages,
             None => {
                 let mut default = HashMap::new();
@@ -4729,7 +4995,7 @@ impl Config {
                 .entry("cryptsetup-var-udev".to_string())
                 .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
-        packages
+        Ok(packages)
     }
 
     /// Runtimes built for `target` that opt into `var.encrypt: true`.
@@ -4855,14 +5121,6 @@ impl Config {
                 .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
         packages
-    }
-
-    /// Get rootfs filesystem format from top-level config.
-    /// Defaults to `"erofs-lz4"` when the section or field is absent.
-    pub fn get_rootfs_filesystem(&self) -> String {
-        self.rootfs_default()
-            .and_then(|r| r.filesystem.clone())
-            .unwrap_or_else(|| "erofs-lz4".to_string())
     }
 
     /// Get initramfs filesystem format from top-level config.
@@ -13088,6 +13346,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(!config
             .get_rootfs_packages(None, "jetson-orin-nx")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
     }
 
@@ -13123,6 +13382,7 @@ runtimes:
         assert_eq!(
             config
                 .get_rootfs_packages(None, "jetson-orin-nx")
+                .unwrap()
                 .get("cryptsetup-var-udev"),
             Some(&serde_yaml::Value::String("*".to_string()))
         );
@@ -13196,6 +13456,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(!config
             .get_rootfs_packages(None, "qemux86-64")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
         assert!(config
             .get_initramfs_packages(None, "jetson-orin-nx")
@@ -13297,6 +13558,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(config
             .get_rootfs_packages(Some(&parsed), "jetson-orin-nx")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
 
         // An override for another target does not leak in, and the typed
@@ -13652,8 +13914,9 @@ rootfs:
         assert!(config.rootfs.as_ref().unwrap().contains_key("default"));
         let rfs = config.rootfs_default().unwrap();
         assert_eq!(rfs.filesystem.as_deref(), Some("erofs-lz4"));
-        // Existing accessors keep working.
-        assert_eq!(config.get_rootfs_filesystem(), "erofs-lz4");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml_single).unwrap();
+        let resolved = config.resolve_rootfs(&parsed, "qemux86-64", None).unwrap();
+        assert_eq!(rootfs_filesystem(resolved.as_ref()), "erofs-lz4");
 
         // Named-map form
         let yaml_named = r#"
@@ -13806,12 +14069,80 @@ kernel:
         assert!(kernel.contains_key("kernel-mainline"));
     }
 
+    /// Beside named rootfs entries, `target-*` / `kernel-*` keys are override
+    /// blocks to the typed config as to the resolver: never entries, never a
+    /// runtime's `rootfs:` ref.
+    #[test]
+    fn regression_rootfs_override_keys_are_not_entries() {
+        let yaml = "rootfs:\n  custom: {filesystem: erofs-zst}\n  target-qemux86-64: {packages: {extra: '*'}}\n  kernel-6.6: {packages: {k: '*'}}\nruntimes:\n  dev:\n    rootfs: target-qemux86-64\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let entries: Vec<&String> = config.rootfs.as_ref().unwrap().keys().collect();
+        assert_eq!(entries, vec!["custom"]);
+        let err = config.validate_runtime_refs().unwrap_err().to_string();
+        assert!(err.contains("per-target override block"), "{err}");
+        assert!(err.contains("Available: custom"), "{err}");
+    }
+
+    #[test]
+    fn rootfs_kernel_overrides_are_reported() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "default: {kernel-6.6: {}, target-x: {}}\nother: {kernel-6.1: {}}\nkernel-6.6: {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rootfs_kernel_override_paths(&raw, Some("default")),
+            vec!["rootfs.kernel-6.6", "rootfs.default.kernel-6.6"]
+        );
+        let flat: serde_yaml::Value = serde_yaml::from_str("packages: {}\ntarget-x: {}\n").unwrap();
+        assert!(rootfs_kernel_override_paths(&flat, Some("default")).is_empty());
+    }
+
+    /// The selected entry, its overrides, and the inline runtime block's
+    /// permissions all come from `resolve_rootfs`.
+    #[test]
+    fn resolve_rootfs_selects_per_runtime() {
+        let yaml = "rootfs:\n  default:\n    filesystem: erofs-lz4\n    post_install: a.sh\n  minimal:\n    filesystem: erofs-zst\n    target-qemux86-64: {post_install: m.sh}\n  target-qemux86-64: {post_install: beside.sh, packages: {extra: '*'}}\nruntimes:\n  dev: {rootfs: minimal}\n  inline:\n    rootfs: {permissions: ops}\n  plain: {}\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let resolve = |rt: Option<&str>, target: &str| {
+            config.resolve_rootfs(&parsed, target, rt).unwrap().unwrap()
+        };
+        let dev = resolve(Some("dev"), "qemux86-64");
+        assert_eq!(get_post_install(Some(&dev.node)).as_deref(), Some("m.sh"));
+        assert_eq!(rootfs_filesystem(Some(&dev)), "erofs-zst");
+        assert!(dev.config.packages.unwrap().contains_key("extra"));
+        let arm = resolve(Some("dev"), "qemuarm64");
+        assert_eq!(get_post_install(Some(&arm.node)), None);
+        for rt in [None, Some("plain"), Some("inline")] {
+            let r = resolve(rt, "qemux86-64");
+            assert_eq!(
+                get_post_install(Some(&r.node)).as_deref(),
+                Some("beside.sh")
+            );
+        }
+        assert!(matches!(
+            resolve(Some("inline"), "qemux86-64").config.permissions,
+            Some(PermissionsRef::Named(ref p)) if p == "ops"
+        ));
+        assert!(resolve(None, "qemux86-64").config.permissions.is_none());
+    }
+
+    /// `dependencies` is folded into `packages` only when the section spells
+    /// it both ways; a consistent flat section is hashed as written.
+    #[test]
+    fn resolve_rootfs_keeps_a_consistent_alias_as_written() {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str("rootfs:\n  dependencies: {base: '*'}\n").unwrap();
+        let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let r = config.resolve_rootfs(&parsed, "x", None).unwrap().unwrap();
+        assert_eq!(r.node, parsed["rootfs"]);
+        assert!(r.config.packages.unwrap().contains_key("base"));
+    }
+
     #[test]
     fn test_per_target_only_section_parses() {
-        // A section with only `target-<name>:` sub-keys and no shared base field
-        // has no recognized config fields, so it parses as a named map (matching
-        // pre-override behavior) rather than hard-erroring. The image commands
-        // still resolve the per-target override on the raw composed value.
+        // A rootfs section with only `target-<name>:` sub-keys is one block
+        // with no base fields: the override keys are never entries.
         let yaml = r#"
 rootfs:
   target-qemux86-64:
@@ -13823,8 +14154,18 @@ rootfs:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let rootfs = config.rootfs.as_ref().unwrap();
-        assert_eq!(rootfs.len(), 2);
-        assert!(rootfs.contains_key("target-qemux86-64"));
+        assert_eq!(rootfs.len(), 1);
+        assert!(rootfs.contains_key("default"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let node = config
+            .resolve_rootfs(&parsed, "qemuarm64", None)
+            .unwrap()
+            .unwrap()
+            .node;
+        assert_eq!(
+            get_ext_image_args(&node).as_deref(),
+            Some("-b -t kos.layer.rootfs --tag qemu-arm64")
+        );
     }
 
     #[test]
@@ -14496,7 +14837,8 @@ rootfs:
         let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
         let pkgs = composed
             .config
-            .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4");
+            .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4")
+            .unwrap();
         assert!(
             pkgs.contains_key("avocado-pkg-rootfs"),
             "fragment's rootfs.packages must merge in"
@@ -14505,8 +14847,12 @@ rootfs:
             pkgs.contains_key("packagegroup-kos-rootfs"),
             "fragment's rootfs.packages must merge in"
         );
+        let resolved = composed
+            .config
+            .resolve_rootfs(&composed.merged_value, "raspberrypi4", None)
+            .unwrap();
         assert_eq!(
-            composed.config.get_rootfs_filesystem(),
+            rootfs_filesystem(resolved.as_ref()),
             "erofs-lz4",
             "fragment's filesystem must merge in"
         );
@@ -14561,10 +14907,15 @@ rootfs:
             composed
                 .config
                 .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4")
+                .unwrap()
                 .contains_key("avocado-pkg-rootfs"),
             "rootfs source.path must resolve relative to src_dir (repo root), not the config dir"
         );
-        assert_eq!(composed.config.get_rootfs_filesystem(), "erofs-lz4");
+        let resolved = composed
+            .config
+            .resolve_rootfs(&composed.merged_value, "raspberrypi4", None)
+            .unwrap();
+        assert_eq!(rootfs_filesystem(resolved.as_ref()), "erofs-lz4");
     }
 
     #[test]

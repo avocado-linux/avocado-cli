@@ -4,7 +4,7 @@ use crate::commands::rootfs::install::{
     compute_sysroot_install_inputs, sysroot_packages, SysrootStampContext,
 };
 use crate::commands::sdk::SdkCompileCommand;
-use crate::utils::config::get_post_install;
+use crate::utils::config::{get_post_install, rootfs_filesystem};
 use crate::utils::snapshot::pinned_releasever;
 use crate::utils::{
     config::{ComposedConfig, Config, ImageConfig},
@@ -296,7 +296,8 @@ impl RuntimeBuildCommand {
             (StampComponent::Rootfs, SysrootType::Rootfs),
             (StampComponent::Initramfs, SysrootType::Initramfs),
         ] {
-            let Some(packages) = sysroot_packages(config, &sysroot_type, target_arch, Some(parsed))
+            let Some(packages) =
+                sysroot_packages(config, &sysroot_type, target_arch, Some(parsed))?
             else {
                 continue;
             };
@@ -319,6 +320,58 @@ impl RuntimeBuildCommand {
             }
         }
         Ok(inputs)
+    }
+
+    /// What the runtime build hash reads: extension boot settings resolved
+    /// for the target, and `rootfs` as the node this runtime's image step
+    /// reads.
+    fn build_hash_view(
+        &self,
+        config: &Config,
+        parsed: &serde_yaml::Value,
+        target_arch: &str,
+    ) -> Result<serde_yaml::Value> {
+        let mut view = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+            config,
+            parsed,
+            target_arch,
+        );
+        let rootfs = config.resolve_rootfs(parsed, target_arch, Some(&self.runtime_name))?;
+        if let (Some(rootfs), Some(map)) = (rootfs, view.as_mapping_mut()) {
+            map.insert("rootfs".into(), rootfs.node);
+        }
+        Ok(view)
+    }
+
+    fn sysroot_image_inputs(
+        &self,
+        composed: &ComposedConfig,
+        section: &str,
+        target_arch: &str,
+        install_digest: &str,
+    ) -> Result<Option<StampInputs>> {
+        let config = &composed.config;
+        let parsed = &composed.merged_value;
+        let project_root = config.project_root(&self.config_path);
+        let resolved = if section == "rootfs" {
+            config
+                .resolve_rootfs(parsed, target_arch, Some(&self.runtime_name))?
+                .map(|r| r.node)
+        } else {
+            config.resolve_image_section(parsed, section, target_arch)
+        };
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        let inputs = crate::utils::stamps::compute_sysroot_image_input_hash(
+            section,
+            &resolved,
+            install_digest,
+            parsed,
+            Some(&self.runtime_name),
+            &project_root,
+        )?;
+        Ok(Some(inputs))
     }
 
     /// Internal implementation of the build logic
@@ -430,33 +483,23 @@ impl RuntimeBuildCommand {
                 else {
                     continue; // install stamp absent or pre-digest: never reuse
                 };
-                let Some(resolved) = config.resolve_image_section(parsed, section, target_arch)
+                let Some(inputs) =
+                    self.sysroot_image_inputs(composed, section, target_arch, &install_digest)?
                 else {
                     continue;
                 };
-                let inputs = crate::utils::stamps::compute_sysroot_image_input_hash(
-                    section,
-                    &resolved,
-                    &install_digest,
-                    parsed,
-                    Some(&self.runtime_name),
-                    &project_root,
-                )?;
                 *flag = crate::utils::stamps::own_stamp_is_current(batch, req, &inputs);
                 if let Some(h) = crate::utils::stamps::content_hash_from_batch(batch, req) {
                     upstream_image_hashes.insert(format!("{section}.image"), h);
                 }
                 image_inputs.push((section, inputs));
             }
+            let build_view = self.build_hash_view(config, parsed, target_arch)?;
             let build_inputs = merged_runtime.as_ref().and_then(|mr| {
                 compute_runtime_build_input_hash(
                     mr,
                     &self.runtime_name,
-                    &crate::utils::device_tree_overlay::with_boot_settings_for_target(
-                        config,
-                        parsed,
-                        target_arch,
-                    ),
+                    &build_view,
                     &project_root,
                     &upstream_image_hashes,
                 )
@@ -841,10 +884,15 @@ impl RuntimeBuildCommand {
         // host, bind-mount it into the container at /tmp/kab.keyset, and
         // set the env var inside.
         let kab_keyset_host_path: Option<String> = {
-            let any_kab = ["rootfs", "initramfs", "kernel"].iter().any(|k| {
-                parsed
-                    .get(*k)
-                    .and_then(crate::utils::config::get_ext_image_type)
+            let rootfs = config.resolve_rootfs(parsed, target_arch, Some(&self.runtime_name))?;
+            let any_kab = [
+                rootfs.as_ref().map(|r| &r.node),
+                parsed.get("initramfs"),
+                parsed.get("kernel"),
+            ]
+            .into_iter()
+            .any(|node| {
+                node.and_then(crate::utils::config::get_ext_image_type)
                     .as_deref()
                     == Some("kab")
             });
@@ -1061,11 +1109,7 @@ impl RuntimeBuildCommand {
             let inputs = compute_runtime_build_input_hash(
                 &merged_runtime,
                 &self.runtime_name,
-                &crate::utils::device_tree_overlay::with_boot_settings_for_target(
-                    config,
-                    parsed,
-                    target_arch,
-                ),
+                &self.build_hash_view(config, parsed, target_arch)?,
                 &config.project_root(&self.config_path),
                 &upstream_image_hashes,
             )?;
@@ -1090,7 +1134,11 @@ impl RuntimeBuildCommand {
                     image_reuse.initramfs
                 };
                 let filesystem = if *section == "rootfs" {
-                    config.get_rootfs_filesystem()
+                    rootfs_filesystem(
+                        config
+                            .resolve_rootfs(parsed, target_arch, Some(&self.runtime_name))?
+                            .as_ref(),
+                    )
                 } else {
                     config.get_initramfs_filesystem()
                 };
@@ -1797,8 +1845,10 @@ fi"#
         // per-target `target-<name>:` overrides (e.g. a custom `--tag`) to match
         // the standalone `avocado <role> image` commands. Resolving once here
         // means every reader below (image type/args *and* `post_install`) sees
-        // the same per-target node instead of the raw section.
-        let rootfs_section = config.resolve_image_section(parsed, "rootfs", target_arch);
+        // the same per-target node instead of the raw section. The rootfs is
+        // the entry this runtime selects.
+        let rootfs = config.resolve_rootfs(parsed, target_arch, Some(&self.runtime_name))?;
+        let rootfs_section = rootfs.as_ref().map(|r| &r.node);
         let initramfs_section = config.resolve_image_section(parsed, "initramfs", target_arch);
         let kernel_section = config.resolve_image_section(parsed, "kernel", target_arch);
 
@@ -1812,7 +1862,7 @@ fi"#
             let a = section.and_then(crate::utils::config::get_ext_image_args);
             (t, a)
         };
-        let (rootfs_image_type, rootfs_image_args) = resolve_img(rootfs_section.as_ref());
+        let (rootfs_image_type, rootfs_image_args) = resolve_img(rootfs_section);
         let (initramfs_image_type, initramfs_image_args) = resolve_img(initramfs_section.as_ref());
         let (kernel_image_type, kernel_image_args) = resolve_img(kernel_section.as_ref());
 
@@ -2456,26 +2506,19 @@ fi"#
             render_users_groups_script(users.as_ref(), groups.as_ref(), etc_dir, None)
         };
 
-        // When the runtime doesn't declare its own `rootfs:` / `initramfs:`
-        // ref, fall back to the top-level default entry — same fallback the
-        // image build itself uses to find filesystem/post_install settings.
-        // Without this fallback, projects that only set permissions at the
-        // top level (the common case) silently get no permissions baked
-        // into the work dir.
-        let resolved_rootfs = config
-            .resolve_runtime_rootfs(&self.runtime_name)
-            .or_else(|| config.rootfs_default());
+        // When the runtime doesn't declare its own `initramfs:` ref, fall back
+        // to the top-level default entry. Without this fallback, projects that
+        // only set permissions at the top level (the common case) silently get
+        // no permissions baked into the work dir. The rootfs gets the same
+        // fallback from `resolve_rootfs`.
         let resolved_initramfs = config
             .resolve_runtime_initramfs(&self.runtime_name)
             .or_else(|| config.initramfs_default());
 
-        // Read `post_install` from the per-target-resolved section (not raw
-        // `parsed`) so a `target-<name>:` override's script is honored, matching
-        // how the image tag override is applied above.
-        let rootfs_post_install = get_post_install(rootfs_section.as_ref());
-        let rootfs_permissions_section = render_perms(resolved_rootfs, "$ROOTFS_WORK/etc");
+        let rootfs_post_install = get_post_install(rootfs_section);
+        let rootfs_permissions_section =
+            render_perms(rootfs.as_ref().map(|r| &r.config), "$ROOTFS_WORK/etc");
         let rootfs_verity = rootfs_section
-            .as_ref()
             .map(crate::utils::config::get_ext_image_verity)
             .transpose()
             .context("rootfs")?
@@ -2488,7 +2531,7 @@ fi"#
                 lock.get_kernel_version(target_arch, &SysrootType::Rootfs)
                     .cloned()
             });
-        let rootfs_fs = config.get_rootfs_filesystem();
+        let rootfs_fs = rootfs_filesystem(rootfs.as_ref());
         let rootfs_output = format!("$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{rootfs_fs}");
         let rootfs_build_section = crate::commands::rootfs::image::gate_image_section(
             &generate_rootfs_build_script(
@@ -4018,6 +4061,438 @@ mod tests {
 
     const REPO_URL: &str = "https://example.invalid/feed";
 
+    #[test]
+    fn regression_named_rootfs_hook_invalidates_image_stamp() {
+        use crate::utils::stamps::{own_stamp_is_current, StampRequirement};
+
+        let tmp = TempDir::new().unwrap();
+        let yaml = r#"
+default_target: qemux86-64
+rootfs:
+  default:
+    post_install: hook.sh
+runtimes:
+  prod: {}
+"#;
+        let path = create_test_config_file(&tmp, yaml);
+        let target = "qemux86-64";
+        let composed = Config::load_composed(&path, Some(target)).unwrap();
+        let command = RuntimeBuildCommand::new("prod".into(), path, false, None, None, None);
+        let script = tmp.path().join("hook.sh");
+        fs::write(&script, "echo original\n").unwrap();
+        let image_inputs = || {
+            command
+                .sysroot_image_inputs(&composed, "rootfs", target, "sha256:install")
+                .unwrap()
+                .unwrap()
+        };
+        let inputs = image_inputs();
+        let req = StampRequirement::rootfs_image("prod");
+        let stamp = Stamp::rootfs_image("prod", target, inputs.clone(), StampOutputs::default());
+        let batch = format!(
+            "{}:::{}\n",
+            req.relative_path(),
+            serde_json::to_string(&stamp).unwrap()
+        );
+        assert!(own_stamp_is_current(&batch, &req, &inputs));
+
+        fs::write(&script, "echo edited\n").unwrap();
+        assert!(
+            !own_stamp_is_current(&batch, &req, &image_inputs()),
+            "editing a named rootfs hook must invalidate the image with an unchanged install digest"
+        );
+    }
+
+    #[test]
+    fn regression_flat_rootfs_hook_hash_is_unchanged() {
+        use crate::utils::overlay_preprocess::path_content_digest;
+        use crate::utils::stamps::compute_config_hash;
+
+        let tmp = TempDir::new().unwrap();
+        let yaml = r#"
+default_target: qemux86-64
+rootfs:
+  filesystem: erofs
+  post_install: hook.sh
+runtimes:
+  prod: {}
+"#;
+        let path = create_test_config_file(&tmp, yaml);
+        fs::write(tmp.path().join("hook.sh"), "echo original\n").unwrap();
+        let target = "qemux86-64";
+        let composed = Config::load_composed(&path, Some(target)).unwrap();
+        let command = RuntimeBuildCommand::new("prod".into(), path, false, None, None, None);
+        let section = composed
+            .config
+            .resolve_image_section(&composed.merged_value, "rootfs", target)
+            .unwrap();
+        let direct_hook = section["post_install"].as_str().unwrap();
+        // The established layout: the direct hook and the whole section.
+        let mut hook = serde_yaml::Mapping::new();
+        hook.insert("path".into(), direct_hook.into());
+        hook.insert(
+            "content_sha256".into(),
+            path_content_digest(tmp.path(), direct_hook)
+                .unwrap()
+                .unwrap()
+                .into(),
+        );
+        let mut expected_data = serde_yaml::Mapping::new();
+        expected_data.insert(
+            "rootfs.install.content_hash".into(),
+            "sha256:install".into(),
+        );
+        expected_data.insert("rootfs.image_section".into(), section);
+        expected_data.insert("rootfs.post_install".into(), hook.into());
+        expected_data.insert("runtime".into(), "prod".into());
+        assert_eq!(
+            command
+                .sysroot_image_inputs(&composed, "rootfs", target, "sha256:install")
+                .unwrap()
+                .unwrap()
+                .config_hash,
+            compute_config_hash(&expected_data.into()).unwrap(),
+            "flat rootfs hooks must keep their existing hash bytes"
+        );
+    }
+
+    #[test]
+    fn regression_named_rootfs_permissions_invalidate_image_stamp() {
+        use crate::utils::stamps::{own_stamp_is_current, StampRequirement};
+
+        let tmp = TempDir::new().unwrap();
+        let yaml = r#"
+default_target: qemux86-64
+rootfs:
+  default: {}
+  production:
+    permissions:
+      users:
+        app: {uid: 1000}
+runtimes:
+  prod:
+    rootfs: production
+"#;
+        let path = create_test_config_file(&tmp, yaml);
+        let target = "qemux86-64";
+        let composed = Config::load_composed(&path, Some(target)).unwrap();
+        let command =
+            RuntimeBuildCommand::new("prod".into(), path.clone(), false, None, None, None);
+        let inputs = command
+            .sysroot_image_inputs(&composed, "rootfs", target, "sha256:install")
+            .unwrap()
+            .unwrap();
+        let req = StampRequirement::rootfs_image("prod");
+        let stamp = Stamp::rootfs_image("prod", target, inputs.clone(), StampOutputs::default());
+        let batch = format!(
+            "{}:::{}\n",
+            req.relative_path(),
+            serde_json::to_string(&stamp).unwrap()
+        );
+        assert!(own_stamp_is_current(&batch, &req, &inputs));
+
+        fs::write(&path, yaml.replace("uid: 1000", "uid: 1001")).unwrap();
+        let edited = Config::load_composed(&path, Some(target)).unwrap();
+        let edited_inputs = command
+            .sysroot_image_inputs(&edited, "rootfs", target, "sha256:install")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !own_stamp_is_current(&batch, &req, &edited_inputs),
+            "editing runtime-referenced rootfs permissions must invalidate its image stamp"
+        );
+
+        for config in [&composed, &edited] {
+            let selected = config
+                .config
+                .resolve_rootfs(&config.merged_value, target, Some("prod"))
+                .unwrap()
+                .unwrap()
+                .node;
+            assert!(selected.get("permissions").is_some(), "{selected:?}");
+            let plain_inputs = crate::utils::stamps::compute_sysroot_image_input_hash(
+                "rootfs",
+                &selected,
+                "sha256:install",
+                &config.merged_value,
+                Some("prod"),
+                tmp.path(),
+            )
+            .unwrap();
+            assert_eq!(
+                command
+                    .sysroot_image_inputs(config, "rootfs", target, "sha256:install")
+                    .unwrap()
+                    .unwrap()
+                    .config_hash,
+                plain_inputs.config_hash,
+                "the image stamp hashes the runtime's selected entry"
+            );
+        }
+    }
+
+    /// `create_build_script` for runtime `dev` on qemux86-64, from `yaml`
+    /// written into `tmp`.
+    fn dev_build_script(tmp: &TempDir, yaml: &str) -> String {
+        let path = create_test_config_file(tmp, yaml);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            path,
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        let config = Config::load(&cmd.config_path).unwrap();
+        cmd.create_build_script(
+            &config,
+            &parsed,
+            "qemux86-64",
+            &[],
+            SysrootImageReuse::default(),
+        )
+        .unwrap()
+    }
+
+    const DEV_RUNTIME_HEAD: &str = "sdk:\n  image: test-image\nconnect:\n  org: test\nruntimes:\n  dev:\n    target: qemux86-64\n";
+
+    /// A lone entry not named `default` stays selected beside a
+    /// `target-<name>:` block, for permissions and filesystem too.
+    #[test]
+    fn regression_lone_rootfs_entry_beside_target_block_keeps_permissions_and_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let yaml = format!(
+            "{DEV_RUNTIME_HEAD}rootfs:\n  custom:\n    filesystem: erofs-zst\n    permissions:\n      users:\n        appuser: {{uid: 1000}}\n  target-qemux86-64:\n    packages: {{extra: '*'}}\n"
+        );
+        let config = Config::load_from_str(&yaml).unwrap();
+        assert_eq!(
+            config.rootfs_default().unwrap().filesystem.as_deref(),
+            Some("erofs-zst")
+        );
+        let script = dev_build_script(&tmp, &yaml);
+        assert!(script.contains("avocado-image-rootfs-$TARGET_ARCH.erofs-zst"));
+        assert!(script.contains("appuser"));
+    }
+
+    /// A runtime's `rootfs: <name>` picks the hook along with the
+    /// permissions, and the image stamp hashes that same hook.
+    #[test]
+    fn regression_runtime_rootfs_ref_selects_the_hook() {
+        use crate::utils::stamps::{own_stamp_is_current, StampRequirement};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("hook.sh"), "echo original\n").unwrap();
+        let yaml = format!(
+            "default_target: qemux86-64\n{DEV_RUNTIME_HEAD}    rootfs: minimal\nrootfs:\n  default:\n    post_install: hook.sh\n  minimal:\n    permissions:\n      users:\n        appuser: {{uid: 1000}}\n"
+        );
+        let script = dev_build_script(&tmp, &yaml);
+        assert!(!script.contains("post_install script: hook.sh"));
+        assert!(script.contains("touch \"$ROOTFS_WORK/etc/machine-id\""));
+        assert!(script.contains("appuser"));
+
+        let path = tmp.path().join("avocado.yaml");
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        let command = RuntimeBuildCommand::new(
+            "dev".into(),
+            path.to_string_lossy().to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+        let image_inputs = || {
+            command
+                .sysroot_image_inputs(&composed, "rootfs", "qemux86-64", "sha256:install")
+                .unwrap()
+                .unwrap()
+        };
+        let inputs = image_inputs();
+        let req = StampRequirement::rootfs_image("dev");
+        let stamp =
+            Stamp::rootfs_image("dev", "qemux86-64", inputs.clone(), StampOutputs::default());
+        let batch = format!(
+            "{}:::{}\n",
+            req.relative_path(),
+            serde_json::to_string(&stamp).unwrap()
+        );
+        fs::write(tmp.path().join("hook.sh"), "echo edited\n").unwrap();
+        assert!(
+            own_stamp_is_current(&batch, &req, &image_inputs()),
+            "a hook the runtime's entry does not run must not invalidate its image"
+        );
+
+        let uses_default = yaml.replace("    rootfs: minimal\n", "    rootfs: default\n");
+        let script = dev_build_script(&tmp, &uses_default);
+        assert!(script.contains("post_install script: hook.sh"));
+        assert!(!script.contains("appuser"));
+    }
+
+    /// A named entry's `image:` and its own target block's are read.
+    #[test]
+    fn regression_named_rootfs_entry_image_settings_are_read() {
+        let tmp = TempDir::new().unwrap();
+        let yaml = format!(
+            "{DEV_RUNTIME_HEAD}rootfs:\n  default:\n    image: {{type: kab, args: '-z entry'}}\n    target-qemux86-64:\n      image: {{args: '-z board'}}\n  other: {{}}\n"
+        );
+        let script = dev_build_script(&tmp, &yaml);
+        assert!(script.contains("-z board"));
+        assert!(!script.contains("-z entry"));
+    }
+
+    /// For a flat `rootfs:` block the image stamp keeps main's bytes: the
+    /// section `resolve_image_section` returns, hook read from it.
+    #[test]
+    fn flat_rootfs_image_hash_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("hook.sh"), "echo original\n").unwrap();
+        fs::write(tmp.path().join("board.sh"), "echo board\n").unwrap();
+        let yaml = r#"
+default_target: qemux86-64
+permissions:
+  ops:
+    users:
+      ops: {uid: 1001}
+rootfs:
+  dependencies: {base: '*'}
+  filesystem: erofs-zst
+  overlay: {dir: overlay, mode: opaque}
+  post_install: hook.sh
+  permissions: ops
+  image: {type: kab, args: '-z base', verity: true}
+  kernel-6.6: {post_install: kernel.sh}
+  target-qemux86-64:
+    image: {args: '-z board'}
+    post_install: board.sh
+runtimes:
+  prod:
+    rootfs: default
+"#;
+        let path = create_test_config_file(&tmp, yaml);
+        let command =
+            RuntimeBuildCommand::new("prod".into(), path.clone(), false, None, None, None);
+        for target in ["qemux86-64", "qemuarm64"] {
+            let composed = Config::load_composed(&path, Some(target)).unwrap();
+            let main_section = composed
+                .config
+                .resolve_image_section(&composed.merged_value, "rootfs", target)
+                .unwrap();
+            let main = crate::utils::stamps::compute_sysroot_image_input_hash(
+                "rootfs",
+                &main_section,
+                "sha256:install",
+                &composed.merged_value,
+                Some("prod"),
+                tmp.path(),
+            )
+            .unwrap();
+            assert_eq!(
+                command
+                    .sysroot_image_inputs(&composed, "rootfs", target, "sha256:install")
+                    .unwrap()
+                    .unwrap(),
+                main,
+                "{target}"
+            );
+            let view = command
+                .build_hash_view(&composed.config, &composed.merged_value, target)
+                .unwrap();
+            let main_view = crate::utils::device_tree_overlay::with_boot_settings_for_target(
+                &composed.config,
+                &composed.merged_value,
+                target,
+            );
+            let runtime = serde_yaml::Value::Mapping(Default::default());
+            let hash = |view| {
+                compute_runtime_build_input_hash(
+                    &runtime,
+                    "prod",
+                    view,
+                    tmp.path(),
+                    &Default::default(),
+                )
+                .unwrap()
+            };
+            if target == "qemuarm64" {
+                // No override applies: the runtime build hash keeps main's bytes too.
+                assert_eq!(hash(&view), hash(&main_view));
+            }
+        }
+    }
+
+    /// Initramfs image stamps are untouched: still `resolve_image_section`'s
+    /// node with the hook read from it.
+    #[test]
+    fn initramfs_image_hash_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("hook.sh"), "echo original\n").unwrap();
+        let yaml = r#"
+default_target: qemux86-64
+initramfs:
+  filesystem: cpio.zst
+  post_install: hook.sh
+  image: {type: kab, args: '-z base'}
+  target-qemux86-64:
+    image: {args: '-z board'}
+rootfs:
+  default: {post_install: other.sh}
+runtimes:
+  prod: {}
+"#;
+        let path = create_test_config_file(&tmp, yaml);
+        let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+        let command = RuntimeBuildCommand::new("prod".into(), path, false, None, None, None);
+        let section = composed
+            .config
+            .resolve_image_section(&composed.merged_value, "initramfs", "qemux86-64")
+            .unwrap();
+        let main = crate::utils::stamps::compute_sysroot_image_input_hash(
+            "initramfs",
+            &section,
+            "sha256:install",
+            &composed.merged_value,
+            Some("prod"),
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            command
+                .sysroot_image_inputs(&composed, "initramfs", "qemux86-64", "sha256:install")
+                .unwrap()
+                .unwrap(),
+            main
+        );
+    }
+
+    /// The runtime build hash reads the rootfs `filesystem`/`image`/
+    /// `permissions` of the runtime's selected entry, so toggling a named
+    /// entry's verity rebuilds the runtime.
+    #[test]
+    fn named_rootfs_image_settings_reach_the_runtime_build_hash() {
+        let tmp = TempDir::new().unwrap();
+        let yaml = "default_target: qemux86-64\nrootfs:\n  default: {}\n  verity:\n    image: {verity: false}\nruntimes:\n  prod:\n    rootfs: verity\n";
+        let path = create_test_config_file(&tmp, yaml);
+        let command =
+            RuntimeBuildCommand::new("prod".into(), path.clone(), false, None, None, None);
+        let hash = || {
+            let composed = Config::load_composed(&path, Some("qemux86-64")).unwrap();
+            let view = command
+                .build_hash_view(&composed.config, &composed.merged_value, "qemux86-64")
+                .unwrap();
+            compute_runtime_build_input_hash(
+                &serde_yaml::Value::Mapping(Default::default()),
+                "prod",
+                &view,
+                tmp.path(),
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        let before = hash();
+        fs::write(&path, yaml.replace("verity: false", "verity: true")).unwrap();
+        assert_ne!(before, hash());
+    }
+
     /// A pinnable feed (`distro` release + channel) and no `src_dir`.
     const PINNED_CONFIG: &str = r#"
 default_target: qemux86-64
@@ -4235,6 +4710,7 @@ runtimes:
             "qemux86-64",
             Some(&composed.merged_value),
         )
+        .unwrap()
         .expect("rootfs packages");
         let want = compute_sysroot_install_inputs(
             &SysrootStampContext {
@@ -4438,6 +4914,7 @@ runtimes:
                 "qemux86-64",
                 Some(&composed.merged_value),
             )
+            .unwrap()
             .expect("sysroot packages");
             let inputs = compute_sysroot_install_inputs(
                 &SysrootStampContext {
@@ -5053,7 +5530,7 @@ runtimes:
 
         // The image's own os-release is required either way: the bundle and
         // the manifest take the build id from it, never from the sysroot.
-        let fs = Config::load_from_str(base).unwrap().get_rootfs_filesystem();
+        let fs = rootfs_filesystem(None);
         let sidecar = crate::commands::rootfs::image::rootfs_os_release_sidecar(&format!(
             "$OUTPUT_DIR/avocado-image-rootfs-$TARGET_ARCH.{fs}"
         ));
