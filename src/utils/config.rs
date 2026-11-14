@@ -823,8 +823,11 @@ impl ContainerConfig {
     /// The block as `docker run` flags.
     fn to_args(&self) -> Vec<String> {
         let mut args = Vec::new();
-        if self.privileged == Some(true) {
-            args.push("--privileged".to_string());
+        match self.privileged {
+            Some(true) => args.push("--privileged".to_string()),
+            // Spelled out, so it overrides an earlier `--privileged` in a merge.
+            Some(false) => args.push("--privileged=false".to_string()),
+            None => {}
         }
         if let Some(network) = &self.network_mode {
             args.push(format!("--network={network}"));
@@ -836,12 +839,12 @@ impl ContainerConfig {
             ("--cap-add", &self.cap_add),
         ] {
             for value in values.iter().flatten() {
-                args.extend([flag.to_string(), value.clone()]);
+                args.extend([flag.to_string(), atom(value)]);
             }
         }
         for (name, value) in self.environment.iter().flatten() {
             let value = value_to_string(value);
-            args.extend(["-e".to_string(), format!("{name}={value}")]);
+            args.extend(["-e".to_string(), atom(&format!("{name}={value}"))]);
         }
         args
     }
@@ -857,35 +860,60 @@ impl ContainerConfig {
             return args.clone();
         };
         let args = args.clone().unwrap_or_default();
-        // An entry is one argument or a whole `--flag value`; the value can
-        // also be the entry after.
-        let mut kept = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            let tokens = crate::utils::container::SdkContainer::parse_container_arg(&args[i]);
-            let (flag, value, joined) = match tokens.as_slice() {
-                [flag] => match flag.split_once('=') {
-                    Some((flag, value)) => (flag.to_string(), Some(value.to_string()), true),
-                    None => (flag.clone(), args.get(i + 1).cloned(), false),
-                },
-                [flag, value] => (flag.clone(), Some(value.clone()), true),
-                _ => (String::new(), None, true),
+        // Walk every argument of every entry, as the entries are split for
+        // docker, so a value in the next entry still pairs with its flag.
+        let tokens: Vec<(usize, String)> = args
+            .iter()
+            .enumerate()
+            .flat_map(|(i, entry)| {
+                crate::utils::container::SdkContainer::parse_container_arg(entry)
+                    .into_iter()
+                    .map(move |token| (i, token))
+            })
+            .collect();
+        let mut replaced = vec![false; tokens.len()];
+        let mut k = 0;
+        while k < tokens.len() {
+            let token = tokens[k].1.as_str();
+            let (flag, inline) = match token.split_once('=') {
+                Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+                _ if token.starts_with("-v") && token.len() > 2 => ("-v", Some(&token[2..])),
+                _ => (token, None),
             };
-            let replaced = match flag.as_str() {
-                "--privileged" => block.privileged.is_some(),
-                "--network" | "--net" => block.network_mode.is_some(),
-                "-v" | "--volume" => value.as_deref().is_some_and(|v| block.mounts_on(v)),
-                _ => false,
+            let value = inline.or(tokens.get(k + 1).map(|(_, t)| t.as_str()));
+            let (hit, valued) = match flag {
+                "--privileged" => (block.privileged.is_some(), false),
+                "--network" | "--net" => (block.network_mode.is_some(), true),
+                "-v" | "--volume" => (value.is_some_and(|v| block.mounts_on(v)), true),
+                _ => (false, false),
             };
-            let width = if replaced && !joined && flag != "--privileged" {
-                2
-            } else {
-                1
-            };
-            if !replaced {
-                kept.push(args[i].clone());
+            let width = if valued && inline.is_none() { 2 } else { 1 };
+            if hit {
+                let end = (k + width).min(tokens.len());
+                replaced[k..end].fill(true);
             }
-            i += width;
+            k += if hit { width } else { 1 };
+        }
+        // An entry nothing was taken from stays exactly as written.
+        let mut kept = Vec::new();
+        for (i, entry) in args.iter().enumerate() {
+            let mine = || {
+                tokens
+                    .iter()
+                    .zip(&replaced)
+                    .filter(move |((at, _), _)| *at == i)
+            };
+            if mine().all(|(_, gone)| !gone) {
+                kept.push(entry.clone());
+                continue;
+            }
+            let rest: Vec<String> = mine()
+                .filter(|(_, gone)| !**gone)
+                .map(|((_, token), _)| atom(token))
+                .collect();
+            if !rest.is_empty() {
+                kept.push(rest.join(" "));
+            }
         }
         kept.extend(block.to_args());
         Some(kept)
@@ -900,6 +928,17 @@ impl ContainerConfig {
                 .flatten()
                 .any(|v| target(v).as_ref() == Some(&t))
         })
+    }
+}
+
+/// One argument as a `container_args` entry: the entries are split on spaces
+/// outside double quotes, so a value with a space is quoted to stay whole.
+// ponytail: that splitter has no escape for `"` itself, so a value holding
+// one is still split; carry block values as argv end to end if that matters.
+fn atom(value: &str) -> String {
+    match value.contains(char::is_whitespace) {
+        true => format!("\"{value}\""),
+        false => value.to_string(),
     }
 }
 
@@ -8291,10 +8330,13 @@ sdk:
     - --privileged
     - --net
     - bridge
+    - --network bridge --init -v/dev:/dev --shm-size 1g
   container:
     privileged: false
     network_mode: none
     volumes: ["/dev:/dev"]
+    environment:
+      GREETING: hello world
 "#,
         );
         assert_eq!(
@@ -8304,11 +8346,40 @@ sdk:
                 "--group-add",
                 "a",
                 "--group-add b",
+                "--init --shm-size 1g",
+                "--privileged=false",
                 "--network=none",
                 "-v",
                 "/dev:/dev",
+                "-e",
+                "\"GREETING=hello world\"",
             ]
         );
+        // The quoted value survives the split the entries get on the way to
+        // docker.
+        assert_eq!(
+            crate::utils::container::SdkContainer::parse_container_arg("\"GREETING=hello world\""),
+            ["GREETING=hello world"]
+        );
+    }
+
+    #[test]
+    fn a_profile_can_turn_privileged_off() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container_args: ["--privileged"]
+provision_profiles:
+  safe:
+    container:
+      privileged: false
+"#,
+        )
+        .unwrap();
+        let merged = config
+            .merge_provision_container_args(Some("safe"), None)
+            .unwrap();
+        assert_eq!(merged, ["--privileged=false"]);
     }
 
     #[test]

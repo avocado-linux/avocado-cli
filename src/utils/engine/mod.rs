@@ -66,9 +66,11 @@ fn use_builtin(tool: &str) -> bool {
         && std::env::var_os(USE_CLI_ENV).is_none()
         // bollard is built without its TLS and ssh transports.
         && std::env::var_os("DOCKER_TLS_VERIFY").is_none()
+        && std::env::var_os("DOCKER_TLS").is_none()
         && reachable(
             std::env::var("DOCKER_HOST").ok().as_deref(),
-            context_host,
+            // A context that will not load is for `connect` to report.
+            || context_host().unwrap_or_default(),
         )
 }
 
@@ -189,10 +191,10 @@ fn describe(e: &anyhow::Error) -> String {
 async fn connect() -> Result<Docker> {
     // Same order as the docker CLI: DOCKER_HOST, then the selected context,
     // then the platform's default socket.
-    let host = std::env::var("DOCKER_HOST")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(context_host);
+    let host = match std::env::var("DOCKER_HOST").ok().filter(|h| !h.is_empty()) {
+        Some(host) => Some(host),
+        None => context_host()?,
+    };
     let unreachable = || {
         let at = host.as_deref().unwrap_or("the default socket");
         format!("Cannot connect to the Docker daemon at {at}. Is the docker daemon running?")
@@ -220,29 +222,37 @@ fn read_json(path: &std::path::Path) -> Option<Value> {
 
 /// Endpoint of the docker context in effect (`docker context use`), which is
 /// how Docker Desktop and rootless docker point clients at their sockets.
-fn context_host() -> Option<String> {
+/// `None` when no context is selected; an error, as with the docker CLI, when
+/// one is but cannot be read, rather than quietly using the default socket.
+fn context_host() -> Result<Option<String>> {
     use sha2::Digest;
-    let dir = docker_config_dir()?;
+    let Some(dir) = docker_config_dir() else {
+        return Ok(None);
+    };
     let name = std::env::var("DOCKER_CONTEXT")
         .ok()
         .filter(|c| !c.is_empty())
         .or_else(|| {
             let config = read_json(&dir.join("config.json"))?;
             Some(config.get("currentContext")?.as_str()?.to_string())
-        })?;
-    if name == "default" {
-        return None;
-    }
+        });
+    let Some(name) = name.filter(|name| name != "default") else {
+        return Ok(None);
+    };
     let id: String = sha2::Sha256::digest(name.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let meta = read_json(&dir.join("contexts/meta").join(id).join("meta.json"))?;
-    Some(
-        meta.pointer("/Endpoints/docker/Host")?
-            .as_str()?
-            .to_string(),
-    )
+    read_json(&dir.join("contexts/meta").join(id).join("meta.json"))
+        .and_then(|meta| {
+            Some(
+                meta.pointer("/Endpoints/docker/Host")?
+                    .as_str()?
+                    .to_string(),
+            )
+        })
+        .map(Some)
+        .with_context(|| format!("docker context \"{name}\" cannot be loaded"))
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +866,27 @@ mod tests {
         assert!(!reachable(None, ctx("tcp://far:2376")));
     }
 
+    /// The tests that point `DOCKER_CONFIG` somewhere take turns.
+    static DOCKER_CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_selected_context_that_will_not_load_is_an_error() {
+        let _env = DOCKER_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"currentContext":"gone"}"#,
+        )
+        .unwrap();
+        std::env::set_var("DOCKER_CONFIG", dir.path());
+        let err = context_host().unwrap_err();
+        std::env::remove_var("DOCKER_CONFIG");
+        assert!(err.to_string().contains("\"gone\""), "{err}");
+    }
+
     #[test]
     fn docker_hub_logins_are_found_however_the_image_names_the_hub() {
+        let _env = DOCKER_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
         use base64::Engine;
         let dir = tempfile::tempdir().unwrap();
         let auth = base64::engine::general_purpose::STANDARD.encode("hubuser:pw");

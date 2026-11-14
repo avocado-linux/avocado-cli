@@ -272,7 +272,7 @@ async fn forward_signals(docker: &Docker, id: &str) -> std::convert::Infallible 
         let signal = tokio::signal::ctrl_c().await.map_or("", |()| "SIGINT");
         if signal.is_empty() {
             // No handler could be installed; signals keep their default action.
-            return std::future::pending().await;
+            std::future::pending::<()>().await;
         }
         let options = q::KillContainerOptionsBuilder::new().signal(signal).build();
         let _ = docker.kill_container(id, Some(options)).await;
@@ -375,7 +375,7 @@ async fn follow_size(docker: Docker, target: Tty) {
 }
 
 /// `-e`/`--env-file` as the `NAME=value` list the daemon takes. A bare `NAME`
-/// passes this process's value through, or nothing when it has none.
+/// passes this process's value through, or stays bare when it has none.
 fn environment(a: &Parsed) -> Result<Vec<String>> {
     let mut env = Vec::new();
     for file in a.all("--env-file") {
@@ -389,13 +389,13 @@ fn environment(a: &Parsed) -> Result<Vec<String>> {
         );
     }
     env.extend(a.all("--env").map(String::from));
+    // A bare name takes the host's value; one the host does not have stays
+    // bare, which the daemon reads as unset, image default or not.
     Ok(env
         .into_iter()
-        .filter_map(|var| match var.contains('=') {
-            true => Some(var),
-            false => std::env::var(&var)
-                .ok()
-                .map(|value| format!("{var}={value}")),
+        .map(|var| match var.contains('=') {
+            true => var,
+            false => std::env::var(&var).map_or(var.clone(), |value| format!("{var}={value}")),
         })
         .collect())
 }
@@ -750,7 +750,11 @@ mod tests {
         assert_eq!(b["Entrypoint"], serde_json::json!(["/bin/sh"]));
         assert_eq!(
             b["Env"],
-            serde_json::json!(["A=1", "AVOCADO_ENGINE_TEST_INHERITED=from-env"])
+            serde_json::json!([
+                "A=1",
+                "AVOCADO_ENGINE_TEST_INHERITED=from-env",
+                "AVOCADO_ENGINE_TEST_UNSET"
+            ])
         );
         assert_eq!(b["OpenStdin"], true);
         assert_eq!(b["Tty"], false);
@@ -795,6 +799,18 @@ mod tests {
         assert_eq!(
             host["RestartPolicy"],
             serde_json::json!({"Name": "on-failure", "MaximumRetryCount": 3})
+        );
+    }
+
+    #[test]
+    fn privileged_false_is_not_privileged() {
+        assert_eq!(
+            body(&["--privileged=false", "image"])["HostConfig"]["Privileged"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body(&["--privileged", "image"])["HostConfig"]["Privileged"],
+            true
         );
     }
 
