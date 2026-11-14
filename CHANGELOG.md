@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
+  RPMs by running the host `createrepo_c`, regenerated on every run. It fails
+  with an error naming `createrepo_c` when the tool is not on PATH, and naming
+  the path when the directory is missing or not a directory. See
+  `docs/feed-index.md`.
 - **A snapshot pin identity covers the feed URL, and a pinned rebuild
   mentions newer snapshots.** A recorded pin now remembers the repository URL
   it came from (trailing slashes ignored), so pointing the config at a mirror
