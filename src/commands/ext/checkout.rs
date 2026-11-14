@@ -441,7 +441,7 @@ impl ExtCheckoutCommand {
             );
         }
 
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .arg("cp")
             .arg(&docker_cp_source)
             .arg(&docker_cp_dest)

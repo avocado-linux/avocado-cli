@@ -850,13 +850,13 @@ impl ExtImageCommand {
         let docker_cp_source = format!("{temp_container_id}:{container_image_path}");
         let docker_cp_dest = host_output_dir.join(image_filename);
 
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .args(["cp", &docker_cp_source, docker_cp_dest.to_str().unwrap()])
             .output()
             .await
             .context("Failed to run docker cp")?;
 
-        let _ = tokio::process::Command::new(container_tool)
+        let _ = crate::utils::engine::command(container_tool)
             .args(["rm", "-f", &temp_container_id])
             .output()
             .await;
@@ -874,7 +874,7 @@ impl ExtImageCommand {
         container_tool: &str,
         volume_name: &str,
     ) -> Result<String> {
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .args([
                 "create",
                 "--rm",

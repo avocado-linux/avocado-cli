@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The `docker` client no longer has to be installed.** `avocado` now talks
+  to the Docker daemon itself, over the Engine API, wherever it used to run
+  the `docker` command, so a host that reaches its daemon through an
+  avocado-vm needs nothing from Docker installed. `DOCKER_HOST` and the
+  current docker context are honoured as before. The `docker` command is
+  still what runs for `avocado container dev`, for `--runs-on` remotes, on
+  Windows, with a `--container-tool` other than `docker`, and when
+  `DOCKER_HOST` is an `ssh://` or TLS endpoint. Set `AVOCADO_DOCKER_CLI=1` to
+  use the `docker` command everywhere, as before.
 - **A snapshot pin identity covers the feed URL, and a pinned rebuild
   mentions newer snapshots.** A recorded pin now remembers the repository URL
   it came from (trailing slashes ignored), so pointing the config at a mirror

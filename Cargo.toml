@@ -41,10 +41,12 @@ tokio = { version = "1.0", features = [
     "time",
     "sync",
 ] }
-# `io` only, for ReaderStream: the registry streams stored blobs off disk instead
-# of sizing an allocation by the blob. Already in the tree transitively (axum,
-# tokio-tungstenite), so this adds an explicit edge rather than a new dependency.
-tokio-util = { version = "0.7", features = ["io"] }
+# `io` for ReaderStream: the registry streams stored blobs off disk instead of
+# sizing an allocation by the blob. `io-util` for SyncIoBridge: `docker cp`
+# unpacks the daemon's archive stream with the blocking tar reader. Already in
+# the tree transitively (axum, tokio-tungstenite), so this adds an explicit edge
+# rather than a new dependency.
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 thiserror = "2.0"
 directories = "6.0"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -99,6 +101,10 @@ rcgen = { version = "0.13", default-features = false, features = [
     "aws_lc_rs",
 ] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+# Docker Engine API client behind `utils::engine`, so container commands need
+# no docker CLI on the host. Default features only: unix socket, named pipe and
+# plain HTTP; no TLS or ssh transport.
+bollard = "0.21"
 
 [dev-dependencies]
 # `oneshot` drives the write router directly, so a body stream that ERRORS can be

@@ -590,7 +590,7 @@ echo "=== Checksum generation complete ==="
             &script,
         ];
 
-        let mut cmd = tokio::process::Command::new(run_cmd[0]);
+        let mut cmd = crate::utils::engine::command(run_cmd[0]);
         cmd.args(&run_cmd[1..]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -657,7 +657,7 @@ echo "=== Checksum generation complete ==="
             "true",
         ];
 
-        let mut cmd = tokio::process::Command::new(create_cmd[0]);
+        let mut cmd = crate::utils::engine::command(create_cmd[0]);
         cmd.args(&create_cmd[1..]);
         let output = cmd
             .output()
@@ -689,7 +689,7 @@ echo "=== Checksum generation complete ==="
 
             let cp_cmd = ["docker", "cp", &container_path, dest_path];
 
-            let mut cmd = tokio::process::Command::new(cp_cmd[0]);
+            let mut cmd = crate::utils::engine::command(cp_cmd[0]);
             cmd.args(&cp_cmd[1..]);
             let output = cmd.output().await?;
 
@@ -811,7 +811,7 @@ echo "=== Checksum generation complete ==="
     async fn cleanup_container(&self, container_name: &str) -> Result<()> {
         let rm_cmd = ["docker", "rm", "-f", container_name];
 
-        let mut cmd = tokio::process::Command::new(rm_cmd[0]);
+        let mut cmd = crate::utils::engine::command(rm_cmd[0]);
         cmd.args(&rm_cmd[1..]);
         let _ = cmd.output().await;
 
