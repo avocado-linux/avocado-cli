@@ -196,6 +196,34 @@ impl ExtFetchCommand {
         let lock_exists = LockFile::get_path(&lock_src_dir).exists()
             || LockFile::legacy_path(&lock_src_dir).exists();
 
+        // Probe the feeds before the first download. Only a package-sourced
+        // extension without `repo_name` that this run will fetch, or a pin the
+        // lock replays, is served from the extension repository. Later rounds
+        // probe again below if they reveal one.
+        let first_round_packages = package_source_names(&extensions_to_fetch);
+        let replays_implied_pin = lock_file
+            .implied_extension_sources(&target)
+            .iter()
+            .any(|(name, pin)| !first_round_packages.contains(name) && pin.version.is_some());
+        let installed_and_kept = |name: &str| {
+            !self.force
+                && !self.locked
+                && ExtensionFetcher::is_extension_installed(&extensions_dir, name)
+        };
+        config
+            .preflight_feeds_once(
+                &target,
+                &self.config_path,
+                &[crate::utils::feeds::FeedStage::Ext],
+                needs_extension_repo(
+                    &extensions_to_fetch,
+                    installed_and_kept,
+                    replays_implied_pin,
+                ),
+                self.runs_on.is_some(),
+            )
+            .await?;
+
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
             target.clone(),
@@ -446,6 +474,21 @@ impl ExtFetchCommand {
             // One transaction for every package-source extension. dnf resolves and
             // installs any dependency extensions beyond those named here.
             if !package_batch.is_empty() {
+                // Round 1 was probed before the first download. A later round
+                // that reveals a package extension without `repo_name` needs
+                // the extension repository too; the probe is cached per target
+                // once it has passed with it.
+                if round > 1 && package_batch.iter().any(|e| e.repo_name.is_none()) {
+                    config
+                        .preflight_feeds_once(
+                            &target,
+                            &self.config_path,
+                            &[crate::utils::feeds::FeedStage::Ext],
+                            true,
+                            self.runs_on.is_some(),
+                        )
+                        .await?;
+                }
                 print_info(
                     &format!(
                         "Fetching {} package extension(s) and their dependencies...",
@@ -822,6 +865,29 @@ fn locked_source_change(
     ))
 }
 
+/// True when the first round will hand dnf a package the extension repository
+/// has to serve: a package-source extension with no `repo_name` that is not
+/// skipped as already installed, or a lock-replayed implied pin, which carries
+/// no `repo_name` either. A `repo_name` makes dnf run with `--repo=<name>`,
+/// which never reads the extension repository, and a git or path source never
+/// reaches dnf.
+fn needs_extension_repo(
+    round: &[(String, ExtensionSource)],
+    skipped: impl Fn(&str) -> bool,
+    replays_implied_pin: bool,
+) -> bool {
+    replays_implied_pin
+        || round.iter().any(|(name, source)| {
+            matches!(
+                source,
+                ExtensionSource::Package {
+                    repo_name: None,
+                    ..
+                }
+            ) && !skipped(name)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,15 +910,74 @@ mod tests {
     }
 
     fn package(name: &str) -> (String, ExtensionSource) {
+        package_in(name, None)
+    }
+
+    fn package_in(name: &str, repo_name: Option<&str>) -> (String, ExtensionSource) {
         (
             name.to_string(),
             ExtensionSource::Package {
                 version: "*".to_string(),
                 package: None,
-                repo_name: None,
+                repo_name: repo_name.map(str::to_string),
                 include: None,
             },
         )
+    }
+
+    fn none_installed(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn needs_extension_repo_true_for_a_package_source_without_repo_name() {
+        let set = vec![
+            (
+                "local-path".to_string(),
+                ExtensionSource::Path {
+                    path: "../x".to_string(),
+                    include: None,
+                },
+            ),
+            package("pkg"),
+        ];
+        assert!(needs_extension_repo(&set, none_installed, false));
+    }
+
+    #[test]
+    fn needs_extension_repo_false_without_a_package_source() {
+        let set = vec![(
+            "local-path".to_string(),
+            ExtensionSource::Path {
+                path: "../x".to_string(),
+                include: None,
+            },
+        )];
+        assert!(!needs_extension_repo(&set, none_installed, false));
+        assert!(!needs_extension_repo(&[], none_installed, false));
+    }
+
+    #[test]
+    fn needs_extension_repo_false_when_repo_name_restricts_dnf() {
+        // `--repo=<name>` hides every other repository, the -ext one included.
+        let set = vec![package_in("pkg", Some("vendor"))];
+        assert!(!needs_extension_repo(&set, none_installed, false));
+    }
+
+    #[test]
+    fn needs_extension_repo_false_when_every_package_is_already_installed() {
+        let set = vec![package("a"), package("b")];
+        assert!(!needs_extension_repo(&set, |_| true, false));
+        // One left to fetch brings the probe back.
+        assert!(needs_extension_repo(&set, |n| n == "a", false));
+    }
+
+    #[test]
+    fn needs_extension_repo_true_for_a_replayed_implied_pin() {
+        // The pin carries no repo_name, so even a fully installed round still
+        // hands dnf a package from the extension repository.
+        let set = vec![package("a")];
+        assert!(needs_extension_repo(&set, |_| true, true));
     }
 
     fn entry(version: Option<&str>, implied: bool) -> ExtensionSourceLock {

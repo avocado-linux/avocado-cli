@@ -55,10 +55,6 @@ pub fn validate_semver(version: &str) -> Result<()> {
 /// The requirement string uses standard semver requirement syntax (e.g., ">=0.25.0",
 /// "^0.25", "~0.25.1", ">=0.25.0, <1.0.0").
 pub fn check_cli_requirement(requirement: &str) -> Result<()> {
-    let req = VersionReq::parse(requirement).with_context(|| {
-        format!("Invalid cli_requirement '{requirement}'. Expected a semver requirement (e.g., '>=0.25.0', '^0.25')")
-    })?;
-
     let running = Version::parse(env!("CARGO_PKG_VERSION")).with_context(|| {
         format!(
             "Failed to parse CLI version '{}' as semver",
@@ -66,7 +62,7 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
         )
     })?;
 
-    if !requirement_matches(&req, &running) {
+    if !cli_requirement_satisfied_by(requirement, &running)? {
         anyhow::bail!(
             "This project requires avocado CLI version '{requirement}', \
              but you are running version {running}.\n\n\
@@ -75,6 +71,17 @@ pub fn check_cli_requirement(requirement: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `running` satisfies the semver requirement string `requirement`.
+///
+/// Version-taking core of [`check_cli_requirement`], which always compares the
+/// compiled version; this lets callers (and tests) pick the version.
+pub(crate) fn cli_requirement_satisfied_by(requirement: &str, running: &Version) -> Result<bool> {
+    let req = VersionReq::parse(requirement).with_context(|| {
+        format!("Invalid cli_requirement '{requirement}'. Expected a semver requirement (e.g., '>=0.25.0', '^0.25')")
+    })?;
+    Ok(requirement_matches(&req, running))
 }
 
 /// Whether `running` satisfies `req`, with pre-release builds read as their

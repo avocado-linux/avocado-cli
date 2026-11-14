@@ -60,6 +60,40 @@ pub const CONTAINER_FEEDS_DIR: &str = "/run/avocado-feeds";
 /// reaches the developer's machine rather than the container itself.
 pub const HOST_GATEWAY_ALIAS: &str = "host.docker.internal";
 
+/// True if `args` request host networking, in either the `--network=host` /
+/// `--net=host` form or the space-separated `--network host` / `--net host`
+/// form.
+///
+/// Each element is split on spaces first, as the container run does, so a
+/// single `"--network host"` element counts.
+pub fn args_have_host_network(args: &[String]) -> bool {
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| crate::utils::container::SdkContainer::parse_container_arg(a))
+        .collect();
+    args.iter().enumerate().any(|(i, a)| {
+        a == "--network=host"
+            || a == "--net=host"
+            || ((a == "--network" || a == "--net")
+                && args.get(i + 1).map(|v| v == "host").unwrap_or(false))
+    })
+}
+
+/// True when host networking cannot share the developer machine's loopback:
+/// on Docker Desktop and under the avocado VM the container's "host" is a VM,
+/// and the deploy path strips `--network=host` there.
+pub fn host_network_is_isolated_from_developer_loopback() -> bool {
+    crate::utils::container::is_docker_desktop() || crate::utils::container::is_vm_routing_active()
+}
+
+/// True iff `args` request host networking AND it is in effect, so a
+/// `localhost` URL on the host is reachable from the container unchanged.
+/// `loopback_isolated` comes from
+/// [`host_network_is_isolated_from_developer_loopback`].
+pub fn host_network_shares_loopback(args: &[String], loopback_isolated: bool) -> bool {
+    !loopback_isolated && args_have_host_network(args)
+}
+
 /// The `--add-host` entry for [`HOST_GATEWAY_ALIAS`]. Under the avocado-vm,
 /// docker's `host-gateway` is the VM itself, so point the alias at QEMU's
 /// user-net address for this machine instead.
@@ -156,6 +190,16 @@ pub enum FeedStage {
 }
 
 impl FeedStage {
+    /// Every stage, for a caller (`install`) that runs all of them.
+    pub const ALL: &'static [FeedStage] = &[
+        FeedStage::Sdk,
+        FeedStage::SdkTarget,
+        FeedStage::Rootfs,
+        FeedStage::Runtime,
+        FeedStage::Ext,
+        FeedStage::Initramfs,
+    ];
+
     /// `sdk`-stage feeds land in the host reposdir (seen by the bootstrap and
     /// combined dnf confs); every other stage's dnf reads the target reposdir.
     fn is_host(self) -> bool {
@@ -283,6 +327,11 @@ pub struct ResolvedFeed {
     pub mount: Option<PathBuf>,
     #[serde(skip)]
     loopback_rewritten: bool,
+    /// Whether this feed's loopback host is rewritten for the container, decided
+    /// at resolve time from project configuration alone. Kept so the Connect path,
+    /// which has no URL until the mint returns, applies the same decision.
+    #[serde(skip)]
+    rewrite_loopback: bool,
     /// The locator as configured, for the lock: a `url:` with `$releasever` and
     /// `$target` expanded but WITHOUT the loopback rewrite, or a `path:` exactly
     /// as written. `baseurl` is the container's view — `host.docker.internal` on
@@ -437,6 +486,68 @@ impl ResolvedFeedSet {
         config_dir: &Path,
         releasever: Option<&str>,
     ) -> Result<Option<Self>> {
+        let args =
+            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        Self::resolve_with_container_args(config, target, config_dir, releasever, &args)
+    }
+
+    /// [`Self::resolve`] with the container arguments docker will receive from
+    /// the project: variables expanded and `sdk.<target>.container_args`
+    /// merged. Production callers use this one; the plain form reads only the
+    /// base `sdk.container_args`.
+    ///
+    /// Command-line `--container-arg`s are not part of it. The resolved set is
+    /// hashed into the stamp and pinned once per target per invocation, and
+    /// install and build must stamp the same baseurl although each command has
+    /// its own command line.
+    pub fn resolve_with_container_args(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        container_args: &[String],
+    ) -> Result<Option<Self>> {
+        Self::resolve_inner(
+            config,
+            target,
+            config_dir,
+            releasever,
+            container_args,
+            host_network_is_isolated_from_developer_loopback(),
+        )
+    }
+
+    /// [`Self::resolve`] with the environment probe supplied by the caller:
+    /// `loopback_isolated` is true when host networking would not share the
+    /// developer machine's loopback (Docker Desktop, the avocado VM).
+    #[cfg(test)]
+    fn resolve_with_loopback_isolated(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        loopback_isolated: bool,
+    ) -> Result<Option<Self>> {
+        let args =
+            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        Self::resolve_inner(
+            config,
+            target,
+            config_dir,
+            releasever,
+            &args,
+            loopback_isolated,
+        )
+    }
+
+    fn resolve_inner(
+        config: &Config,
+        target: &str,
+        config_dir: &Path,
+        releasever: Option<&str>,
+        container_args: &[String],
+        loopback_isolated: bool,
+    ) -> Result<Option<Self>> {
         let repos = config.repos.as_ref();
         let distro = config.distro.as_ref();
         let feeds_list = distro.and_then(|d| d.feeds.as_ref());
@@ -474,6 +585,7 @@ impl ResolvedFeedSet {
         }
         let empty = HashMap::new();
         let repos = repos.unwrap_or(&empty);
+        let host_network = host_network_shares_loopback(container_args, loopback_isolated);
 
         // Validate definitions once, independent of enablement — in name order so
         // the first error reported is the same every run.
@@ -533,6 +645,7 @@ impl ResolvedFeedSet {
                     ("password", def.password.is_some()),
                     ("ca", def.ca.is_some()),
                     ("tls_verify", def.tls_verify.is_some()),
+                    ("rewrite_loopback", def.rewrite_loopback.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(k, set)| set.then_some(k))
@@ -580,6 +693,7 @@ impl ResolvedFeedSet {
                     ("gpgcheck", def.gpgcheck.is_some()),
                     ("targets", def.targets.is_some()),
                     ("stages", def.stages.is_some()),
+                    ("rewrite_loopback", def.rewrite_loopback.is_some()),
                 ]
                 .into_iter()
                 .filter_map(|(k, set)| set.then_some(k))
@@ -620,7 +734,7 @@ impl ResolvedFeedSet {
                 // Connect provides it" is more use than "password is missing".
                 // Minting is skipped for a feed that already has a credential, so
                 // an `org:` feed carrying one would keep its `connect://<org>/...`
-                // placeholder baseurl and dnf would fail to resolve it.
+                // stand-in baseurl and dnf would fail to resolve it.
                 bail!(
                     "repos.{name}: an `org:` feed gets its credential from Connect; \
                      remove `username`/`password` (they are for feeds Connect knows \
@@ -794,6 +908,7 @@ impl ResolvedFeedSet {
                     ca: None,
                     mount: None,
                     loopback_rewritten: false,
+                    rewrite_loopback: false,
                     placement: Placement::Any,
                 });
                 continue;
@@ -825,6 +940,10 @@ impl ResolvedFeedSet {
                 (None, Some(u)) => format!("basic:{}", short_sha256(u.as_bytes())),
                 (None, None) => "none".to_string(),
             };
+            // From project configuration alone: command-line container args are
+            // not consulted, so install and build stamp the same baseurl. An
+            // explicit key wins over detection.
+            let rewrite = def.rewrite_loopback.unwrap_or(!host_network);
             let common = |kind,
                           baseurl,
                           locality,
@@ -855,6 +974,7 @@ impl ResolvedFeedSet {
                     ca: def.ca.as_ref().map(|c| resolve_relative(config_dir, c)),
                     mount,
                     loopback_rewritten,
+                    rewrite_loopback: rewrite,
                     placement: addon_placement.get(name).copied().unwrap_or_default(),
                 }
             };
@@ -868,7 +988,11 @@ impl ResolvedFeedSet {
                 // container reachability, and on an ephemeral port it would make
                 // the lock churn every run.
                 let configured = expanded.clone();
-                let (expanded, rewritten) = rewrite_loopback(&expanded);
+                let (expanded, rewritten) = if rewrite {
+                    rewrite_loopback(&expanded)
+                } else {
+                    (expanded, false)
+                };
                 feeds.push(common(
                     FeedKind::Url,
                     expanded,
@@ -888,7 +1012,7 @@ impl ResolvedFeedSet {
                     .unwrap_or_else(|| "2026".to_string());
                 let branch = def.channel.clone().unwrap_or_else(|| "main".to_string());
                 let path = format!("{rel}/orgs/{org}/{branch}/target/{target}");
-                // A placeholder host, replaced with the minted `feed_url` at
+                // A stand-in host, replaced with the minted `feed_url` at
                 // materialize time. Recording it rather than the real URL keeps the
                 // canonical document stable across builds and keeps a server-side
                 // URL change out of the stamp hash — the org is the input, the host
@@ -943,6 +1067,7 @@ impl ResolvedFeedSet {
                 ca: None,
                 mount: None,
                 loopback_rewritten: false,
+                rewrite_loopback: false,
                 placement: Placement::Any,
             });
         }
@@ -1106,7 +1231,7 @@ impl ResolvedFeedSet {
     /// Deliberately **not** part of `resolve`. The token changes on every mint, so
     /// letting it near the stamp hash or the canonical document would invalidate
     /// every cached sysroot once per build. `resolve` records `connect:<org>` as
-    /// the credential identity and a `connect://` placeholder as the URL; this
+    /// the credential identity and a `connect://` stand-in as the URL; this
     /// fills in the real host and the secret, in memory, for the life of one
     /// invocation. The canonical document is written before this runs.
     ///
@@ -1235,7 +1360,7 @@ impl ResolvedFeedSet {
             // a baseurl pointing at the feed ROOT rather than the org's subtree —
             // dnf would then read someone else's metadata, or nothing, and report
             // it as a broken feed. A Connect feed reaching this point without its
-            // placeholder is a logic error in resolve, not a user mistake.
+            // stand-in is a logic error in resolve, not a user mistake.
             let prefix = format!("connect://{org}/");
             let path = feed
                 .baseurl
@@ -1253,8 +1378,12 @@ impl ResolvedFeedSet {
             // `url:` feeds are rewritten at resolve time, but a Connect feed has no
             // URL until now, so it has to happen here or a local Connect silently
             // resolves to nothing.
-            let (baseurl, rewritten) =
-                rewrite_loopback(&format!("{}/{path}", minted.feed_url.trim_end_matches('/')));
+            let minted_url = format!("{}/{path}", minted.feed_url.trim_end_matches('/'));
+            let (baseurl, rewritten) = if feed.rewrite_loopback {
+                rewrite_loopback(&minted_url)
+            } else {
+                (minted_url, false)
+            };
             feed.baseurl = baseurl;
             feed.loopback_rewritten = rewritten;
             // The username is for log correlation only; the verifier reads the
@@ -1502,6 +1631,200 @@ impl ResolvedFeedSet {
     }
 }
 
+/// One repository metadata index to probe before anything is downloaded.
+struct Probe<'a> {
+    /// Names the failing feed in the error, e.g. `feed 'local'`.
+    subject: String,
+    /// The `repodata/repomd.xml` URL, from the locator as configured so it is
+    /// reachable from the host, not the container's rewritten view.
+    url: String,
+    ca: Option<PathBuf>,
+    tls_verify: bool,
+    credential: Option<&'a (String, String)>,
+}
+
+/// Every certificate in the CA file. A bundle may carry several, and dnf
+/// trusts all of them, so the probe must as well.
+fn load_ca_certificates(ca: &Path, subject: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = fs::read(ca).with_context(|| format!("{subject}: reading ca {}", ca.display()))?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("{subject}: parsing ca {}", ca.display()))?;
+    // An empty or non-PEM (e.g. DER) file parses to no certificates; trusting
+    // nothing extra would quietly fall back to the system roots.
+    if certs.is_empty() {
+        bail!("{subject}: no PEM certificates in ca {}", ca.display());
+    }
+    Ok(certs)
+}
+
+impl Probe<'_> {
+    /// One client per probe: `ca`, `tls_verify` and the credential differ per feed.
+    async fn run(&self) -> Result<()> {
+        // The probe never disables certificate verification. A feed that opts
+        // out of it is left to dnf, which honours the setting.
+        if !self.tls_verify {
+            crate::utils::output::print_warning_stderr(&format!(
+                "{}: not probed because TLS verification is disabled for it; \
+                 dnf will report it if the feed is unusable",
+                self.subject
+            ));
+            return Ok(());
+        }
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent(user_agent());
+        if let Some(ca) = &self.ca {
+            for cert in load_ca_certificates(ca, &self.subject)? {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder
+            .build()
+            .with_context(|| format!("{}: building the HTTP client", self.subject))?;
+        let mut req = client.get(&self.url);
+        if let Some((user, pass)) = self.credential {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => bail!("{}: cannot connect to {} ({e})", self.subject, self.url),
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            bail!(
+                "{}: not found at {} (the feed serves no repository metadata there)",
+                self.subject,
+                self.url
+            );
+        }
+        if !status.is_success() {
+            // The feed answered, so it is reachable and may well serve dnf (a probe
+            // rejected by rate limiting or a proxy says nothing about the repo).
+            // Only a definite "no metadata" or "no server" stops the command.
+            crate::utils::output::print_warning_stderr(&format!(
+                "{}: {} answered {status}; continuing, dnf will report it if the feed is unusable",
+                self.subject, self.url
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fail before the first download when a feed repository is unreachable,
+/// naming the feed.
+///
+/// Probes the metadata index of each `http(s)` URL feed in `feeds` that applies
+/// to one of `stages` and whose locator has no `$` variable left for dnf to
+/// expand, and the extension
+/// repository (`<repo url>/<releasever>/target/<target>-ext`, through the distro
+/// feed's TLS settings) only when `needs_extension_repo`. The caller decides
+/// that from the runtime extensions it will fetch, `enabled: false` ones
+/// included, since they are fetched regardless of the flag. A `path:` feed is
+/// checked on disk and never probed over the network. A project that needs no
+/// extension repository is not asked to serve one.
+///
+/// Unlike [`ResolvedFeedSet::check_addons`], which tolerates an unreadable
+/// index with a warning, an unreachable feed here is an error: dnf would
+/// otherwise fail the same way later with less to say about which feed.
+pub async fn preflight_feeds(
+    config: &Config,
+    feeds: Option<&ResolvedFeedSet>,
+    target: &str,
+    stages: &[FeedStage],
+    needs_extension_repo: bool,
+) -> Result<()> {
+    for feed in feeds.into_iter().flat_map(|s| s.feeds.iter()) {
+        // A feed scoped away from every stage the caller will run never reaches
+        // its dnf, so its reachability cannot matter to this command.
+        if !stages.iter().any(|&s| feed.applies_to(s)) {
+            continue;
+        }
+        // An add-on is checked against the channel's index (or the pinned
+        // snapshot) by `check_addons`, whose message names what was mistyped. A
+        // bare metadata probe here would pre-empt it with a less useful one. With
+        // no index to check against, `check_addons` does nothing, so probe.
+        let addon_base = feed
+            .name
+            .strip_suffix(ADDON_SDK_SUFFIX)
+            .unwrap_or(&feed.name);
+        if feeds.is_some_and(|s| {
+            s.addon_index_url.is_some()
+                && s.addons.iter().any(|a| a == &feed.name || a == addon_base)
+        }) {
+            continue;
+        }
+        let subject = format!("feed '{}'", feed.name);
+        let locator = match feed.kind {
+            FeedKind::Path => {
+                let host = feed
+                    .mount
+                    .as_ref()
+                    .with_context(|| format!("{subject}: a path feed without a directory"))?;
+                if !host.join("repodata").join("repomd.xml").is_file() {
+                    bail!(
+                        "{subject}: {} has no repodata/repomd.xml; run `createrepo_c` on it first",
+                        host.display()
+                    );
+                }
+                continue;
+            }
+            FeedKind::Url => feed.configured_locator.as_str(),
+            // The mint's host is only known once minted, and a loopback one has
+            // been rewritten for the container, which the host cannot reach.
+            FeedKind::Connect
+                if !feed.baseurl.starts_with("connect://") && !feed.loopback_rewritten =>
+            {
+                feed.baseurl.as_str()
+            }
+            FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
+        };
+        // dnf expands what is left of `$releasever`/`$basearch` inside the
+        // container and reads `file://` itself; the host can check neither.
+        if !(locator.starts_with("http://") || locator.starts_with("https://"))
+            || locator.contains('$')
+        {
+            continue;
+        }
+        Probe {
+            subject,
+            url: format!("{}/repodata/repomd.xml", locator.trim_end_matches('/')),
+            ca: feed.ca.clone(),
+            tls_verify: feed.tls_verify,
+            credential: feed.credential.as_ref(),
+        }
+        .run()
+        .await?;
+    }
+    if needs_extension_repo {
+        let repo_url = config.effective_repo_url();
+        // Without a releasever the container falls back to the image's
+        // os-release, which this host cannot see; a URL built without one would
+        // 404 on a feed that serves the repository fine.
+        let Some(rv) = config.get_releasever() else {
+            crate::utils::output::print_info_stderr(
+                "skipping the extension repository probe: no releasever is configured, so its URL cannot be known here",
+            );
+            return Ok(());
+        };
+        let root = format!("{}/{rv}", repo_url.trim_end_matches('/'));
+        let distro_feed = match config.distro.as_ref().and_then(|d| d.repo.as_ref()) {
+            Some(DistroRepoRef::Named(n)) => n.as_str(),
+            _ => DEFAULT_DISTRO_FEED_NAME,
+        };
+        Probe {
+            subject: format!("feed '{distro_feed}' extension repository"),
+            url: format!("{root}/target/{target}-ext/repodata/repomd.xml"),
+            ca: config.get_repo_ca().map(PathBuf::from),
+            tls_verify: !config.get_repo_insecure(),
+            credential: None,
+        }
+        .run()
+        .await?;
+    }
+    Ok(())
+}
+
 /// Under the avocado-vm, docker only sees the shared workspace. A `path:` feed
 /// outside it mounts empty and fails with a cryptic error, so fail here instead.
 fn check_in_vm_share(feed: &str, host: &Path, vm_workspace: Option<&Path>) -> Result<()> {
@@ -1529,8 +1852,15 @@ fn resolve_relative(config_dir: &Path, p: &str) -> PathBuf {
 /// distro feed the same single report. Saying nothing was the previous
 /// behaviour, and it made an unreachable localhost feed look like a feed that
 /// was simply down.
-pub fn rewrite_loopback_reported(url: &str) -> String {
+///
+/// `host_network` is the decision derived from `sdk.container_args`: under host
+/// networking the container shares the host's loopback, so the URL is left alone.
+/// The `repos.*.rewrite_loopback` key does not apply to the distro feed.
+pub fn rewrite_loopback_reported(url: &str, host_network: bool) -> String {
     static REPORTED: std::sync::Once = std::sync::Once::new();
+    if host_network {
+        return url.to_string();
+    }
     let (rewritten, changed) = rewrite_loopback(url);
     if changed {
         let msg = rewritten.clone();
@@ -1738,6 +2068,47 @@ fi
 mod tests {
     use super::*;
 
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_args_have_host_network_eq_form() {
+        assert!(args_have_host_network(&sv(&[
+            "--privileged",
+            "--network=host"
+        ])));
+        assert!(args_have_host_network(&sv(&["--net=host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_space_form() {
+        assert!(args_have_host_network(&sv(&["--network", "host"])));
+        assert!(args_have_host_network(&sv(&["--net", "host"])));
+    }
+
+    #[test]
+    fn test_args_have_host_network_single_element_with_a_space() {
+        // Each element is split on spaces before docker sees it.
+        assert!(args_have_host_network(&sv(&["--network host"])));
+        assert!(args_have_host_network(&sv(&["--privileged", "--net host"])));
+        assert!(!args_have_host_network(&sv(&["--network bridge"])));
+    }
+
+    #[test]
+    fn named_feed_loopback_kept_for_a_single_element_network_host() {
+        let set = local_feed_set("", Some("\"--network host\""));
+        assert_eq!(local_baseurl(&set), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_args_have_host_network_none() {
+        assert!(!args_have_host_network(&sv(&["--privileged"])));
+        // `--network` followed by something other than host is not host networking.
+        assert!(!args_have_host_network(&sv(&["--network", "bridge"])));
+        assert!(!args_have_host_network(&sv(&[])));
+    }
+
     fn load(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("yaml parses")
     }
@@ -1792,7 +2163,7 @@ distro:
         }
     }
 
-    /// An `org:` feed resolves without contacting anything: a placeholder URL that
+    /// An `org:` feed resolves without contacting anything: a stand-in URL that
     /// shows the layout, and the org as the credential identity. Both are stable
     /// across builds, which is what keeps a per-build token out of the stamp hash.
     #[test]
@@ -1854,7 +2225,7 @@ distro:
     }
 
     /// An `org:` feed with its own credential would skip minting and keep the
-    /// `connect://` placeholder as its baseurl, so dnf would fail to resolve a
+    /// `connect://` stand-in as its baseurl, so dnf would fail to resolve a
     /// config that looks perfectly reasonable.
     #[test]
     fn an_org_feed_cannot_carry_its_own_credential() {
@@ -2311,7 +2682,9 @@ distro:
     /// the distro feed: both halves, target and SDK, off the distro feed's base
     /// URL and releasever, in the listed position and in that order.
     #[test]
+    #[serial_test::serial]
     fn undefined_feed_name_is_a_distro_addon_with_both_halves() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  repo:\n    url: https://feed.example/\n  feeds: [ros2-jazzy]\n"
         ));
@@ -2353,7 +2726,9 @@ distro:
     /// carry the distro feed's TLS settings, and the index is the channel's even
     /// under a snapshot pin.
     #[test]
+    #[serial_test::serial]
     fn addon_halves_are_placed_and_inherit_distro_tls() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  repo:\n    url: https://feed.example/\n    tls_verify: false\n  feeds: [ros2-jazzy]\n"
         ));
@@ -2541,7 +2916,9 @@ distro:
     /// must follow it, not the process env, or install-time and build-time hash
     /// different strings for the same config.
     #[test]
+    #[serial_test::serial]
     fn explicit_releasever_drives_every_expansion() {
+        clear_release_env();
         let c = load(&format!(
             "{BASE}  feeds: [v]\nrepos:\n  v:\n    url: https://v.example/$releasever\n"
         ));
@@ -2698,7 +3075,7 @@ distro:
             ));
             assert!(e.contains("base URL") && e.contains(var), "{e}");
         }
-        // And a named feed still requires the placeholder, so the two rules do
+        // And a named feed still requires the stand-in, so the two rules do
         // not quietly contradict each other.
         let named = load(
             "distro:\n  release: 2026\n  channel: next\n  feeds: [v]\nrepos:\n  v:\n    url: https://v/$releasever\n",
@@ -2801,7 +3178,9 @@ distro:
     }
 
     #[test]
+    #[serial_test::serial]
     fn per_feed_release_overrides_distro_and_literal_stays_when_unresolvable() {
+        clear_release_env();
         let c = load(&format!("{BASE}  feeds: [old]\nrepos:\n  old:\n    url: https://o/$releasever\n    release: 2024\n    channel: edge\n"));
         let set = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
             .unwrap()
@@ -2885,5 +3264,675 @@ distro:
             })
             .expect("sh available");
         assert!(out.success(), "FEEDS_SETUP_SNIPPET failed sh -n");
+    }
+
+    fn local_feed_set(extra_key: &str, container_args: Option<&str>) -> ResolvedFeedSet {
+        let sdk = container_args
+            .map(|a| format!("sdk:\n  container_args: [{a}]\n"))
+            .unwrap_or_default();
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n{extra_key}{sdk}"
+        ));
+        ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn local_baseurl(set: &ResolvedFeedSet) -> String {
+        set.feeds
+            .iter()
+            .find(|f| f.name == "local")
+            .unwrap()
+            .baseurl
+            .clone()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn named_feed_loopback_follows_an_expanded_network_variable() {
+        let prior = std::env::var_os("FEEDS_TEST_NET");
+        std::env::set_var("FEEDS_TEST_NET", "host");
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\nsdk:\n  container_args: [\"--network=${{FEEDS_TEST_NET}}\"]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        match prior {
+            Some(v) => std::env::set_var("FEEDS_TEST_NET", v),
+            None => std::env::remove_var("FEEDS_TEST_NET"),
+        }
+        assert_eq!(local_baseurl(&set), "http://localhost:8080");
+    }
+
+    #[test]
+    fn named_feed_loopback_follows_the_container_args_it_is_given() {
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n"
+        ));
+        let isolated = host_network_is_isolated_from_developer_loopback();
+        let baseurl = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            local_baseurl(
+                &ResolvedFeedSet::resolve_with_container_args(&c, "t", Path::new("."), None, &args)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            baseurl(&["--net=host"]) == "http://localhost:8080",
+            !isolated
+        );
+        assert!(baseurl(&[]).contains("host.docker.internal"));
+        assert!(baseurl(&["--network=bridge"]).contains("host.docker.internal"));
+    }
+
+    fn local_feed_set_probed(container_args: Option<&str>, isolated: bool) -> ResolvedFeedSet {
+        let sdk = container_args
+            .map(|a| format!("sdk:\n  container_args: [{a}]\n"))
+            .unwrap_or_default();
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: http://localhost:8080\n{sdk}"
+        ));
+        ResolvedFeedSet::resolve_with_loopback_isolated(
+            &c,
+            "t",
+            Path::new("."),
+            Some("2026/next"),
+            isolated,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Install hashes the projection with its command-line container args in
+    /// hand and build does not. The decision reads `sdk.container_args` from
+    /// project configuration alone and its outcome reaches the stamp only as the
+    /// baseurl, so neither the probe nor the decision flag is a stamp field.
+    #[test]
+    fn stage_projection_equal_with_and_without_cli_args() {
+        for stage in [FeedStage::Ext, FeedStage::Rootfs] {
+            // Where host networking is not in effect, the flag changes nothing.
+            let with = local_feed_set_probed(Some("--network=host"), true);
+            let without = local_feed_set_probed(None, true);
+            assert_eq!(
+                with.stage_projection_json(stage).unwrap(),
+                without.stage_projection_json(stage).unwrap()
+            );
+            assert_eq!(
+                with.canonical_json().unwrap(),
+                without.canonical_json().unwrap()
+            );
+            // Container args other than host networking never reach the stamp.
+            for isolated in [true, false] {
+                assert_eq!(
+                    local_feed_set_probed(Some("--privileged"), isolated)
+                        .stage_projection_json(stage)
+                        .unwrap(),
+                    local_feed_set_probed(None, isolated)
+                        .stage_projection_json(stage)
+                        .unwrap()
+                );
+            }
+            // Where it is in effect, the only difference is the baseurl: the
+            // decision and the probe are not serialized.
+            let shared = local_feed_set_probed(Some("--network=host"), false);
+            let doc = shared.canonical_json().unwrap();
+            assert!(
+                !doc.contains("rewrite_loopback") && !doc.contains("isolated"),
+                "{doc}"
+            );
+            assert_eq!(
+                doc.replace("http://localhost:8080", HOST_GATEWAY_ALIAS_URL),
+                without.canonical_json().unwrap()
+            );
+        }
+    }
+
+    const HOST_GATEWAY_ALIAS_URL: &str = "http://host.docker.internal:8080";
+
+    #[test]
+    fn host_network_only_shares_loopback_when_in_effect() {
+        let hn = sv(&["--network=host"]);
+        assert!(host_network_shares_loopback(&hn, false));
+        assert!(!host_network_shares_loopback(&hn, true));
+        assert!(!host_network_shares_loopback(&sv(&[]), false));
+    }
+
+    #[test]
+    fn loopback_is_rewritten_when_host_network_is_not_in_effect() {
+        let isolated = local_feed_set_probed(Some("--network=host"), true);
+        assert!(local_baseurl(&isolated).contains(HOST_GATEWAY_ALIAS));
+        let shared = local_feed_set_probed(Some("--network=host"), false);
+        assert_eq!(local_baseurl(&shared), "http://localhost:8080");
+    }
+
+    #[test]
+    fn loopback_rewritten_by_default_and_skipped_under_host_network() {
+        assert!(local_baseurl(&local_feed_set("", None)).contains(HOST_GATEWAY_ALIAS));
+        assert!(
+            local_baseurl(&local_feed_set("", Some("--privileged"))).contains(HOST_GATEWAY_ALIAS)
+        );
+        assert_eq!(
+            local_baseurl(&local_feed_set("", Some("--network=host"))),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            local_baseurl(&local_feed_set("", Some("--network, host"))),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn explicit_rewrite_loopback_key_wins_over_detection() {
+        let on = local_feed_set("    rewrite_loopback: true\n", Some("--network=host"));
+        assert!(local_baseurl(&on).contains(HOST_GATEWAY_ALIAS));
+        assert!(
+            on.feeds
+                .iter()
+                .find(|f| f.name == "local")
+                .unwrap()
+                .rewrite_loopback
+        );
+        let off = local_feed_set("    rewrite_loopback: false\n", None);
+        assert_eq!(local_baseurl(&off), "http://localhost:8080");
+        assert!(
+            !off.feeds
+                .iter()
+                .find(|f| f.name == "local")
+                .unwrap()
+                .rewrite_loopback
+        );
+    }
+
+    /// One canned feed-token response on an ephemeral loopback port.
+    async fn serve_mint_once(feed_url: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = format!(r#"{{"token":"t","tier":1,"feed_url":"{feed_url}"}}"#);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn connect_feed_stores_the_rewrite_decision() {
+        let mk = |extra: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [acme]\nrepos:\n  acme:\n    org: acme\n{extra}"
+            ));
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let flag = |s: &ResolvedFeedSet| {
+            s.feeds
+                .iter()
+                .find(|f| f.name == "acme")
+                .unwrap()
+                .rewrite_loopback
+        };
+        assert!(flag(&mk("")));
+        assert!(!flag(&mk("    rewrite_loopback: false\n")));
+        assert!(!flag(&mk("sdk:\n  container_args: [--net=host]\n")));
+
+        // The stored decision drives the minted base URL.
+        for (extra, want_rewritten) in [("", true), ("    rewrite_loopback: false\n", false)] {
+            let mut set = mk(extra);
+            let api = serve_mint_once("http://localhost:9999/feeds").await;
+            std::env::set_var("AVOCADO_CONNECT_TOKEN", "tok");
+            std::env::set_var("AVOCADO_CONNECT_URL", &api);
+            let res = set.resolve_connect_credentials(FeedStage::Ext).await;
+            std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+            std::env::remove_var("AVOCADO_CONNECT_URL");
+            res.unwrap();
+            let feed = set.feeds.iter().find(|f| f.name == "acme").unwrap();
+            assert_eq!(feed.loopback_rewritten, want_rewritten);
+            assert_eq!(
+                feed.baseurl.contains(HOST_GATEWAY_ALIAS),
+                want_rewritten,
+                "{}",
+                feed.baseurl
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_loopback_key_is_rejected_on_distro_and_builtin_feeds() {
+        let c = load(&format!(
+            "{BASE}repos:\n  avocado-ext:\n    rewrite_loopback: true\n"
+        ));
+        let e = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).unwrap_err();
+        assert!(e.to_string().contains("rewrite_loopback"), "{e}");
+        let c = load(&format!(
+            "{BASE}repos:\n  {DEFAULT_DISTRO_FEED_NAME}:\n    url: https://repo.example.org\n    rewrite_loopback: true\n"
+        ));
+        let e = ResolvedFeedSet::resolve(&c, "t", Path::new("."), None).unwrap_err();
+        assert!(e.to_string().contains("rewrite_loopback"), "{e}");
+    }
+
+    #[test]
+    fn reported_rewrite_skips_distro_url_under_host_network() {
+        assert_eq!(
+            rewrite_loopback_reported("http://localhost:1/x", true),
+            "http://localhost:1/x"
+        );
+        assert!(
+            rewrite_loopback_reported("http://localhost:1/x", false).contains(HOST_GATEWAY_ALIAS)
+        );
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A loopback listener that answers every request with `status` and records
+    /// each request's head, so a test can say what was asked of it.
+    async fn serve_status(status: &'static str) -> (String, Seen) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// An address nothing listens on.
+    async fn closed_port_url() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{addr}")
+    }
+
+    fn url_feed_set(url: &str, extra: &str) -> (Config, ResolvedFeedSet) {
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    url: {url}/feed\n{extra}"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        (c, set)
+    }
+
+    #[tokio::test]
+    async fn unreachable_feed_fails_naming_feed() {
+        let (c, set) = url_feed_set(&closed_port_url().await, "");
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'"), "{e}");
+        assert!(e.contains("cannot connect"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn feed_without_metadata_fails_naming_feed_and_status() {
+        let (base, _) = serve_status("404 Not Found").await;
+        let (c, set) = url_feed_set(&base, "");
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'"), "{e}");
+        assert!(e.contains("not found"), "{e}");
+        assert!(e.contains("/feed/repodata/repomd.xml"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn reachable_feed_passes_and_is_probed_at_the_configured_locator() {
+        let (base, seen) = serve_status("200 OK").await;
+        // Loopback is rewritten to the container's host alias in `baseurl`; the
+        // probe runs on the host, so it must use the locator as configured.
+        let (c, set) = url_feed_set(&base, "");
+        assert!(set
+            .feeds
+            .iter()
+            .any(|f| f.baseurl.contains(HOST_GATEWAY_ALIAS)));
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].starts_with("GET /feed/repodata/repomd.xml "),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_credential_reaches_the_probe() {
+        let (base, seen) = serve_status("200 OK").await;
+        let (c, set) = url_feed_set(&base, "    username: u\n    password: p\n");
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+        let head = seen.lock().unwrap()[0].to_ascii_lowercase();
+        // base64("u:p")
+        assert!(head.contains("authorization: basic dtpw"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn directory_feed_is_checked_on_disk_and_never_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [here]\nrepos:\n  here:\n    path: feed\n"
+        ));
+        let resolve = || {
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", dir.path(), None, false)
+                .unwrap()
+                .unwrap()
+        };
+        std::fs::create_dir_all(dir.path().join("feed")).unwrap();
+        let e = preflight_feeds(&c, Some(&resolve()), "t", FeedStage::ALL, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'here'") && e.contains("repomd.xml"), "{e}");
+
+        std::fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
+        std::fs::write(dir.path().join("feed/repodata/repomd.xml"), "<repomd/>").unwrap();
+        preflight_feeds(&c, Some(&resolve()), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+    }
+
+    fn config_with_repo(url: &str) -> Config {
+        load(&format!("{BASE}  repo:\n    url: {url}\n"))
+    }
+
+    #[tokio::test]
+    async fn missing_extension_repository_fails_naming_feed_and_repository() {
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = config_with_repo(&base);
+        let e = preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'avocado' extension repository"), "{e}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[0].contains("/target/t-ext/repodata/repomd.xml "),
+            "{}",
+            seen[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_repository_is_not_probed_when_no_extension_needs_it() {
+        // Nothing listens: a probe would fail. A minimal project against a feed
+        // with no extension repository must still succeed.
+        let c = config_with_repo(&closed_port_url().await);
+        preflight_feeds(&c, None, "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reachable_extension_repository_passes() {
+        let (base, _) = serve_status("200 OK").await;
+        let c = config_with_repo(&base);
+        preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gone_feed_fails_like_not_found() {
+        let (base, _) = serve_status("410 Gone").await;
+        let (c, set) = url_feed_set(&base, "");
+        let e = preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'local'") && e.contains("not found"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn other_statuses_warn_and_let_dnf_proceed() {
+        for status in [
+            "503 Service Unavailable",
+            "403 Forbidden",
+            "401 Unauthorized",
+            "429 Too Many Requests",
+        ] {
+            let (base, seen) = serve_status(status).await;
+            let (c, set) = url_feed_set(&base, "");
+            preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+                .await
+                .unwrap_or_else(|e| panic!("{status} must not be fatal: {e}"));
+            assert_eq!(seen.lock().unwrap().len(), 1, "{status} was not probed");
+        }
+    }
+
+    fn probe_for(url: &str, tls_verify: bool) -> Probe<'static> {
+        Probe {
+            subject: "feed 'x'".to_string(),
+            url: format!("{url}/repodata/repomd.xml"),
+            ca: None,
+            tls_verify,
+            credential: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feed_with_tls_verification_disabled_is_not_probed() {
+        // A 404 would fail a probe that connected.
+        let (base, seen) = serve_status("404 Not Found").await;
+        probe_for(&base, false).run().await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
+    }
+
+    #[tokio::test]
+    async fn a_verifying_probe_that_cannot_trust_the_server_fails_naming_the_feed() {
+        // A plain-HTTP listener answering a TLS client: the handshake cannot
+        // verify anything, and verification stays on.
+        let (base, _seen) = serve_status("200 OK").await;
+        let e = probe_for(&base.replace("http://", "https://"), true)
+            .run()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("feed 'x'") && e.contains("cannot connect"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_ca_file_without_pem_certificates_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty.pem", &b""[..]),
+            ("der.crt", &[0x30, 0x82, 0x01, 0x0a][..]),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let e = load_ca_certificates(&path, "feed 'x'")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("feed 'x': no PEM certificates in ca"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_ca_bundle_contributes_every_certificate() {
+        let pem = |name: &str| {
+            rcgen::generate_simple_self_signed(vec![name.to_string()])
+                .unwrap()
+                .cert
+                .pem()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.pem");
+        fs::write(&path, format!("{}{}", pem("one.test"), pem("two.test"))).unwrap();
+        let certs = load_ca_certificates(&path, "feed 'x'").unwrap();
+        assert_eq!(certs.len(), 2);
+    }
+
+    /// The release and channel env vars are process-wide; this module is
+    /// `#[serial]`, so clearing them here cannot race another test.
+    fn clear_release_env() {
+        for var in [
+            "AVOCADO_RELEASEVER",
+            "AVOCADO_SDK_REPO_RELEASE",
+            "AVOCADO_DISTRO_RELEASE",
+            "AVOCADO_DISTRO_CHANNEL",
+            "AVOCADO_REPO_URL",
+            "AVOCADO_SDK_REPO_URL",
+            "AVOCADO_REPO_INSECURE",
+            "AVOCADO_REPO_CA",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_repository_is_skipped_without_a_releasever() {
+        // Nothing listens and no release/channel is configured: the URL would be
+        // a guess, so it is not probed.
+        let url = closed_port_url().await;
+        clear_release_env();
+        let c = load(&format!("repo:\n  url: {url}\n"));
+        assert_eq!(c.get_releasever(), None);
+        preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_locator_dnf_still_has_to_expand_is_left_to_dnf() {
+        // dnf substitutes `$releasever` and `$basearch` inside the container; the
+        // literal URL would 404 here on a feed that serves dnf fine.
+        clear_release_env();
+        let (base, seen) = serve_status("404 Not Found").await;
+        for url in [format!("{base}/$releasever"), format!("{base}/$basearch")] {
+            let c = load(&format!(
+                "distro:\n  feeds: [v]\nrepos:\n  v:\n    url: {url}\n"
+            ));
+            let set = ResolvedFeedSet::resolve_with_loopback_isolated(
+                &c,
+                "t",
+                Path::new("."),
+                None,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+                .await
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
+    }
+
+    #[tokio::test]
+    async fn a_file_url_feed_is_left_to_dnf() {
+        // reqwest cannot fetch `file://`; dnf reads it from inside the container.
+        let (c, set) = url_feed_set("file:///nonexistent", "");
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_feed_scoped_to_another_stage_is_not_probed() {
+        // Nothing listens: an SDK-only feed must not stop a rootfs install,
+        // whose dnf never sees it, but must still stop an SDK install.
+        let (c, set) = url_feed_set(&closed_port_url().await, "    stages: [sdk]\n");
+        preflight_feeds(&c, Some(&set), "t", &[FeedStage::Rootfs], false)
+            .await
+            .unwrap();
+        let e = preflight_feeds(&c, Some(&set), "t", &[FeedStage::Sdk], false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("feed 'local'") && e.contains("cannot connect"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn addon_feeds_are_left_to_check_addons_when_the_index_is_known() {
+        // A misspelled add-on would otherwise surface here as a bare "not found at
+        // .../repomd.xml", ahead of check_addons' did-you-mean text.
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = load(&format!(
+            "{BASE}  repo:\n    url: {base}\n  feeds: [ros2-jazy]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        assert!(set.feeds.iter().any(|f| f.name == "ros2-jazy"));
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        let idx = index(&[("t", &["target/t-ros2-jazzy", "sdk/t-ros2-jazzy"])]);
+        let e = check_addons_against(&idx, "t", &["ros2-jazy".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("did you mean"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn addon_feeds_without_an_index_are_left_to_dnf() {
+        // No index means no releasever, so the add-on's URL still carries the
+        // literal `$releasever` that only dnf can expand.
+        clear_release_env();
+        let (base, seen) = serve_status("404 Not Found").await;
+        let c = load(&format!(
+            "distro:\n  repo:\n    url: {base}\n  feeds: [ros2-jazzy]\n"
+        ));
+        let set =
+            ResolvedFeedSet::resolve_with_loopback_isolated(&c, "t", Path::new("."), None, false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(set.addon_index_url, None);
+        let addon: Vec<_> = set
+            .feeds
+            .iter()
+            .filter(|f| f.name.starts_with("ros2-jazzy"))
+            .collect();
+        assert!(!addon.is_empty());
+        assert!(addon
+            .iter()
+            .all(|f| f.configured_locator.contains("$releasever")));
+        preflight_feeds(&c, Some(&set), "t", FeedStage::ALL, false)
+            .await
+            .unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "the feed was contacted");
     }
 }

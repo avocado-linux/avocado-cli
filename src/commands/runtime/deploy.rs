@@ -2,6 +2,7 @@ use crate::commands::connect::client::{self as connect_client, ConnectClient};
 use crate::utils::{
     config::{ComposedConfig, Config},
     container::{is_docker_desktop, is_vm_routing_active, RunConfig, SdkContainer},
+    feeds::args_have_host_network,
     lockfile::LockFile,
     output::{print_info, print_success, print_warning, OutputLevel},
     output_format::{emit_json_event, is_json_output_active},
@@ -1029,23 +1030,28 @@ struct MacDeployNet {
     forward: Option<OpenForward>,
 }
 
-/// True if `args` request host networking, in either the `--network=host` /
-/// `--net=host` form or the space-separated `--network host` / `--net host`
-/// form.
-fn args_have_host_network(args: &[String]) -> bool {
-    args.iter().enumerate().any(|(i, a)| {
-        a == "--network=host"
-            || a == "--net=host"
-            || ((a == "--network" || a == "--net")
-                && args.get(i + 1).map(|v| v == "host").unwrap_or(false))
-    })
-}
-
 /// Remove host-networking flags from container args so a published port (`-p`)
 /// takes effect. Handles both the `--network=host` / `--net=host` and
 /// space-separated `--network host` / `--net host` forms. See
 /// [`args_have_host_network`] and `prepare_mac_deploy_net`.
-fn strip_host_network_args(args: &mut Vec<String>) {
+fn strip_host_network_args(args_out: &mut Vec<String>) {
+    let args = std::mem::take(args_out);
+    // The run splits every element on spaces, and detection does the same, so
+    // flatten every element the same way before removing the flag; otherwise a
+    // form detection sees (`--network="host"`, a flag split across elements)
+    // would survive. Splitting strips quotes, so a token holding a space is
+    // re-quoted for the run's own re-split.
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| SdkContainer::parse_container_arg(a))
+        .map(|t| {
+            if t.contains(' ') {
+                format!("\"{t}\"")
+            } else {
+                t
+            }
+        })
+        .collect();
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -1063,7 +1069,7 @@ fn strip_host_network_args(args: &mut Vec<String>) {
         out.push(a.clone());
         i += 1;
     }
-    *args = out;
+    *args_out = out;
 }
 
 /// A qemu slirp host-forward opened for the duration of one deploy. Teardown
@@ -1702,34 +1708,61 @@ mod tests {
     }
 
     #[test]
-    fn test_args_have_host_network_eq_form() {
-        assert!(args_have_host_network(&sv(&[
-            "--privileged",
-            "--network=host"
-        ])));
-        assert!(args_have_host_network(&sv(&["--net=host"])));
-    }
-
-    #[test]
-    fn test_args_have_host_network_space_form() {
-        assert!(args_have_host_network(&sv(&["--network", "host"])));
-        assert!(args_have_host_network(&sv(&["--net", "host"])));
-    }
-
-    #[test]
-    fn test_args_have_host_network_none() {
-        assert!(!args_have_host_network(&sv(&["--privileged"])));
-        // `--network` followed by something other than host is not host networking.
-        assert!(!args_have_host_network(&sv(&["--network", "bridge"])));
-        assert!(!args_have_host_network(&sv(&[])));
-    }
-
-    #[test]
     fn test_strip_host_network_eq_form() {
         let mut args = sv(&["--privileged", "--network=host", "-v", "/x:/y"]);
         strip_host_network_args(&mut args);
         assert_eq!(args, sv(&["--privileged", "-v", "/x:/y"]));
         assert!(!args_have_host_network(&args));
+    }
+
+    #[test]
+    fn test_strip_host_network_single_element_space_form() {
+        let mut args = vec!["--privileged".to_string(), "--network host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["--privileged".to_string()]);
+    }
+
+    #[test]
+    fn test_strip_host_network_element_among_other_flags() {
+        let mut args = vec!["--privileged --network host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["--privileged".to_string()]);
+        let mut args = vec!["-v /dev:/dev --net=host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["-v".to_string(), "/dev:/dev".to_string()]);
+    }
+
+    #[test]
+    fn test_strip_host_network_keeps_quoted_values_intact() {
+        let mut args = vec!["-e \"A=b c\" --network host".to_string()];
+        strip_host_network_args(&mut args);
+        assert_eq!(args, vec!["-e".to_string(), "\"A=b c\"".to_string()]);
+        // The run re-splits each element; the value must survive that.
+        let resplit: Vec<String> = args
+            .iter()
+            .flat_map(|a| SdkContainer::parse_container_arg(a))
+            .collect();
+        assert_eq!(resplit, vec!["-e".to_string(), "A=b c".to_string()]);
+    }
+
+    #[test]
+    fn test_strip_removes_every_form_detection_sees() {
+        let cases: [&[&str]; 4] = [
+            &["--network=\"host\""],
+            &["--privileged --net", "host"],
+            &["--net", "host --privileged"],
+            &["--privileged --network host"],
+        ];
+        for case in cases {
+            let mut args: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            assert!(args_have_host_network(&args), "{case:?} not detected");
+            strip_host_network_args(&mut args);
+            assert!(!args_have_host_network(&args), "{case:?} -> {args:?}");
+            assert!(
+                args.iter().all(|a| !a.contains("host")),
+                "{case:?} -> {args:?}"
+            );
+        }
     }
 
     #[test]

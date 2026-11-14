@@ -70,6 +70,8 @@ pub struct InitCommand {
     name: Option<String>,
     /// Output format (human prose vs NDJSON for the desktop app).
     output: OutputFormat,
+    /// Omit the default remote extensions from the generated template.
+    minimal: bool,
 }
 
 impl InitCommand {
@@ -94,7 +96,17 @@ impl InitCommand {
             reference_repo,
             name,
             output,
+            minimal: false,
         }
+    }
+
+    /// Generate a template without the three default remote extensions
+    /// (`avocado-ext-dev`, `avocado-ext-sshd-dev`, the board BSP), so the
+    /// project builds from a feed that does not carry them. Only affects
+    /// the template path; a `--reference` download is left untouched.
+    pub fn with_minimal(mut self, minimal: bool) -> Self {
+        self.minimal = minimal;
+        self
     }
 
     /// Resolve the on-disk destination directory. When `--name` is
@@ -180,12 +192,32 @@ impl InitCommand {
     ///
     /// # Returns
     /// * The configuration template content as a string
-    fn load_config_template(target: &str) -> String {
+    fn load_config_template(target: &str, minimal: bool) -> String {
         // All targets start from the default config template.
         // To add target-specific config additions in the future, create a YAML file at
         // configs/additions/<target>.yaml and add an include_str! match arm here.
         let default_template = include_str!("../../configs/default.yaml");
-        default_template.replace("{target}", target)
+        let template = if minimal {
+            Self::strip_remote_extensions(default_template)
+        } else {
+            default_template.to_string()
+        };
+        template.replace("{target}", target)
+    }
+
+    /// Removes the runtime references and definitions of the default
+    /// remote extensions. Exact-block removal: a template edit that
+    /// breaks a block fails `minimal_output_is_valid`.
+    fn strip_remote_extensions(template: &str) -> String {
+        const BLOCKS: [&str; 4] = [
+            "      - avocado-ext-dev\n      - avocado-ext-sshd-dev\n      - avocado-bsp-{{ avocado.target.board }}\n",
+            "  avocado-ext-dev:\n    source:\n      type: package\n      version: \"*\"\n\n",
+            "  avocado-ext-sshd-dev:\n    source:\n      type: package\n      version: \"*\"\n\n",
+            "  avocado-bsp-{{ avocado.target.board }}:\n    source:\n      type: package\n      version: \"*\"\n\n",
+        ];
+        BLOCKS
+            .iter()
+            .fold(template.to_string(), |acc, block| acc.replace(block, ""))
     }
 
     /// Checks if a reference exists in the repository.
@@ -1064,7 +1096,7 @@ impl InitCommand {
             }
 
             // Load the configuration template for the target
-            let config_content = Self::load_config_template(target);
+            let config_content = Self::load_config_template(target, self.minimal);
 
             // Write the configuration file
             fs::write(&toml_path, config_content).with_context(|| {
@@ -1122,6 +1154,100 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    async fn template_requirement_matches_prerelease() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
+        init_cmd.execute().await.unwrap();
+
+        let content = fs::read_to_string(PathBuf::from(temp_path).join("avocado.yaml")).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let requirement = yaml["cli_requirement"].as_str().unwrap();
+        assert_eq!(requirement, ">=1.0.0");
+
+        let dev = semver::Version::parse("1.1.0-dev").unwrap();
+        let old = semver::Version::parse("0.99.0").unwrap();
+        assert!(crate::utils::version::cli_requirement_satisfied_by(requirement, &dev).unwrap());
+        assert!(!crate::utils::version::cli_requirement_satisfied_by(requirement, &old).unwrap());
+    }
+
+    #[tokio::test]
+    async fn minimal_output_is_valid() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+
+        let init_cmd = InitCommand::new(
+            Some("qemux86-64".to_string()),
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        )
+        .with_minimal(true);
+        init_cmd.execute().await.unwrap();
+
+        let content = fs::read_to_string(PathBuf::from(temp_path).join("avocado.yaml")).unwrap();
+        for dropped in ["avocado-ext-dev", "avocado-ext-sshd-dev", "avocado-bsp-"] {
+            assert!(!content.contains(dropped), "minimal output kept {dropped}");
+        }
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let runtime_exts: Vec<&str> = yaml["runtimes"]["dev"]["extensions"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(runtime_exts, vec!["app"]);
+        let ext_names: Vec<&str> = yaml["extensions"]
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert_eq!(ext_names, vec!["app"]);
+
+        let report = crate::commands::config_validate::validate(&content);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[tokio::test]
+    async fn default_output_keeps_remote_extensions() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path().to_str().unwrap();
+
+        let init_cmd = InitCommand::new(
+            None,
+            Some(temp_path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Human,
+        );
+        init_cmd.execute().await.unwrap();
+
+        let content = fs::read_to_string(PathBuf::from(temp_path).join("avocado.yaml")).unwrap();
+        assert!(content.contains("avocado-ext-dev"));
+        assert!(content.contains("avocado-ext-sshd-dev"));
+        assert!(content.contains("avocado-bsp-"));
+    }
+
+    #[tokio::test]
     async fn test_init_default_target() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_str().unwrap();
@@ -1146,7 +1272,7 @@ mod tests {
         let content = fs::read_to_string(&config_path).unwrap();
         let expected_target = InitCommand::get_default_target();
         assert!(content.contains(&format!("default_target: \"{expected_target}\"")));
-        assert!(content.contains("cli_requirement: \">=0.41.0\""));
+        assert!(content.contains("cli_requirement: \">=1.0.0\""));
         assert!(content.contains("distro:"));
         assert!(content.contains("channel: edge"));
         assert!(content.contains("release: 2026"));

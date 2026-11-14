@@ -1080,6 +1080,8 @@ pub struct RepoDef {
     pub password: Option<String>,
     pub ca: Option<String>,
     pub tls_verify: Option<bool>,
+    /// Rewrite a loopback host in `url` to one the build container can reach.
+    pub rewrite_loopback: Option<bool>,
 }
 
 /// Reference to a Docker image for priming on the var partition at build time.
@@ -2177,7 +2179,6 @@ impl Config {
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
         config.promote_repo_tls_env();
-
         Ok(ComposedConfig {
             config,
             merged_value: main_config,
@@ -4522,7 +4523,138 @@ async fn invocation_feeds(
     .cloned()
 }
 
+/// The stages whose feeds one target's probes covered, and whether they covered
+/// the extension repository too.
+type FeedsProbed = (
+    std::collections::BTreeSet<crate::utils::feeds::FeedStage>,
+    bool,
+);
+
+/// Targets whose feed repositories this process has already probed.
+static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedsProbed>>> =
+    std::sync::OnceLock::new();
+
+/// Set once the `--runs-on` preflight skip has been announced, so the
+/// per-extension and per-runtime install tasks do not repeat it.
+static RUNS_ON_SKIP_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Config {
+    /// Print the `--runs-on` skip notice unless `flag` says it already was.
+    /// Returns true when it printed. Takes the flag so a test can use its own.
+    fn preflight_runs_on_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::utils::output::print_info_stderr(
+            "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
+        );
+        true
+    }
+
+    /// Whether any of the `active` extensions is fetched from the extension
+    /// repository: one declaring a package `source` without `repo_name`. A local
+    /// extension (no `source`, as `avocado init --minimal` keeps), a git or path
+    /// source, and a package source with `repo_name` (dnf then runs `--repo=<name>`
+    /// and never reads that repository) never touch it, so a feed without one must
+    /// not be refused for them.
+    /// `enabled: false` does not exempt a sourced extension; it is fetched anyway.
+    ///
+    /// `parsed` must already be interpolated.
+    pub fn extensions_need_extension_repo<'a>(
+        parsed: &serde_yaml::Value,
+        active: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
+        let packages: std::collections::HashSet<String> =
+            Self::discover_remote_extensions_from_value(parsed)?
+                .into_iter()
+                .filter(|(_, source)| {
+                    matches!(
+                        source,
+                        ExtensionSource::Package {
+                            repo_name: None,
+                            ..
+                        }
+                    )
+                })
+                .map(|(name, _)| name)
+                .collect();
+        Ok(active.into_iter().any(|name| packages.contains(name)))
+    }
+
+    /// Fail before the first download when a feed repository is unreachable.
+    ///
+    /// `install`, `sdk install`, `ext install`, `runtime install`, `rootfs
+    /// install`, `initramfs install`, `fetch` and `ext fetch` call this on the
+    /// way in, and `install` runs several of them, so the probes are keyed by
+    /// target and run once per invocation. The lock is held across the probes so
+    /// two concurrent callers do not both run them. Only a pass is recorded; a
+    /// failure ends the command.
+    /// Only feeds that apply to one of `stages` are probed. A later call that
+    /// names a stage, or needs the extension repository, which no earlier pass
+    /// covered runs again, so the second caller is not told yes on the first's
+    /// narrower check.
+    /// Resolution is repeated here rather than shared with `materialize_feeds`,
+    /// which runs later and needs the mint this check must precede.
+    ///
+    /// With `runs_on` the probes are skipped: dnf runs on the remote runner,
+    /// which may reach feeds this host cannot.
+    pub async fn preflight_feeds_once(
+        &self,
+        target: &str,
+        config_path: &str,
+        stages: &[crate::utils::feeds::FeedStage],
+        needs_extension_repo: bool,
+        runs_on: bool,
+    ) -> Result<()> {
+        if runs_on {
+            Self::preflight_runs_on_skip_with(&RUNS_ON_SKIP_PRINTED);
+            return Ok(());
+        }
+        let probed = FEEDS_PROBED.get_or_init(Default::default);
+        let mut done = probed.lock().await;
+        if let Some((stages_probed, ext_probed)) = done.get(target) {
+            if stages.iter().all(|s| stages_probed.contains(s))
+                && (*ext_probed || !needs_extension_repo)
+            {
+                return Ok(());
+            }
+        }
+        let project_root = self.project_root(config_path);
+        let container_args = self.feed_container_args(target, config_path);
+        let set = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?;
+        crate::utils::feeds::preflight_feeds(
+            self,
+            set.as_ref(),
+            target,
+            stages,
+            needs_extension_repo,
+        )
+        .await?;
+        let entry = done.entry(target.to_string()).or_default();
+        entry.0.extend(stages.iter().copied());
+        entry.1 |= needs_extension_repo;
+        Ok(())
+    }
+
+    /// The project's container arguments as docker receives them for `target`:
+    /// `sdk.<target>.container_args` replacing the base list, variables
+    /// expanded. An unreadable config file falls back to the base list, since
+    /// the loaded `Config` already parsed it once.
+    fn feed_container_args(&self, target: &str, config_path: &str) -> Vec<String> {
+        let args = match self.get_merged_sdk_config(target, config_path) {
+            Ok(merged) => merged.container_args,
+            Err(_) => self.get_sdk_container_args().cloned(),
+        };
+        Self::process_container_args(args.as_ref()).unwrap_or_default()
+    }
+
     /// Resolve, record, and materialize the named feeds for one container run.
     /// `None` when the project declares no feeds — the zero-cost path. The first
     /// call for a target writes the canonical document to
@@ -4543,8 +4675,14 @@ impl Config {
         // sets `src_dir` would otherwise get its feed document beside the config
         // file while the rest of its build state sits somewhere else.
         let project_root = self.project_root(config_path);
-        let Some(set) =
-            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
+        let container_args = self.feed_container_args(target, config_path);
+        let Some(set) = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?
         else {
             // No named feeds. Still a fact worth recording, because it is the fact
             // that removes a set the lock may still be carrying from a config that
@@ -13326,6 +13464,30 @@ runtimes:
             .is_empty());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn feed_container_args_merge_the_target_section_and_expand_variables() {
+        let prior = std::env::var_os("FEED_ARGS_TEST_NET");
+        std::env::set_var("FEED_ARGS_TEST_NET", "host");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container_args:\n    - --network=${FEED_ARGS_TEST_NET}\n  other-target:\n    container_args:\n      - --net=bridge\n  qemux86-64:\n    container_args:\n      - --cap-add=NET_ADMIN\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let config = Config::load(&path).unwrap();
+        let base = config.feed_container_args("unlisted-target", &path_str);
+        let targeted = config.feed_container_args("qemux86-64", &path_str);
+        match prior {
+            Some(v) => std::env::set_var("FEED_ARGS_TEST_NET", v),
+            None => std::env::remove_var("FEED_ARGS_TEST_NET"),
+        }
+        assert_eq!(base, vec!["--network=host".to_string()]);
+        assert_eq!(targeted, vec!["--cap-add=NET_ADMIN".to_string()]);
+    }
+
     /// `avocado build` and `avocado install` load exclusively through
     /// `load_composed*`, which validated only the CLI requirement. An empty
     /// `targets:` therefore reached the build: the empty scope filtered the
@@ -14859,6 +15021,7 @@ mod kernel_cmdline_tests {
 #[cfg(test)]
 mod invocation_feeds_tests {
     use super::*;
+    use crate::utils::feeds::FeedStage;
 
     /// The feeds dir is a docker bind source, so under the avocado-vm it must sit
     /// in the VM workspace, outside the project. Elsewhere it stays in `$TMPDIR`.
@@ -14944,6 +15107,211 @@ mod invocation_feeds_tests {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(&format!("avocado-feeds-{}-", std::process::id())));
         assert!(FEED_DIRS.lock().unwrap().iter().any(|d| d == path));
+    }
+
+    /// `install` and `sdk install` both call the hook on the way to the first
+    /// download; the feeds must be asked about once between them.
+    #[tokio::test]
+    async fn probe_runs_once_per_invocation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\nrepos:\n  local:\n    url: http://{addr}/feed\n"
+        ))
+        .unwrap();
+        let cfg = cfg.to_str().unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loopback server answering every request with `status`, counting requests.
+    async fn serve_counting(
+        status: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn repo_config(url: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  repo:\n    url: {url}\n"
+        ))
+        .unwrap()
+    }
+
+    const MINIMAL: &str = "extensions:\n  app:\n    version: '1.0.0'\n";
+    const SOURCED: &str = "extensions:\n  app:\n    version: '1.0.0'\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n  git-ext:\n    version: '*'\n    source:\n      type: git\n      url: https://example.com/x.git\n";
+
+    fn needs(yaml: &str, active: &[&str]) -> bool {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        Config::extensions_need_extension_repo(&v, active.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn only_an_active_package_sourced_extension_needs_the_extension_repo() {
+        assert!(
+            !needs(MINIMAL, &["app"]),
+            "a local extension is not fetched"
+        );
+        assert!(needs(SOURCED, &["app", "avocado-ext-dev"]));
+        assert!(!needs(SOURCED, &["app"]), "an inactive sourced extension");
+        assert!(!needs(SOURCED, &["git-ext"]), "a git source skips the repo");
+        assert!(!needs(SOURCED, &[]));
+    }
+
+    #[test]
+    fn a_package_source_with_repo_name_does_not_need_the_extension_repo() {
+        let yaml = "extensions:\n  vendor-ext:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n      repo_name: vendor\n";
+        assert!(!needs(yaml, &["vendor-ext"]));
+    }
+
+    #[test]
+    fn enabled_false_does_not_exempt_a_sourced_extension() {
+        let yaml = "runtimes:\n  r:\n    extensions:\n      - avocado-ext-dev:\n          enabled: false\nextensions:\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n";
+        // Activity ignores `enabled`; the helper only sees the active names.
+        assert!(needs(yaml, &["avocado-ext-dev"]));
+    }
+
+    #[tokio::test]
+    async fn minimal_project_against_a_feed_without_an_extension_repo_passes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(MINIMAL, &["app"]);
+        c.preflight_feeds_once(
+            "minimal-no-ext-repo",
+            "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
+            need,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sourced_extension_against_a_feed_without_an_extension_repo_fails_naming_it() {
+        let (base, _) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(SOURCED, &["avocado-ext-dev"]);
+        let e = c
+            .preflight_feeds_once(
+                "sourced-no-ext-repo",
+                "/nonexistent/avocado.yaml",
+                FeedStage::ALL,
+                need,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'avocado' extension repository"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_later_call_needing_the_extension_repo_still_probes_it() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("extension repository"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_later_call_for_another_stage_still_probes_its_feeds() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [sdkonly]\nrepos:\n  sdkonly:\n    url: {base}/feed\n    stages: [sdk]\n"
+        ))
+        .unwrap();
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Rootfs], false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Sdk], false, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'sdkonly'"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runs_on_skips_the_local_probes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        c.preflight_feeds_once(
+            "runs-on-test",
+            "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn runs_on_skip_message_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(Config::preflight_runs_on_skip_with(&flag));
+        assert!(!Config::preflight_runs_on_skip_with(&flag));
     }
 }
 
@@ -15208,5 +15576,53 @@ supported_targets: [raspberrypi0-2w, raspberrypi4]
         let got = composed.config.get_sdk_repo_release();
         std::env::remove_var("AVOCADO_RELEASEVER");
         assert_eq!(got.as_deref(), Some("env/rv"));
+    }
+}
+
+#[cfg(test)]
+mod enabled_flag_ruling_tests {
+    use super::*;
+
+    const YAML: &str = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - on-ext
+        - shipped-off:
+            enabled: false
+extensions:
+  on-ext:
+    version: "1.0.0"
+  shipped-off:
+    version: "1.0.0"
+"#;
+
+    /// Ruling 1.4: `enabled: false` keeps current semantics. The flag only
+    /// controls whether an extension ships in the runtime image; the extension
+    /// is still fetched at SDK install, so the active set includes it.
+    #[test]
+    fn test_find_active_extensions_follows_ruling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, YAML).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let active = find_active_extensions(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            config_path,
+            None,
+        )
+        .expect("active extensions");
+
+        let mut names: Vec<_> = active.into_iter().collect();
+        names.sort();
+        assert_eq!(names, vec!["on-ext", "shipped-off"]);
     }
 }
