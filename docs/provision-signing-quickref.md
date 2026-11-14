@@ -53,6 +53,7 @@ fi
 - `$AVOCADO_EXT_LIST` - Space-separated list of required extensions
 - `$AVOCADO_PROVISION_OUT` - Output directory (if `--out` specified). File ownership automatically fixed to calling user.
 - `$AVOCADO_PROVISION_STATE` - Path to state file for persisting state between provision runs (if `--provision-profile` specified). See State File section below.
+- `$AVOCADO_PROVISION_FORCE` - `1` if `--force` was passed, `0` otherwise (always set). `--force` runs without a terminal, so scripts use this to tell an operator-confirmed run from an unattended one.
 - `$AVOCADO_STONE_INCLUDE_PATHS` - Stone include paths (if configured)
 - `$AVOCADO_STONE_MANIFEST` - Stone manifest path (if configured)
 

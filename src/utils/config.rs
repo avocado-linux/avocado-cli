@@ -966,6 +966,18 @@ pub struct PackageConfig {
     pub arch: Option<String>,
     /// RPM Requires dependencies
     pub requires: Option<Vec<String>>,
+    /// RPM Provides entries (e.g. "foo = 1.0")
+    pub provides: Option<Vec<String>>,
+    /// RPM epoch (omitted from the spec when not set)
+    pub epoch: Option<u32>,
+    /// Script run before the package is installed (%pre)
+    pub pre_install: Option<String>,
+    /// Script run after the package is installed (%post)
+    pub post_install: Option<String>,
+    /// Script run before the package is removed (%preun)
+    pub pre_uninstall: Option<String>,
+    /// Script run after the package is removed (%postun)
+    pub post_uninstall: Option<String>,
     /// Glob patterns for files included in main package (all staged files if omitted)
     pub files: Option<Vec<String>>,
     /// Sub-package definitions (Yocto-inspired splitting)
@@ -15417,5 +15429,74 @@ supported_targets: [raspberrypi0-2w, raspberrypi4]
         let got = composed.config.get_sdk_repo_release();
         std::env::remove_var("AVOCADO_RELEASEVER");
         assert_eq!(got.as_deref(), Some("env/rv"));
+    }
+}
+
+#[cfg(test)]
+mod package_section_metadata_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:dev"
+  compile:
+    my-app:
+      compile: build.sh
+      package:
+        install: install.sh
+        version: "1.0.0"
+"#;
+
+    fn yaml_with(extra: &str) -> String {
+        format!("{BASE}{extra}")
+    }
+
+    #[test]
+    fn package_section_accepts_provides_epoch_scriptlets() {
+        let yaml = yaml_with(
+            r#"        provides:
+          - "foo = 1.0"
+          - "bar"
+        epoch: 2
+        pre_install: "echo pre"
+        post_install: "echo post"
+        pre_uninstall: "echo preun"
+        post_uninstall: "echo postun"
+"#,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            crate::utils::config_lint::ignored_keys(&doc),
+            Vec::<String>::new()
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, &yaml).unwrap();
+        let config = Config::load(&path).unwrap();
+        let compile = config.sdk.unwrap().compile.unwrap();
+        let pkg = compile.get("my-app").unwrap().package.as_ref().unwrap();
+        assert_eq!(
+            pkg.provides.as_deref(),
+            Some(&["foo = 1.0".to_string(), "bar".to_string()][..])
+        );
+        assert_eq!(pkg.epoch, Some(2));
+        assert_eq!(pkg.pre_install.as_deref(), Some("echo pre"));
+        assert_eq!(pkg.post_install.as_deref(), Some("echo post"));
+        assert_eq!(pkg.pre_uninstall.as_deref(), Some("echo preun"));
+        assert_eq!(pkg.post_uninstall.as_deref(), Some("echo postun"));
+    }
+
+    #[test]
+    fn package_section_rejects_unknown_key() {
+        let yaml = yaml_with("        post_instal: \"echo typo\"\n");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let warnings = crate::utils::config_lint::ignored_keys(&doc);
+        assert_eq!(
+            warnings,
+            vec![
+                "unknown key 'sdk.compile.my-app.package.post_instal' is ignored; did you mean 'post_install'?"
+            ]
+        );
     }
 }
