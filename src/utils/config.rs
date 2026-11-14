@@ -805,6 +805,67 @@ pub struct RuntimeConfig {
     pub container_dev: Option<ContainerDevConfig>,
 }
 
+/// Container settings by name, in Docker Compose's spelling. The structured
+/// form of `container_args`, which stays for whatever has no key here.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerConfig {
+    pub privileged: Option<bool>,
+    pub network_mode: Option<String>,
+    pub volumes: Option<Vec<String>>,
+    pub devices: Option<Vec<String>>,
+    pub extra_hosts: Option<Vec<String>>,
+    pub cap_add: Option<Vec<String>>,
+    pub environment: Option<BTreeMap<String, serde_yaml::Value>>,
+}
+
+impl ContainerConfig {
+    /// The block as `docker run` flags.
+    fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.privileged == Some(true) {
+            args.push("--privileged".to_string());
+        }
+        if let Some(network) = &self.network_mode {
+            args.push(format!("--network={network}"));
+        }
+        for (flag, values) in [
+            ("-v", &self.volumes),
+            ("--device", &self.devices),
+            ("--add-host", &self.extra_hosts),
+            ("--cap-add", &self.cap_add),
+        ] {
+            for value in values.iter().flatten() {
+                args.extend([flag.to_string(), value.clone()]);
+            }
+        }
+        for (name, value) in self.environment.iter().flatten() {
+            let value = value_to_string(value);
+            args.extend(["-e".to_string(), format!("{name}={value}")]);
+        }
+        args
+    }
+
+    /// `container_args` followed by the `container` block. Where both name
+    /// one setting the block's is kept: docker takes a second `--network` as
+    /// a second network to join, not as an override.
+    fn with_args(args: &Option<Vec<String>>, block: &Option<Self>) -> Option<Vec<String>> {
+        let Some(block) = block else {
+            return args.clone();
+        };
+        let mut all = args.clone().unwrap_or_default();
+        all.extend(block.to_args());
+        Some(Config::deduplicate_container_args(all))
+    }
+}
+
+impl SdkConfig {
+    /// `container_args` followed by the `container` block.
+    pub fn all_container_args(&self) -> Option<Vec<String>> {
+        ContainerConfig::with_args(&self.container_args, &self.container)
+    }
+}
+
 /// SDK configuration section
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SdkConfig {
@@ -816,6 +877,7 @@ pub struct SdkConfig {
     pub repo_release: Option<String>,
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
+    pub container: Option<ContainerConfig>,
     pub disable_weak_dependencies: Option<bool>,
     /// Host UID for bindfs permission translation (overrides libc::getuid())
     pub host_uid: Option<u32>,
@@ -951,6 +1013,7 @@ pub struct PermissionsConfig {
 pub struct ProvisionProfileConfig {
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
+    pub container: Option<ContainerConfig>,
     /// Path to state file relative to src_dir for persisting state between provision runs.
     /// Defaults to `.avocado/provision-{profile}.state` when not specified.
     /// The state file is copied into the container before provisioning and copied back after.
@@ -4670,9 +4733,10 @@ impl Config {
         self.get_distro_release()
     }
 
-    /// Get the SDK container args from configuration
-    pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
-        self.sdk.as_ref()?.container_args.as_ref()
+    /// Get the SDK container args from configuration: `sdk.container_args`
+    /// followed by the `sdk.container` block.
+    pub fn get_sdk_container_args(&self) -> Option<Vec<String>> {
+        self.sdk.as_ref()?.all_container_args()
     }
 
     /// Get the disable_weak_dependencies setting from SDK configuration
@@ -5093,10 +5157,9 @@ impl Config {
     }
 
     /// Get container args from provision profile
-    pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<&Vec<String>> {
-        self.get_provision_profile(profile_name)?
-            .container_args
-            .as_ref()
+    pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<Vec<String>> {
+        let profile = self.get_provision_profile(profile_name)?;
+        ContainerConfig::with_args(&profile.container_args, &profile.container)
     }
 
     /// Get the state file path for a provision profile.
@@ -5783,7 +5846,7 @@ impl Config {
     pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
         let config_args = self.get_sdk_container_args();
 
-        match (config_args, cli_args) {
+        match (config_args.as_ref(), cli_args) {
             (Some(config), Some(cli)) => {
                 let mut merged = Self::process_container_args(Some(config)).unwrap_or_default();
                 merged.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
@@ -5811,11 +5874,11 @@ impl Config {
         // Collect all args in order: SDK first, then provision profile, then CLI
         let mut all_args: Vec<String> = Vec::new();
 
-        if let Some(sdk) = sdk_args {
+        if let Some(sdk) = &sdk_args {
             all_args.extend(Self::process_container_args(Some(sdk)).unwrap_or_default());
         }
 
-        if let Some(profile) = profile_args {
+        if let Some(profile) = &profile_args {
             all_args.extend(Self::process_container_args(Some(profile)).unwrap_or_default());
         }
 
@@ -6474,6 +6537,9 @@ fn merge_sdk_configs(mut base: SdkConfig, target: SdkConfig) -> SdkConfig {
     }
     if target.container_args.is_some() {
         base.container_args = target.container_args;
+    }
+    if target.container.is_some() {
+        base.container = target.container;
     }
     if target.host_uid.is_some() {
         base.host_uid = target.host_uid;
@@ -7988,6 +8054,65 @@ runtimes:
 
         let config = Config::load_from_str(config_content).unwrap();
         assert_eq!(config.default_target_board, None);
+    }
+
+    #[test]
+    fn container_block_overrides_container_args() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  image: "sdk"
+  container_args: ["--network=bridge", "--init", "-v /dev:/dev"]
+  container:
+    privileged: true
+    network_mode: host
+    volumes: ["/dev:/dev"]
+    devices: ["/dev/ttyUSB0"]
+    extra_hosts: ["feed:10.0.0.1"]
+    cap_add: ["NET_ADMIN"]
+    environment:
+      DEBUG: 1
+      NAME: value
+provision_profiles:
+  usb:
+    container:
+      volumes: ["/sys:/sys:ro"]
+"#,
+        )
+        .unwrap();
+
+        // The block's network and its restated mount replace the ones in
+        // `container_args`; docker would refuse the run with both.
+        let expected = [
+            "--init",
+            "--privileged",
+            "--network=host",
+            "-v",
+            "/dev:/dev",
+            "--device",
+            "/dev/ttyUSB0",
+            "--add-host",
+            "feed:10.0.0.1",
+            "--cap-add",
+            "NET_ADMIN",
+            "-e",
+            "DEBUG=1",
+            "-e",
+            "NAME=value",
+        ];
+        assert_eq!(config.get_sdk_container_args().unwrap(), expected);
+        assert_eq!(
+            config.get_provision_profile_container_args("usb").unwrap(),
+            ["-v", "/sys:/sys:ro"]
+        );
+        // The profile's block reaches the merge.
+        let merged = config
+            .merge_provision_container_args(Some("usb"), None)
+            .unwrap();
+        assert!(merged.contains(&"/sys:/sys:ro".to_string()));
+
+        // A key that is not a setting is a mistake, not something to drop.
+        assert!(Config::load_from_str("sdk:\n  container:\n    priviledged: true\n").is_err());
     }
 
     #[test]

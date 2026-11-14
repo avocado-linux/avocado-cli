@@ -386,6 +386,62 @@
         "--privileged --network=host"
       ]
     },
+    "containerConfig": {
+      "title": "Container settings",
+      "type": "object",
+      "description": "Settings for the container, by name, spelled as Docker Compose spells them. Applied after 'container_args', which stays for anything that has no key here. Supports environment variable expansion using ${VAR_NAME} syntax.",
+      "properties": {
+        "privileged": {
+          "type": "boolean",
+          "description": "Run the container privileged."
+        },
+        "network_mode": {
+          "type": "string",
+          "description": "Network the container joins.",
+          "examples": [
+            "host"
+          ]
+        },
+        "volumes": {
+          "$ref": "#/definitions/stringList",
+          "description": "Bind mounts and volumes, as 'source:target[:options]'.",
+          "examples": [
+            [
+              "/dev:/dev"
+            ]
+          ]
+        },
+        "devices": {
+          "$ref": "#/definitions/stringList",
+          "description": "Host devices to pass through.",
+          "examples": [
+            [
+              "/dev/ttyUSB0"
+            ]
+          ]
+        },
+        "extra_hosts": {
+          "$ref": "#/definitions/stringList",
+          "description": "Extra /etc/hosts entries, as 'host:ip'."
+        },
+        "cap_add": {
+          "$ref": "#/definitions/stringList",
+          "description": "Linux capabilities to add."
+        },
+        "environment": {
+          "type": "object",
+          "description": "Environment variables to set in the container.",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "distroConfig": {
       "title": "Distribution configuration",
       "type": "object",
@@ -710,6 +766,9 @@
         },
         "container_args": {
           "$ref": "#/definitions/containerArgs"
+        },
+        "container": {
+          "$ref": "#/definitions/containerConfig"
         },
         "disable_weak_dependencies": {
           "title": "Disable weak dependencies",
@@ -1722,6 +1781,9 @@
       "properties": {
         "container_args": {
           "$ref": "#/definitions/containerArgs"
+        },
+        "container": {
+          "$ref": "#/definitions/containerConfig"
         },
         "state_file": {
           "title": "State file",

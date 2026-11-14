@@ -81,3 +81,14 @@ fn an_override_inherits_recovery_and_encrypt_from_the_base() {
         "{base}    target-qemux86-64:\n      var:\n        recovery: other\n"
     )));
 }
+
+#[test]
+fn the_container_block_is_accepted_where_container_args_is() {
+    assert!(accepts(
+        "sdk:\n  container:\n    privileged: true\n    volumes: ['/dev:/dev']\n    environment:\n      DEBUG: 1\n"
+    ));
+    assert!(accepts(
+        "provision_profiles:\n  usb:\n    container:\n      network_mode: host\n"
+    ));
+    assert!(!accepts("sdk:\n  container:\n    priviledged: true\n"));
+}
