@@ -86,6 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows, with a `--container-tool` other than `docker`, and when
   `DOCKER_HOST` is an `ssh://` or TLS endpoint. Set `AVOCADO_DOCKER_CLI=1` to
   use the `docker` command everywhere, as before.
+- **`container:` names the common container settings.** `sdk` and each
+  provision profile take a `container:` block with `privileged`,
+  `network_mode`, `volumes`, `devices`, `extra_hosts`, `cap_add` and
+  `environment`, spelled as Docker Compose spells them. `container_args`
+  still works and is still the place for any flag without a key; where both
+  set the same thing, the block wins.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's

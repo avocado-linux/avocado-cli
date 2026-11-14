@@ -1501,6 +1501,13 @@ pub fn compute_sdk_input_hash(config: &serde_yaml::Value) -> Result<StampInputs>
                 args.clone(),
             );
         }
+        // The same settings by name; see `ContainerConfig`.
+        if let Some(block) = sdk.get("container") {
+            hash_data.insert(
+                serde_yaml::Value::String("sdk.container".to_string()),
+                block.clone(),
+            );
+        }
     }
     // `src_dir` moves the base every relative path in the config resolves
     // against; the content behind those paths is hashed elsewhere, but the
