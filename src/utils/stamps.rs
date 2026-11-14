@@ -70,6 +70,7 @@ pub enum StampCommand {
     Sign,
     Provision,
     CompileDeps,
+    Compile,
 }
 
 impl fmt::Display for StampCommand {
@@ -81,6 +82,7 @@ impl fmt::Display for StampCommand {
             StampCommand::Sign => write!(f, "sign"),
             StampCommand::Provision => write!(f, "provision"),
             StampCommand::CompileDeps => write!(f, "compile-deps"),
+            StampCommand::Compile => write!(f, "compile"),
         }
     }
 }
@@ -277,6 +279,26 @@ impl Stamp {
         )
     }
 
+    /// Create the stamp of one `sdk.compile` section.
+    ///
+    /// Stored under `sdk/{host_arch}/compile/{section}.stamp`, next to the
+    /// build directory it describes (`$AVOCADO_SDK_PREFIX/build/{section}`).
+    pub fn sdk_compile(
+        section: &str,
+        target: &str,
+        inputs: StampInputs,
+        outputs: StampOutputs,
+    ) -> Self {
+        Self::new(
+            StampCommand::Compile,
+            StampComponent::Sdk,
+            Some(section.to_string()),
+            target.to_string(),
+            inputs,
+            outputs,
+        )
+    }
+
     /// Create extension install stamp
     pub fn ext_install(
         name: &str,
@@ -456,6 +478,9 @@ impl Stamp {
     /// the host architecture where the SDK runs) to support --runs-on with different architectures.
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name) {
+            (StampComponent::Sdk, Some(section)) => {
+                format!("sdk/{}/{}/{}.stamp", self.target, self.command, section)
+            }
             (StampComponent::Sdk, _) => format!("sdk/{}/{}.stamp", self.target, self.command),
             (StampComponent::Extension, Some(name)) => {
                 format!("ext/{}/{}.stamp", name, self.command)
@@ -568,6 +593,16 @@ impl StampRequirement {
         }
     }
 
+    /// Compile section requirement for the local host architecture
+    pub fn sdk_compile(section: &str) -> Self {
+        Self {
+            command: StampCommand::Compile,
+            component: StampComponent::Sdk,
+            component_name: Some(section.to_string()),
+            host_arch: Some(get_local_arch().to_string()),
+        }
+    }
+
     /// Extension install requirement
     pub fn ext_install(name: &str) -> Self {
         Self::new(StampCommand::Install, StampComponent::Extension, Some(name))
@@ -635,6 +670,17 @@ impl StampRequirement {
     /// running on remotes with different CPU architectures via --runs-on.
     pub fn relative_path(&self) -> String {
         match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, Some(section), Some(arch)) => {
+                format!("sdk/{}/{}/{}.stamp", arch, self.command, section)
+            }
+            (StampComponent::Sdk, Some(section), None) => {
+                format!(
+                    "sdk/{}/{}/{}.stamp",
+                    get_local_arch(),
+                    self.command,
+                    section
+                )
+            }
             (StampComponent::Sdk, _, Some(arch)) => {
                 format!("sdk/{}/{}.stamp", arch, self.command)
             }
@@ -665,6 +711,9 @@ impl StampRequirement {
     /// Human-readable description
     pub fn description(&self) -> String {
         match (&self.component, &self.component_name, &self.host_arch) {
+            (StampComponent::Sdk, Some(section), _) => {
+                format!("compile section '{section}'")
+            }
             (StampComponent::Sdk, _, Some(arch)) => {
                 format!("SDK {} ({})", self.command, arch)
             }
@@ -704,6 +753,9 @@ impl StampRequirement {
                 Some(remote) => format!("avocado sdk install --runs-on {remote}"),
                 None => "avocado sdk install".to_string(),
             },
+            (StampComponent::Sdk, Some(section), StampCommand::Compile) => {
+                format!("avocado sdk compile {section}")
+            }
             (StampComponent::Extension, Some(name), StampCommand::Install) => {
                 format!("avocado ext install {name}")
             }
@@ -1561,6 +1613,219 @@ pub fn compute_compile_deps_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
+/// Compute input hash for one `sdk.compile` section run by `ext build`:
+/// everything the section's compile script is known to read.
+///
+/// - the `sdk.compile.<section>` node itself
+/// - the bytes of `script`, the compile script that runs (resolved for the
+///   target), found the way [`fold_package_scripts`] finds it
+/// - the `package_files` tree and `source` of every extension in `exts`. The
+///   lists are the only declared record of the sources a compile script reads
+///   (see [`sdk_compile_inputs_are_complete`])
+/// - the SDK settings the container is started with
+/// - `environment`: facts only the caller knows, such as the lock pins of the
+///   SDK and the target sysroot (see [`locked_packages_hash`]), so a toolchain
+///   or library change runs the section again
+///
+/// `exts` holds every extension that names the section, the calling extension
+/// first, each node with its `target-<name>:`, `kernel-<spec>:` and bare-target
+/// overrides resolved as `ext build` resolves them. The stamp is keyed by the
+/// section alone, so its hash must not depend on which extension builds it: a
+/// source that one extension lists and another does not must still move it.
+/// The script is found under the calling extension's content root.
+pub fn compute_sdk_compile_input_hash(
+    config: &serde_yaml::Value,
+    section: &str,
+    script: &str,
+    exts: &[(String, serde_yaml::Value)],
+    project_root: &Path,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<StampInputs> {
+    let sdk = config.get("sdk");
+    let section_node = sdk
+        .and_then(|s| s.get("compile"))
+        .and_then(|c| c.get(section))
+        .ok_or_else(|| anyhow::anyhow!("sdk.compile.{section} not found in config"))?;
+    let caller_root = exts
+        .first()
+        .and_then(|(_, ext)| ext_content_root(ext, project_root));
+
+    let mut hash_data = serde_yaml::Mapping::new();
+    let key = |k: &str| serde_yaml::Value::String(format!("sdk.compile.{section}.{k}"));
+    hash_data.insert(key("config"), section_node.clone());
+
+    fold_file_content(
+        &mut hash_data,
+        &format!("sdk.compile.{section}.compile_script"),
+        compile_script_root(caller_root.as_deref(), project_root, script),
+        script,
+    )?;
+
+    // By name, so the hash is the same whichever extension builds the section.
+    let mut by_name: Vec<&(String, serde_yaml::Value)> = exts.iter().collect();
+    by_name.sort_by(|a, b| a.0.cmp(&b.0));
+    for (ext_name, ext) in by_name {
+        if let (Some(files), Some(root)) = (
+            ext.get("package_files").and_then(|v| v.as_sequence()),
+            ext_content_root(ext, project_root),
+        ) {
+            let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.package_files")),
+                serde_yaml::Value::String(package_files_digest(&root, &patterns)?),
+            );
+        }
+        if let Some(source) = ext.get("source") {
+            hash_data.insert(
+                serde_yaml::Value::String(format!("ext.{ext_name}.source")),
+                source.clone(),
+            );
+        }
+    }
+
+    for k in ["image", "repo_url", "repo_release", "container_args"] {
+        if let Some(v) = sdk.and_then(|s| s.get(k)) {
+            hash_data.insert(serde_yaml::Value::String(format!("sdk.{k}")), v.clone());
+        }
+    }
+
+    for (k, v) in environment {
+        hash_data.insert(
+            serde_yaml::Value::String(format!("env.{k}")),
+            serde_yaml::Value::String(v.clone()),
+        );
+    }
+
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// Whether [`compute_sdk_compile_input_hash`] describes everything the
+/// compile script reads when `ext build` runs it. `exts` is every extension
+/// that names the section, the caller first, each resolved for the target. The
+/// section may be skipped only when this holds.
+///
+/// A compile script reads source files that no config key names. Without a
+/// list of them, a source edit leaves every input unmoved, the section is
+/// skipped, and the extension ships the previous binary with exit 0. An
+/// extension's `package_files` is that list, and it is the same declaration
+/// that lets `ext build` skip itself ([`ext_build_inputs_are_complete`]). So
+/// the rule is the same, for each extension that names the section: its
+/// sources are declared and can be hashed ([`declared_sources_are_hashable`]).
+///
+/// It also needs the compile script on the host, as a regular file. A remote
+/// extension's scripts are unpacked into the SDK volume, where nothing here can
+/// hash them, and the content digest hashes a top-level symlink by its link.
+pub fn sdk_compile_inputs_are_complete(
+    exts: &[(String, serde_yaml::Value)],
+    script: &str,
+    project_root: &Path,
+) -> bool {
+    let Some(caller_root) = exts
+        .first()
+        .and_then(|(_, ext)| ext_content_root(ext, project_root))
+    else {
+        return false;
+    };
+    let script_path = compile_script_root(Some(&caller_root), project_root, script).join(script);
+    let script_on_host = std::fs::symlink_metadata(script_path).is_ok_and(|m| m.is_file());
+    script_on_host
+        && exts
+            .iter()
+            .all(|(_, ext)| declared_sources_are_hashable(ext, project_root))
+}
+
+/// Whether an extension declares the sources it is built from in a way the
+/// hash can follow: a non-empty `package_files` list under a content root the
+/// host can read, with no symlink among the paths it selects, no glob that
+/// matches nothing, and with neither `package_files` nor `source` set again
+/// under an override.
+///
+/// - A host that cannot see the source (a git- or package-sourced extension)
+///   cannot hash a byte of it.
+/// - The content digest hashes a symlink by its link, not by what it points
+///   to, so an edit made through it would not move the hash.
+/// - The hashes that read the unresolved node (the `ext build` input hash)
+///   fold the top-level list, never one an override sets for this target.
+///
+/// Used by both the `ext build` skip and the compile section skip, so the two
+/// cannot disagree about what counts as declared.
+pub fn declared_sources_are_hashable(ext: &serde_yaml::Value, project_root: &Path) -> bool {
+    if declares_sources_in_override(ext) {
+        return false;
+    }
+    let Some(root) = ext_content_root(ext, project_root) else {
+        return false;
+    };
+    let Some(files) = ext.get("package_files").and_then(|v| v.as_sequence()) else {
+        return false;
+    };
+    let patterns: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+    !patterns.is_empty() && !package_files_hide_an_edit(&root, &patterns)
+}
+
+/// Whether the build reads from the same tree the hash reads.
+///
+/// Without `src_dir`, the SDK container mounts the working directory at
+/// `/opt/src`, while every input hash reads files under the config file's
+/// directory (`Config::project_root`). Run from another directory, the build
+/// compiles one tree and the hash reads another, so no skip may trust it.
+pub fn hash_root_is_mounted(project_root: &Path, mounted_src_dir: &Path) -> bool {
+    match (project_root.canonicalize(), mounted_src_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Where a compile script is read from: the extension's content root when the
+/// script is there, else the project root. The same rule as
+/// [`fold_package_scripts`].
+fn compile_script_root<'a>(
+    content_root: Option<&'a Path>,
+    project_root: &'a Path,
+    script: &str,
+) -> &'a Path {
+    match content_root {
+        Some(c) if c.join(script).is_file() => c,
+        _ => project_root,
+    }
+}
+
+/// Digest of the lockfile pins of one sysroot of `target`, the same digest the
+/// sysroot install stamps record ([`package_list_hash`]). The SDK and
+/// compile-deps stamps hash only config, so a re-pin moves neither of them.
+/// A compile section folds this instead, so it runs again against the new
+/// toolchain or libraries.
+pub fn locked_packages_hash(
+    lock: &crate::utils::lockfile::LockFile,
+    target: &str,
+    sysroot: &crate::utils::lockfile::SysrootType,
+) -> String {
+    package_list_hash(lock.get_sysroot_versions(target, sysroot))
+}
+
+/// The parts of a stamp in a batch read that say what it was made from and
+/// what it produced, without its timestamp. `"absent"` when there is no stamp.
+/// A step folds this into its own input hash when it depends on the other
+/// step's result but the other step records no `content_hash`.
+pub fn stamp_identity_from_batch(batch_output: &str, req: &StampRequirement) -> String {
+    parse_batch_stamps_output(batch_output)
+        .get(&req.relative_path())
+        .and_then(|json| json.as_deref())
+        .and_then(|json| Stamp::from_json(json).ok())
+        .map(|stamp| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                stamp.version,
+                stamp.inputs.config_hash,
+                stamp.inputs.package_list_hash.unwrap_or_default(),
+                stamp.outputs.installed_packages_hash.unwrap_or_default(),
+                stamp.outputs.content_hash.unwrap_or_default(),
+            )
+        })
+        .unwrap_or_else(|| "absent".to_string())
+}
+
 /// Compute input hash for **extension install**, folding in the state of the
 /// extensions this one was seeded from (`dep_state` empty for an extension
 /// with no dependencies).
@@ -2277,11 +2542,14 @@ fn ext_has_compile_package(ext: &serde_yaml::Value) -> bool {
 /// ignored by the hash, and treating it as a promise would restore the silent
 /// skip it is meant to prevent.
 ///
-/// A package with both `compile` and `install` is the same gap. `ext build`
-/// runs its compile section and then its install script, and both read files
-/// that no config key lists: a source tree, the compile output, whatever the
-/// install script copies out of the project. The hash reads only the bytes of
-/// the two scripts, so it needs the same `package_files` declaration (B-31).
+/// A package with both `compile` and `install` never skips here. `ext build`
+/// runs its compile section and then its install script, and the compile
+/// reads more than this hash can see: the SDK image, the lock pins, the host
+/// env and mounts the container args pass in. A skip here would also skip the
+/// compile step's own check, which reads all of them, and ship the old binary
+/// after a re-pin (B-32). The compile step decides instead
+/// (`compute_sdk_compile_input_hash`), and the install script reruns, which
+/// costs seconds.
 ///
 /// The conservative answer for everything else is to rebuild. A hook run costs
 /// one script; a wrong answer costs a developer their afternoon on the device.
@@ -2304,7 +2572,10 @@ pub fn ext_build_inputs_are_complete(
     if declares_build_step_in_override(ext) {
         return false;
     }
-    if ext.get("post_build").and_then(|v| v.as_str()).is_none() && !runs_compile_install(ext) {
+    if runs_compile_install(ext) {
+        return false;
+    }
+    if ext.get("post_build").and_then(|v| v.as_str()).is_none() {
         return true;
     }
     // Every condition the fold is gated on, and nothing else. Reproducing only
@@ -2312,12 +2583,7 @@ pub fn ext_build_inputs_are_complete(
     // out: `content_root` is `None` for any source the host cannot see, so a
     // package- or git-sourced extension can carry the full declaration while
     // not one byte of it reaches the hash.
-    ext_has_compile_package(ext)
-        && ext_content_root(ext, project_root).is_some()
-        && ext
-            .get("package_files")
-            .and_then(|v| v.as_sequence())
-            .is_some_and(|files| !files.is_empty())
+    ext_has_compile_package(ext) && declared_sources_are_hashable(ext, project_root)
 }
 
 /// Whether an override declares a `post_build` hook, or a package `compile`
@@ -2352,6 +2618,124 @@ fn declares_build_step_in_override(ext: &serde_yaml::Value) -> bool {
         m.iter()
             .any(|(key, value)| !matches!(key.as_str(), Some("packages")) && declares(value))
     })
+}
+
+/// Whether an override sets `package_files` or `source`. The keys at the top
+/// of the extension node are the ones a hash of the unresolved node reads; the
+/// same key below any other key (`target-<name>:`, `kernel-<spec>:`, a bare
+/// target, or an override nested in one) can replace them for the build.
+fn declares_sources_in_override(ext: &serde_yaml::Value) -> bool {
+    fn declares(node: &serde_yaml::Value) -> bool {
+        let Some(map) = node.as_mapping() else {
+            return false;
+        };
+        map.iter().any(|(key, value)| {
+            matches!(key.as_str(), Some("package_files" | "source")) || declares(value)
+        })
+    }
+    ext.as_mapping().is_some_and(|m| m.values().any(declares))
+}
+
+/// Whether a `package_files` list could hide an edit from
+/// [`package_files_digest`]: a path it selects is a symlink or holds one, or a
+/// glob matches nothing. Literal entries are checked as they are, and globs
+/// are expanded the way the digest expands them. A path that cannot be read
+/// counts as a symlink: the answer must fail toward "no skip". A missing
+/// literal does not, because the digest already fails on it.
+///
+/// A glob with no match records only `(no match)`, which never moves. Some
+/// patterns never match here while `ext package` expands them fine in bash
+/// (`./src/*.c`: the walk yields `src/main.c`), so an edit under them would
+/// skip and ship the old build.
+fn package_files_hide_an_edit(root: &Path, patterns: &[&str]) -> bool {
+    let is_glob = |p: &str| p.contains(['*', '?', '[']);
+    let mut selected: Vec<std::path::PathBuf> = patterns
+        .iter()
+        .filter(|p| !is_glob(p))
+        .map(|p| root.join(p))
+        .collect();
+    let globs: Vec<globset::GlobMatcher> = match patterns
+        .iter()
+        .filter(|p| is_glob(p))
+        .map(|p| {
+            globset::GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .map(|g| g.compile_matcher())
+        })
+        .collect()
+    {
+        Ok(globs) => globs,
+        Err(_) => return true,
+    };
+    // The walk below does not follow links, so a glob that has to pass through
+    // a symlinked directory would match nothing and the digest would record
+    // `(no match)` for good. Refuse any symlink on or under a glob's literal
+    // directory prefix.
+    for pattern in patterns.iter().filter(|p| is_glob(p)) {
+        let mut base = root.to_path_buf();
+        for part in Path::new(pattern).components() {
+            if part.as_os_str().to_str().is_some_and(is_glob) {
+                break;
+            }
+            base.push(part);
+            match std::fs::symlink_metadata(&base) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return true,
+                Ok(m) if m.file_type().is_symlink() => return true,
+                Ok(_) => {}
+            }
+        }
+        if base.is_dir()
+            && walkdir::WalkDir::new(&base)
+                .into_iter()
+                .any(|entry| entry.map_or(true, |e| e.path_is_symlink()))
+        {
+            return true;
+        }
+    }
+    if !globs.is_empty() {
+        let mut matched = vec![false; globs.len()];
+        for entry in walkdir::WalkDir::new(root) {
+            let Ok(entry) = entry else { return true };
+            let Some(rel) = entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .and_then(|r| r.to_str())
+            else {
+                continue;
+            };
+            if rel.is_empty() {
+                continue;
+            }
+            let mut hit = false;
+            for (glob, seen) in globs.iter().zip(matched.iter_mut()) {
+                if glob.is_match(rel) {
+                    *seen = true;
+                    hit = true;
+                }
+            }
+            if hit {
+                selected.push(entry.path().to_path_buf());
+            }
+        }
+        if matched.contains(&false) {
+            return true;
+        }
+    }
+    selected
+        .iter()
+        .any(|path| match std::fs::symlink_metadata(path) {
+            // A missing entry is not a symlink. `package_files_digest` refuses it,
+            // and a hash that fails is never skipped on.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            Ok(m) if m.file_type().is_symlink() => true,
+            Ok(_) => walkdir::WalkDir::new(path)
+                .into_iter()
+                .any(|entry| entry.map_or(true, |e| e.path_is_symlink())),
+        })
 }
 
 /// Whether any package declares both a `compile` section and an `install`
@@ -7373,10 +7757,12 @@ find() {
     /// reach for: a source tree, the compile output, files the install script
     /// copies out of the project. The hash reads only the two scripts' bytes,
     /// so a source edit moved nothing and `ext build` said "up to date" over
-    /// the previous build (B-31). It is the same gap as a `post_build` hook,
-    /// and `package_files` buys the skip back the same way.
+    /// the previous build (B-31). Declared sources do not buy the skip back:
+    /// the compile also reads the SDK image, the lock pins and the host state
+    /// the container args pass, and a skip here would skip the compile step's
+    /// check of them too (B-32). The compile step decides instead.
     #[test]
-    fn a_compile_install_extension_may_be_skipped_only_when_declared() {
+    fn a_compile_install_extension_never_skips_ext_build() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let config = |body: &str| -> serde_yaml::Value {
@@ -7394,8 +7780,8 @@ find() {
             "{compiled_installed}    package_files: []\n"
         ))));
 
-        // Declared sources are hashed, so an edit under them moves the hash.
-        assert!(complete(&config(&format!("{compiled_installed}{files}"))));
+        // Declared sources leave the call to the compile step.
+        assert!(!complete(&config(&format!("{compiled_installed}{files}"))));
 
         // A source the host cannot see adds nothing to the hash, whatever it
         // declares.
@@ -7436,15 +7822,14 @@ find() {
             "    qemux86-64:\n      packages:\n        curl: \"8.*\"\n"
         )));
 
-        // A path source has a content root, so its declaration is hashed.
+        // A path source has a content root, so the compile step can hash its
+        // declaration.
         std::fs::create_dir_all(root.join("vendored")).unwrap();
         let path_src = "    source:\n      type: path\n      path: vendored\n";
-        assert!(complete(&config(&format!(
-            "{compiled_installed}{files}{path_src}"
-        ))));
-        assert!(!complete(&config(&format!(
-            "{compiled_installed}{path_src}"
-        ))));
+        let hashable =
+            |body: &str| declared_sources_are_hashable(&config(body)["extensions"]["app"], root);
+        assert!(hashable(&format!("{compiled_installed}{files}{path_src}")));
+        assert!(!hashable(&format!("{compiled_installed}{path_src}")));
     }
 
     /// The build stamp sits at `ext/<name>/build.stamp` for the whole target,
@@ -8658,5 +9043,420 @@ rootfs:
         let hash =
             |rt: &str| image_hash_in("rootfs", "filesystem: erofs\n", cfg, Some(rt), root).unwrap();
         assert_ne!(hash("main"), hash("release"));
+    }
+
+    // ========================================================================
+    // Compile section stamp (B-32)
+    // ========================================================================
+
+    const COMPILE_SECTION_YAML: &str = r#"
+sdk:
+  image: sdk:2024
+  compile:
+    app-compile:
+      compile: compile.sh
+      packages:
+        gcc: "*"
+extensions:
+  my-ext:
+    package_files: [src]
+    packages:
+      app:
+        compile: app-compile
+        install: install.sh
+"#;
+
+    fn compile_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("compile.sh"), "make\n").unwrap();
+        std::fs::write(root.join("install.sh"), "install app $DEST\n").unwrap();
+        std::fs::write(root.join("src/main.c"), "int main() {}\n").unwrap();
+        dir
+    }
+
+    fn compile_hash_at(
+        root: &Path,
+        yaml: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> String {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let exts = [("my-ext".to_string(), v["extensions"]["my-ext"].clone())];
+        compute_sdk_compile_input_hash(&v, "app-compile", "compile.sh", &exts, root, env)
+            .unwrap()
+            .config_hash
+    }
+
+    #[test]
+    fn sdk_compile_stamp_path_is_per_arch_and_section() {
+        let req = StampRequirement::sdk_compile("app-compile");
+        assert_eq!(
+            req.relative_path(),
+            format!("sdk/{}/compile/app-compile.stamp", get_local_arch())
+        );
+        assert_eq!(req.description(), "compile section 'app-compile'");
+        assert_eq!(req.fix_command(), "avocado sdk compile app-compile");
+
+        // The writer and the reader agree on the path.
+        let stamp = Stamp::sdk_compile(
+            get_local_arch(),
+            get_local_arch(),
+            StampInputs::new("h".to_string()),
+            StampOutputs::default(),
+        );
+        assert_eq!(
+            stamp.relative_path(),
+            format!("sdk/{0}/compile/{0}.stamp", get_local_arch())
+        );
+        let stamp = Stamp::sdk_compile(
+            "app-compile",
+            get_local_arch(),
+            StampInputs::new("h".to_string()),
+            StampOutputs::default(),
+        );
+        assert_eq!(stamp.relative_path(), req.relative_path());
+
+        // The SDK install stamp path does not change.
+        assert_eq!(
+            StampRequirement::sdk_install().relative_path(),
+            format!("sdk/{}/install.stamp", get_local_arch())
+        );
+    }
+
+    /// The reported case: an edit to the extension's install script reruns the
+    /// extension build, and must not move the compile section's hash. Every
+    /// input the compile script reads must move it.
+    #[test]
+    fn sdk_compile_hash_ignores_install_script_and_tracks_compile_inputs() {
+        let dir = compile_project();
+        let root = dir.path();
+        let env = std::collections::BTreeMap::new();
+        let base = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+
+        std::fs::write(root.join("install.sh"), "install -m755 app $DEST\n").unwrap();
+        assert_eq!(
+            base,
+            compile_hash_at(root, COMPILE_SECTION_YAML, &env),
+            "install script is not a compile input"
+        );
+
+        std::fs::write(root.join("src/main.c"), "int main() { return 1; }\n").unwrap();
+        let source_edit = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+        assert_ne!(base, source_edit, "source under package_files");
+
+        std::fs::write(root.join("compile.sh"), "make -j4\n").unwrap();
+        let script_edit = compile_hash_at(root, COMPILE_SECTION_YAML, &env);
+        assert_ne!(source_edit, script_edit, "compile script content");
+
+        let config_edit = COMPILE_SECTION_YAML.replace("gcc: \"*\"", "gcc: \"13.*\"");
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, &config_edit, &env),
+            "section packages"
+        );
+
+        let image_edit = COMPILE_SECTION_YAML.replace("sdk:2024", "sdk:2026");
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, &image_edit, &env),
+            "SDK image"
+        );
+
+        let mut toolchain = std::collections::BTreeMap::new();
+        toolchain.insert("sdk_install".to_string(), "5:abc:::".to_string());
+        assert_ne!(
+            script_edit,
+            compile_hash_at(root, COMPILE_SECTION_YAML, &toolchain),
+            "SDK install stamp"
+        );
+    }
+
+    #[test]
+    fn sdk_compile_skip_needs_declared_sources_on_the_host() {
+        let dir = compile_project();
+        let root = dir.path();
+        let complete = |yaml: &str| {
+            let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let exts = [("my-ext".to_string(), v["extensions"]["my-ext"].clone())];
+            sdk_compile_inputs_are_complete(&exts, "compile.sh", root)
+        };
+
+        assert!(complete(COMPILE_SECTION_YAML));
+
+        // No source list: a source edit would not move the hash.
+        assert!(!complete(
+            &COMPILE_SECTION_YAML.replace("    package_files: [src]\n", "")
+        ));
+        assert!(!complete(
+            &COMPILE_SECTION_YAML.replace("package_files: [src]", "package_files: []")
+        ));
+
+        // A source the host cannot see.
+        assert!(!complete(&COMPILE_SECTION_YAML.replace(
+            "    package_files: [src]\n",
+            "    package_files: [src]\n    source:\n      type: git\n      url: https://example.com/x.git\n",
+        )));
+
+        // A symlinked compile script: the digest hashes the link, not the
+        // file it points to, so an edit there would not move the hash.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("scripts")).unwrap();
+            std::fs::write(root.join("scripts/build.sh"), "make\n").unwrap();
+            std::fs::remove_file(root.join("compile.sh")).unwrap();
+            std::os::unix::fs::symlink("scripts/build.sh", root.join("compile.sh")).unwrap();
+            assert!(!complete(COMPILE_SECTION_YAML));
+        }
+
+        // A compile script that is not on the host.
+        std::fs::remove_file(root.join("compile.sh")).unwrap();
+        assert!(!complete(COMPILE_SECTION_YAML));
+    }
+
+    /// The hash reads the extension node it is given, which `ext build`
+    /// resolves for the target. A `package_files` override (`target-<name>:`,
+    /// `kernel-<spec>:`, a bare target key) is then the list that is hashed.
+    #[test]
+    fn sdk_compile_hash_reads_the_resolved_extension() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("arm-src")).unwrap();
+        std::fs::write(root.join("arm-src/arm.c"), "int arm;\n").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        let resolved: serde_yaml::Value =
+            serde_yaml::from_str("package_files: [arm-src]\n").unwrap();
+        let env = std::collections::BTreeMap::new();
+        let hash = || {
+            compute_sdk_compile_input_hash(
+                &v,
+                "app-compile",
+                "compile.sh",
+                &[("my-ext".to_string(), resolved.clone())],
+                root,
+                &env,
+            )
+            .unwrap()
+            .config_hash
+        };
+
+        let base = hash();
+        std::fs::write(root.join("arm-src/arm.c"), "int arm = 1;\n").unwrap();
+        assert_ne!(base, hash(), "source under the resolved package_files");
+        assert!(sdk_compile_inputs_are_complete(
+            &[("my-ext".to_string(), resolved.clone())],
+            "compile.sh",
+            root
+        ));
+    }
+
+    /// The hash reads the script that runs, which may differ from the
+    /// section's unresolved `compile:` key.
+    #[test]
+    fn sdk_compile_hash_reads_the_script_that_runs() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::write(root.join("compile-arm.sh"), "make arm\n").unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        let ext = &v["extensions"]["my-ext"];
+        let env = std::collections::BTreeMap::new();
+        let hash = || {
+            compute_sdk_compile_input_hash(
+                &v,
+                "app-compile",
+                "compile-arm.sh",
+                &[("my-ext".to_string(), ext.clone())],
+                root,
+                &env,
+            )
+            .unwrap()
+            .config_hash
+        };
+        let base = hash();
+        std::fs::write(root.join("compile-arm.sh"), "make arm -j4\n").unwrap();
+        assert_ne!(base, hash());
+    }
+
+    /// The shared rule both skips use. Sources must be declared, readable by
+    /// the host, free of symlinks, and not set again under an override.
+    #[test]
+    fn declared_sources_are_hashable_refuses_what_the_hash_cannot_follow() {
+        let dir = compile_project();
+        let root = dir.path();
+        let ok = |yaml: &str| {
+            let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            declared_sources_are_hashable(&v, root)
+        };
+        assert!(ok("package_files: [src]\n"));
+        assert!(ok("package_files: ['src/*.c']\n"));
+        assert!(!ok("package_files: []\n"));
+        assert!(!ok("overlay: overlay\n"));
+        assert!(!ok("package_files: [src]\nsource: {type: git, url: x}\n"));
+
+        // An override that sets the sources the unresolved hash never reads.
+        for form in ["target-qemuarm64", "kernel-6.6", "qemuarm64"] {
+            assert!(!ok(&format!(
+                "package_files: [src]\n{form}:\n  package_files: [other]\n"
+            )));
+            assert!(!ok(&format!(
+                "package_files: [src]\n{form}:\n  source: {{type: path, path: x}}\n"
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            // A symlink inside a listed directory, and one a glob selects.
+            std::os::unix::fs::symlink("main.c", root.join("src/link.c")).unwrap();
+            assert!(!ok("package_files: [src]\n"));
+            assert!(!ok("package_files: ['src/*.c']\n"));
+            std::fs::remove_file(root.join("src/link.c")).unwrap();
+            assert!(ok("package_files: [src]\n"));
+
+            // A top-level symlinked entry.
+            std::os::unix::fs::symlink("src", root.join("src-link")).unwrap();
+            assert!(!ok("package_files: [src-link]\n"));
+        }
+    }
+
+    /// The source check both skips share refuses a `package_files` entry that
+    /// points through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn ext_build_skip_refuses_symlinked_sources() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::os::unix::fs::symlink("src", root.join("src-link")).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(
+            &COMPILE_SECTION_YAML.replace("package_files: [src]", "package_files: [src-link]"),
+        )
+        .unwrap();
+        assert!(!declared_sources_are_hashable(
+            &v["extensions"]["my-ext"],
+            root
+        ));
+        let v: serde_yaml::Value = serde_yaml::from_str(COMPILE_SECTION_YAML).unwrap();
+        assert!(declared_sources_are_hashable(
+            &v["extensions"]["my-ext"],
+            root
+        ));
+    }
+
+    /// A glob that passes through a symlinked directory matches nothing, so
+    /// its digest never moves. The skip is refused, whether the link is the
+    /// glob's literal prefix or sits under it.
+    #[cfg(unix)]
+    #[test]
+    fn a_glob_through_a_symlinked_directory_is_not_hashable() {
+        let dir = compile_project();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("vendor/src/sub")).unwrap();
+        std::fs::write(root.join("vendor/src/foo.c"), "int foo;\n").unwrap();
+        std::os::unix::fs::symlink("vendor/src", root.join("vsrc")).unwrap();
+        let with = |files: &str| -> serde_yaml::Value {
+            serde_yaml::from_str(&COMPILE_SECTION_YAML.replace("package_files: [src]", files))
+                .unwrap()
+        };
+        assert!(!declared_sources_are_hashable(
+            &with("package_files: ['vsrc/*.c']")["extensions"]["my-ext"],
+            root
+        ));
+        std::os::unix::fs::symlink("../vendor/src/sub", root.join("src/sub")).unwrap();
+        assert!(!declared_sources_are_hashable(
+            &with("package_files: ['src/**/*.c']")["extensions"]["my-ext"],
+            root
+        ));
+        assert!(declared_sources_are_hashable(
+            &with("package_files: ['vendor/src/*.c']")["extensions"]["my-ext"],
+            root
+        ));
+    }
+
+    /// A glob that matches nothing records `(no match)`, which never moves.
+    /// `./src/*.c` is one: bash expands it for `ext package`, but the walk
+    /// yields `src/main.c` and globset keeps the `./`.
+    #[test]
+    fn a_glob_that_matches_nothing_is_not_hashable() {
+        let dir = compile_project();
+        let root = dir.path();
+        let hashable = |files: &str| {
+            let v: serde_yaml::Value =
+                serde_yaml::from_str(&COMPILE_SECTION_YAML.replace("package_files: [src]", files))
+                    .unwrap();
+            declared_sources_are_hashable(&v["extensions"]["my-ext"], root)
+        };
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/lib.c"), "int lib;\n").unwrap();
+        let absolute = format!("package_files: ['{}/src/*.c']", root.display());
+        for files in [
+            "package_files: ['./src/*.c']",
+            "package_files: ['src/*/']",
+            "package_files: ['src//*.c']",
+            "package_files: ['../shared/*.c']",
+            "package_files: ['src/*.c', 'src/*.h']",
+            absolute.as_str(),
+        ] {
+            assert!(!hashable(files), "{files}");
+        }
+        assert!(hashable("package_files: ['src/*.c']"));
+        assert!(hashable("package_files: ['./src']"));
+    }
+
+    #[test]
+    fn hash_root_is_mounted_compares_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(hash_root_is_mounted(root, &root.join("sub/..")));
+        assert!(!hash_root_is_mounted(&root.join("sub"), root));
+        assert!(!hash_root_is_mounted(&root.join("missing"), root));
+    }
+
+    /// A re-pin in the lock moves the pins digest even when no config changes.
+    #[test]
+    fn locked_packages_hash_moves_on_a_re_pin() {
+        use crate::utils::lockfile::{LockFile, SysrootType};
+        let mut lock = LockFile::new();
+        lock.update_sysroot_versions(
+            "qemuarm64",
+            &SysrootType::TargetSysroot,
+            [("libfoo".to_string(), "1.0-r0".to_string())].into(),
+        );
+        let first = locked_packages_hash(&lock, "qemuarm64", &SysrootType::TargetSysroot);
+        lock.update_sysroot_versions(
+            "qemuarm64",
+            &SysrootType::TargetSysroot,
+            [("libfoo".to_string(), "1.1-r0".to_string())].into(),
+        );
+        assert_ne!(
+            first,
+            locked_packages_hash(&lock, "qemuarm64", &SysrootType::TargetSysroot)
+        );
+    }
+
+    #[test]
+    fn stamp_identity_ignores_the_timestamp() {
+        let req = StampRequirement::sdk_install();
+        let batch = |stamp: &Stamp| {
+            format!(
+                "{}:::{}",
+                req.relative_path(),
+                serde_json::to_string(stamp).unwrap()
+            )
+        };
+        let mut stamp = Stamp::sdk_install(
+            get_local_arch(),
+            StampInputs::new("h1".to_string()),
+            StampOutputs::default(),
+        );
+        let first = stamp_identity_from_batch(&batch(&stamp), &req);
+        stamp.timestamp += chrono::Duration::hours(1);
+        assert_eq!(first, stamp_identity_from_batch(&batch(&stamp), &req));
+
+        stamp.outputs.installed_packages_hash = Some("pkgs".to_string());
+        assert_ne!(first, stamp_identity_from_batch(&batch(&stamp), &req));
+
+        let missing = format!("{}:::null", req.relative_path());
+        assert_eq!(stamp_identity_from_batch(&missing, &req), "absent");
     }
 }

@@ -451,25 +451,32 @@ impl ExtBuildCommand {
             }
 
             // Skip: this step's own stamp is current for every input computed
-            // above (config, compile and install script content, the
-            // `package_files` source tree, the overlay, the sysroot tree it
-            // builds per runtime or per target), and that sysroot is still
-            // there. Nothing it would do could change the tree.
+            // above (config, script content, the `package_files` source tree,
+            // the overlay, the sysroot tree it builds per runtime or per
+            // target), and that sysroot is still there. Nothing it would do
+            // could change the tree.
             // The stamp is left as it is; `ext image` reads the same
             // content_hash from it and reaches the same verdict.
             //
             // The skip is only sound while those inputs describe the whole
-            // build. A `post_build` hook or a compile/install package installs
-            // content that no config key lists, so such an extension is
-            // rebuilt unless it declares `package_files`. See
+            // build. A `post_build` hook installs content that no config key
+            // lists, so such an extension is rebuilt unless it declares
+            // `package_files`. A compile/install package is always rebuilt
+            // here, and its compile step decides whether to skip. See
             // `ext_build_inputs_are_complete`.
             let sysroot_present = crate::utils::stamps::output_listing_from_batch(batch)
                 .iter()
                 .any(|d| d == &self.extension);
+            // The hash reads files under `project_root`; the build reads the
+            // tree the container mounts. They differ when there is no
+            // `src_dir` and the CLI runs from another directory.
             let inputs_are_complete = crate::utils::stamps::ext_build_inputs_are_complete(
                 parsed,
                 &self.extension,
                 &project_root,
+            ) && crate::utils::stamps::hash_root_is_mounted(
+                &project_root,
+                container_helper.mounted_src_dir(),
             );
             if let Some(ref i) = build_inputs {
                 if inputs_are_complete
@@ -562,7 +569,7 @@ impl ExtBuildCommand {
         // Handle compile dependencies with install scripts before building the extension
         // Pass the ext_config_path so SDK compile sections are loaded from the correct config
         self.handle_compile_dependencies(
-            config,
+            &composed,
             &ext_config,
             &target,
             &ext_config_path,
@@ -1847,13 +1854,14 @@ fi
     /// (container path). For remote extensions, this is `$AVOCADO_PREFIX/includes/<ext>/`.
     async fn handle_compile_dependencies(
         &self,
-        config: &Config,
+        composed: &ComposedConfig,
         ext_config: &serde_yaml::Value,
         target: &str,
         sdk_config_path: &str,
         ext_script_workdir: Option<&str>,
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<()> {
+        let config = &composed.config;
         // Get dependencies from extension configuration
         let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
 
@@ -1938,7 +1946,21 @@ fi
                 self.container_args.clone(),
                 self.dnf_args.clone(),
             )
-            .with_workdir(ext_script_workdir.map(|s| s.to_string()));
+            .with_workdir(ext_script_workdir.map(|s| s.to_string()))
+            .with_no_stamps(self.no_stamps);
+            // Every extension that builds this section, so its stamp hashes
+            // all of their sources. Without them the section always runs.
+            if let Some(extensions) = super::extensions_naming_compile_section(
+                config,
+                &composed.merged_value,
+                &self.config_path,
+                (&self.extension, ext_config),
+                &compile_section,
+                target,
+                self.target_board.as_deref(),
+            ) {
+                compile_command = compile_command.with_extensions(extensions);
+            }
             if let Some(ref ctx) = effective_tui_context {
                 compile_command = compile_command.with_tui_context(ctx.clone());
             }

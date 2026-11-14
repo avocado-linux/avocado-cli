@@ -90,6 +90,55 @@ pub(crate) fn resolve_remote_ext_config(
     ))
 }
 
+/// Every extension whose node names `sdk.compile.<section>` (in a package,
+/// under an override, anywhere), each with its config resolved for `target`
+/// the way `ext build` resolves it. `caller` comes first, with the node `ext
+/// build` already resolved for it.
+///
+/// The compile section stamp is keyed by the section, so it must hash the
+/// sources of every extension that builds it, not only the caller's. `None`
+/// when one of them cannot be resolved: the section then always runs.
+pub(crate) fn extensions_naming_compile_section(
+    config: &crate::utils::config::Config,
+    parsed: &serde_yaml::Value,
+    config_path: &str,
+    caller: (&str, &serde_yaml::Value),
+    section: &str,
+    target: &str,
+    target_board: Option<&str>,
+) -> Option<Vec<(String, serde_yaml::Value)>> {
+    fn names(node: &serde_yaml::Value, section: &str) -> bool {
+        node.as_mapping().is_some_and(|m| {
+            m.iter().any(|(k, v)| {
+                (k.as_str() == Some("compile") && v.as_str() == Some(section)) || names(v, section)
+            })
+        })
+    }
+    let mut out = vec![(caller.0.to_string(), caller.1.clone())];
+    let others = parsed
+        .get("extensions")
+        .and_then(|e| e.as_mapping())
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str()?, v)))
+        .filter(|(name, node)| *name != caller.0 && names(node, section));
+    for (name, _) in others {
+        let resolved = match config
+            .find_extension_in_dependency_tree(config_path, name, target)
+            .ok()??
+        {
+            crate::utils::config::ExtensionLocation::Remote { .. } => {
+                resolve_remote_ext_config(config, parsed, name, target)?
+            }
+            crate::utils::config::ExtensionLocation::Local { config_path, .. } => config
+                .get_merged_ext_config_with_board(name, target, &config_path, target_board)
+                .ok()??,
+        };
+        out.push((name.to_string(), resolved));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
