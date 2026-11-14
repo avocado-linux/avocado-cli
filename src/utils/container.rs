@@ -3162,8 +3162,7 @@ impl SdkContainer {
         }
 
         // Execute command and capture output
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(&container_cmd)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd
@@ -3536,8 +3535,7 @@ impl SdkContainer {
         }
 
         if detach {
-            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-            cmd.args(&container_cmd[1..]);
+            let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
                 .output()
@@ -3564,8 +3562,7 @@ impl SdkContainer {
             }
         } else {
             // In non-detached mode, wait for completion with Ctrl-C handling.
-            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-            cmd.args(&container_cmd[1..]);
+            let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
 
             // When a TUI renderer is globally active, pipe output instead of
             // inheriting stdio.  This prevents container output from leaking
@@ -3763,8 +3760,7 @@ impl SdkContainer {
             .renderer
             .set_status(&tui_ctx.task_id, TaskStatus::Running);
 
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
         // Pipe stdout/stderr so we can capture output line by line.
         // The container still gets a PTY (-t flag) so programs like dnf
         // produce live progress output.
@@ -3959,8 +3955,7 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             );
         }
 
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(&container_cmd)?;
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let status = cmd
