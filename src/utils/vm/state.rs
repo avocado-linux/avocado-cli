@@ -142,11 +142,7 @@ impl VmPaths {
     /// Where QEMU serves a chardev on this host: the Unix socket, or on
     /// Windows a loopback TCP port recorded in `<name>.port`.
     fn chardev_endpoint(&self, socket: PathBuf) -> Endpoint {
-        if cfg!(windows) {
-            Endpoint::TcpPortFile(socket.with_extension("port"))
-        } else {
-            Endpoint::Unix(socket)
-        }
+        Endpoint::for_socket(&socket)
     }
     pub fn qmp_endpoint(&self) -> Endpoint {
         self.chardev_endpoint(self.qmp_socket())
@@ -406,6 +402,7 @@ pub fn cleanup_transient(paths: &VmPaths) {
         paths.lock_file(),
         paths.docker_socket(),
         paths.docker_port_file(),
+        paths.docker_socket_stream().with_extension("port"),
         paths.docker_socket_internal(),
         paths.docker_socket_stream(),
         paths.forwarder_pid(),

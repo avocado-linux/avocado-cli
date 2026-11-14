@@ -30,6 +30,18 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
+    /// The endpoint that stands for `socket` on this host: the Unix socket
+    /// itself, or on Windows the loopback port recorded in the file of the
+    /// same stem (`qmp.sock` -> `qmp.port`). Lets code that is handed a
+    /// socket path (the supervisor's argv) stay platform-neutral.
+    pub fn for_socket(socket: &Path) -> Self {
+        if cfg!(windows) {
+            Endpoint::TcpPortFile(socket.with_extension("port"))
+        } else {
+            Endpoint::Unix(socket.to_path_buf())
+        }
+    }
+
     /// The file that represents this endpoint on disk: the socket itself,
     /// or the port file. Removed on VM shutdown.
     pub fn file(&self) -> &Path {
