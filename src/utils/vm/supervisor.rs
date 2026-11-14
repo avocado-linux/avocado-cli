@@ -137,10 +137,13 @@ impl State {
 
     /// Halt the VM and tear down the tunnel so QEMU isn't holding any
     /// kernel-side state that the guest can't service while paused.
-    async fn pause(self: &Arc<Self>) -> Result<()> {
+    /// `false` when it turned out not to be idle any more: the idle check
+    /// ran before the lock, and a connection or an outside wake can have
+    /// come in since.
+    async fn pause(self: &Arc<Self>) -> Result<bool> {
         let _guard = self.qmp_lock.lock().await;
-        if self.paused.load(Ordering::Relaxed) {
-            return Ok(());
+        if self.paused.load(Ordering::Relaxed) || !self.idle() {
+            return Ok(false);
         }
         // Tear down tunnel first; its SSH keepalives would otherwise
         // timeout while QEMU is stopped and the child would die in
@@ -153,7 +156,13 @@ impl State {
         // An infra-lane `ensure_tunnel` that started before the flag was set
         // can have brought one back up; it holds the tunnel lock until done.
         self.kill_tunnel().await;
-        Ok(())
+        Ok(true)
+    }
+
+    /// No connection open and none for the idle threshold.
+    fn idle(&self) -> bool {
+        self.active_conns.load(Ordering::Relaxed) == 0
+            && now_ms() - self.last_activity_ms.load(Ordering::Relaxed) >= self.idle_threshold_ms
     }
 
     /// Clear a stale `paused`: something other than this supervisor (the
@@ -171,8 +180,10 @@ impl State {
             status["running"].as_bool()
         };
         if running.await == Some(true) {
-            self.paused.store(false, Ordering::Relaxed);
+            // Fresh clock first, so the idle watcher never sees the VM awake
+            // with its pre-pause timestamp.
             self.touch();
+            self.paused.store(false, Ordering::Relaxed);
             slog!("VM was resumed outside the supervisor");
         }
     }
@@ -527,13 +538,11 @@ async fn idle_watcher(state: Arc<State>) {
         if state.paused.load(Ordering::Relaxed) {
             continue;
         }
-        if state.active_conns.load(Ordering::Relaxed) > 0 {
-            continue;
-        }
-        let since = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
-        if since >= state.idle_threshold_ms {
+        if state.idle() {
+            let since = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
             match state.pause().await {
-                Ok(_) => slog!("paused VM after {since} ms idle"),
+                Ok(true) => slog!("paused VM after {since} ms idle"),
+                Ok(false) => {}
                 Err(e) => {
                     slog!("pause failed: {e}");
                     state.touch(); // back off
@@ -708,5 +717,16 @@ mod tests {
         assert!(state.paused.load(Ordering::Relaxed));
         assert!(state.ensure_tunnel().await.is_err());
         assert!(state.tunnel.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pause_queued_before_new_activity_does_not_stop_the_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        // No QMP server: reaching `stop` would be an error, not `Ok(false)`.
+        let state = paused_state(dir.path(), dir.path().join("no-qmp.sock"));
+        state.paused.store(false, Ordering::Relaxed);
+        assert!(state.idle());
+        state.touch();
+        assert!(!state.pause().await.unwrap());
     }
 }
