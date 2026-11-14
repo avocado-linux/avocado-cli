@@ -98,10 +98,11 @@ pub(super) async fn run(docker: &Docker, args: &[String], start: bool) -> Result
         .create_container(Some(options.clone()), body.clone())
         .await
     {
+        // Any 404 from create is the image: missing, or not there for the
+        // requested platform. docker pulls on either.
         Err(ApiError::DockerResponseServerError {
-            status_code: 404,
-            message,
-        }) if policy == "missing" && message.contains("No such image") => {
+            status_code: 404, ..
+        }) if policy == "missing" => {
             eprintln!("Unable to find image '{image}' locally");
             pull(docker, image, a.get("--platform")).await?;
             docker.create_container(Some(options), body).await?
@@ -153,11 +154,12 @@ pub(super) async fn run(docker: &Docker, args: &[String], start: bool) -> Result
     }
 
     let size = tty.then(|| tokio::spawn(follow_size(docker.clone(), Tty::Container(id.clone()))));
+    // With a terminal in raw mode ^C is a byte, not a signal; what still
+    // arrives as one came from outside and goes on, as with docker's
+    // sig-proxy. Not dying of it also puts the terminal back.
     tokio::select! {
         streamed = stream(attached.output, attached.input, stdin, tty) => streamed?,
-        // Only without a terminal: with one, ^C is a byte the container's own
-        // terminal turns into the signal.
-        never = forward_signals(docker, &id), if !tty => match never {},
+        never = forward_signals(docker, &id) => match never {},
     }
     if let Some(size) = size {
         size.abort();
@@ -238,20 +240,33 @@ async fn wait(docker: Docker, id: String, condition: &str) -> Result<i32> {
     }
 }
 
-/// Send SIGINT and SIGTERM on to the container instead of dying of them, as
-/// `docker run` does, so the container gets to shut down and this process
+/// Send the terminating signals on to the container instead of dying of them,
+/// as `docker run` does, so the container gets to shut down and this process
 /// still reports how it exited.
 async fn forward_signals(docker: &Docker, id: &str) -> std::convert::Infallible {
     #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let mut signals: Vec<_> = {
+        use tokio::signal::unix::{signal, SignalKind as K};
+        [
+            (K::interrupt(), "SIGINT"),
+            (K::terminate(), "SIGTERM"),
+            (K::hangup(), "SIGHUP"),
+            (K::quit(), "SIGQUIT"),
+        ]
+        .into_iter()
+        .filter_map(|(kind, name)| Some((signal(kind).ok()?, name)))
+        .collect()
+    };
     loop {
         #[cfg(unix)]
-        let signal = match &mut terminate {
-            Ok(terminate) => tokio::select! {
-                _ = tokio::signal::ctrl_c() => "SIGINT",
-                _ = terminate.recv() => "SIGTERM",
-            },
-            Err(_) => tokio::signal::ctrl_c().await.map_or("", |()| "SIGINT"),
+        let signal = if signals.is_empty() {
+            ""
+        } else {
+            let next = signals.iter_mut().map(|(stream, name)| {
+                let name = *name;
+                Box::pin(async move { stream.recv().await.map_or("", |()| name) })
+            });
+            futures_util::future::select_all(next).await.0
         };
         #[cfg(not(unix))]
         let signal = tokio::signal::ctrl_c().await.map_or("", |()| "SIGINT");
