@@ -686,8 +686,41 @@ fn grow_var_file(paths: &VmPaths, target_bytes: u64) -> Result<()> {
         .write(true)
         .open(&var)
         .with_context(|| format!("open {} to grow", var.display()))?;
+    // The "sparse" this relies on is implicit on macOS and Linux. NTFS
+    // allocates every byte `set_len` adds unless the file is first marked
+    // sparse, so a 50 GiB var disk would cost 50 GiB of real disk.
+    #[cfg(windows)]
+    mark_sparse(&f).with_context(|| format!("marking {} sparse", var.display()))?;
     f.set_len(target_bytes)
         .with_context(|| format!("set_len {} -> {target_bytes}", var.display()))?;
+    Ok(())
+}
+
+/// Mark an open file as sparse on NTFS, so space is only allocated where
+/// data is written. Idempotent.
+#[cfg(windows)]
+fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let mut returned = 0u32;
+    // SAFETY: a plain ioctl on a handle this function borrows for the call;
+    // FSCTL_SET_SPARSE with no input buffer sets the flag.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 

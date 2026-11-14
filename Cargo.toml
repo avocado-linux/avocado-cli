@@ -112,6 +112,8 @@ bollard = "0.21"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Threading",
 ] }
 
