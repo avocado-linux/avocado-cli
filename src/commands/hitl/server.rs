@@ -225,7 +225,9 @@ impl HitlServerCommand {
                         OutputLevel::Normal,
                     );
                 }
-                let _ = Command::new(&tool).args(["rm", "-f", &name]).output();
+                let _ = crate::utils::engine::std_command(&tool)
+                    .args(["rm", "-f", &name])
+                    .output();
             }
             None => {}
         }
@@ -448,7 +450,7 @@ impl HitlServerCommand {
 /// `Err` when the container tool itself failed -- a daemon that is down must
 /// not read as "no server".
 fn container_state(tool: &str, name: &str) -> Result<Option<String>> {
-    let out = Command::new(tool)
+    let out = crate::utils::engine::std_command(tool)
         .args(["container", "inspect", "-f", "{{.State.Status}}", name])
         .output()
         .with_context(|| format!("running {tool} inspect"))?;
@@ -472,7 +474,7 @@ fn is_no_such(stderr: &str) -> bool {
 
 /// What a running server was started with, from its labels.
 fn running_port_and_extensions(tool: &str, name: &str) -> Option<(u16, Vec<String>)> {
-    let out = Command::new(tool)
+    let out = crate::utils::engine::std_command(tool)
         .args([
             "container",
             "inspect",
@@ -502,7 +504,7 @@ fn parse_port_and_extensions(text: &str) -> Option<(u16, Vec<String>)> {
 
 /// `docker ps -a` over every HITL server on this machine, in `format`.
 fn list_servers(tool: &str, format: &str) -> Result<String> {
-    let out = Command::new(tool)
+    let out = crate::utils::engine::std_command(tool)
         .args([
             "ps",
             "-a",
@@ -523,7 +525,7 @@ fn list_servers(tool: &str, format: &str) -> Result<String> {
 }
 
 fn logs(tool: &str, name: &str) -> String {
-    Command::new(tool)
+    crate::utils::engine::std_command(tool)
         .args(["logs", name])
         .output()
         .map(|o| {
@@ -576,7 +578,9 @@ fn wait_for_ready(tool: &str, name: &str) -> Result<()> {
     loop {
         if let Some(verdict) = judge_startup(&logs(tool, name)) {
             if verdict.is_err() {
-                let _ = Command::new(tool).args(["stop", name]).output();
+                let _ = crate::utils::engine::std_command(tool)
+                    .args(["stop", name])
+                    .output();
             }
             return verdict.with_context(|| {
                 format!(
@@ -596,7 +600,9 @@ fn wait_for_ready(tool: &str, name: &str) -> Result<()> {
         }
         if start.elapsed() > STARTUP_TIMEOUT {
             // An unverified server must not be left holding the port.
-            let _ = Command::new(tool).args(["stop", name]).output();
+            let _ = crate::utils::engine::std_command(tool)
+                .args(["stop", name])
+                .output();
             bail!(
                 "HITL server '{name}' did not report ready within {}s; stopped it, container kept for `{tool} logs {name}`. Last log lines:\n{}",
                 STARTUP_TIMEOUT.as_secs(),
@@ -725,7 +731,7 @@ pub fn stop(tool: &str, identity: Option<&HitlIdentity>, all: bool) -> Result<()
     }
     let mut failed = Vec::new();
     for name in names {
-        let out = Command::new(tool)
+        let out = crate::utils::engine::std_command(tool)
             .args(["rm", "-f", &name])
             .output()
             .with_context(|| format!("running {tool} rm"))?;
@@ -764,7 +770,9 @@ pub fn show_logs(tool: &str, identity: &HitlIdentity, follow: bool) -> Result<()
         args.push("-f");
     }
     args.push(&name);
-    let status = Command::new(tool).args(&args).status()?;
+    let status = crate::utils::engine::std_command(tool)
+        .args(&args)
+        .status()?;
     if !status.success() {
         bail!("{tool} logs exited with {status}");
     }

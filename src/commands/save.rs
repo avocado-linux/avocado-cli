@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::utils::config::Config;
 use crate::utils::lockfile::LockFile;
@@ -296,7 +296,7 @@ fn build_save_archive(
         &volume_spec,
         &image,
     )?;
-    let mut child = Command::new(container_tool)
+    let mut child = crate::utils::engine::std_command(container_tool)
         .args(["exec", &session, "tar", "cf", "-", "-C", "/data", "."])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
