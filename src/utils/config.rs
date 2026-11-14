@@ -847,15 +847,59 @@ impl ContainerConfig {
     }
 
     /// `container_args` followed by the `container` block. Where both name
-    /// one setting the block's is kept: docker takes a second `--network` as
-    /// a second network to join, not as an override.
+    /// one setting the block's is kept: docker refuses a second `--network`
+    /// or a second mount on one path rather than taking the later one.
+    // ponytail: only the network, privileged and mounts are taken out of
+    // `container_args`. The block's other keys add to it, as docker does with
+    // repeated devices, hosts and caps; repeated env takes the later value.
     fn with_args(args: &Option<Vec<String>>, block: &Option<Self>) -> Option<Vec<String>> {
         let Some(block) = block else {
             return args.clone();
         };
-        let mut all = args.clone().unwrap_or_default();
-        all.extend(block.to_args());
-        Some(Config::deduplicate_container_args(all))
+        let args = args.clone().unwrap_or_default();
+        // An entry is one argument or a whole `--flag value`; the value can
+        // also be the entry after.
+        let mut kept = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let tokens = crate::utils::container::SdkContainer::parse_container_arg(&args[i]);
+            let (flag, value, joined) = match tokens.as_slice() {
+                [flag] => match flag.split_once('=') {
+                    Some((flag, value)) => (flag.to_string(), Some(value.to_string()), true),
+                    None => (flag.clone(), args.get(i + 1).cloned(), false),
+                },
+                [flag, value] => (flag.clone(), Some(value.clone()), true),
+                _ => (String::new(), None, true),
+            };
+            let replaced = match flag.as_str() {
+                "--privileged" => block.privileged.is_some(),
+                "--network" | "--net" => block.network_mode.is_some(),
+                "-v" | "--volume" => value.as_deref().is_some_and(|v| block.mounts_on(v)),
+                _ => false,
+            };
+            let width = if replaced && !joined && flag != "--privileged" {
+                2
+            } else {
+                1
+            };
+            if !replaced {
+                kept.push(args[i].clone());
+            }
+            i += width;
+        }
+        kept.extend(block.to_args());
+        Some(kept)
+    }
+
+    /// Whether one of the block's volumes mounts where `volume` does.
+    fn mounts_on(&self, volume: &str) -> bool {
+        let target = |v: &str| v.split(':').nth(1).map(str::to_string);
+        target(volume).is_some_and(|t| {
+            self.volumes
+                .iter()
+                .flatten()
+                .any(|v| target(v).as_ref() == Some(&t))
+        })
     }
 }
 
@@ -8054,6 +8098,46 @@ runtimes:
 
         let config = Config::load_from_str(config_content).unwrap();
         assert_eq!(config.default_target_board, None);
+    }
+
+    #[test]
+    fn container_block_replaces_only_what_it_names_in_any_spelling() {
+        let args = |yaml: &str| {
+            Config::load_from_str(yaml)
+                .unwrap()
+                .get_sdk_container_args()
+        };
+        let got = args(
+            r#"
+sdk:
+  container_args:
+    - --network host
+    - --pid host --ipc host
+    - --group-add
+    - a
+    - --group-add b
+    - -v /dev:/dev:ro
+    - --privileged
+    - --net
+    - bridge
+  container:
+    privileged: false
+    network_mode: none
+    volumes: ["/dev:/dev"]
+"#,
+        );
+        assert_eq!(
+            got.unwrap(),
+            [
+                "--pid host --ipc host",
+                "--group-add",
+                "a",
+                "--group-add b",
+                "--network=none",
+                "-v",
+                "/dev:/dev",
+            ]
+        );
     }
 
     #[test]

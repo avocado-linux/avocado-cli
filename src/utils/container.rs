@@ -4400,7 +4400,7 @@ fi
     }
 
     /// Parse a container argument, splitting on spaces while respecting quotes
-    fn parse_container_arg(arg: &str) -> Vec<String> {
+    pub(crate) fn parse_container_arg(arg: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
