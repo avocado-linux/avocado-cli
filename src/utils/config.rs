@@ -4539,7 +4539,23 @@ static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, Feed
 static RUNS_ON_SKIP_PRINTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set once the `--offline` preflight skip has been announced.
+static OFFLINE_SKIP_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Config {
+    /// Print the `--offline` skip notice unless `flag` says it already was.
+    /// Returns true when it printed. Takes the flag so a test can use its own.
+    fn preflight_offline_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::utils::output::print_info_stderr(
+            "skipping the feed preflight: --offline is set, so no feed is probed",
+        );
+        true
+    }
+
     /// Print the `--runs-on` skip notice unless `flag` says it already was.
     /// Returns true when it printed. Takes the flag so a test can use its own.
     fn preflight_runs_on_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
@@ -4598,7 +4614,8 @@ impl Config {
     /// which runs later and needs the mint this check must precede.
     ///
     /// With `runs_on` the probes are skipped: dnf runs on the remote runner,
-    /// which may reach feeds this host cannot.
+    /// which may reach feeds this host cannot. With `--offline` they are skipped
+    /// too, before anything is recorded, so no feed is asked about at all.
     pub async fn preflight_feeds_once(
         &self,
         target: &str,
@@ -4609,6 +4626,10 @@ impl Config {
     ) -> Result<()> {
         if runs_on {
             Self::preflight_runs_on_skip_with(&RUNS_ON_SKIP_PRINTED);
+            return Ok(());
+        }
+        if crate::utils::offline::is_offline() {
+            Self::preflight_offline_skip_with(&OFFLINE_SKIP_PRINTED);
             return Ok(());
         }
         let probed = FEEDS_PROBED.get_or_init(Default::default);
@@ -15112,6 +15133,7 @@ mod invocation_feeds_tests {
     /// `install` and `sdk install` both call the hook on the way to the first
     /// download; the feeds must be asked about once between them.
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn probe_runs_once_per_invocation() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
@@ -15217,6 +15239,7 @@ mod invocation_feeds_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn minimal_project_against_a_feed_without_an_extension_repo_passes() {
         let (base, hits) = serve_counting("404 Not Found").await;
         let c = repo_config(&base);
@@ -15234,6 +15257,7 @@ mod invocation_feeds_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn sourced_extension_against_a_feed_without_an_extension_repo_fails_naming_it() {
         let (base, _) = serve_counting("404 Not Found").await;
         let c = repo_config(&base);
@@ -15253,6 +15277,7 @@ mod invocation_feeds_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn a_later_call_needing_the_extension_repo_still_probes_it() {
         let (base, hits) = serve_counting("404 Not Found").await;
         let c = repo_config(&base);
@@ -15271,6 +15296,7 @@ mod invocation_feeds_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(offline)]
     async fn a_later_call_for_another_stage_still_probes_its_feeds() {
         let (base, hits) = serve_counting("404 Not Found").await;
         let c: Config = serde_yaml::from_str(&format!(
@@ -15305,6 +15331,42 @@ mod invocation_feeds_tests {
         .await
         .unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn offline_skips_feed_preflight() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let cfg = "/nonexistent/avocado.yaml";
+
+        crate::utils::offline::set_offline(true);
+        let skipped = c
+            .preflight_feeds_once("offline-skip-test", cfg, FeedStage::ALL, true, false)
+            .await;
+        crate::utils::offline::set_offline(false);
+        skipped.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "offline must make no request"
+        );
+
+        // Control: the same call online does probe, so the zero above is the
+        // skip, and the skip recorded nothing that lets this call pass.
+        let online = c
+            .preflight_feeds_once("offline-skip-test", cfg, FeedStage::ALL, true, false)
+            .await;
+        assert!(online.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn offline_skip_message_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(Config::preflight_offline_skip_with(&flag));
+        assert!(!Config::preflight_offline_skip_with(&flag));
     }
 
     #[test]
