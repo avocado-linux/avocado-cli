@@ -851,6 +851,36 @@
             ]
           ]
         },
+        "provides": {
+          "$ref": "#/definitions/stringList",
+          "description": "RPM Provides entries for the package.",
+          "examples": [
+            [
+              "foo = 1.0"
+            ]
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "RPM epoch. Omitted from the generated spec when not set."
+        },
+        "pre_install": {
+          "type": "string",
+          "description": "Script run before the package is installed (%pre scriptlet)."
+        },
+        "post_install": {
+          "type": "string",
+          "description": "Script run after the package is installed (%post scriptlet)."
+        },
+        "pre_uninstall": {
+          "type": "string",
+          "description": "Script run before the package is removed (%preun scriptlet)."
+        },
+        "post_uninstall": {
+          "type": "string",
+          "description": "Script run after the package is removed (%postun scriptlet)."
+        },
         "files": {
           "$ref": "#/definitions/stringList",
           "description": "Glob patterns for files to include in the main package (relative to $DESTDIR). Defaults to all files if not specified.",
