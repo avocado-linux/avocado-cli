@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
@@ -716,7 +715,7 @@ $DNF_SDK_HOST \
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_tool);
+        let mut cmd = crate::utils::engine::command(&container_tool);
         cmd.arg("pull").arg(container_image);
 
         let output = cmd.output().await?;

@@ -2208,6 +2208,13 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `avocado __docker …` is this binary standing in for the docker CLI; see
+    // `utils::engine`. It is not a subcommand, so it never reaches clap.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(utils::engine::SHIM_ARG) {
+        std::process::exit(utils::engine::main(args.collect()).await);
+    }
+
     // Intercept tab-completion requests before any other work. The
     // `COMPLETE` env var is set by the wrapper script that
     // `avocado completion <shell>` installs; when present, this call

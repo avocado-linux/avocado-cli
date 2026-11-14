@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::utils::lockfile::LockFile;
 use crate::utils::output::{print_info, print_success, print_warning, OutputLevel};
@@ -186,7 +186,7 @@ fn import_archive(
         );
     }
 
-    let output = Command::new(container_tool)
+    let output = crate::utils::engine::std_command(container_tool)
         .args([
             "volume",
             "create",
@@ -216,7 +216,7 @@ fn import_archive(
     // cannot see a host temp directory, and would mount an empty one.
     // The CLI owns this stdin pipe, so `-i` without a TTY is the arrangement
     // whatever the terminal is.
-    let mut child = Command::new(container_tool)
+    let mut child = crate::utils::engine::std_command(container_tool)
         .args(["run", "--rm"])
         .args(crate::utils::interactivity::ContainerStdio::StdinOnly.flags())
         .args([
@@ -260,13 +260,13 @@ fn import_archive(
 
     if !status.success() {
         // Clean up the volume on failure
-        let _ = Command::new(container_tool)
+        let _ = crate::utils::engine::std_command(container_tool)
             .args(["volume", "rm", &volume_name])
             .output();
         anyhow::bail!("Volume import failed: {}", stderr_text.trim());
     }
     if let Err(e) = streamed {
-        let _ = Command::new(container_tool)
+        let _ = crate::utils::engine::std_command(container_tool)
             .args(["volume", "rm", &volume_name])
             .output();
         return Err(e.context("Volume import failed"));

@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::volume::avo_abandonment_reason;
@@ -161,7 +160,7 @@ impl PruneCommand {
 
     /// List all Avocado-related volumes
     async fn list_avocado_volumes(&self) -> Result<Vec<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "ls", "--format", "{{.Name}}"])
             .output()
             .await
@@ -253,7 +252,7 @@ impl PruneCommand {
 
     /// Inspect a volume and return its info
     async fn inspect_volume(&self, volume_name: &str) -> Result<VolumeInspectInfo> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "inspect", volume_name])
             .output()
             .await
@@ -276,7 +275,7 @@ impl PruneCommand {
 
     /// Get list of container IDs using a specific volume
     async fn get_containers_using_volume(&self, volume_name: &str) -> Result<Vec<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args([
                 "ps",
                 "-a",
@@ -305,7 +304,7 @@ impl PruneCommand {
 
     /// Check if a container is running
     async fn is_container_running(&self, container_id: &str) -> Result<bool> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["inspect", "--format", "{{.State.Running}}", container_id])
             .output()
             .await
@@ -337,13 +336,13 @@ impl PruneCommand {
             }
 
             // Kill the container (in case it's running)
-            let _ = AsyncCommand::new(&self.container_tool)
+            let _ = crate::utils::engine::command(&self.container_tool)
                 .args(["kill", container_id])
                 .output()
                 .await;
 
             // Remove the container
-            let output = AsyncCommand::new(&self.container_tool)
+            let output = crate::utils::engine::command(&self.container_tool)
                 .args(["rm", "-f", container_id])
                 .output()
                 .await
@@ -363,7 +362,7 @@ impl PruneCommand {
         }
 
         // Remove the volume
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()
             .await

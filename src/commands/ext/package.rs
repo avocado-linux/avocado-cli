@@ -1094,7 +1094,7 @@ rm -rf "$TMPDIR"
         }
 
         // Use tokio::process::Command directly like checkout does
-        let copy_output = tokio::process::Command::new(container_tool)
+        let copy_output = crate::utils::engine::command(container_tool)
             .arg("cp")
             .arg(&docker_cp_source)
             .arg(&docker_cp_dest)
@@ -1103,7 +1103,7 @@ rm -rf "$TMPDIR"
             .context("Failed to execute docker cp")?;
 
         // Clean up temporary container
-        let _ = tokio::process::Command::new(container_tool)
+        let _ = crate::utils::engine::command(container_tool)
             .arg("rm")
             .arg("-f")
             .arg(&temp_container_id)
@@ -1131,7 +1131,7 @@ rm -rf "$TMPDIR"
         container_tool: &str,
         volume_name: &str,
     ) -> Result<String> {
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .arg("create")
             .arg("-v")
             .arg(format!("{volume_name}:/opt/_avocado:ro"))

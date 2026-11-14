@@ -923,7 +923,7 @@ avocado-provision-{target_arch} {name}
             );
         }
 
-        let mut cmd = tokio::process::Command::new(&copy_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&copy_cmd[0]);
         cmd.args(&copy_cmd[1..]);
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -991,7 +991,7 @@ avocado-provision-{target_arch} {name}
         check_cmd.push("-c".to_string());
         check_cmd.push(check_script);
 
-        let mut cmd = tokio::process::Command::new(&check_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&check_cmd[0]);
         cmd.args(&check_cmd[1..]);
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

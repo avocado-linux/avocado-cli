@@ -385,18 +385,19 @@ impl SdkRunCommand {
         };
 
         // Merge container args from merged config with CLI args
-        let config_container_args = merged_sdk_config.container_args.as_ref();
-        let merged_container_args = match (config_container_args, self.container_args.as_ref()) {
-            (Some(config_args), Some(cli_args)) => {
-                let mut processed_args =
-                    Config::process_container_args(Some(config_args)).unwrap_or_default();
-                processed_args.extend_from_slice(cli_args);
-                Some(processed_args)
-            }
-            (Some(config_args), None) => Config::process_container_args(Some(config_args)),
-            (None, Some(cli_args)) => Some(cli_args.clone()),
-            (None, None) => None,
-        };
+        let config_container_args = merged_sdk_config.all_container_args();
+        let merged_container_args =
+            match (config_container_args.as_ref(), self.container_args.as_ref()) {
+                (Some(config_args), Some(cli_args)) => {
+                    let mut processed_args =
+                        Config::process_container_args(Some(config_args)).unwrap_or_default();
+                    processed_args.extend_from_slice(cli_args);
+                    Some(processed_args)
+                }
+                (Some(config_args), None) => Config::process_container_args(Some(config_args)),
+                (None, Some(cli_args)) => Some(cli_args.clone()),
+                (None, None) => None,
+            };
 
         // Get the SDK image from merged configuration
         let container_image = merged_sdk_config.image.ok_or_else(|| {

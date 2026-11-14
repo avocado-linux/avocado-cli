@@ -312,7 +312,7 @@ impl ExtFileReader for ExtSourceReader {
 
 /// Resolve a Docker volume's host mountpoint.
 pub fn volume_mountpoint(state: &VolumeState) -> Result<PathBuf> {
-    let output = std::process::Command::new(&state.container_tool)
+    let output = crate::utils::engine::std_command(&state.container_tool)
         .args([
             "volume",
             "inspect",
