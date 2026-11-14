@@ -85,7 +85,7 @@ pub fn is_vm_routing_active() -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    host == format!("unix://{}", paths.docker_socket().display())
+    paths.docker_host().as_deref() == Some(host.as_str())
 }
 
 /// Host UID/GID passed to the container entrypoint, which bindfs-maps them to
@@ -5501,13 +5501,13 @@ extensions:
         for k in ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"] {
             std::env::remove_var(k);
         }
-        let vm_sock = format!(
-            "unix://{}",
-            crate::utils::vm::state::VmPaths::resolve()
-                .unwrap()
-                .docker_socket()
-                .display()
-        );
+        // The forward's address, as `vm::route` exports it. On Windows that
+        // is a TCP port recorded only while a VM runs, so without one this
+        // is empty and the routing-on half of a test is skipped.
+        let vm_sock = crate::utils::vm::state::VmPaths::resolve()
+            .unwrap()
+            .docker_host()
+            .unwrap_or_default();
         (restore, vm_sock)
     }
 
@@ -5552,6 +5552,9 @@ extensions:
             assert!(!cmd.contains(&git), "{name}: git trust without VM routing");
         }
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
             assert!(
@@ -5589,6 +5592,9 @@ extensions:
             .iter()
             .any(|e| e.starts_with("GIT_CONFIG")));
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         assert_eq!(src_mount_uid_gid(), (0, 0));
         assert_eq!(
@@ -6601,6 +6607,9 @@ extensions:
         // Per-step variables stay on the exec.
         assert!(!args.iter().any(|a| a.starts_with("AVOCADO_RUNTIME")));
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         let args = session_create_env(&env);
         has(

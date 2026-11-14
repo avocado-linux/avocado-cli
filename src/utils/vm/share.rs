@@ -86,6 +86,13 @@ pub fn read_recorded_workspace(paths: &VmPaths) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(raw.trim())))
 }
 
+/// Whether this host's QEMU can export a directory over virtio-9p.
+/// Windows builds of QEMU are compiled without `-fsdev`, so there is no
+/// workspace share there yet.
+pub fn host_supports_9p() -> bool {
+    !cfg!(windows)
+}
+
 /// QEMU arg fragments declaring the workspace 9p export.
 /// Append these to the rest of the `-fsdev` / `-device` lines.
 ///

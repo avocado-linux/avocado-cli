@@ -70,17 +70,22 @@ pub fn qemu_binary_for(manifest: &Manifest) -> Result<&'static str> {
     }
 }
 
-/// Acceleration flag for the host: HVF on macOS, KVM on Linux, TCG fallback.
+/// Acceleration flag for the host: HVF on macOS, KVM on Linux, WHPX
+/// (Windows Hypervisor Platform) on Windows, TCG fallback.
 fn accel_flag() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         "hvf"
     }
-    #[cfg(all(not(target_os = "macos"), target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
         "kvm"
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        "whpx"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "tcg"
     }
@@ -250,15 +255,20 @@ pub fn build_qemu_args(
 
     // 9p workspace share — declared once at launch, mounted post-boot at
     // /mnt/workspace by share::ensure_mounted_in_guest().
-    for a in super::share::qemu_args_for(&cfg.workspace) {
-        args.push(a);
+    // Windows builds of QEMU have no `-fsdev` (9p) support at all, so the
+    // share is not declared there; see share::host_supports_9p.
+    if super::share::host_supports_9p() {
+        for a in super::share::qemu_args_for(&cfg.workspace) {
+            args.push(a);
+        }
     }
 
-    // QMP control socket
+    // QMP control socket. The three chardevs below are Unix sockets, or
+    // loopback TCP ports on Windows (see endpoint.rs).
     args.push("-chardev".into());
     args.push(format!(
-        "socket,id=qmp,path={},server=on,wait=off",
-        paths.qmp_socket().display()
+        "socket,id=qmp,{},server=on,wait=off",
+        paths.qmp_endpoint().chardev_addr()?
     ));
     args.push("-mon".into());
     args.push("chardev=qmp,mode=control".into());
@@ -266,8 +276,8 @@ pub fn build_qemu_args(
     // qga virtio-serial channel
     args.push("-chardev".into());
     args.push(format!(
-        "socket,id=qga,path={},server=on,wait=off",
-        paths.qga_socket().display()
+        "socket,id=qga,{},server=on,wait=off",
+        paths.qga_endpoint().chardev_addr()?
     ));
     args.push("-device".into());
     args.push("virtio-serial".into());
@@ -283,8 +293,8 @@ pub fn build_qemu_args(
     // (the helper waits forever for `control.sock` to materialize).
     args.push("-chardev".into());
     args.push(format!(
-        "socket,id=avocadoctl,path={},server=on,wait=off",
-        paths.control_socket().display()
+        "socket,id=avocadoctl,{},server=on,wait=off",
+        paths.control_endpoint().chardev_addr()?
     ));
     args.push("-device".into());
     args.push("virtserialport,chardev=avocadoctl,name=avocado.control".into());
@@ -463,6 +473,15 @@ pub async fn spawn_detached(manifest: &Manifest, paths: &VmPaths, cfg: &QemuConf
             Ok(())
         });
     }
+    // The Windows equivalent: no console (so closing the terminal or a
+    // Ctrl-C in it never reaches QEMU) and its own process group.
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        super::state::stop_std_handle_inheritance();
+    }
 
     let child = cmd
         .spawn()
@@ -481,7 +500,10 @@ pub fn ensure_qemu_available(manifest: &Manifest) -> Result<()> {
     let bin = qemu_binary_for(manifest)?;
     // Cross-platform `which`: scan `$PATH`.
     if which_on_path(bin).is_none() {
-        bail!("{bin} not found in $PATH; install QEMU (e.g. `brew install qemu` on macOS)");
+        bail!(
+            "{bin} not found in $PATH; install QEMU (e.g. `brew install qemu` on macOS, \
+             `winget install SoftwareFreedomConservancy.QEMU` on Windows)"
+        );
     }
     Ok(())
 }
@@ -492,6 +514,14 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
         let full = dir.join(bin);
         if full.is_file() {
             return Some(full);
+        }
+        // Windows executables carry an extension the caller doesn't name.
+        // Only `.exe`: that is what `Command::new(bin)` resolves too.
+        if cfg!(windows) {
+            let exe = dir.join(format!("{bin}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
         }
     }
     None
@@ -528,6 +558,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// State dir with the chardev addresses reserved, as `vm start` does
+    /// before it builds the argv (a no-op where they are Unix sockets).
+    fn paths_at(root: &Path) -> VmPaths {
+        let paths = VmPaths::at(root);
+        for e in [
+            paths.qmp_endpoint(),
+            paths.qga_endpoint(),
+            paths.control_endpoint(),
+        ] {
+            e.allocate().unwrap();
+        }
+        paths
+    }
+
     fn fake_manifest(arch: &str) -> Manifest {
         let raw = json!({
             "format": "avocado-direct",
@@ -557,7 +601,7 @@ mod tests {
     fn assembles_expected_arg_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let m = fake_manifest("arm64");
-        let paths = VmPaths::at(tmp.path());
+        let paths = paths_at(tmp.path());
         let cfg = QemuConfig {
             memory_mib: 2048,
             cpus: 2,
@@ -579,7 +623,12 @@ mod tests {
         assert!(rendered.contains("qemu-xhci"));
         assert!(rendered.contains("org.qemu.guest_agent.0"));
         assert!(rendered.contains("readonly=on"));
-        assert!(rendered.contains("mount_tag=workspace"));
+        assert_eq!(
+            rendered.contains("mount_tag=workspace"),
+            crate::utils::vm::share::host_supports_9p()
+        );
+        // All three chardevs are served, whatever the transport.
+        assert_eq!(rendered.matches("server=on,wait=off").count(), 3);
     }
 
     fn cfg_for(tmp: &Path, var_seed: Option<VarSeed>) -> QemuConfig {
@@ -601,7 +650,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = build_qemu_args(
             &fake_manifest("arm64"),
-            &VmPaths::at(tmp.path()),
+            &paths_at(tmp.path()),
             &cfg_for(tmp.path(), None),
         )
         .unwrap();
@@ -623,7 +672,7 @@ mod tests {
 
         let args = build_qemu_args(
             &fake_manifest("arm64"),
-            &VmPaths::at(tmp.path()),
+            &paths_at(tmp.path()),
             &cfg_for(
                 tmp.path(),
                 Some(VarSeed {

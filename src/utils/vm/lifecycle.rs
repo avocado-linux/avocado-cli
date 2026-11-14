@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use super::manifest::Manifest;
 use super::qemu::{self, QemuConfig};
-#[cfg(unix)]
 use super::qmp::QmpClient;
 use super::ssh::SshTarget;
 use super::state::{self, VmPaths};
@@ -252,6 +251,17 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         });
     let pending_seed_sha = var_seed.as_ref().map(|vs| vs.sha256.clone());
 
+    // Reserve the QMP / qga / control-plane addresses. A no-op where they
+    // are Unix sockets; on Windows this picks the loopback TCP ports and
+    // records them for every later client (this CLI, Avocado Desktop).
+    for endpoint in [
+        paths.qmp_endpoint(),
+        paths.qga_endpoint(),
+        paths.control_endpoint(),
+    ] {
+        endpoint.allocate()?;
+    }
+
     let cfg = QemuConfig {
         memory_mib,
         cpus,
@@ -312,7 +322,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     .await?;
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
-    let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_socket(), ssh_port, None)
+    let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_endpoint(), ssh_port, None)
         .await
         .context("guest never became ready (check `avocado vm logs`)")?;
     let _ = signal; // currently informational; callers may want to log which path won
@@ -321,9 +331,16 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // start — if it fails, we surface the error so the user can debug,
     // but the VM stays up.
     let target = super::ssh::SshTarget::local(&paths, ssh_port);
-    if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
-        // Don't tear down the VM — user can `avocado vm shell` and inspect.
-        return Err(e).context("workspace 9p mount in guest");
+    if super::share::host_supports_9p() {
+        if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
+            // Don't tear down the VM — user can `avocado vm shell` and inspect.
+            return Err(e).context("workspace 9p mount in guest");
+        }
+    } else {
+        crate::utils::output::print_warning_stderr(
+            "the workspace folder share is not available on this host yet; \
+             the VM is up but host project directories are not mounted in it.",
+        );
     }
 
     // Grow /var inside the VM to fill the resized block device. Idempotent
@@ -431,9 +448,9 @@ async fn stop_inner(force: bool) -> Result<()> {
     notify_desktop("vm.notify.stopping", serde_json::json!({ "pid": pid }));
 
     // Try QMP quit first if the socket is around.
-    #[cfg(unix)]
-    if paths.qmp_socket().exists() {
-        if let Ok(mut q) = QmpClient::connect(&paths.qmp_socket()).await {
+    let qmp = paths.qmp_endpoint();
+    if qmp.exists() {
+        if let Ok(mut q) = QmpClient::connect_endpoint(&qmp).await {
             let _ = q.quit().await;
         }
     }
@@ -823,7 +840,14 @@ fn send_signal(pid: u32, sig: libc::c_int) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
-    #[cfg(not(unix))]
+    // No signals on Windows: both TERM and KILL end the process outright.
+    // QEMU has already been asked to quit over QMP by the time we get here.
+    #[cfg(windows)]
+    {
+        let _ = sig;
+        state::terminate_pid(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (pid, sig);
     }
@@ -978,28 +1002,21 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
 /// state, and `None` if the QMP socket is unreachable. Short timeout
 /// (~500ms) so a wedged QEMU doesn't make `vm status` hang.
 async fn probe_paused(paths: &VmPaths) -> Option<bool> {
-    #[cfg(unix)]
-    {
-        if !paths.qmp_socket().exists() {
-            return None;
-        }
-        let probe = async {
-            let mut client = QmpClient::connect(&paths.qmp_socket()).await.ok()?;
-            let v = client.execute("query-status", None).await.ok()?;
-            v.get("status")
-                .and_then(|s| s.as_str())
-                .map(|s| s == "paused")
-        };
-        tokio::time::timeout(Duration::from_millis(500), probe)
-            .await
-            .ok()
-            .flatten()
+    let qmp = paths.qmp_endpoint();
+    if !qmp.exists() {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = paths;
-        None
-    }
+    let probe = async {
+        let mut client = QmpClient::connect_endpoint(&qmp).await.ok()?;
+        let v = client.execute("query-status", None).await.ok()?;
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "paused")
+    };
+    tokio::time::timeout(Duration::from_millis(500), probe)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Default idle timeout in seconds when neither config nor env var sets

@@ -10,26 +10,27 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
+
+use super::endpoint::{BoxedRead, BoxedWrite, Endpoint};
 
 #[allow(dead_code)]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct QgaClient {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<BoxedRead>,
+    writer: BoxedWrite,
 }
 
 impl QgaClient {
-    /// Connect to the qga socket. Does not require any handshake.
-    pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
+    /// Connect to the qga endpoint (Unix socket, or loopback TCP on
+    /// Windows). Does not require any handshake.
+    pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
+        let (rh, wh) = endpoint
+            .connect()
             .await
-            .with_context(|| format!("connect to qga {}", socket.display()))?;
-        let (rh, wh) = stream.into_split();
+            .with_context(|| format!("connect to qga {endpoint}"))?;
         Ok(Self {
             reader: BufReader::new(rh),
             writer: wh,
