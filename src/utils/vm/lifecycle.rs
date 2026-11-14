@@ -317,16 +317,9 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // start — if it fails, we surface the error so the user can debug,
     // but the VM stays up.
     let target = super::ssh::SshTarget::local(&paths, ssh_port);
-    if super::share::host_supports_9p() {
-        if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
-            // Don't tear down the VM — user can `avocado vm shell` and inspect.
-            return Err(e).context("workspace 9p mount in guest");
-        }
-    } else {
-        crate::utils::output::print_warning_stderr(
-            "the workspace folder share is not available on this host yet; \
-             the VM is up but host project directories are not mounted in it.",
-        );
+    if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
+        // Don't tear down the VM — user can `avocado vm shell` and inspect.
+        return Err(e).context("workspace mount in guest");
     }
 
     // Grow /var inside the VM to fill the resized block device. Idempotent

@@ -80,6 +80,40 @@ impl SshTarget {
         Ok((stdout, stderr))
     }
 
+    /// Run a shell script in the guest, fed over stdin to `sh -s`.
+    ///
+    /// For scripts that carry a secret: nothing of the script appears on
+    /// the ssh command line (visible to every local process) and, unlike
+    /// [`Self::exec`], a failure does not echo it back in the error.
+    /// Returns (stdout, stderr) on success.
+    pub async fn exec_script(&self, script: &str) -> Result<(String, String)> {
+        use tokio::io::AsyncWriteExt;
+        let mut cmd = AsyncCommand::new("ssh");
+        cmd.args(self.base_args());
+        cmd.arg("sh -s");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().context("failed to spawn ssh")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(script.as_bytes())
+                .await
+                .context("writing script to ssh")?;
+            // Dropping stdin closes it, which ends `sh -s`.
+        }
+        let out = child.wait_with_output().await.context("ssh wait failed")?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !out.status.success() {
+            bail!(
+                "guest script exited with status {}\nstdout: {stdout}\nstderr: {stderr}",
+                out.status,
+            );
+        }
+        Ok((stdout, stderr))
+    }
+
     /// Drop the user into an interactive shell. Returns when ssh exits.
     pub async fn interactive(
         &self,
