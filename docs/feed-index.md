@@ -37,8 +37,11 @@ repos:
     path: /abs/dir
 ```
 
-List the feed before `avocado` so it wins on priority. dnf still picks the
-highest version across enabled feeds unless a package is pinned:
+List the feed before `avocado` so it wins on priority. dnf repository priority
+takes precedence over version: a package present in the higher-priority feed is
+chosen from it even when a lower-priority feed carries a newer version. A package
+the higher-priority feed lacks still comes from the other feeds. To fix a
+package at a specific version, pin it separately:
 
 ```yaml
 packages:
