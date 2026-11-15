@@ -442,6 +442,8 @@ impl RuntimeProvisionCommand {
             None
         };
 
+        insert_provision_force_env(&mut env_vars, self.config.force);
+
         let env_vars = if env_vars.is_empty() {
             None
         } else {
@@ -1238,6 +1240,19 @@ rpm --root="$AVOCADO_EXT_SYSROOTS/{ext_name}" --dbpath=/var/lib/extension.d/rpm 
     }
 }
 
+/// Tell the provision script whether the operator passed `--force`.
+///
+/// With `--force` the container runs without a TTY, so a script cannot tell
+/// "the operator already confirmed" from "nobody confirmed" by probing for a
+/// terminal. Always set (`1` or `0`) and inserted last so a value passed with
+/// `--env` cannot claim a confirmation that did not happen.
+fn insert_provision_force_env(env_vars: &mut HashMap<String, String>, force: bool) {
+    env_vars.insert(
+        "AVOCADO_PROVISION_FORCE".to_string(),
+        if force { "1" } else { "0" }.to_string(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1394,6 +1409,39 @@ mod tests {
         assert_eq!(cmd.config.out, None);
         assert_eq!(cmd.config.container_args, container_args);
         assert_eq!(cmd.config.dnf_args, dnf_args);
+    }
+
+    #[test]
+    fn provision_force_env_is_1_when_force_is_set() {
+        let mut env_vars = HashMap::new();
+        insert_provision_force_env(&mut env_vars, true);
+        assert_eq!(
+            env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn provision_force_env_is_0_when_force_is_not_set() {
+        let mut env_vars = HashMap::new();
+        insert_provision_force_env(&mut env_vars, false);
+        assert_eq!(
+            env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn provision_force_env_overrides_a_value_passed_with_env() {
+        // `--env AVOCADO_PROVISION_FORCE=1` must not let a run without
+        // --force claim the operator already confirmed.
+        let mut env_vars = HashMap::new();
+        env_vars.insert("AVOCADO_PROVISION_FORCE".to_string(), "1".to_string());
+        insert_provision_force_env(&mut env_vars, false);
+        assert_eq!(
+            env_vars.get("AVOCADO_PROVISION_FORCE").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]
