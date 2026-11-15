@@ -117,6 +117,7 @@ The following environment variables are available in provision and build scripts
 - `AVOCADO_EXT_LIST`: Space-separated list of extensions required by the runtime (if any)
 - `AVOCADO_PROVISION_OUT`: Output directory path in the container (if `--out` flag is specified). Files written here will have their ownership automatically fixed to match the calling user.
 - `AVOCADO_PROVISION_STATE`: Path to a state file for persisting data between provision runs (if `--provision-profile` is specified). See [State File Management](#state-file-management) section below.
+- `AVOCADO_PROVISION_FORCE`: `1` when `--force` was passed, `0` otherwise. Always set. With `--force` the container runs without a terminal, so a script that asks the operator to confirm a destructive step can read this variable to tell "the operator already confirmed" from "nobody confirmed". Treat `0` with no terminal as unconfirmed and refuse the destructive step.
 - `AVOCADO_STONE_INCLUDE_PATHS`: Stone include paths (if configured for the runtime)
 - `AVOCADO_STONE_MANIFEST`: Stone manifest path (if configured for the runtime)
 
