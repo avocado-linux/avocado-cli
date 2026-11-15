@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
+  RPMs by running the host `createrepo_c`, regenerated on every run. It fails
+  with an error naming `createrepo_c` when the tool is not on PATH, and naming
+  the path when the directory is missing or not a directory. See
+  `docs/feed-index.md`.
 - **Optional `provides`, `epoch` and scriptlet keys in `sdk.compile.<section>.package`.**
   `provides` adds one `Provides:` line per entry, `epoch` sets `Epoch:`, and
   `pre_install`, `post_install`, `pre_uninstall` and `post_uninstall` emit
