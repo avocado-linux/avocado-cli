@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
+  RPMs by running the host `createrepo_c`, regenerated on every run. It fails
+  with an error naming `createrepo_c` when the tool is not on PATH, and naming
+  the path when the directory is missing or not a directory. See
+  `docs/feed-index.md`.
+- **Optional `provides`, `epoch` and scriptlet keys in `sdk.compile.<section>.package`.**
+  `provides` adds one `Provides:` line per entry, `epoch` sets `Epoch:`, and
+  `pre_install`, `post_install`, `pre_uninstall` and `post_uninstall` emit
+  `%pre`, `%post`, `%preun` and `%postun`. A `%` is escaped so rpm reads it
+  literally. See `docs/sdk-package.md`.
+- **A snapshot pin identity covers the feed URL, and a pinned rebuild
+  mentions newer snapshots.** A recorded pin now remembers the repository URL
+  it came from (trailing slashes ignored), so pointing the config at a mirror
+  or another feed with the same release and channel warns that the pin does not
+  match instead of reusing a snapshot ID that repository never issued. When
+  only the URL changed, the warning names the new feed URL. Lock files written
+  before the URL was recorded still match. A pinned rebuild also prints one
+  line naming the pinned and latest snapshots and pointing at `avocado update`
+  when the channel has moved on; a failed lookup prints nothing.
+
+### Fixed
+- **A failed run's summary no longer calls the steps it never reached "up to
+  date".** After `sdk bootstrap` failed, for example, `sdk packages` and
+  `rootfs install` printed with a check mark and `(up to date)`. Steps after
+  the first failed one now print `(skipped: earlier step failed)` with no
+  check mark; steps before it keep `(up to date)`. Steps that had started
+  but not finished when a step failed, which printed no line at all, now
+  print `(not finished: a step failed)`.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added

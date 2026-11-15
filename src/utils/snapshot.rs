@@ -53,17 +53,29 @@ pub struct SnapshotPointer {
 pub enum PinStatus {
     /// No pin recorded for this target.
     None,
-    /// Pin matches the configured release+channel — reuse it.
+    /// Pin matches the configured release+channel+repo URL — reuse it.
     Matches,
-    /// Pin is for a different release/channel than the config now names.
+    /// Pin is for a different release/channel/repo URL than the config now names.
     Mismatch,
 }
 
 /// Classify a recorded pin against the configured feed. Pure — unit-tested.
-pub fn pin_status(pin: Option<&RepoSnapshot>, release: &str, channel: &str) -> PinStatus {
+/// A pin recorded without a URL (older lock files) matches any URL.
+pub fn pin_status(
+    pin: Option<&RepoSnapshot>,
+    release: &str,
+    channel: &str,
+    repo_url: &str,
+) -> PinStatus {
+    let url_matches = |p: &RepoSnapshot| match &p.repo_url {
+        None => true,
+        Some(recorded) => recorded.trim_end_matches('/') == repo_url.trim_end_matches('/'),
+    };
     match pin {
         None => PinStatus::None,
-        Some(p) if p.release == release && p.channel == channel => PinStatus::Matches,
+        Some(p) if p.release == release && p.channel == channel && url_matches(p) => {
+            PinStatus::Matches
+        }
         Some(_) => PinStatus::Mismatch,
     }
 }
@@ -266,6 +278,76 @@ async fn verify_pin_available(
     }
 }
 
+/// Warning for a pin that no longer applies. When release and channel are
+/// unchanged the URL is the only difference, so say that rather than claiming
+/// the config names a different release/channel.
+fn mismatch_warning(snap: &RepoSnapshot, release: &str, channel: &str, repo_url: &str) -> String {
+    let tail = "Tracking the live channel head; run 'avocado update' to re-pin.";
+    if snap.release == release && snap.channel == channel {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot '{}' for {}/{} on a different feed URL than \
+             the config now names ({}). {tail}",
+            snap.snapshot, release, channel, repo_url
+        )
+    } else {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. {tail}",
+            snap.release, snap.channel, release, channel
+        )
+    }
+}
+
+/// One line naming the pinned and latest snapshots when they differ. Tolerant:
+/// any fetch or parse failure, a feed without snapshots, or an up-to-date pin
+/// yields `None`, so an advisory never fails or slows a pinned rebuild.
+async fn newer_snapshot_notice(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+) -> Option<String> {
+    newer_snapshot_notice_within(
+        client,
+        repo_url,
+        release,
+        channel,
+        target,
+        pinned,
+        NEWER_SNAPSHOT_NOTICE_LIMIT,
+    )
+    .await
+}
+
+/// The notice is advisory, so a slow feed must not hold up a pinned rebuild.
+const NEWER_SNAPSHOT_NOTICE_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn newer_snapshot_notice_within(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let latest = tokio::time::timeout(
+        limit,
+        fetch_latest(client, repo_url, release, channel, target),
+    )
+    .await
+    .ok()?;
+    match latest {
+        Ok(LatestResult::Found(latest)) if latest.id != pinned.snapshot => Some(format!(
+            "Pinned to snapshot '{}'; latest for {release}/{channel} is '{}'. \
+             Run 'avocado update' to move the pin.",
+            pinned.snapshot, latest.id
+        )),
+        _ => None,
+    }
+}
+
 /// Resolve the snapshot pin for `target` and, when one applies, expose it via
 /// `AVOCADO_RELEASEVER` so every downstream `get_releasever()` fetches against
 /// the frozen snapshot subtree. Auto-pins (and persists) on first fetch.
@@ -287,20 +369,26 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
     let client = build_client(config)?;
 
-    let effective = match pin_status(lock.get_repo_snapshot(target), &release, &channel) {
+    let effective = match pin_status(
+        lock.get_repo_snapshot(target),
+        &release,
+        &channel,
+        &repo_url,
+    ) {
         PinStatus::Matches => {
             let snap = lock.get_repo_snapshot(target).expect("matched");
             verify_pin_available(&client, &repo_url, snap, target).await?;
+            if let Some(notice) =
+                newer_snapshot_notice(&client, &repo_url, &release, &channel, target, snap).await
+            {
+                print_info(&notice, OutputLevel::Normal);
+            }
             effective_releasever(&snap.release, &snap.channel, &snap.snapshot)
         }
         PinStatus::Mismatch => {
             let snap = lock.get_repo_snapshot(target).expect("mismatch");
             print_info(
-                &format!(
-                    "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. \
-                     Tracking the live channel head; run 'avocado update' to re-pin.",
-                    snap.release, snap.channel, release, channel
-                ),
+                &mismatch_warning(snap, &release, &channel, &repo_url),
                 OutputLevel::Normal,
             );
             return Ok(());
@@ -341,7 +429,7 @@ pub fn pinned_releasever(config: &Config, lock: &LockFile, target: &str) -> Opti
     }
     let (release, channel) = (config.get_distro_release()?, config.get_distro_channel()?);
     let snap = lock.get_repo_snapshot(target)?;
-    match pin_status(Some(snap), &release, &channel) {
+    match pin_status(Some(snap), &release, &channel, &config.effective_repo_url()) {
         PinStatus::Matches => Some(effective_releasever(
             &snap.release,
             &snap.channel,
@@ -388,15 +476,17 @@ mod tests {
     }
     use super::*;
 
-    fn snap(release: &str, channel: &str, id: &str) -> RepoSnapshot {
+    fn snap(release: &str, channel: &str, id: &str, url: Option<&str>) -> RepoSnapshot {
         RepoSnapshot {
             release: release.to_string(),
             channel: channel.to_string(),
             snapshot: id.to_string(),
-            repo_url: None,
+            repo_url: url.map(str::to_string),
             created: None,
         }
     }
+
+    const URL: &str = "https://repo.example.com";
 
     #[test]
     fn effective_releasever_injects_snapshot_segment() {
@@ -408,7 +498,7 @@ mod tests {
 
     #[test]
     fn pin_status_none_when_unpinned() {
-        assert_eq!(pin_status(None, "2026", "edge"), PinStatus::None);
+        assert_eq!(pin_status(None, "2026", "edge", URL), PinStatus::None);
     }
 
     /// The pin that `Config::load_composed` reads from the lock is not an
@@ -427,15 +517,43 @@ mod tests {
 
     #[test]
     fn pin_status_matches_same_feed() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "edge"), PinStatus::Matches);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+        let slashed = format!("{URL}/");
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", &slashed),
+            PinStatus::Matches
+        );
+        let unrecorded = snap("2026", "edge", "X", None);
+        assert_eq!(
+            pin_status(Some(&unrecorded), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+    }
+
+    #[test]
+    fn pin_with_other_url_is_not_matching() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", "https://mirror.example.com"),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
     fn pin_status_mismatch_on_channel_change() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "stable"), PinStatus::Mismatch);
-        assert_eq!(pin_status(Some(&p), "2027", "edge"), PinStatus::Mismatch);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "stable", URL),
+            PinStatus::Mismatch
+        );
+        assert_eq!(
+            pin_status(Some(&p), "2027", "edge", URL),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
@@ -457,5 +575,124 @@ mod tests {
             repomd_url("https://r.io", "2026", "edge", "qemux86-64", "SNAP"),
             "https://r.io/2026/edge/snapshots/SNAP/target/qemux86-64/repodata/repomd.xml"
         );
+    }
+
+    #[test]
+    fn url_only_change_does_not_claim_release_or_channel_changed() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "edge", "https://mirror.example.com");
+        assert!(msg.contains("different feed URL"), "{msg}");
+        assert!(msg.contains("https://mirror.example.com"), "{msg}");
+        assert!(!msg.contains("config now names 2026/edge"), "{msg}");
+    }
+
+    #[test]
+    fn channel_change_still_names_both_feeds() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "stable", URL);
+        assert!(
+            msg.contains("pinned to snapshot for 2026/edge but config now names 2026/stable"),
+            "{msg}"
+        );
+    }
+
+    /// Serve one canned HTTP response on a loopback port, then return its base URL.
+    fn serve_once(status: &str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn newer_latest_names_pinned_latest_and_update_command() {
+        let url = serve_once("200 OK", r#"{"id":"NEW"}"#);
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await
+        .expect("a differing latest yields a notice");
+        assert!(msg.contains("'OLD'") && msg.contains("'NEW'"), "{msg}");
+        assert!(msg.contains("avocado update"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn latest_equal_to_pin_prints_nothing() {
+        let url = serve_once("200 OK", r#"{"id":"SAME"}"#);
+        let p = snap("2026", "edge", "SAME", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn unreachable_latest_prints_nothing() {
+        // Bind then drop, so the port is closed when the client connects.
+        let url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn hung_latest_endpoint_is_abandoned_within_the_limit() {
+        // Accepts the connection and never answers.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let started = std::time::Instant::now();
+        let msg = newer_snapshot_notice_within(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(msg, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "advisory held the command for {:?}",
+            started.elapsed()
+        );
+        drop(l);
     }
 }
