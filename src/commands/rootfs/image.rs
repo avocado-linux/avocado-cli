@@ -23,8 +23,12 @@ pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
 /// Removes every non-directory under `$ROOTFS_WORK/boot`, keeping the
 /// directory tree (mountpoints). See `DEFAULT_ROOTFS_POST_INSTALL`.
+///
+/// `-H` follows `/boot` itself when it is a symlink to a directory (as the
+/// old `boot/*` glob did), and only a missing `/boot` is tolerated: a `find`
+/// failure fails the hook, since runtime builds run without `set -e`.
 pub const BOOT_STRIP_KEEP_DIRS: &str =
-    "[ -d \"$ROOTFS_WORK/boot\" ] && find \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete || true";
+    "[ ! -d \"$ROOTFS_WORK/boot\" ] || find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete";
 
 /// Default post-install commands for the rootfs build. Run on the work
 /// directory (`$ROOTFS_WORK`) after package install + overlay, before
@@ -970,6 +974,54 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    /// A /boot that is a symlink to a directory is stripped through the link.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_follows_a_symlinked_boot() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("efi")).unwrap();
+        std::fs::write(real.join("Image"), b"k").unwrap();
+        std::os::unix::fs::symlink("real", root.path().join("boot")).unwrap();
+
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(!real.join("Image").exists());
+        assert!(real.join("efi").is_dir());
+    }
+
+    /// A strip that cannot delete fails the hook instead of imaging the kernel.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_fails_when_find_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("boot/extlinux");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("extlinux.conf"), b"c").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap();
+        let blocked = sub.join("extlinux.conf").exists();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // root ignores directory write bits; only judge a delete that failed.
+        if blocked {
+            assert!(!status.success());
+        }
     }
 
     /// `.exports` records exactly the variables that are set, as sourceable
