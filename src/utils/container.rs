@@ -1414,13 +1414,29 @@ fn take_git_config_args_with(
     let mut kept = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
-        if let Some((used, operand)) = docker_env_flag(args, i) {
+        // A short flag clustered with `-e` (`-de K=V`) is read as its leading
+        // flags plus the env flag, so only the setting is taken out of it.
+        let cluster = unpack_env_cluster(&args[i]);
+        let owned: Vec<String>;
+        let window: &[String] = match &cluster {
+            Some((_, env)) => {
+                owned = std::iter::once(env.clone())
+                    .chain(args.get(i + 1).cloned())
+                    .collect();
+                &owned
+            }
+            None => &args[i..],
+        };
+        if let Some((used, operand)) = docker_env_flag(window, 0) {
             let (key, value) = match operand.split_once('=') {
                 Some((k, v)) => (k, Some(v.to_string())),
                 None => (operand, None),
             };
             if key == KEY {
                 values.extend(value.or_else(|| host_env(KEY)));
+                if let Some((flags, _)) = cluster {
+                    kept.extend(flags);
+                }
                 i += used;
                 continue;
             }
@@ -1475,30 +1491,38 @@ pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
 /// `-w`) takes the rest of the token as its own operand, so such a token is
 /// left alone.
 fn split_env_tokens(args: &[String]) -> Vec<String> {
-    const BOOL_SHORT: &str = "dPqit";
     let mut out = Vec::new();
     for tok in args
         .iter()
         .flat_map(|a| SdkContainer::parse_container_arg(a))
     {
-        let cluster = tok
-            .strip_prefix('-')
-            .filter(|r| !r.starts_with('-') && !r.is_empty());
-        let split = cluster.and_then(|r| {
-            let at = r.find('e')?;
-            let flags = &r[..at];
-            (!flags.is_empty() && flags.chars().all(|c| BOOL_SHORT.contains(c)))
-                .then(|| (flags.to_string(), r[at..].to_string()))
-        });
-        match split {
+        match unpack_env_cluster(&tok) {
             Some((flags, env)) => {
-                out.extend(flags.chars().map(|c| format!("-{c}")));
-                out.push(format!("-{env}"));
+                out.extend(flags);
+                out.push(env);
             }
             None => out.push(tok),
         }
     }
     out
+}
+
+/// Split a short-flag cluster that ends in `e` into its separate boolean flags
+/// (`-d`, `-i`) and the env flag with the rest of the token (`-eK=V` or a bare
+/// `-e`). `None` when the token is not such a cluster.
+fn unpack_env_cluster(tok: &str) -> Option<(Vec<String>, String)> {
+    const BOOL_SHORT: &str = "dPqit";
+    let rest = tok
+        .strip_prefix('-')
+        .filter(|r| !r.starts_with('-') && !r.is_empty())?;
+    let at = rest.find('e')?;
+    let flags = &rest[..at];
+    (!flags.is_empty() && flags.chars().all(|c| BOOL_SHORT.contains(c))).then(|| {
+        (
+            flags.chars().map(|c| format!("-{c}")).collect(),
+            format!("-{}", &rest[at..]),
+        )
+    })
 }
 
 /// What raw container args set in the container's environment: each env flag
@@ -6184,6 +6208,33 @@ extensions:
             .collect();
         assert_eq!(take_git_config_args_with(&mut args, host), None);
         assert_eq!(args.len(), 4);
+    }
+
+    /// A short flag clustered with `-e` (`-de K=V`, `-deK=V`) is an env flag to
+    /// docker, so the git settings in it are taken out and merged, and the
+    /// other flags of the cluster stay.
+    #[test]
+    fn clustered_short_env_flags_are_taken_out_of_git_config_args() {
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        let forms: &[(&[&str], &str)] = &[
+            (&["-de", "GIT_CONFIG_PARAMETERS=V"], "V"),
+            (&["-deGIT_CONFIG_PARAMETERS=V"], "V"),
+            (&["-de", "GIT_CONFIG_PARAMETERS"], "'h.x'='9'"),
+        ];
+        for (form, want) in forms {
+            let mut args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            args.push("--privileged".to_string());
+            assert_eq!(
+                take_git_config_args_with(&mut args, host).as_deref(),
+                Some(*want),
+                "{form:?}"
+            );
+            assert_eq!(args, ["-d", "--privileged"], "{form:?}");
+        }
+        // A cluster for another variable is kept whole.
+        let mut args: Vec<String> = ["-de", "OTHER=1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(take_git_config_args_with(&mut args, host), None);
+        assert_eq!(args, ["-de", "OTHER=1"]);
     }
 
     /// The session split takes env flags in every docker form, so a compact
