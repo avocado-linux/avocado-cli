@@ -4551,10 +4551,16 @@ fi
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
-        let chars = arg.chars().peekable();
+        let mut chars = arg.chars().peekable();
 
-        for ch in chars {
+        while let Some(ch) = chars.next() {
             match ch {
+                // Inside quotes, as in a shell's double quotes, `\"` and `\\`
+                // are a literal quote and backslash. Outside them a
+                // backslash is just a character, as in a Windows path.
+                '\\' if in_quotes && matches!(chars.peek(), Some('"' | '\\')) => {
+                    current.extend(chars.next());
+                }
                 '"' => {
                     in_quotes = !in_quotes;
                 }

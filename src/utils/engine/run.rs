@@ -121,16 +121,22 @@ pub(super) async fn run(docker: &Docker, args: &[String], start: bool) -> Result
         return Ok(0);
     }
 
-    // A `--rm` container is gone the moment it exits, so ask how it exited
-    // before it can start. Otherwise the container is still there to be asked
-    // afterwards.
-    // ponytail: nothing confirms the daemon has registered this wait before
-    // `start` goes out; it has the attach round trip to do so. Losing that
-    // race reports "no such container" instead of the exit code. Close it by
-    // not using the daemon's auto-remove if it is ever seen.
-    let removed = a
-        .has("--rm")
-        .then(|| tokio::spawn(wait(docker.clone(), id.clone(), "removed")));
+    // A `--rm` container is gone the moment it exits, so a wait sent after
+    // that finds nothing, and nothing says when the daemon has taken one in.
+    // Its event log does not race: read from the container's creation, it
+    // has the exit code whenever it is read. The daemon still does the
+    // removing, so a killed shim leaves nothing behind.
+    let removed = match a.has("--rm") {
+        true => {
+            let since = created_at(docker, &id).await?;
+            Some(tokio::spawn(exit_from_events(
+                docker.clone(),
+                id.clone(),
+                since,
+            )))
+        }
+        false => None,
+    };
     let attach = q::AttachContainerOptionsBuilder::new()
         .stream(true)
         .stdout(true)
@@ -238,6 +244,57 @@ async fn wait(docker: Docker, id: String, condition: &str) -> Result<i32> {
         Some(Err(e)) => Err(e.into()),
         None => bail!("the daemon closed the wait for container {id} without an exit status"),
     }
+}
+
+/// When `id` was created, as an events `since`, in the daemon's own clock.
+async fn created_at(docker: &Docker, id: &str) -> Result<String> {
+    let created = docker.inspect_container(id, None).await?.created;
+    let seconds = created
+        .as_deref()
+        .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+        .context("the daemon gave no creation time for the container")?
+        .timestamp();
+    // Whole seconds round down; one more covers the fraction.
+    Ok((seconds - 1).to_string())
+}
+
+/// The exit code of a `--rm` container, from its `die` event, once its
+/// `destroy` event says it is gone, as `docker run --rm` waits for.
+async fn exit_from_events(docker: Docker, id: String, since: String) -> Result<i32> {
+    let filters = HashMap::from([
+        ("type", vec!["container"]),
+        ("container", vec![id.as_str()]),
+    ]);
+    let options = q::EventsOptionsBuilder::new()
+        .since(&since)
+        .filters(&filters)
+        .build();
+    let mut events = Box::pin(docker.events(Some(options)));
+    let mut code = None;
+    loop {
+        // ponytail: once it has died, give the removal a minute rather than
+        // hanging on a daemon that failed to remove it.
+        let next = match code {
+            None => events.next().await,
+            Some(_) => tokio::time::timeout(Duration::from_secs(60), events.next())
+                .await
+                .unwrap_or(None),
+        };
+        let Some(event) = next.transpose()? else {
+            break;
+        };
+        match event.action.as_deref() {
+            Some("die") => {
+                code = event
+                    .actor
+                    .and_then(|actor| actor.attributes)
+                    .and_then(|attributes| attributes.get("exitCode")?.parse().ok());
+            }
+            Some("destroy") => break,
+            _ => {}
+        }
+    }
+    code.with_context(|| format!("container {id} went away without an exit status"))
 }
 
 /// Send the terminating signals on to the container instead of dying of them,

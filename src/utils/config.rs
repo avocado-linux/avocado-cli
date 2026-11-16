@@ -931,15 +931,15 @@ impl ContainerConfig {
     }
 }
 
-/// One argument as a `container_args` entry: the entries are split on spaces
-/// outside double quotes, so a value with a space is quoted to stay whole.
-// ponytail: that splitter has no escape for `"` itself, so a value holding
-// one is still split; carry block values as argv end to end if that matters.
+/// One argument as a `container_args` entry. The entries are split on spaces
+/// outside double quotes, and a bare `"` toggles quoting, so a value with
+/// either is quoted, its quotes and backslashes escaped as in a shell.
 fn atom(value: &str) -> String {
-    match value.contains(char::is_whitespace) {
-        true => format!("\"{value}\""),
-        false => value.to_string(),
+    if !value.contains(|c: char| c.is_whitespace() || c == '"') {
+        return value.to_string();
     }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 impl SdkConfig {
@@ -5410,7 +5410,9 @@ impl Config {
         self.provision_profiles.as_ref()?.get(profile_name)
     }
 
-    /// Get container args from provision profile
+    /// Get container args from provision profile, on their own; the merge
+    /// applies the profile's block over the SDK's args as well.
+    #[cfg(test)]
     pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<Vec<String>> {
         let profile = self.get_provision_profile(profile_name)?;
         ContainerConfig::with_args(&profile.container_args, &profile.container)
@@ -6121,20 +6123,24 @@ impl Config {
         provision_profile: Option<&str>,
         cli_args: Option<&Vec<String>>,
     ) -> Option<Vec<String>> {
-        let sdk_args = self.get_sdk_container_args();
-        let profile_args = provision_profile
-            .and_then(|profile| self.get_provision_profile_container_args(profile));
-
-        // Collect all args in order: SDK first, then provision profile, then CLI
-        let mut all_args: Vec<String> = Vec::new();
-
-        if let Some(sdk) = &sdk_args {
-            all_args.extend(Self::process_container_args(Some(sdk)).unwrap_or_default());
+        // SDK first, then the profile's `container_args`, then its block, which
+        // replaces what it names in both: a profile's network or mount must
+        // not end up beside the SDK's, which docker refuses.
+        let profile = provision_profile.and_then(|name| self.get_provision_profile(name));
+        let mut inherited = self.get_sdk_container_args();
+        if let Some(args) = profile.and_then(|p| p.container_args.as_ref()) {
+            inherited
+                .get_or_insert_with(Vec::new)
+                .extend(args.iter().cloned());
         }
+        let inherited = match profile {
+            Some(profile) => ContainerConfig::with_args(&inherited, &profile.container),
+            None => inherited,
+        };
 
-        if let Some(profile) = &profile_args {
-            all_args.extend(Self::process_container_args(Some(profile)).unwrap_or_default());
-        }
+        // Then CLI
+        let mut all_args: Vec<String> =
+            Self::process_container_args(inherited.as_ref()).unwrap_or_default();
 
         if let Some(cli) = cli_args {
             all_args.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
@@ -8360,6 +8366,53 @@ sdk:
         assert_eq!(
             crate::utils::container::SdkContainer::parse_container_arg("\"GREETING=hello world\""),
             ["GREETING=hello world"]
+        );
+    }
+
+    #[test]
+    fn a_profile_block_replaces_what_the_sdk_set() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container_args: ["--network bridge"]
+  container:
+    volumes: ["/tmp:/data:ro"]
+provision_profiles:
+  usb:
+    container:
+      network_mode: host
+      volumes: ["/tmp:/data:rw"]
+"#,
+        )
+        .unwrap();
+        let merged = config
+            .merge_provision_container_args(Some("usb"), None)
+            .unwrap();
+        assert_eq!(merged, ["--network=host", "-v", "/tmp:/data:rw"]);
+    }
+
+    #[test]
+    fn quotes_in_a_block_value_reach_the_container_intact() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container:
+    environment:
+      PAYLOAD: '{"name":"x y"}'
+      WIN: 'C:\dir\'
+"#,
+        )
+        .unwrap();
+        // The entries as `build_container_command` splits them for docker.
+        let argv: Vec<String> = config
+            .get_sdk_container_args()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| crate::utils::container::SdkContainer::parse_container_arg(entry))
+            .collect();
+        assert_eq!(
+            argv,
+            ["-e", r#"PAYLOAD={"name":"x y"}"#, "-e", r"WIN=C:\dir\"]
         );
     }
 
