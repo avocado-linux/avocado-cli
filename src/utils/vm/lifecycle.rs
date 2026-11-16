@@ -260,6 +260,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         artifact_dir: artifact_dir.clone(),
         workspace: workspace.clone(),
         var_seed,
+        uuid: super::state::instance_id(&paths)?,
     };
 
     // The CLI is authoritative for the qemu lifecycle on every platform.
@@ -376,6 +377,21 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
         }
     }
 
+    // Hub: hand the agent the host facts + Rubicon list (config.yaml is the
+    // source of truth). Silent when nothing is configured and the image's
+    // agent predates the hub.
+    if let Err(e) = super::hub::push_configure(&paths, &target).await {
+        let has_rubicons = super::config::VmConfig::load(&paths)
+            .ok()
+            .and_then(|c| super::hub::rubicons(&c).ok())
+            .is_some_and(|r| !r.is_empty());
+        if has_rubicons {
+            crate::utils::output::print_warning_stderr(&format!(
+                "could not configure Rubicons in the VM agent: {e:#}"
+            ));
+        }
+    }
+
     notify_desktop(
         "vm.notify.running",
         serde_json::json!({ "pid": pid, "ssh_port": ssh_port }),
@@ -429,6 +445,21 @@ async fn stop_inner(force: bool) -> Result<()> {
     // dashboard to "Stopping…" right away rather than wait for the
     // reconciler to notice the pid is gone.
     notify_desktop("vm.notify.stopping", serde_json::json!({ "pid": pid }));
+
+    // QMP quit is a power cut: flush the guest first. btrfs commits every
+    // 30 s, so without this the last writes (a fresh claim, a config edit)
+    // come back as empty files. Best-effort and bounded: a hibernated or
+    // wedged guest can't answer, and stopping must still work then.
+    #[cfg(unix)]
+    if !force && paths.qga_socket().exists() {
+        let _ = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut g = super::qga::QgaClient::connect(&paths.qga_socket()).await?;
+            g.ping().await?;
+            g.execute_with_timeout("guest-fsfreeze-freeze", None, Duration::from_secs(10))
+                .await
+        })
+        .await;
+    }
 
     // Try QMP quit first if the socket is around.
     #[cfg(unix)]

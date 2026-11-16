@@ -296,6 +296,9 @@ pub struct ClaimTokenInfo {
     pub max_uses: Option<i64>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// `"vm"` for a VM claim token; absent on servers without VM claims.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +357,9 @@ pub struct CreateClaimTokenParams {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// `"vm"` for an Avocado VM hub; omitted for ordinary devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,6 +1328,32 @@ impl ConnectClient {
             .to_string();
 
         Ok(etag)
+    }
+
+    /// A JSON request to `{api_url}{path}`; returns the response body.
+    pub async fn json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut req = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.api_url))
+            .header("authorization", format!("Bearer {}", self.token));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let res = req
+            .send()
+            .await
+            .with_context(|| format!("{method} {path}"))?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("{method} {path} failed (HTTP {status}): {text}");
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
     /// Step 3: Complete the runtime upload (finalize all multipart uploads).

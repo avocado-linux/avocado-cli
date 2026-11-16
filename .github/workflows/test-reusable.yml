@@ -50,4 +50,8 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
+        # Debug builds parse the full CLI in the test threads' default 2 MiB
+        # stack; the clap tree is now deep enough to overflow it.
+        env:
+          RUST_MIN_STACK: 8388608
         run: cargo test --verbose

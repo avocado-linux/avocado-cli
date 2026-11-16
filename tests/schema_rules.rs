@@ -81,3 +81,45 @@ fn an_override_inherits_recovery_and_encrypt_from_the_base() {
         "{base}    target-qemux86-64:\n      var:\n        recovery: other\n"
     )));
 }
+
+// `with_usb` and `hold_usb: ["*"]` are run profile steps the CLI accepts
+// (`Config::validate_rubicon`).
+#[test]
+fn rubicon_with_usb_and_a_whole_port_hold_are_accepted() {
+    assert!(accepts(
+        "rubicon:\n  run:\n    rec:\n      - with_usb: { id: \"0955:7045\", run: [boardctl, recovery], timeout_s: 30 }\n      - hold_usb: [\"*\", \"0955:*\", \"1d6b:0104\"]\n"
+    ));
+    for bad in [
+        "with_usb: { id: \"0955:*\", run: [x] }",
+        "with_usb: { id: \"0955:7045\" }",
+        "with_usb: { id: \"0955:7045\", run: [] }",
+        "with_usb: { id: \"0955:7045\", run: [x], extra: 1 }",
+        "hold_usb: [\"**\"]",
+    ] {
+        assert!(
+            !accepts(&format!("rubicon:\n  run:\n    rec:\n      - {bad}\n")),
+            "{bad}"
+        );
+    }
+}
+
+// Servo widths match `Config::validate_rubicon`: 0 (off) or 400-2600 us.
+#[test]
+fn rubicon_servo_width_is_zero_or_400_to_2600() {
+    for (us, ok) in [
+        (0, true),
+        (400, true),
+        (2600, true),
+        (1, false),
+        (399, false),
+        (2601, false),
+    ] {
+        assert_eq!(
+            accepts(&format!(
+                "rubicon:\n  run:\n    move:\n      - servo: {{ sv1: {us} }}\n"
+            )),
+            ok,
+            "{us}"
+        );
+    }
+}
