@@ -25,10 +25,14 @@ pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 /// directory tree (mountpoints). See `DEFAULT_ROOTFS_POST_INSTALL`.
 ///
 /// `-H` follows `/boot` itself when it is a symlink to a directory (as the
-/// old `boot/*` glob did), and only a missing `/boot` is tolerated: a `find`
-/// failure fails the hook, since runtime builds run without `set -e`.
-pub const BOOT_STRIP_KEEP_DIRS: &str =
-    "[ ! -d \"$ROOTFS_WORK/boot\" ] || find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete";
+/// old `boot/*` glob did), but only to a directory below `$ROOTFS_WORK`: an
+/// absolute link resolves in the build container, not the image, and is
+/// refused. Only a missing `/boot` is tolerated: a refusal or `find` failure
+/// fails the hook, since runtime builds run without `set -e`.
+pub const BOOT_STRIP_KEEP_DIRS: &str = "[ ! -d \"$ROOTFS_WORK/boot\" ] || \
+case \"$(cd -P \"$ROOTFS_WORK/boot\" && pwd -P)\" in \
+\"$(cd -P \"$ROOTFS_WORK\" && pwd -P)\"/?*) find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete ;; \
+*) echo \"/boot leads outside the rootfs; not stripping it\" >&2; false ;; esac";
 
 /// Default post-install commands for the rootfs build. Run on the work
 /// directory (`$ROOTFS_WORK`) after package install + overlay, before
@@ -996,6 +1000,30 @@ mod tests {
 
         assert!(!real.join("Image").exists());
         assert!(real.join("efi").is_dir());
+    }
+
+    /// A /boot that leads out of the rootfs (an absolute link resolves in the
+    /// build container) is refused, and nothing out there is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_refuses_a_boot_outside_the_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"k").unwrap();
+        std::fs::create_dir(outside.path().join(".git")).unwrap();
+        std::fs::write(outside.path().join(".git/HEAD"), b"h").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("boot")).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap();
+
+        assert!(!status.success());
+        assert!(outside.path().join("keep").exists());
+        assert!(outside.path().join(".git/HEAD").exists());
     }
 
     /// A strip that cannot delete fails the hook instead of imaging the kernel.
