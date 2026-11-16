@@ -1711,6 +1711,13 @@ impl Probe<'_> {
     }
 }
 
+/// dnf expands what is left of `$releasever`/`$basearch` inside the container
+/// and reads `file://` and every other non-HTTP locator itself; the host can
+/// check neither, so those are left to dnf.
+fn host_can_probe(locator: &str) -> bool {
+    (locator.starts_with("http://") || locator.starts_with("https://")) && !locator.contains('$')
+}
+
 /// Fail before the first download when a feed repository is unreachable,
 /// naming the feed.
 ///
@@ -1779,11 +1786,7 @@ pub async fn preflight_feeds(
             }
             FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
         };
-        // dnf expands what is left of `$releasever`/`$basearch` inside the
-        // container and reads `file://` itself; the host can check neither.
-        if !(locator.starts_with("http://") || locator.starts_with("https://"))
-            || locator.contains('$')
-        {
+        if !host_can_probe(locator) {
             continue;
         }
         Probe {
@@ -1812,9 +1815,13 @@ pub async fn preflight_feeds(
             Some(DistroRepoRef::Named(n)) => n.as_str(),
             _ => DEFAULT_DISTRO_FEED_NAME,
         };
+        let url = format!("{root}/target/{target}-ext/repodata/repomd.xml");
+        if !host_can_probe(&url) {
+            return Ok(());
+        }
         Probe {
             subject: format!("feed '{distro_feed}' extension repository"),
-            url: format!("{root}/target/{target}-ext/repodata/repomd.xml"),
+            url,
             ca: config.get_repo_ca().map(PathBuf::from),
             tls_verify: !config.get_repo_insecure(),
             credential: None,
@@ -3686,6 +3693,16 @@ distro:
             "{}",
             seen[0]
         );
+    }
+
+    #[tokio::test]
+    async fn extension_repository_probe_leaves_a_file_url_to_dnf() {
+        // dnf reads `file://` inside the container; the host cannot probe it,
+        // and a probe attempt would fail with a client-builder error.
+        let c = config_with_repo("file:///opt/local-feed");
+        preflight_feeds(&c, None, "t", FeedStage::ALL, true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
