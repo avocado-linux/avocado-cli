@@ -91,26 +91,68 @@ pub(crate) fn resolve_remote_ext_config(
 }
 
 /// An extension config's `version` as a string: a number is printed whole.
-/// An empty one is no version: an unset `{{ env.X }}` renders empty.
+/// An empty one is no version: an unset `{{ env.X }}` renders empty, and a
+/// bare `version:` is null.
 pub(crate) fn ext_config_version(ext_config: &serde_yaml::Value) -> Option<String> {
-    let v = ext_config.get("version")?;
-    let version = v.as_str().map(str::to_string).unwrap_or_else(|| {
-        v.as_i64()
-            .or_else(|| v.as_f64().map(|f| f as i64))
-            .unwrap_or(0)
-            .to_string()
-    });
+    let version = match ext_config.get("version")? {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))?
+            .to_string(),
+        _ => return None,
+    };
     (!version.is_empty()).then_some(version)
+}
+
+/// [`ext_config_version`] of the extension as `target` sees it, with its
+/// target overrides applied.
+pub(crate) fn effective_ext_version(
+    config: &crate::utils::config::Config,
+    parsed: &serde_yaml::Value,
+    extension_name: &str,
+    target: &str,
+) -> Option<String> {
+    resolve_remote_ext_config(config, parsed, extension_name, target)
+        .as_ref()
+        .and_then(ext_config_version)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_version_is_read_with_the_target_overrides_applied() {
+        let yaml = r#"
+extensions:
+  from-target:
+    version: ''
+    qemux86-64:
+      version: '1.2.0'
+  emptied-by-target:
+    version: '1.0.0'
+    qemux86-64:
+      version: ''
+"#;
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let version = |name| super::effective_ext_version(&config, &parsed, name, "qemux86-64");
+        assert_eq!(version("from-target"), Some("1.2.0".to_string()));
+        assert_eq!(version("emptied-by-target"), None);
+        // Another target sees the base version.
+        assert_eq!(
+            super::effective_ext_version(&config, &parsed, "emptied-by-target", "qemuarm64"),
+            Some("1.0.0".to_string())
+        );
+    }
+
     #[test]
     fn an_empty_version_is_no_version() {
         let version = |y: &str| super::ext_config_version(&serde_yaml::from_str(y).unwrap());
         assert_eq!(version("version: '1.2.0'"), Some("1.2.0".to_string()));
         assert_eq!(version("version: 3"), Some("3".to_string()));
         assert_eq!(version("version: ''"), None);
+        assert_eq!(version("version:"), None);
+        assert_eq!(version("version: null"), None);
         assert_eq!(version("name: x"), None);
     }
 

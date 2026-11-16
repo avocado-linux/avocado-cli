@@ -1641,13 +1641,18 @@ echo -n '}}'
             for (ext_name_val, ext_data) in ext_config {
                 if let Some(ext_name) = ext_name_val.as_str() {
                     if all_required_extensions.contains(ext_name) {
-                        let ext_version = crate::commands::ext::ext_config_version(ext_data)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Extension '{ext_name}' has a missing or empty 'version' field. \
+                        let ext_version = crate::commands::ext::effective_ext_version(
+                            config,
+                            parsed,
+                            ext_name,
+                            target_arch,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Extension '{ext_name}' has a missing or empty 'version' field. \
                                  A templated one like '{{{{ env.X }}}}' is empty when X is unset."
-                                )
-                            })?;
+                            )
+                        })?;
 
                         let ext_suffix = crate::utils::config::get_ext_image_type(ext_data)
                             .map(|t| {
@@ -2921,20 +2926,17 @@ export AVOCADO_OS_VERSION_ID
     async fn resolve_extension_version(
         &self,
         parsed: &serde_yaml::Value,
-        _config: &crate::utils::config::Config,
+        config: &crate::utils::config::Config,
         _config_path: &str,
         ext_name: &str,
         container_image: &str,
         target_arch: &str,
         container_args: Option<Vec<String>>,
     ) -> Result<String> {
-        // Try to get version from local [ext] section
-        if let Some(version) = parsed
-            .get("extensions")
-            .and_then(|ext_section| ext_section.as_mapping())
-            .and_then(|ext_table| ext_table.get(ext_name))
-            .and_then(|ext_config| ext_config.get("version"))
-            .and_then(|v| v.as_str())
+        // Try to get version from local [ext] section, as the target sees it:
+        // the same version the copy step names the image by.
+        if let Some(version) =
+            crate::commands::ext::effective_ext_version(config, parsed, ext_name, target_arch)
         {
             if version != "*" {
                 return Ok(version.to_string());
