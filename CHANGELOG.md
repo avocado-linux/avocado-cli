@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`--offline` flag and `AVOCADO_OFFLINE`.** avocado skips its own
+  latest-snapshot pointer lookup, the pin HEAD check and the feed preflight,
+  and uses the locked pin, printing it once. Commands whose purpose is a
+  network call, Connect login and `avocado upgrade`, still connect. An old
+  locked pin installs old packages. With no locked pin on the
+  default repository it stops before any request and tells you to run
+  `avocado update` online; another `distro.repo.url` proceeds unpinned with a
+  notice. `avocado update` and an `org:` feed that needs a token fail with an
+  error naming `--offline` instead of connecting. `AVOCADO_OFFLINE` accepts
+  `1`, `true` or `yes`. It does not
+  make the package manager inside the SDK container work offline: an install
+  that needs a remote feed still needs the network. See `docs/offline.md`.
 - **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
   RPMs by running the host `createrepo_c`, regenerated on every run. It fails
   with an error naming `createrepo_c` when the tool is not on PATH, and naming
