@@ -125,6 +125,14 @@ impl RuntimeProvisionCommand {
                 &target_arch,
                 &self.config.config_path,
             )?;
+            crate::commands::profiles::dry_run_container_args_preflight(
+                config
+                    .merge_provision_container_args(
+                        self.config.provision_profile.as_deref(),
+                        self.config.container_args.as_ref(),
+                    )
+                    .as_deref(),
+            )?;
             let profile = crate::commands::profiles::dry_run_preflight(
                 self.config.env_vars.as_ref(),
                 self.config.provision_profile.as_deref(),

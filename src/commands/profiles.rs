@@ -433,6 +433,36 @@ pub fn dry_run_preflight(
     }))
 }
 
+/// Refuse `--dry-run` when the merged container args (SDK, profile and CLI
+/// args, which reach the provision container after the generated env) would
+/// supply stone include paths or an `--env-file`. [`dry_run_preflight`] only
+/// sees the config and `--env` map, so `-e AVOCADO_STONE_INCLUDE_PATHS=...`
+/// there would put an unchecked manifest ahead of the staged one, and an env
+/// file can set the same variable or the profile without the gate seeing it.
+pub fn dry_run_container_args_preflight(args: Option<&[String]>) -> Result<()> {
+    let Some(args) = args else { return Ok(()) };
+    let (set, env_file) = crate::utils::container::scan_env_args(args);
+    if set
+        .iter()
+        .any(|(k, v)| k == "AVOCADO_STONE_INCLUDE_PATHS" && v.as_deref() != Some(""))
+    {
+        anyhow::bail!(
+            "--dry-run cannot be verified with stone include paths set in container args \
+             (-e AVOCADO_STONE_INCLUDE_PATHS): stone provision searches them before the staged \
+             stone dir, so a manifest or profile script there would run unchecked. Run without \
+             --dry-run, or drop the argument."
+        );
+    }
+    if env_file {
+        anyhow::bail!(
+            "--dry-run cannot be verified with --env-file in container args: the file can set \
+             stone include paths or the provision profile, which the gate does not read. Run \
+             without --dry-run, or pass the variables with --env."
+        );
+    }
+    Ok(())
+}
+
 /// The `manifest.json` that `stone provision` loads for `runtime` when no
 /// stone include paths are set: the copy `stone create` staged at build time,
 /// which already reflects a custom `stone_manifest`. The SDK's
@@ -853,6 +883,48 @@ mod tests {
             format!("{err:#}").contains("stone include paths"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn container_args_refuse_stone_include_paths_in_any_env_form() {
+        for form in [
+            &["-e AVOCADO_STONE_INCLUDE_PATHS=/opt/src/custom-stone"][..],
+            &["--env=AVOCADO_STONE_INCLUDE_PATHS=/x"],
+            &["-e", "AVOCADO_STONE_INCLUDE_PATHS"],
+        ] {
+            let args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            let err = dry_run_container_args_preflight(Some(&args)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("stone include paths"),
+                "{form:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_args_refuse_an_env_file() {
+        for form in [&["--env-file /p/e.env"][..], &["--env-file=/p/e.env"]] {
+            let args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            let err = dry_run_container_args_preflight(Some(&args)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("--env-file"),
+                "{form:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_args_allow_unrelated_env_and_empty_include_paths() {
+        let args: Vec<String> = [
+            "-e FOO=1",
+            "-e AVOCADO_STONE_INCLUDE_PATHS=",
+            "--privileged",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(dry_run_container_args_preflight(Some(&args)).is_ok());
+        assert!(dry_run_container_args_preflight(None).is_ok());
     }
 
     #[test]

@@ -1470,6 +1470,35 @@ pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// What raw container args set in the container's environment: each env flag
+/// as `(key, value)` (`None` for a bare `-e K`, which passes the host's
+/// value), and whether a `--env-file` is present. Args are split as
+/// [`strip_env_args`] splits them.
+pub(crate) fn scan_env_args(args: &[String]) -> (Vec<(String, Option<String>)>, bool) {
+    let tokens: Vec<String> = args
+        .iter()
+        .flat_map(|a| SdkContainer::parse_container_arg(a))
+        .collect();
+    let mut set = Vec::new();
+    let mut env_file = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "--env-file" || tokens[i].starts_with("--env-file=") {
+            env_file = true;
+        }
+        if let Some((used, operand)) = docker_env_flag(&tokens, i) {
+            set.push(match operand.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (operand.to_string(), None),
+            });
+            i += used;
+            continue;
+        }
+        i += 1;
+    }
+    (set, env_file)
+}
+
 /// The env flag at `args[i]`, in any form docker accepts: `-e X`, `--env X`,
 /// `-eX`, `-e=X`, `--env=X`. Returns how many args it takes and its operand,
 /// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
