@@ -1,8 +1,10 @@
 # Offline mode
 
-`--offline` (or `AVOCADO_OFFLINE` set to `1`, `true` or `yes`) makes the avocado process itself open no
-network connection. It is CLI-side only. It does not make the package manager
-inside the SDK container work offline.
+`--offline` (or `AVOCADO_OFFLINE` set to `1`, `true` or `yes`) stops avocado's own
+release, snapshot and feed lookups, and uses the locked pin instead. It is
+CLI-side only. It does not make the package manager inside the SDK container
+work offline, and it does not stop commands whose purpose is a network call
+(see below).
 
 ## What it does
 
@@ -37,6 +39,10 @@ the run resolves the moving channel, not a snapshot.
 - A private `org:` feed needs a short-lived Connect token minted over HTTPS.
   When an enabled `org:` feed has no token yet, `--offline` fails naming the
   feed instead of opening a connection.
+
+Commands whose purpose is a network call are not guarded and still connect
+under `--offline`: Connect login (it calls `GET /api/me`) and `avocado
+upgrade`.
 
 ## What it does not do
 

@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project that has a locked pin, avocado prints
   `pin ignored: AVOCADO_RELEASEVER is set to <value>; the locked pin <pin> is not used`
   once per run. The override still wins. See docs/releasever.md.
-- **`--offline` flag and `AVOCADO_OFFLINE`.** The avocado process opens no
-  network connection: it skips the latest-snapshot pointer lookup, the pin
-  HEAD check and the feed preflight, and uses the locked pin, printing it
-  once. An old locked pin installs old packages. With no locked pin on the
+- **`--offline` flag and `AVOCADO_OFFLINE`.** avocado skips its own
+  latest-snapshot pointer lookup, the pin HEAD check and the feed preflight,
+  and uses the locked pin, printing it once. Commands whose purpose is a
+  network call, Connect login and `avocado upgrade`, still connect. An old
+  locked pin installs old packages. With no locked pin on the
   default repository it stops before any request and tells you to run
   `avocado update` online; another `distro.repo.url` proceeds unpinned with a
   notice. `avocado update` and an `org:` feed that needs a token fail with an
