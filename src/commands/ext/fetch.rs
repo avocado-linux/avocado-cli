@@ -190,6 +190,9 @@ impl ExtFetchCommand {
                 .unwrap_or(Path::new("."))
                 .to_path_buf()
         });
+        // `ext fetch` never resolves a pin, so announce a release override here;
+        // the notice reads the lock only and makes no snapshot request.
+        crate::utils::snapshot::announce_pin_ignored(config, &lock_src_dir, &target);
         let mut lock_file =
             LockFile::load(&lock_src_dir).with_context(|| "Failed to load lock file")?;
         let mut lock_file_dirty = false;
