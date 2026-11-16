@@ -448,6 +448,11 @@ enum Commands {
         /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
+        /// Run the provision script without writing the target. The script
+        /// receives AVOCADO_PROVISION_DRY_RUN=1, and the host-side SD card
+        /// burn is skipped.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Runtime name to provision (deprecated, use positional argument)
         #[arg(short = 'r', long = "runtime", hide = true)]
         runtime: Option<String>,
@@ -476,7 +481,7 @@ enum Commands {
         /// target instead of provisioning. Reads the stone manifest
         /// from the installed SDK volume; requires `avocado install`
         /// to have run.
-        #[arg(long = "list", conflicts_with_all = ["name", "force", "env", "out", "provision_profile"])]
+        #[arg(long = "list", conflicts_with_all = ["name", "force", "dry_run", "env", "out", "provision_profile"])]
         list: bool,
         /// Output format. JSON skips TUI rendering and emits NDJSON events.
         #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -1846,6 +1851,11 @@ enum RuntimeCommands {
         /// host still asks for confirmation.
         #[arg(short, long)]
         force: bool,
+        /// Run the provision script without writing the target. The script
+        /// receives AVOCADO_PROVISION_DRY_RUN=1, and the host-side SD card
+        /// burn is skipped.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Runtime name (deprecated, use positional argument)
         #[arg(short = 'r', long = "runtime", hide = true)]
         runtime: Option<String>,
@@ -2531,6 +2541,7 @@ async fn main() -> Result<()> {
             config,
             verbose,
             force,
+            dry_run,
             runtime,
             target,
             target_board,
@@ -2572,6 +2583,7 @@ async fn main() -> Result<()> {
                     config_path: config,
                     verbose,
                     force,
+                    dry_run,
                     target: target.or(cli.target),
                     target_board: park_target_board(target_board),
                     provision_profile: provision_profile.clone(),
@@ -2853,6 +2865,7 @@ async fn main() -> Result<()> {
                 config,
                 verbose,
                 force,
+                dry_run,
                 target,
                 target_board,
                 provision_profile,
@@ -2870,6 +2883,7 @@ async fn main() -> Result<()> {
                         config_path: config,
                         verbose,
                         force,
+                        dry_run,
                         target: target.or(cli.target),
                         target_board: park_target_board(target_board),
                         provision_profile: provision_profile.clone(),
