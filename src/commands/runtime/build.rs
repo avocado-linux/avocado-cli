@@ -2935,13 +2935,23 @@ export AVOCADO_OS_VERSION_ID
     ) -> Result<String> {
         // Try to get version from local [ext] section, as the target sees it:
         // the same version the copy step names the image by.
-        if let Some(version) =
-            crate::commands::ext::effective_ext_version(config, parsed, ext_name, target_arch)
-        {
-            if version != "*" {
-                return Ok(version.to_string());
+        let stated =
+            crate::commands::ext::resolve_remote_ext_config(config, parsed, ext_name, target_arch)
+                .filter(|ext_config| ext_config.get("version").is_some());
+        if let Some(ext_config) = stated {
+            match crate::commands::ext::ext_config_version(&ext_config) {
+                // If version is "*", fall through to query RPM
+                Some(version) if version == "*" => {}
+                Some(version) => return Ok(version),
+                // A version the config states but that came out empty is the
+                // config's problem; asking RPM would only say to install it.
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Extension '{ext_name}' has an empty 'version' field. \
+                         A templated one like '{{{{ env.X }}}}' is empty when X is unset."
+                    ))
+                }
             }
-            // If version is "*", fall through to query RPM
         }
 
         // No version found in config - this is likely a package repository extension
@@ -3633,6 +3643,39 @@ mod tests {
     /// the host under the directory the container mounts there: `src_dir`
     /// when set, else the working directory. Never the config file's
     /// directory unless one of those is it.
+
+    #[tokio::test]
+    async fn a_stated_but_empty_version_is_an_error_not_an_rpm_lookup() {
+        let yaml = r#"
+extensions:
+  app:
+    version: ''
+"#;
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        // Returns before any container is started for the RPM query.
+        let err = cmd
+            .resolve_extension_version(
+                &parsed,
+                &config,
+                "avocado.yaml",
+                "app",
+                "no-image",
+                "qemux86-64",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty 'version'"), "{err}");
+    }
     #[tokio::test]
     async fn stage_into_volume_writes_under_the_mounted_src_dir() {
         let (_root, project, config_path) = src_dir_above_config_dir();
