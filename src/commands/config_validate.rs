@@ -1170,6 +1170,18 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_loopback_wrong_type_points_at_key() {
+        let errs = errors(
+            "default_target: qemux86-64\nrepos:\n  local:\n    path: ./rpms\n    rewrite_loopback: yes-please\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("/repos/local/rewrite_loopback ")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn an_unknown_key_is_a_warning_not_an_error() {
         let report = validate("default_target: qemux86-64\nrutimes: {}\n");
         assert!(report.errors.is_empty(), "{:?}", report.errors);

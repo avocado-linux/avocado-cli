@@ -813,6 +813,24 @@ mod tests {
         assert!(err.to_string().contains("non-UTF-8"));
     }
 
+    /// Whether the host `tar` leaves setgid on an existing directory when the
+    /// overlay is copied without `-p`.
+    #[cfg(unix)]
+    fn host_tar_keeps_special_bits_on_existing_dirs() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("ov"), tmp.path().join("sysroot"));
+        std::fs::create_dir_all(dst.join("d")).unwrap();
+        set(&dst.join("d"), 0o2755);
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        std::fs::write(src.join("d/f"), "x").unwrap();
+        let (ok, _) = run_overlay_copy(&src, &dst, false);
+        ok && mode(&dst.join("d")) == 0o2755
+    }
+
     /// Runs `overlay_copy_command` with bash against a sysroot that already
     /// holds package paths. Returns (exit status, stderr). On macOS, `tar` is
     /// GNU: see [`crate::utils::gnu_test_tools`].
@@ -890,10 +908,10 @@ mod tests {
             let (ok, err) = run_overlay_copy(&src, &dst, preserve);
             assert!(ok, "preserve={preserve}: {err}");
             assert_eq!(mode(&dst), 0o755, "the sysroot root keeps its mode");
-            // GNU tar on macOS clears setgid and sticky on an existing
-            // directory unless `-p` is set. The SDK container is Linux, where
-            // it does not.
-            if preserve || !cfg!(target_os = "macos") {
+            // Host tar behavior: macOS and some Linux tars (GNU 1.35 as a
+            // non-root user) clear setgid and sticky on an existing directory
+            // unless `-p` is set. Production runs in the SDK container.
+            if preserve || host_tar_keeps_special_bits_on_existing_dirs() {
                 assert_eq!(mode(&dst.join("var/log/journal")), 0o2755);
                 assert_eq!(mode(&dst.join("tmp")), 0o1777);
             }

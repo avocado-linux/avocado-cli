@@ -505,7 +505,7 @@
     "repoDef": {
       "title": "Package feed",
       "type": "object",
-      "description": "A named package feed with exactly one locator: 'url' (a remote repository), 'org' (a Peridio Connect private feed) or 'path' (a local RPM directory). 'username' and 'password' go together. An entry used as the distribution feed accepts only 'url', 'release', 'channel', 'releasever', 'ca' and 'tls_verify', and its url must not contain '$releasever' or '$target'.",
+      "description": "A named package feed with exactly one locator: 'url' (a remote repository), 'org' (a Peridio Connect private feed) or 'path' (a local RPM directory). 'username' and 'password' go together. An entry used as the distribution feed accepts only 'url', 'release', 'channel', 'releasever', 'ca' and 'tls_verify' ('rewrite_loopback' is not offered there), and its url must not contain '$releasever' or '$target'.",
       "properties": {
         "url": {
           "type": "string",
@@ -579,6 +579,10 @@
         "tls_verify": {
           "type": "boolean",
           "description": "Whether to verify the feed's TLS certificate. Defaults to true."
+        },
+        "rewrite_loopback": {
+          "type": "boolean",
+          "description": "Rewrite a loopback host (localhost, 127.0.0.1) in 'url' to an address the build container can reach. Not accepted on the distribution feed."
         }
       },
       "additionalProperties": false
