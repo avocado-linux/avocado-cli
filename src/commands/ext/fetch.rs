@@ -196,10 +196,12 @@ impl ExtFetchCommand {
         let lock_exists = LockFile::get_path(&lock_src_dir).exists()
             || LockFile::legacy_path(&lock_src_dir).exists();
 
-        // Probe the feeds before the first download. Only a package-sourced
-        // extension without `repo_name` that this run will fetch, or a pin the
-        // lock replays, is served from the extension repository. Later rounds
-        // probe again below if they reveal one.
+        // Probe the feeds before the first download, but only when a dnf
+        // transaction will follow: a path or git extension never reads them.
+        // Only a package-sourced extension without `repo_name` that this run
+        // will fetch, or a pin the lock replays, is served from the extension
+        // repository. Later rounds probe again below if they reveal package
+        // work.
         let first_round_packages = package_source_names(&extensions_to_fetch);
         let replays_implied_pin = lock_file
             .implied_extension_sources(&target)
@@ -210,19 +212,25 @@ impl ExtFetchCommand {
                 && !self.locked
                 && ExtensionFetcher::is_extension_installed(&extensions_dir, name)
         };
-        config
-            .preflight_feeds_once(
-                &target,
-                &self.config_path,
-                &[crate::utils::feeds::FeedStage::Ext],
-                needs_extension_repo(
-                    &extensions_to_fetch,
-                    installed_and_kept,
-                    replays_implied_pin,
-                ),
-                self.runs_on.is_some(),
-            )
-            .await?;
+        if needs_package_transaction(
+            &extensions_to_fetch,
+            installed_and_kept,
+            replays_implied_pin,
+        ) {
+            config
+                .preflight_feeds_once(
+                    &target,
+                    &self.config_path,
+                    &[crate::utils::feeds::FeedStage::Ext],
+                    needs_extension_repo(
+                        &extensions_to_fetch,
+                        installed_and_kept,
+                        replays_implied_pin,
+                    ),
+                    self.runs_on.is_some(),
+                )
+                .await?;
+        }
 
         let fetcher = ExtensionFetcher::new(
             self.config_path.clone(),
@@ -474,21 +482,20 @@ impl ExtFetchCommand {
             // One transaction for every package-source extension. dnf resolves and
             // installs any dependency extensions beyond those named here.
             if !package_batch.is_empty() {
-                // Round 1 was probed before the first download. A later round
-                // that reveals a package extension without `repo_name` needs
-                // the extension repository too; the probe is cached per target
-                // once it has passed with it.
-                if round > 1 && package_batch.iter().any(|e| e.repo_name.is_none()) {
-                    config
-                        .preflight_feeds_once(
-                            &target,
-                            &self.config_path,
-                            &[crate::utils::feeds::FeedStage::Ext],
-                            true,
-                            self.runs_on.is_some(),
-                        )
-                        .await?;
-                }
+                // Round 1 was probed before the first download when it had
+                // package work. A later round that reveals a package extension
+                // needs the feeds too, and the extension repository when one
+                // has no `repo_name`; the probe is cached per target once it
+                // has passed with it.
+                config
+                    .preflight_feeds_once(
+                        &target,
+                        &self.config_path,
+                        &[crate::utils::feeds::FeedStage::Ext],
+                        package_batch.iter().any(|e| e.repo_name.is_none()),
+                        self.runs_on.is_some(),
+                    )
+                    .await?;
                 print_info(
                     &format!(
                         "Fetching {} package extension(s) and their dependencies...",
@@ -865,6 +872,21 @@ fn locked_source_change(
     ))
 }
 
+/// True when the round will run a dnf transaction at all: a package-source
+/// extension that is not skipped as already installed, or a lock-replayed
+/// implied pin. Only then do the feeds matter; a git or path source never
+/// reaches dnf.
+fn needs_package_transaction(
+    round: &[(String, ExtensionSource)],
+    skipped: impl Fn(&str) -> bool,
+    replays_implied_pin: bool,
+) -> bool {
+    replays_implied_pin
+        || round.iter().any(|(name, source)| {
+            matches!(source, ExtensionSource::Package { .. }) && !skipped(name)
+        })
+}
+
 /// True when the first round will hand dnf a package the extension repository
 /// has to serve: a package-source extension with no `repo_name` that is not
 /// skipped as already installed, or a lock-replayed implied pin, which carries
@@ -978,6 +1000,24 @@ mod tests {
         // hands dnf a package from the extension repository.
         let set = vec![package("a")];
         assert!(needs_extension_repo(&set, |_| true, true));
+    }
+
+    #[test]
+    fn needs_package_transaction_covers_repo_name_packages_but_not_path_sources() {
+        // A `repo_name` package skips the extension repository yet still runs
+        // dnf against the named feeds.
+        let named = vec![package_in("pkg", Some("vendor"))];
+        assert!(needs_package_transaction(&named, none_installed, false));
+        assert!(!needs_package_transaction(&named, |_| true, false));
+        assert!(needs_package_transaction(&named, |_| true, true));
+        let path = vec![(
+            "p".to_string(),
+            ExtensionSource::Path {
+                path: "../x".to_string(),
+                include: None,
+            },
+        )];
+        assert!(!needs_package_transaction(&path, none_installed, false));
     }
 
     fn entry(version: Option<&str>, implied: bool) -> ExtensionSourceLock {
@@ -1099,5 +1139,39 @@ mod tests {
             locked_source_change("app", Some(&old), Some(&moved)).as_deref(),
             Some("  app: 1.0-r0 -> 1.1-r0")
         );
+    }
+
+    /// A path extension never reaches dnf, so a feed that cannot be reached
+    /// must not stop the fetch. Whatever the path fetch itself then does, the
+    /// error must not be the feed probe's.
+    #[tokio::test]
+    async fn path_only_fetch_does_not_probe_an_offline_feed() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\n\
+                 repos:\n  local:\n    url: http://{addr}/feed\n\
+                 sdk:\n  image: example.invalid/sdk:latest\n\
+                 extensions:\n  app:\n    source: {{type: path, path: ./app}}\n"
+            ),
+        )
+        .unwrap();
+        let cmd = ExtFetchCommand::new(
+            cfg.to_string_lossy().into_owned(),
+            None,
+            false,
+            false,
+            Some("probe-test-target".to_string()),
+            None,
+        );
+        if let Err(e) = cmd.execute().await {
+            let msg = format!("{e:#}");
+            assert!(!msg.contains("feed 'local'"), "{msg}");
+        }
     }
 }
