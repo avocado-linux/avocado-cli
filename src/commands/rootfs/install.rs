@@ -1091,9 +1091,10 @@ pub async fn install_sysroot(params: &mut SysrootInstallParams<'_>) -> Result<()
     // and kernel-image-image.gz-${kver}); dnf pulls both. Initramfs doesn't
     // need this — boot.img embeds the initramfs cpio, the kernel comes from
     // the rootfs sysroot.
+    let kernel_declared = params.parsed.is_some_and(|p| p.get("kernel").is_some());
     let auto_kernel_image_pkg: Option<String> = match (
         resolved_kver.as_deref(),
-        has_default_pkg,
+        has_default_pkg || kernel_declared,
         &params.sysroot_type,
     ) {
         (Some(kver), true, SysrootType::Rootfs) => {
