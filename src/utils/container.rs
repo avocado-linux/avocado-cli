@@ -1439,10 +1439,7 @@ fn take_git_config_args_with(
 /// args come back unchanged; otherwise as split tokens, a token with a space
 /// re-quoted so the later split keeps it whole.
 pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
-    let tokens: Vec<String> = args
-        .iter()
-        .flat_map(|a| SdkContainer::parse_container_arg(a))
-        .collect();
+    let tokens = split_env_tokens(args);
     let mut kept = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {
@@ -1470,15 +1467,46 @@ pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Split raw container args into tokens, as `build_container_command` does,
+/// and unpack short flags clustered with `-e` (`-ie K=V`, `-ieK=V`) into
+/// `-i`, `-e K=V`, so [`docker_env_flag`] sees the env flag and the rest of
+/// the cluster stays a separate flag. Only the boolean short flags docker
+/// takes without a value may precede the `e`; any other letter (`-v`, `-p`,
+/// `-w`) takes the rest of the token as its own operand, so such a token is
+/// left alone.
+fn split_env_tokens(args: &[String]) -> Vec<String> {
+    const BOOL_SHORT: &str = "dPqit";
+    let mut out = Vec::new();
+    for tok in args
+        .iter()
+        .flat_map(|a| SdkContainer::parse_container_arg(a))
+    {
+        let cluster = tok
+            .strip_prefix('-')
+            .filter(|r| !r.starts_with('-') && !r.is_empty());
+        let split = cluster.and_then(|r| {
+            let at = r.find('e')?;
+            let flags = &r[..at];
+            (!flags.is_empty() && flags.chars().all(|c| BOOL_SHORT.contains(c)))
+                .then(|| (flags.to_string(), r[at..].to_string()))
+        });
+        match split {
+            Some((flags, env)) => {
+                out.extend(flags.chars().map(|c| format!("-{c}")));
+                out.push(format!("-{env}"));
+            }
+            None => out.push(tok),
+        }
+    }
+    out
+}
+
 /// What raw container args set in the container's environment: each env flag
 /// as `(key, value)` (`None` for a bare `-e K`, which passes the host's
 /// value), and whether a `--env-file` is present. Args are split as
 /// [`strip_env_args`] splits them.
 pub(crate) fn scan_env_args(args: &[String]) -> (Vec<(String, Option<String>)>, bool) {
-    let tokens: Vec<String> = args
-        .iter()
-        .flat_map(|a| SdkContainer::parse_container_arg(a))
-        .collect();
+    let tokens = split_env_tokens(args);
     let mut set = Vec::new();
     let mut env_file = false;
     let mut i = 0;
@@ -1504,8 +1532,8 @@ pub(crate) fn scan_env_args(args: &[String]) -> (Vec<(String, Option<String>)>, 
 /// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
 ///
 /// Not handled: `--env-file`, which docker reads itself (an explicit `-e`
-/// wins over it, so the generated git settings still apply), and short
-/// flags packed together with `-e` (`-ie K=V`).
+/// wins over it, so the generated git settings still apply). Short flags
+/// packed with `-e` (`-ie K=V`) must be unpacked first by [`split_env_tokens`].
 fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
     let a = args.get(i)?.as_str();
     if a == "-e" || a == "--env" {

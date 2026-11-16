@@ -1847,6 +1847,32 @@ runtimes:
         assert_eq!(strip_cli_owned_provision_env(None), None);
     }
 
+    // Docker accepts `-ie K=V` as `-i -e K=V`. Appended after the generated
+    // `-e AVOCADO_PROVISION_DRY_RUN=1`, an unstripped cluster would win and turn
+    // the dry run into a real write. The assertion is on the environment the
+    // container ends up with, and the other flag in the cluster must survive.
+    #[test]
+    fn clustered_short_env_flags_cannot_override_cli_owned_provision_env() {
+        let generated = ["-e", "AVOCADO_PROVISION_DRY_RUN=1"].map(String::from);
+        for cluster in [
+            vec!["-de AVOCADO_PROVISION_DRY_RUN=0".to_string()],
+            vec!["-de".to_string(), "AVOCADO_PROVISION_DRY_RUN=0".to_string()],
+            vec!["-deAVOCADO_PROVISION_DRY_RUN=0".to_string()],
+        ] {
+            let kept = strip_cli_owned_provision_env(Some(cluster.clone())).unwrap();
+            let mut argv: Vec<String> = generated.to_vec();
+            argv.extend(kept.clone());
+            let (set, _) = crate::utils::container::scan_env_args(&argv);
+            let last = set
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "AVOCADO_PROVISION_DRY_RUN")
+                .and_then(|(_, v)| v.clone());
+            assert_eq!(last.as_deref(), Some("1"), "{cluster:?} -> {kept:?}");
+            assert!(kept.contains(&"-d".to_string()), "{cluster:?} -> {kept:?}");
+        }
+    }
+
     // A runtime's `stone_include_paths` puts a project dir ahead of the staged
     // manifest in `stone provision -i`, so the gate must refuse from config
     // alone, before it reads anything.
