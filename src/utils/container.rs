@@ -783,6 +783,25 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
     }
 }
 
+/// The User-Agent a run's dnf sends (`AVOCADO_FEED_UA`): the materialized
+/// feed's key id and minted tier, else the default credential's.
+fn feed_user_agent(feeds: Option<&crate::utils::feeds::FeedMaterialization>) -> String {
+    crate::utils::feeds::user_agent_for(
+        feeds.and_then(|f| f.key_id.as_deref()),
+        feeds.and_then(|f| f.tier),
+    )
+}
+
+/// The feed a failed run's dnf talked to and the User-Agent it sent, for the
+/// post-failure 429 check.
+fn rate_limit_probe_target(config: &RunConfig) -> (String, String) {
+    let repo_url = config
+        .repo_url
+        .clone()
+        .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string());
+    (repo_url, feed_user_agent(config.feeds.as_ref()))
+}
+
 /// Inject the named-feeds env (see FEEDS_SETUP_SNIPPET) and fold the feeds'
 /// dnf args into `AVOCADO_DNF_ARGS`, which every `$DNF_SDK_HOST` call carries.
 pub fn inject_feed_env(
@@ -793,13 +812,7 @@ pub fn inject_feed_env(
     // mint when there was one: a hard-coded tier/1 put every authenticated client
     // in the same rate-limit bucket regardless of what Connect actually issued,
     // which made the tier in the mint response decorative.
-    env_vars.insert(
-        "AVOCADO_FEED_UA".to_string(),
-        crate::utils::feeds::user_agent_for(
-            feeds.and_then(|f| f.key_id.as_deref()),
-            feeds.and_then(|f| f.tier),
-        ),
-    );
+    env_vars.insert("AVOCADO_FEED_UA".to_string(), feed_user_agent(feeds));
     let Some(feeds) = feeds else { return };
     for (k, v) in &feeds.env {
         env_vars.insert(k.clone(), v.clone());
@@ -2054,13 +2067,10 @@ impl SdkContainer {
     /// the feed's rate limit, because dnf reports a 429 as "No more mirrors
     /// to try" and gives no hint that waiting or logging in would fix it.
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
-        let repo_url = config
-            .repo_url
-            .clone()
-            .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string());
+        let (repo_url, user_agent) = rate_limit_probe_target(&config);
         let ok = self.run_in_container_once(config).await?;
         if !ok {
-            crate::utils::feed_limit::explain_if_rate_limited(&repo_url).await;
+            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
         }
         Ok(ok)
     }
@@ -2355,9 +2365,16 @@ impl SdkContainer {
             anyhow::bail!("RunsOnContext is not active (already torn down)");
         }
 
-        self.execute_remote_command(context, config)
+        let ok = self
+            .execute_remote_command(context, config)
             .await
-            .context("Remote container execution failed")
+            .context("Remote container execution failed")?;
+        // Same 429 check as run_in_container, which shared-context runs bypass.
+        if !ok {
+            let (repo_url, user_agent) = rate_limit_probe_target(config);
+            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
+        }
+        Ok(ok)
     }
 
     /// Execute a command on a remote host using an existing RunsOnContext
