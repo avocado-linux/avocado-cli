@@ -95,6 +95,7 @@ impl ResetCommand {
             "avocado vm reset: var.btrfs replaced with seed ({} bytes).",
             std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
         );
+        println!("avocado vm reset: {}", super::BUILD_VOLUMES_DELETED_NOTE);
 
         if was_running {
             println!("avocado vm reset: restarting VM…");
