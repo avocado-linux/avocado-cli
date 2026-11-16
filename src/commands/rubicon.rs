@@ -38,6 +38,7 @@ pub enum RubiconAction {
     Console {
         board: Option<String>,
         read_only: bool,
+        for_secs: Option<u64>,
     },
     Logs {
         board: Option<String>,
@@ -141,12 +142,17 @@ impl RubiconCommand {
                 .await
             }
             RubiconAction::Run { board, profile } => self.run(board, profile).await,
-            RubiconAction::Console { board, read_only } => {
+            RubiconAction::Console {
+                board,
+                read_only,
+                for_secs,
+            } => {
                 let b = self.board(board).await?;
                 let token =
                     remote::local_token(&b, "rubicon_console", self.connect_profile.as_deref())
                         .await?;
-                self.console(&b, !read_only, true, true, token)
+                let limit = for_secs.map(std::time::Duration::from_secs);
+                self.console(&b, !read_only, true, true, token, limit).await
             }
             RubiconAction::Update {
                 board,
@@ -203,7 +209,7 @@ impl RubiconCommand {
                 } else {
                     None
                 };
-                self.console(&b, false, true, *follow, token)
+                self.console(&b, false, true, *follow, token, None).await
             }
         }
     }
@@ -419,14 +425,16 @@ impl RubiconCommand {
     }
 
     /// The board's serial console through this machine's VM: interactive
-    /// (`write`), or its history and then (`follow`) what it prints.
-    fn console(
+    /// (`write`; piped stdin when there is no terminal), or its history and
+    /// then (`follow`) what it prints. `limit` ends the session after that long.
+    async fn console(
         &self,
         b: &Board,
         write: bool,
         history: bool,
         follow: bool,
         token: Option<String>,
+        limit: Option<std::time::Duration>,
     ) -> Result<()> {
         if !matches!(b.hub, Hub::Local) {
             bail!(
@@ -468,11 +476,15 @@ impl RubiconCommand {
         }
         let mut ssh = Command::new("ssh");
         ssh.args(target.base_args());
-        if write {
-            use crate::utils::interactivity::{ContainerStdio, StdioCapabilities};
-            if !ContainerStdio::decide(true, &StdioCapabilities::detect()).allocates_tty() {
-                bail!("an interactive console needs a terminal; `avocado rubicon logs -f` watches without one");
-            }
+        use crate::utils::interactivity::{ContainerStdio, StdioCapabilities};
+        let tty = write
+            && match ContainerStdio::decide(true, &StdioCapabilities::detect()) {
+                ContainerStdio::StdinAndTty => true,
+                // Scripted: stdin's bytes go to the DUT as they are.
+                ContainerStdio::StdinOnly => false,
+                _ => bail!("console input needs a terminal or piped stdin; `avocado rubicon logs -f` watches without either"),
+            };
+        if tty {
             eprintln!("[console of {}; Ctrl-] to leave]", b.describe());
             // A remote tty in raw mode: keys go to the DUT as typed.
             ssh.args(["-o", "RequestTTY=force"])
@@ -480,15 +492,60 @@ impl RubiconCommand {
         } else {
             ssh.arg(cmd);
         }
-        let st = ssh.status().context("ssh to the VM")?;
-        if write {
+        let mut child = tokio::process::Command::from(ssh)
+            .kill_on_drop(true)
+            .spawn()
+            .context("ssh to the VM")?;
+        let st = wait_or_kill(&mut child, limit).await?;
+        if tty {
             eprintln!();
         }
-        if !st.success() {
-            bail!("console session ended with {st}");
+        match st {
+            Some(st) if !st.success() => bail!("console session ended with {st}"),
+            _ => Ok(()),
         }
-        Ok(())
     }
+}
+
+/// Waits for the console's ssh; `None` once `limit` passes and it is
+/// killed. A signal kills it too: left running, an orphaned ssh keeps the
+/// board's console write lease from everyone after.
+async fn wait_or_kill(
+    child: &mut tokio::process::Child,
+    limit: Option<std::time::Duration>,
+) -> Result<Option<std::process::ExitStatus>> {
+    let limit = async {
+        match limit {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(unix)]
+    let signalled = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut int = signal(SignalKind::interrupt())?;
+        let mut term = signal(SignalKind::terminate())?;
+        let mut hup = signal(SignalKind::hangup())?;
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+        anyhow::Ok(())
+    };
+    #[cfg(not(unix))]
+    let signalled = async { Ok(tokio::signal::ctrl_c().await?) };
+    tokio::select! {
+        st = child.wait() => return Ok(Some(st.context("ssh to the VM")?)),
+        r = signalled => {
+            r.context("console signal handlers")?;
+            child.kill().await.ok();
+            bail!("console interrupted");
+        }
+        _ = limit => {}
+    }
+    child.kill().await.ok();
+    Ok(None)
 }
 
 /// A signed Rubicon image.
@@ -753,6 +810,47 @@ fn job_id(queue: &[Value], wanted: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// `--for` ends the session: the ssh is killed, not left holding the lease.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn console_limit_kills_the_ssh() {
+        let mut child = sleeper();
+        let st = wait_or_kill(&mut child, Some(std::time::Duration::from_millis(100)))
+            .await
+            .unwrap();
+        assert!(st.is_none());
+        assert!(child.try_wait().unwrap().is_some(), "ssh still running");
+    }
+
+    /// A SIGTERM to the CLI takes its ssh down with it instead of orphaning
+    /// it (and its console write lease) to init.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn console_sigterm_kills_the_ssh() {
+        let mut child = sleeper();
+        let pid = child.id().unwrap();
+        tokio::spawn(async {
+            // After wait_or_kill has its handlers in place.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+        let err = wait_or_kill(&mut child, None).await.unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "ssh {pid} still running"
+        );
+    }
 
     fn command(config_path: &str, target: Option<&str>) -> RubiconCommand {
         RubiconCommand {

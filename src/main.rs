@@ -3648,7 +3648,15 @@ async fn main() -> Result<()> {
                 RubiconCommands::Remove { board } => A::Remove { board },
                 RubiconCommands::Label { board, label } => A::Label { board, label },
                 RubiconCommands::Run { profile, board } => A::Run { board, profile },
-                RubiconCommands::Console { board, read_only } => A::Console { board, read_only },
+                RubiconCommands::Console {
+                    board,
+                    read_only,
+                    for_secs,
+                } => A::Console {
+                    board,
+                    read_only,
+                    for_secs,
+                },
                 RubiconCommands::Logs { board, follow } => A::Logs { board, follow },
                 RubiconCommands::Cancel { job, board } => A::Cancel { board, job },
                 RubiconCommands::Claim { board } => A::Claim { board },
@@ -5558,12 +5566,17 @@ enum RubiconCommands {
         #[arg(long)]
         board: Option<String>,
     },
-    /// Interactive serial console of a board's DUT (Ctrl-] leaves).
+    /// Interactive serial console of a board's DUT (Ctrl-] leaves). Without
+    /// a terminal, piped stdin goes to the DUT as raw bytes (`printf
+    /// '\033[B\r' | avocado rubicon console --for 5`).
     Console {
         board: Option<String>,
         /// Watch only; never send input.
         #[arg(long)]
         read_only: bool,
+        /// Leave after this many seconds, releasing the console.
+        #[arg(long = "for", value_name = "SECS")]
+        for_secs: Option<u64>,
     },
     /// Claim a board for the Connect org: someone presses its SW2 within
     /// the minute. Claimed, the board accepts actions only with tokens.
