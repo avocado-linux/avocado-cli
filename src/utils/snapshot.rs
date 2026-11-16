@@ -430,6 +430,24 @@ fn pin_ignored_notice(config: &Config, src_dir: &Path, target: &str) -> Option<S
     ))
 }
 
+/// Print the [`pin_ignored_notice`] once per process. Returns true when it
+/// printed. Reads the lock file and the environment only and opens no
+/// connection, so a command that never resolves a pin, such as `ext fetch`,
+/// can announce an override without adding a snapshot request.
+pub fn announce_pin_ignored(config: &Config, src_dir: &Path, target: &str) -> bool {
+    if !releasever_is_overridden(config) {
+        return false;
+    }
+    let Some(msg) = pin_ignored_notice(config, src_dir, target) else {
+        return false;
+    };
+    if PIN_IGNORED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    print_info(&msg, OutputLevel::Normal);
+    true
+}
+
 /// Resolve the snapshot pin for `target` and, when one applies, expose it via
 /// `AVOCADO_RELEASEVER` so every downstream `get_releasever()` fetches against
 /// the frozen snapshot subtree. Auto-pins (and persists) on first fetch.
@@ -438,11 +456,7 @@ fn pin_ignored_notice(config: &Config, src_dir: &Path, target: &str) -> Option<S
 /// in-process install task graph (children see the parent's env and no-op).
 pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) -> Result<()> {
     if releasever_is_overridden(config) {
-        if let Some(msg) = pin_ignored_notice(config, src_dir, target) {
-            if !PIN_IGNORED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                print_info(&msg, OutputLevel::Normal);
-            }
-        }
+        announce_pin_ignored(config, src_dir, target);
         return Ok(());
     }
     let (Some(release), Some(channel)) = (config.get_distro_release(), config.get_distro_channel())
@@ -1011,6 +1025,61 @@ mod tests {
         let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
         env::remove_var("AVOCADO_RELEASEVER");
         assert_eq!(msg, None);
+    }
+
+    /// `ext fetch` never calls `resolve_and_apply`, so it needs a notice-only
+    /// entry that reads the lock and the environment and opens no connection.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_prints_once_for_an_override() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let first = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        let second = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert!(first, "the first call prints the notice");
+        assert!(!second, "the once-guard suppresses the second call");
+        assert!(PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_is_silent_for_own_export_and_equal_pin() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+
+        set_exported_record(Some("2026/edge/snapshots/PINNED".into()));
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let own = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        set_exported_record(None);
+
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let equal = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+
+        assert!(!own, "avocado's own export is not an override");
+        assert!(!equal, "a value equal to the pin changes nothing");
+        assert!(!PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_is_silent_without_a_pin() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let printed = announce_pin_ignored(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert!(!printed);
     }
 
     #[tokio::test]
