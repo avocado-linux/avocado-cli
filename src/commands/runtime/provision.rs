@@ -140,7 +140,6 @@ impl RuntimeProvisionCommand {
             )?;
             crate::commands::profiles::ensure_dry_run_supported(
                 config,
-                &self.config.config_path,
                 &target_arch,
                 &self.config.runtime_name,
                 profile.as_deref(),

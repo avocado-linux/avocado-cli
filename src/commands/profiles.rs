@@ -472,12 +472,23 @@ pub fn staged_stone_manifest_path(target: &str, runtime: &str) -> String {
     format!("/opt/_avocado/{target}/output/runtimes/{runtime}/stone/manifest.json")
 }
 
+/// The SDK volume the provisioning run uses. `SdkContainer` keys it on the
+/// working directory, so the gate reads `.avocado-state` there too: beside
+/// `-C configs/avocado.yaml` it would miss the root's volume, or inspect a
+/// different one when both directories hold a state file.
+fn dry_run_volume_state() -> Result<VolumeState> {
+    VolumeState::load_from_current_dir()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dry-run cannot be verified, stone manifest could not be read: SDK not yet installed. Run `avocado install` first."
+        )
+    })
+}
+
 /// Read the staged stone manifest for `runtime` from the project's SDK volume
 /// and apply [`require_dry_run_support`]. The manifest read is a read-only
 /// `cat` in a one-shot container; no provisioning container has started yet.
 pub async fn ensure_dry_run_supported(
     config: &Config,
-    config_path: &str,
     target: &str,
     runtime: &str,
     profile: Option<&str>,
@@ -485,15 +496,7 @@ pub async fn ensure_dry_run_supported(
     let sdk_image = config.get_sdk_image().ok_or_else(|| {
         anyhow::anyhow!("--dry-run cannot be verified, stone manifest could not be read: avocado.yaml has no `sdk.image` set")
     })?;
-    let project_dir = Path::new(config_path)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| Path::new(".").to_path_buf());
-    let volume = VolumeState::load_from_dir(&project_dir)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--dry-run cannot be verified, stone manifest could not be read: SDK not yet installed. Run `avocado install` first."
-        )
-    })?;
+    let volume = dry_run_volume_state()?;
     let path = staged_stone_manifest_path(target, runtime);
     // The path goes in as `$1`, not spliced into the script, so a runtime name
     // never reaches the shell as code.
@@ -881,6 +884,35 @@ mod tests {
         let err = dry_run_preflight(Some(&e), Some("p"), None).unwrap_err();
         assert!(
             format!("{err:#}").contains("stone include paths"),
+            "{err:#}"
+        );
+    }
+
+    // `SdkContainer` keys the provisioning volume on the working directory, so
+    // `avocado provision -C configs/avocado.yaml --dry-run` from the project
+    // root must read the root's state file, not one beside the config file.
+    #[test]
+    #[serial]
+    fn dry_run_gate_reads_volume_state_from_the_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let configs = root_path.join("configs");
+        std::fs::create_dir_all(&configs).unwrap();
+        VolumeState::new(root_path.clone(), "docker".to_string())
+            .save_to_dir(&root_path)
+            .unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root_path).unwrap();
+        let from_root = dry_run_volume_state();
+        std::env::set_current_dir(&configs).unwrap();
+        let from_configs = dry_run_volume_state();
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(from_root.is_ok(), "{:?}", from_root.err());
+        let err = from_configs.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SDK not yet installed"),
             "{err:#}"
         );
     }
