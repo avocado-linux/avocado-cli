@@ -146,16 +146,7 @@ impl ExtCheckoutCommand {
 
         // Get the volume state for this project
         let volume_manager = VolumeManager::new(self.container_tool.clone(), self.verbose);
-        let volume_state = match volume_manager.get_or_create_volume(&cwd).await {
-            Ok(state) => state,
-            Err(_) => {
-                print_error(
-                    "No avocado volume found. Run an extension build first to create the volume.",
-                    OutputLevel::Normal,
-                );
-                return Ok(());
-            }
-        };
+        let volume_state = volume_manager.get_or_create_volume(&cwd).await?;
 
         // Create a temporary container to access the volume
         let temp_container_name = format!("avocado-checkout-{}", uuid::Uuid::new_v4());
