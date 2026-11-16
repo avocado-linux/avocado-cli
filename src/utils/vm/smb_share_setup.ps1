@@ -5,17 +5,20 @@
 # from the host's own file server, reached through the VM's user-mode
 # network. This script creates what that needs:
 #
-#   1. a local account used only for this share, with a random password;
+#   1. a local account used only for this share;
 #   2. Modify rights for that account on the workspace folder;
 #   3. an SMB share of the workspace folder, open to that account alone.
 #
-# The password is written to -CredentialFile encrypted with DPAPI for the
-# current user, so only this Windows user can read it back. It is never
-# printed. Re-running is safe: it resets the password and re-creates the
-# share for the given folder.
+# The account's password is chosen by the avocado CLI, which also keeps it
+# (DPAPI-encrypted for the user who ran the CLI). This script may run as a
+# different administrator, when a standard user approves the prompt with
+# someone else's credentials, so it stores nothing itself: it reads the
+# password from -PasswordFile and deletes that file at once. The password
+# is never printed. Re-running is safe: it sets the password again and
+# re-creates the share for the given folder.
 param(
     [Parameter(Mandatory = $true)][string]$Workspace,
-    [Parameter(Mandatory = $true)][string]$CredentialFile,
+    [Parameter(Mandatory = $true)][string]$PasswordFile,
     [string]$User = 'avocado-vm',
     [string]$Share = 'avocado-workspace',
     [string]$ResultFile = ''
@@ -31,10 +34,9 @@ try {
         throw "workspace folder '$Workspace' does not exist"
     }
 
-    $bytes = New-Object byte[] 24
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    # URL-safe base64: no characters that need escaping in a mount option.
-    $plain = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
+    $plain = ([IO.File]::ReadAllText($PasswordFile)).Trim()
+    Remove-Item -LiteralPath $PasswordFile -Force
+    if (-not $plain) { throw 'no password was supplied' }
     $secure = ConvertTo-SecureString $plain -AsPlainText -Force
 
     if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
@@ -60,13 +62,9 @@ try {
     New-SmbShare -Name $Share -Path $Workspace -FullAccess "$env:COMPUTERNAME\$User" `
         -Description 'Avocado VM workspace' | Out-Null
 
-    # DPAPI (current user) protected; readable only by this Windows user.
-    $dir = Split-Path -Parent $CredentialFile
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    ConvertFrom-SecureString $secure | Set-Content -Path $CredentialFile -Encoding ASCII
-
     Finish 'ok'
 } catch {
+    if (Test-Path -LiteralPath $PasswordFile) { Remove-Item -LiteralPath $PasswordFile -Force }
     Finish "error: $($_.Exception.Message)"
     exit 1
 }

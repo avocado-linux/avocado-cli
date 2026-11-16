@@ -120,11 +120,19 @@ const ARGV_FILE_PREFIX: char = '@';
 /// the program path and the quoting, which is only estimated.
 const COMMAND_LINE_BUDGET: usize = 30_000;
 
-/// Roughly how long `argv` is once joined into a Windows command line: each
-/// argument, a separator, a pair of quotes, a backslash per embedded quote.
+/// An upper bound, in UTF-16 units (what the Windows limit counts), on how
+/// long `argv` is once quoted into a command line: each argument, a
+/// separator and a pair of quotes, one escaping backslash per embedded
+/// quote, and every backslash counted twice, since the quoting doubles the
+/// ones that precede a quote or end the argument. Over-counting only moves
+/// the argv to a file a little early; under-counting fails the spawn.
 fn command_line_len<S: AsRef<str>>(argv: &[S]) -> usize {
     argv.iter()
-        .map(|a| a.as_ref().len() + 3 + a.as_ref().matches('"').count())
+        .map(|a| {
+            let a = a.as_ref();
+            let escapes = a.chars().filter(|c| matches!(c, '"' | '\\')).count();
+            a.encode_utf16().count() + escapes + 3
+        })
         .sum()
 }
 
@@ -998,6 +1006,18 @@ mod tests {
         let script = "if [ \"$A\" = 'b' ]; then\n  echo \"$0 $@\"\nfi\n".repeat(2_000);
         let args = ["run", "--rm", "image", "bash", "-c", script.as_str()];
         assert!(command_line_len(&args) > COMMAND_LINE_BUDGET);
+
+        // The bound covers what quoting adds: a doubled backslash, an
+        // escaped quote, and characters that take two UTF-16 units.
+        assert_eq!(command_line_len(&["ab"]), 2 + 3);
+        assert_eq!(command_line_len(&[r"a\"]), 2 + 1 + 3);
+        assert_eq!(command_line_len(&[r#"say \"hi\""#]), 10 + 4 + 3);
+        assert_eq!(command_line_len(&["\u{1F600}"]), 2 + 3);
+        // 15,000 escaped quotes are 30,000 bytes but up to 60,000 on the
+        // command line: that must count as over the budget.
+        let quotes = r#"\""#.repeat(15_000);
+        assert!(quotes.len() <= COMMAND_LINE_BUDGET);
+        assert!(command_line_len(&[quotes.as_str()]) > COMMAND_LINE_BUDGET);
 
         let file = write_argv_file(&args).unwrap();
         let at = format!("{ARGV_FILE_PREFIX}{}", file.path().display());
