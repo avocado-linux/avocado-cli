@@ -3224,6 +3224,7 @@ async fn main() -> Result<()> {
                 verbose,
                 target,
                 runtime,
+                skip_compile,
                 container_args,
                 dnf_args,
             } => {
@@ -3240,7 +3241,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_runtime(resolved_runtime);
+                .with_runtime(resolved_runtime)
+                .with_skip_compile(skip_compile);
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -4814,6 +4816,9 @@ enum ExtCommands {
         /// when no runtime resolves.
         #[arg(short = 'r', long)]
         runtime: Option<String>,
+        /// Skip cleaning the compile sections the extension uses (they are cleaned by default)
+        #[arg(long)]
+        skip_compile: bool,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -5575,6 +5580,27 @@ mod tests {
             .expect("--minimal has no effect on a reference project");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(Cli::try_parse_from(["avocado", "init", "--minimal"]).is_ok());
+    }
+
+    #[test]
+    fn ext_clean_skip_compile_is_opt_in() {
+        let skip_compile = |args: &[&str]| match Cli::try_parse_from(args)
+            .expect("args should parse")
+            .command
+        {
+            Commands::Ext {
+                command: ExtCommands::Clean { skip_compile, .. },
+            } => skip_compile,
+            _ => panic!("expected ext clean"),
+        };
+        assert!(!skip_compile(&["avocado", "ext", "clean", "app"]));
+        assert!(skip_compile(&[
+            "avocado",
+            "ext",
+            "clean",
+            "app",
+            "--skip-compile"
+        ]));
     }
 
     #[test]

@@ -95,6 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `environment`, spelled as Docker Compose spells them. `container_args`
   still works and is still the place for any flag without a key; where both
   set the same thing, the block wins.
+- **`avocado ext clean --skip-compile`.** Cleans the extension sysroot and
+  its stamps, and leaves the `sdk.compile` sections it uses as they are. By
+  default `ext clean` still runs the clean script of each section.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's
@@ -143,6 +146,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the entry, as `provides` already did, and a sub-package's `requires` under
   `split` fails the same way, also naming the sub-package. A `%` macro in
   `requires` still expands.
+- **An unchanged compile section no longer runs on each extension build.**
+  `ext build` writes a stamp for each `sdk.compile` section it runs, at
+  `.stamps/sdk/<arch>/compile/<section>.stamp`, and skips the section when
+  the stamp is current and the section's build directory exists. The stamp
+  hashes the section config, the compile script, the `package_files` of
+  every extension that names the section (with their target overrides
+  resolved), the SDK settings and the repo the container uses, the SDK
+  install and compile-deps stamps, and the lock pins of the SDK and the
+  target sysroot. The skip needs `package_files` on each of those
+  extensions: without a list of sources, an edit to a source file would not
+  move the hash. A section always compiles, as before, when an extension
+  that names it has no `package_files`, when a `package_files` path or glob
+  directory is or holds a symlink, when a glob matches nothing (such as
+  `./src/*.c`), when `sdk.container_args` or the `sdk.container` block
+  passes anything other than `--privileged`, `--network=host`,
+  `-v /dev:/dev`, `-v /sys:/sys` and env flags with a value
+  (`-e CFLAGS=-O2`), when there is no lock file, or when the CLI runs from
+  a directory other than the project and there is no `src_dir`. With `-v`,
+  the build says how to get the skip when `package_files` is missing.
+  `avocado sdk compile` always runs, and `--no-stamps`, `ext clean` and
+  `sdk clean <section>` remove the section stamp.
+- **`ext build` no longer skips over inputs it cannot hash.** An extension
+  with a package that has both `compile` and `install` is always rebuilt,
+  and its compile step decides whether the compile can be skipped. The `ext
+  build` hash does not read the SDK image, the lock pins or the host state
+  the container args pass, so its skip could ship a binary built against an
+  old library. An extension with a `post_build` hook is rebuilt when a
+  `package_files` path or glob directory is or holds a symlink, when a glob
+  matches nothing, when an override sets `package_files` or `source`, or
+  when the CLI runs from a directory other than the project and there is no
+  `src_dir`.
 - **Named rootfs entries and `target-<name>:` overrides apply everywhere the
   rootfs is read.** A rootfs written as named entries
   (`rootfs: { default: { overlay: ... } }`) had its `overlay` ignored at
