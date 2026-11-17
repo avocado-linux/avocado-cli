@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once per run. The override still wins. See docs/releasever.md.
 - **`--offline` flag and `AVOCADO_OFFLINE`.** avocado skips its own
   latest-snapshot pointer lookup, the pin HEAD check and the feed preflight,
-  and uses the locked pin, printing it once. Commands whose purpose is a
-  network call, Connect login and `avocado upgrade`, still connect. An old
-  locked pin installs old packages. With no locked pin on the
+  and uses the locked pin, printing it once. It gates only those lookups, the
+  release check, the add-on check and the Connect token mint;
+  `init --reference`, `upgrade`, `vm update`, `connect` and `runtime deploy`
+  still connect. An old locked pin installs old packages. With no locked pin on the
   default repository it stops before any request and tells you to run
   `avocado update` online; another `distro.repo.url` proceeds unpinned with a
   notice. `avocado update` and an `org:` feed that needs a token fail with an

@@ -28,9 +28,17 @@ missing pin and tells you to run `avocado update` while online. Run it once
 online to record a pin.
 
 Any other `distro.repo.url` (a mirror, an `http://` spelling of the default,
-an explicit port) proceeds unpinned with a notice instead of failing, because
-avocado cannot tell whether that repository publishes snapshots. If it does,
-the run resolves the moving channel, not a snapshot.
+an explicit port) proceeds unpinned instead of failing, and prints one notice
+naming the release, channel and URL, because avocado cannot tell whether that
+repository publishes snapshots. If it does, the run resolves the moving
+channel, not a snapshot.
+
+## A pin for another feed
+
+When the lock file holds a pin recorded for a different release, channel or
+feed URL than the config now names, `--offline` behaves as an online run does:
+it warns that the pin does not match and continues on the configured release
+unpinned, rather than failing.
 
 ## Commands that need the network
 
@@ -40,9 +48,15 @@ the run resolves the moving channel, not a snapshot.
   When an enabled `org:` feed has no token yet, `--offline` fails naming the
   feed instead of opening a connection.
 
-Commands whose purpose is a network call are not guarded and still connect
-under `--offline`: Connect login (it calls `GET /api/me`) and `avocado
-upgrade`.
+`--offline` gates only avocado's release, snapshot and feed lookups described
+on this page. Every other command connects as usual under `--offline`,
+including:
+
+- `avocado init --reference`, which downloads the reference from GitHub,
+- `avocado upgrade`,
+- `avocado vm update`,
+- `avocado connect` (login calls `GET /api/me`),
+- `avocado runtime deploy`, which connects to the device over SSH.
 
 ## What it does not do
 
