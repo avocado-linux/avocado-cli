@@ -4823,13 +4823,13 @@ impl Config {
     }
 
     /// The project's container arguments as docker receives them for `target`:
-    /// `sdk.<target>.container_args` replacing the base list, variables
-    /// expanded. An unreadable config file falls back to the base list, since
+    /// `sdk.<target>.container_args` replacing the base list, then the
+    /// `container:` block, variables expanded. An unreadable config file falls back to the base list, since
     /// the loaded `Config` already parsed it once.
     fn feed_container_args(&self, target: &str, config_path: &str) -> Vec<String> {
         let args = match self.get_merged_sdk_config(target, config_path) {
-            Ok(merged) => merged.container_args,
-            Err(_) => self.get_sdk_container_args().cloned(),
+            Ok(merged) => merged.all_container_args(),
+            Err(_) => self.get_sdk_container_args(),
         };
         Self::process_container_args(args.as_ref()).unwrap_or_default()
     }
@@ -13852,6 +13852,22 @@ runtimes:
         }
         assert_eq!(base, vec!["--network=host".to_string()]);
         assert_eq!(targeted, vec!["--cap-add=NET_ADMIN".to_string()]);
+    }
+
+    /// The `container:` block reaches the feed's view of the arguments, so
+    /// `network_mode: host` keeps a loopback feed URL as written.
+    #[test]
+    fn feed_container_args_include_the_container_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container:\n    network_mode: host\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let args = config.feed_container_args("qemux86-64", &path.to_string_lossy());
+        assert_eq!(args, vec!["--network=host".to_string()]);
     }
 
     /// `avocado build` and `avocado install` load exclusively through
