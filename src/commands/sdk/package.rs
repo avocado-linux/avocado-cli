@@ -463,7 +463,7 @@ impl SdkPackageCommand {
 
         // Build sub-package spec sections and partition script
         let (split_spec_sections, partition_script) = if let Some(split) = &pkg_config.split {
-            let spec = self.generate_split_spec_sections(split, name, version, arch);
+            let spec = self.generate_split_spec_sections(split, name, version, arch)?;
             let script = self.generate_partition_script(split);
             // Add sub-package RPM filenames
             for subpkg_name in split.keys() {
@@ -592,7 +592,7 @@ rm -rf "$TMPDIR"
         parent_name: &str,
         version: &str,
         arch: &str,
-    ) -> String {
+    ) -> Result<String> {
         let mut sections = String::new();
 
         // Sort for deterministic output
@@ -613,14 +613,20 @@ rm -rf "$TMPDIR"
                 .clone()
                 .unwrap_or_else(|| format!("Sub-package {full_name}"));
 
-            let requires_lines: String = subpkg
-                .requires
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|r| format!("Requires: {r}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // `%` is left alone, as for the main package's requires.
+            let mut requires = Vec::new();
+            for require in subpkg.requires.as_deref().unwrap_or(&[]) {
+                if require.chars().any(char::is_control) {
+                    anyhow::bail!(
+                        "Section '{}': sub-package '{}' requires entry {:?} contains a newline or control character",
+                        self.section,
+                        subpkg_name,
+                        require
+                    );
+                }
+                requires.push(format!("Requires: {require}"));
+            }
+            let requires_lines = requires.join("\n");
 
             // %files section for this sub-package uses the patterns from config
             let files_list: String = subpkg.files.join("\n");
@@ -644,7 +650,7 @@ Summary: {summary}
             let _ = (version, arch); // suppress unused warnings
         }
 
-        sections
+        Ok(sections)
     }
 
     /// Generate file partitioning script for split packages.
@@ -1220,6 +1226,43 @@ sdk:
         let spec = spec_of(&gen_script(&pkg).unwrap());
         assert!(
             spec.contains("\nRequires: %{name}-libs = %{version}\n"),
+            "{spec}"
+        );
+    }
+
+    fn pkg_with_split_requires(requires: &[&str]) -> PackageConfig {
+        let mut pkg = bare_pkg();
+        let sub = SplitPackageConfig {
+            summary: None,
+            description: None,
+            requires: Some(requires.iter().map(|r| r.to_string()).collect()),
+            files: vec!["/usr/include/*".to_string()],
+        };
+        pkg.split = Some(HashMap::from([("dev".to_string(), sub)]));
+        pkg
+    }
+
+    #[test]
+    fn split_requires_with_newline_is_rejected_naming_the_subpackage() {
+        for bad in ["foo\nProvides: evil", "foo\rbar", "foo\u{1b}bar", "foo\0"] {
+            let err = gen_script(&pkg_with_split_requires(&["ok", bad]))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Section 'my-app': sub-package 'dev' requires entry {bad:?} contains a newline or control character"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn split_requires_entry_is_emitted_verbatim() {
+        let pkg = pkg_with_split_requires(&["%{name} = %{version}"]);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(
+            spec.contains("\nSummary: my-app-dev package\nRequires: %{name} = %{version}\n"),
             "{spec}"
         );
     }

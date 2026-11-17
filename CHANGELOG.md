@@ -135,8 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`sdk package` rejects a `requires` entry holding a newline.** The entry
   was written into the spec unchecked, so a newline added spec lines of its
   own. A newline or other control character now fails naming the section and
-  the entry, as `provides` already did. A `%` macro in `requires` still
-  expands.
+  the entry, as `provides` already did, and a sub-package's `requires` under
+  `split` fails the same way, also naming the sub-package. A `%` macro in
+  `requires` still expands.
 
 ## [1.1.0] - 2026-11-11
 
