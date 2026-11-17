@@ -1024,8 +1024,9 @@ mod tests {
         reset_notice_state();
         let url = "http://127.0.0.1:1";
         let dir = pinned_dir(url);
-        set_exported_record(Some("2026/edge/snapshots/PINNED".into()));
-        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        // Differs from the pin, so only the export record can silence it.
+        set_exported_record(Some("2026/edge/snapshots/OLDER".into()));
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/OLDER");
         let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
         env::remove_var("AVOCADO_RELEASEVER");
         set_exported_record(None);
@@ -1107,25 +1108,26 @@ mod tests {
         let url = "http://127.0.0.1:1";
         let dir = pinned_dir(url);
         let config = offline_config(url);
+        reset_notice_state();
+        let tui = ActiveRenderer::new();
         let mut seen = Vec::new();
-        for _ in 0..2 {
-            // First iteration fires the notice, second finds it already printed.
-            reset_notice_state();
+        for _ in 0..3 {
             env::set_var("AVOCADO_RELEASEVER", "custom/rel");
             resolve_and_apply(&config, dir.path(), "qemux86-64")
                 .await
                 .expect("override never refuses");
-            seen.push(env::var("AVOCADO_RELEASEVER").unwrap());
+            seen.push((
+                env::var("AVOCADO_RELEASEVER").unwrap(),
+                tui.count("pin ignored: AVOCADO_RELEASEVER is set to custom/rel"),
+            ));
         }
-        // Same call again with the once-guard already set: no notice path.
-        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
-        resolve_and_apply(&config, dir.path(), "qemux86-64")
-            .await
-            .unwrap();
-        seen.push(env::var("AVOCADO_RELEASEVER").unwrap());
-        env::remove_var("AVOCADO_RELEASEVER");
-        assert!(PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(seen.iter().all(|r| r == "custom/rel"), "{seen:?}");
+        reset_notice_state();
+        // The release stays the override, and the notice prints on the first
+        // call only.
+        assert_eq!(
+            seen,
+            [1, 1, 1].map(|n| ("custom/rel".to_string(), n)).to_vec()
+        );
     }
 
     /// An offline run makes no request, so a CA bundle it cannot read must not
