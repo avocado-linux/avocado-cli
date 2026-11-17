@@ -372,7 +372,7 @@ impl ExtDnfCommand {
         let installroot = format!("$AVOCADO_EXT_SYSROOTS/{extension_name}");
         let contract_check = crate::commands::sdk::install::scriptlet_contract_check();
         let offline_env = crate::commands::sdk::install::offline_scriptlet_env(&installroot);
-        let command_args_str = self.command.join(" ");
+        let command_args_str = crate::utils::shell::join_argv(&self.command);
         let dnf_args_str = if let Some(args) = &self.dnf_args {
             format!(" {} ", args.join(" "))
         } else {
@@ -395,5 +395,29 @@ $DNF_SDK_HOST \
     {command_args_str}
 "#
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dnf_command_keeps_argv_boundaries() {
+        let cmd = ExtDnfCommand::new(
+            "avocado.yaml".to_string(),
+            "app".to_string(),
+            vec!["install".to_string(), "a b; $X*".to_string()],
+            false,
+            None,
+            None,
+            None,
+        );
+        let location = ExtensionLocation::Local {
+            name: "app".to_string(),
+            config_path: "avocado.yaml".to_string(),
+        };
+        let script = cmd.build_dnf_command(&location);
+        assert!(script.contains("    'install' 'a b; $X*'\n"), "{script}");
     }
 }

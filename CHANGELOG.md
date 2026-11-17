@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's
   `cli_requirement` is now `>=1.0.0` (was `>=0.41.0`). Pre-release builds such
   as `1.1.0-dev` still satisfy it.
+- **`sdk dnf`, `ext dnf` and `runtime dnf` pass each argument to dnf as
+  given.** They were joined with spaces and run by the container shell, which
+  split them again and expanded them. An argument containing `$VAR`, a glob or
+  `&&` now reaches dnf literally instead of being interpreted, as `sdk run`
+  already does.
 
 ### Fixed
 - **An HTTP 429 from a package repository is now reported as one.** dnf
