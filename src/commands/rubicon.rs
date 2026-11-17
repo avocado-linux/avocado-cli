@@ -492,6 +492,9 @@ impl RubiconCommand {
         } else {
             ssh.arg(cmd);
         }
+        // Before the ssh, so it drops after it: put back on every way out.
+        #[cfg(unix)]
+        let _term = tty.then(|| TermRestore::save(0)).flatten();
         let mut child = tokio::process::Command::from(ssh)
             .kill_on_drop(true)
             .spawn()
@@ -504,6 +507,29 @@ impl RubiconCommand {
             Some(st) if !st.success() => bail!("console session ended with {st}"),
             _ => Ok(()),
         }
+    }
+}
+
+/// A terminal's settings, put back on drop. ssh sets the local terminal
+/// raw for an interactive console, and a killed ssh never restores it.
+#[cfg(unix)]
+struct TermRestore(i32, libc::termios);
+
+#[cfg(unix)]
+impl TermRestore {
+    fn save(fd: i32) -> Option<Self> {
+        let mut t = std::mem::MaybeUninit::uninit();
+        // SAFETY: tcgetattr fills `t` when it returns 0.
+        (unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } == 0)
+            .then(|| Self(fd, unsafe { t.assume_init() }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TermRestore {
+    fn drop(&mut self) {
+        // SAFETY: a termios that tcgetattr filled.
+        unsafe { libc::tcsetattr(self.0, libc::TCSANOW, &self.1) };
     }
 }
 
@@ -974,5 +1000,35 @@ mod tests {
     fn quoting_survives_odd_addresses() {
         assert_eq!(sh_quote("10.0.0.1"), "'10.0.0.1'");
         assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+    }
+
+    /// A raw terminal is cooked again once the guard drops, as after a
+    /// killed ssh.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_raw_terminal_is_put_back() {
+        let (mut m, mut s) = (0, 0);
+        let null = std::ptr::null_mut();
+        // SAFETY: openpty writes the two fds.
+        let r = unsafe { libc::openpty(&mut m, &mut s, null, std::ptr::null(), std::ptr::null()) };
+        assert_eq!(r, 0);
+        let attrs = || {
+            let mut t = std::mem::MaybeUninit::uninit();
+            // SAFETY: as in TermRestore::save.
+            assert_eq!(unsafe { libc::tcgetattr(s, t.as_mut_ptr()) }, 0);
+            unsafe { t.assume_init() }
+        };
+        let cooked = attrs().c_lflag & (libc::ICANON | libc::ECHO);
+        assert_ne!(cooked, 0);
+        let guard = TermRestore::save(s).unwrap();
+        // What ssh does to the local terminal.
+        let mut raw = attrs();
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(unsafe { libc::tcsetattr(s, libc::TCSANOW, &raw) }, 0);
+        assert_eq!(attrs().c_lflag & (libc::ICANON | libc::ECHO), 0);
+        drop(guard);
+        assert_eq!(attrs().c_lflag & (libc::ICANON | libc::ECHO), cooked);
+        unsafe { libc::close(m) };
+        unsafe { libc::close(s) };
     }
 }
