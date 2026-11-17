@@ -30,11 +30,30 @@ pub fn set_active_renderer(renderer: &Arc<TaskRenderer>) {
     *guard = Some(Arc::downgrade(renderer));
 }
 
-/// Unregister the global renderer (called by `shutdown()`).
+/// Unregister whichever renderer is active.
+#[cfg(test)]
 pub fn clear_active_renderer() {
     let mut guard = ACTIVE_RENDERER.lock().unwrap();
     *guard = None;
 }
+
+/// Unregister `renderer` if it is the active one (called by `shutdown()`): shutting one
+/// renderer down must not unregister another, which concurrent tests each with their own
+/// renderer would otherwise do to each other.
+pub(crate) fn clear_active_renderer_if(renderer: &TaskRenderer) {
+    let mut guard = ACTIVE_RENDERER.lock().unwrap();
+    if guard
+        .as_ref()
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), renderer))
+    {
+        *guard = None;
+    }
+}
+
+/// Serialize tests that touch the global ACTIVE_RENDERER, in this module and elsewhere.
+/// Tests run in parallel by default; the global static causes races.
+#[cfg(test)]
+pub(crate) static TEST_RENDERER_LOCK: Mutex<()> = Mutex::new(());
 
 /// If a TUI renderer is active, return a strong reference to it.
 pub fn get_active_renderer() -> Option<Arc<TaskRenderer>> {
@@ -172,10 +191,6 @@ impl Drop for TuiGuard {
 pub(crate) mod tests {
     use super::*;
 
-    /// Serialize tests that touch the global ACTIVE_RENDERER.
-    /// Tests run in parallel by default; the global static causes races.
-    pub(crate) static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Create a test renderer in Passthrough mode (doesn't need a terminal).
     fn test_renderer() -> Arc<TaskRenderer> {
         Arc::new(TaskRenderer::new_test())
@@ -183,7 +198,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_active_renderer_lifecycle() {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
+        let _lock = TEST_RENDERER_LOCK.lock().unwrap();
         clear_active_renderer();
 
         let r = test_renderer();
@@ -200,7 +215,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_active_renderer_cleared_when_dropped() {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
+        let _lock = TEST_RENDERER_LOCK.lock().unwrap();
         clear_active_renderer();
         {
             let r = test_renderer();
@@ -216,7 +231,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_print_and_exit_shuts_down_tui() {
-        let _lock = GLOBAL_LOCK.lock().unwrap();
+        let _lock = TEST_RENDERER_LOCK.lock().unwrap();
         clear_active_renderer();
 
         let r = test_renderer();

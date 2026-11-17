@@ -107,8 +107,8 @@ pub fn print_warning_above(message: &str) {
 ///
 /// The renderer `Option` is bound once and matched alongside the sink rather
 /// than looked up a second time behind an `expect`. `get_active_renderer`
-/// returning `None` on the second call is reachable - `clear_active_renderer`
-/// is `pub` and is the first statement of `TaskRenderer::shutdown` - so the
+/// returning `None` on the second call is reachable - `clear_active_renderer_if`
+/// is the first statement of `TaskRenderer::shutdown` - so the
 /// old shape could abort the process while printing an informational notice.
 /// Pairing the two makes that branch fall through to stderr instead of
 /// depending on the interleaving being impossible.
