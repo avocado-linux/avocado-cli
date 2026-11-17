@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::utils::config::Config;
 use crate::utils::container::{RunConfig, SdkContainer};
 use crate::utils::lockfile::LockFile;
-use crate::utils::output::{print_error, print_info, print_success, OutputLevel};
+use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::target::resolve_target_required;
 use crate::utils::volume::{VolumeManager, VolumeState};
 
@@ -127,13 +127,9 @@ impl CleanCommand {
         // pair its removal with volume removal — `--skip-volumes`
         // means "leave both alone" so unlock-/stamps-only invocations
         // don't orphan the volume by deleting its name reference.
-        if self.volumes {
-            self.clean_volume(&directory_path).await?;
-            self.clean_state_file(&directory_path)?;
-        }
-
         // Staged overlays are rebuilt every build, so a clean never needs
-        // them, and they can hold templated secrets.
+        // them, and they can hold templated secrets. First, so a volume that
+        // cannot be removed does not leave them behind.
         for root in self.staging_roots(&directory_path) {
             if crate::utils::overlay_preprocess::clear_staging(&root)? {
                 print_success(
@@ -141,6 +137,11 @@ impl CleanCommand {
                     OutputLevel::Normal,
                 );
             }
+        }
+
+        if self.volumes {
+            self.clean_volume(&directory_path).await?;
+            self.clean_state_file(&directory_path)?;
         }
 
         // Clean stamp files if requested
@@ -156,20 +157,35 @@ impl CleanCommand {
         Ok(())
     }
 
-    /// Where builds staged overlays: the project root of the config (`-C`, or
-    /// `avocado.yaml` in the directory), which `src_dir` can move away from
-    /// the directory, and the directory itself.
+    /// Where builds staged overlays: the directory itself, and the project
+    /// root of the config (`-C`, or `avocado.yaml` in the directory), which
+    /// `src_dir` can move away from it. The config is composed for the
+    /// clean's target, as a build composes it, so a target-templated
+    /// `src_dir` names the same root.
     fn staging_roots(&self, directory_path: &Path) -> Vec<PathBuf> {
         let config_path = match &self.config_path {
             Some(c) => PathBuf::from(c),
             None => directory_path.join("avocado.yaml"),
         };
         let mut roots = vec![directory_path.to_path_buf()];
-        if let Ok(config) = Config::load(&config_path) {
-            let root = config.project_root(&config_path);
-            if !roots.contains(&root) {
-                roots.push(root);
+        if !config_path.exists() {
+            return roots;
+        }
+        match Config::load_composed(&config_path, self.target.as_deref()) {
+            Ok(composed) => {
+                let root = composed.config.project_root(&config_path);
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
             }
+            // A broken config must not block a clean, but say what was skipped.
+            Err(e) => print_warning(
+                &format!(
+                    "Could not read {} ({e:#}); staged overlays under its src_dir, if it moves the project root, were not removed.",
+                    config_path.display()
+                ),
+                OutputLevel::Normal,
+            ),
         }
         roots
     }
@@ -370,6 +386,35 @@ mod tests {
 
         assert!(!temp_dir.path().join(".avocado/overlay-staging").exists());
         assert!(temp_dir.path().join(".avocado").exists());
+    }
+
+    /// A target-templated `src_dir` resolves for the clean's target, as the
+    /// build that staged it did.
+    #[tokio::test]
+    async fn clean_resolves_src_dir_for_its_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let project = temp_dir.path().join("avocado");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("avocado.yaml"),
+            "default_target: a\nsrc_dir: ../{{ avocado.target }}\n",
+        )
+        .unwrap();
+        let staged = temp_dir.path().join("b/.avocado/overlay-staging/rootfs");
+        fs::create_dir_all(&staged).unwrap();
+
+        CleanCommand::new(
+            Some(project.to_string_lossy().to_string()),
+            false,
+            None,
+            false,
+        )
+        .with_target(Some("b".to_string()))
+        .execute()
+        .await
+        .unwrap();
+
+        assert!(!temp_dir.path().join("b/.avocado/overlay-staging").exists());
     }
 
     /// With `src_dir` moving the project root away from the directory, the
