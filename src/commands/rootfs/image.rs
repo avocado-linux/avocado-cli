@@ -21,6 +21,19 @@ use crate::utils::{
 /// Namespace UUID for deterministic OS build ID generation (shared with runtime build).
 pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
+/// Removes every non-directory under `$ROOTFS_WORK/boot`, keeping the
+/// directory tree (mountpoints). See `DEFAULT_ROOTFS_POST_INSTALL`.
+///
+/// `-H` follows `/boot` itself when it is a symlink to a directory (as the
+/// old `boot/*` glob did), but only to a directory below `$ROOTFS_WORK`: an
+/// absolute link resolves in the build container, not the image, and is
+/// refused. Only a missing `/boot` is tolerated; a refusal or `find` failure
+/// exits the build script, whether or not `set -e` is in effect there.
+pub const BOOT_STRIP_KEEP_DIRS: &str = "[ ! -d \"$ROOTFS_WORK/boot\" ] || \
+case \"$(cd -P \"$ROOTFS_WORK/boot\" && pwd -P)\" in \
+\"$(cd -P \"$ROOTFS_WORK\" && pwd -P)\"/?*) find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete ;; \
+*) echo \"/boot leads outside the rootfs; not stripping it\" >&2; false ;; esac || exit 1";
+
 /// Default post-install commands for the rootfs build. Run on the work
 /// directory (`$ROOTFS_WORK`) after package install + overlay, before
 /// the identity stamp and `mkfs.erofs`. These mirror what Yocto's
@@ -37,7 +50,11 @@ pub const DEFAULT_ROOTFS_POST_INSTALL: &[&str] = &[
     "ln -sfn usr/lib \"$ROOTFS_WORK/lib\"",
     // Strip dirs that Yocto's avocado-image-rootfs.bb also stripped.
     "rm -rf \"$ROOTFS_WORK/media\" \"$ROOTFS_WORK/mnt\" \"$ROOTFS_WORK/srv\"",
-    "rm -rf \"$ROOTFS_WORK/boot/\"*",
+    // Strip what packages put under /boot (kernel images, DTBs: they ship
+    // outside the rootfs), but keep its directories: they are mountpoints
+    // packages rely on (e.g. /boot/efi for a Jetson's boot-efi.mount), and a
+    // read-only rootfs cannot create one at boot.
+    BOOT_STRIP_KEEP_DIRS,
     "mkdir -p \"$ROOTFS_WORK/opt\"",
     // Empty /etc/machine-id for stateless systemd on read-only rootfs.
     "touch \"$ROOTFS_WORK/etc/machine-id\"",
@@ -920,6 +937,126 @@ export AVOCADO_OS_VERSION_ID
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The /boot strip removes files and links but keeps directories, so a
+    /// package-owned mountpoint such as /boot/efi survives into the image.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_keeps_mountpoint_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let boot = root.path().join("boot");
+        std::fs::create_dir_all(boot.join("efi")).unwrap();
+        std::fs::create_dir_all(boot.join("extlinux")).unwrap();
+        std::fs::write(boot.join("Image-6.18.52"), b"k").unwrap();
+        std::fs::write(boot.join("extlinux/extlinux.conf"), b"c").unwrap();
+        std::os::unix::fs::symlink("Image-6.18.52", boot.join("Image")).unwrap();
+
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(boot.join("efi").is_dir());
+        assert!(boot.join("extlinux").is_dir());
+        assert!(!boot.join("Image-6.18.52").exists());
+        assert!(!boot.join("extlinux/extlinux.conf").exists());
+        assert!(std::fs::symlink_metadata(boot.join("Image")).is_err());
+    }
+
+    /// A rootfs without /boot is not an error.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_tolerates_missing_boot() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// A /boot that is a symlink to a directory is stripped through the link.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_follows_a_symlinked_boot() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("efi")).unwrap();
+        std::fs::write(real.join("Image"), b"k").unwrap();
+        std::os::unix::fs::symlink("real", root.path().join("boot")).unwrap();
+
+        assert!(std::process::Command::new("sh")
+            .arg("-c")
+            .arg(BOOT_STRIP_KEEP_DIRS)
+            .env("ROOTFS_WORK", root.path())
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(!real.join("Image").exists());
+        assert!(real.join("efi").is_dir());
+    }
+
+    /// A /boot that leads out of the rootfs (an absolute link resolves in the
+    /// build container) is refused, and nothing out there is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn boot_strip_refuses_a_boot_outside_the_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"k").unwrap();
+        std::fs::create_dir(outside.path().join(".git")).unwrap();
+        std::fs::write(outside.path().join(".git/HEAD"), b"h").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("boot")).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{BOOT_STRIP_KEEP_DIRS}\necho next-hook"))
+            .env("ROOTFS_WORK", root.path())
+            .output()
+            .unwrap();
+
+        // Even without `set -e`, the refusal stops the script.
+        assert!(!status.status.success());
+        assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
+        assert!(outside.path().join("keep").exists());
+        assert!(outside.path().join(".git/HEAD").exists());
+    }
+
+    /// A strip that cannot delete fails the hook instead of imaging the kernel.
+    /// Linux only: BSD find (macOS) exits 0 on a delete it was denied, while
+    /// the build runs GNU find in the SDK container.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_strip_fails_when_find_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("boot/extlinux");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("extlinux.conf"), b"c").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{BOOT_STRIP_KEEP_DIRS}\necho next-hook"))
+            .env("ROOTFS_WORK", root.path())
+            .output()
+            .unwrap();
+        let blocked = sub.join("extlinux.conf").exists();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // root ignores directory write bits; only judge a delete that failed.
+        // Even without `set -e`, the failure stops the script.
+        if blocked {
+            assert!(!status.status.success());
+            assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
+        }
+    }
 
     /// `.exports` records exactly the variables that are set, as sourceable
     /// `export` lines, so a reused image replays what a full build exported

@@ -1982,6 +1982,16 @@ pub fn compute_ext_image_input_hash(
     Ok(StampInputs::new(config_hash))
 }
 
+/// The CLI's built-in post-install hooks for an image section, which run when
+/// the section declares no `post_install` script.
+fn default_post_install(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "rootfs" => Some(crate::commands::rootfs::image::DEFAULT_ROOTFS_POST_INSTALL),
+        "initramfs" => Some(crate::commands::initramfs::image::DEFAULT_INITRAMFS_POST_INSTALL),
+        _ => None,
+    }
+}
+
 /// Compute input hash for **rootfs image** / **initramfs image**.
 ///
 /// `section` is `"rootfs"` / `"initramfs"`; `resolved_section` is what
@@ -2026,6 +2036,27 @@ pub fn compute_sysroot_image_input_hash(
     runtime_name: Option<&str>,
     project_root: &Path,
 ) -> Result<StampInputs> {
+    let hash_data = sysroot_image_hash_data(
+        section,
+        resolved_section,
+        install_content_hash,
+        config,
+        runtime_name,
+        project_root,
+    )?;
+    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
+    Ok(StampInputs::new(config_hash))
+}
+
+/// The inputs [`compute_sysroot_image_input_hash`] hashes.
+fn sysroot_image_hash_data(
+    section: &str,
+    resolved_section: &serde_yaml::Value,
+    install_content_hash: &str,
+    config: &serde_yaml::Value,
+    runtime_name: Option<&str>,
+    project_root: &Path,
+) -> Result<serde_yaml::Mapping> {
     let mut hash_data = serde_yaml::Mapping::new();
     hash_data.insert(
         serde_yaml::Value::String(format!("{section}.install.content_hash")),
@@ -2045,6 +2076,18 @@ pub fn compute_sysroot_image_input_hash(
             project_root,
             post_install,
         )?;
+    } else if let Some(defaults) = default_post_install(section) {
+        // No post_install script: the CLI's default hooks shape the image, so
+        // a CLI that changes them must not reuse an image built by the old ones.
+        hash_data.insert(
+            serde_yaml::Value::String(format!("{section}.default_post_install")),
+            serde_yaml::Value::Sequence(
+                defaults
+                    .iter()
+                    .map(|s| serde_yaml::Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
     }
     for (key, value) in [
         ("permissions", config.get("permissions")),
@@ -2107,8 +2150,7 @@ pub fn compute_sysroot_image_input_hash(
             serde_yaml::Value::String(digest),
         );
     }
-    let config_hash = compute_config_hash(&serde_yaml::Value::Mapping(hash_data))?;
-    Ok(StampInputs::new(config_hash))
+    Ok(hash_data)
 }
 
 /// Mapping construction for `ext build`'s input hash: everything the build
@@ -8337,6 +8379,45 @@ rootfs:
             compute_sysroot_image_input_hash(section, &node, "sha256:aa", &cfg, rt, root)?
                 .config_hash,
         )
+    }
+
+    /// Without a `post_install` script the CLI's default hooks build the
+    /// image, so they are hashed: a CLI that changes them (e.g. keeping
+    /// /boot mountpoints) must not reuse an image the old hooks built.
+    #[test]
+    fn image_hash_covers_default_post_install() {
+        let cfg = serde_yaml::Value::Mapping(Default::default());
+        let data = |section: &str, yaml: &str, root: &Path| {
+            let node: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            sysroot_image_hash_data(section, &node, "sha256:aa", &cfg, None, root).unwrap()
+        };
+        let folded = |m: &serde_yaml::Mapping, key: &str| -> Option<Vec<String>> {
+            m.get(key)?
+                .as_sequence()
+                .map(|s| s.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+        };
+        let root = Path::new(".");
+        assert_eq!(
+            folded(
+                &data("rootfs", "filesystem: erofs\n", root),
+                "rootfs.default_post_install"
+            )
+            .unwrap(),
+            crate::commands::rootfs::image::DEFAULT_ROOTFS_POST_INSTALL
+        );
+        assert_eq!(
+            folded(
+                &data("initramfs", "filesystem: cpio\n", root),
+                "initramfs.default_post_install"
+            )
+            .unwrap(),
+            crate::commands::initramfs::image::DEFAULT_INITRAMFS_POST_INSTALL
+        );
+        // A project script replaces the defaults; its content is hashed instead.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("post.sh"), "true\n").unwrap();
+        let scripted = data("rootfs", "post_install: post.sh\n", tmp.path());
+        assert!(folded(&scripted, "rootfs.default_post_install").is_none());
     }
 
     /// The standalone-command shape: empty config, no runtime.
