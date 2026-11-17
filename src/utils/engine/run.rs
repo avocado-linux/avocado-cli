@@ -135,7 +135,7 @@ pub(super) async fn run(docker: &Docker, args: &[String], start: bool) -> Result
             let removed = tokio::spawn(exit_from_events(docker.clone(), id.clone(), since, ready));
             // ponytail: a replay that lost the `create` is not waited on past
             // this; `exit_from_events` then falls back to inspecting.
-            let _ = tokio::time::timeout(Duration::from_secs(10), subscribed).await;
+            let _ = tokio::time::timeout(SUBSCRIBE, subscribed).await;
             Some(removed)
         }
         false => None,
@@ -330,6 +330,8 @@ async fn exit_from_events(
     code.with_context(|| format!("container {id} went away without an exit status"))
 }
 
+/// How long a `--rm` start waits for its events subscription to show live.
+const SUBSCRIBE: Duration = Duration::from_millis(if cfg!(test) { 1_000 } else { 10_000 });
 /// How long events may be quiet before the container is inspected.
 const QUIET: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 5_000 });
 /// How long a container that has died gets to be removed.
@@ -931,6 +933,117 @@ mod tests {
         };
         let (code, _) = rm_exit(events, None, delay).await;
         assert_eq!(code.unwrap(), 5);
+    }
+
+    /// A daemon for `run --rm`: it records each request line, and holds the
+    /// replayed `create` back until `release` is notified (`None`: never).
+    /// Attach and start fail, which ends the run.
+    #[cfg(unix)]
+    async fn fake_engine(
+        release: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) -> (
+        Docker,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let (log, release) = (log.clone(), release.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if conn.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    log.lock().unwrap().push(line.clone());
+                    let reply = |status: &str, body: &str| {
+                        format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    };
+                    let out = if line.contains("/events") {
+                        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                        match release {
+                            Some(release) => release.notified().await,
+                            None => std::future::pending().await,
+                        }
+                        let e = "{\"Type\":\"container\",\"Action\":\"create\",\"Actor\":{\"ID\":\"c1\"}}\n";
+                        conn.write_all(format!("{:x}\r\n{e}\r\n", e.len()).as_bytes())
+                            .await
+                            .unwrap();
+                        std::future::pending::<String>().await
+                    } else if line.contains("/containers/create") {
+                        reply("201 Created", r#"{"Id":"c1","Warnings":[]}"#)
+                    } else if line.contains("/containers/c1/json") {
+                        reply("200 OK", r#"{"Id":"c1","Created":"2026-01-01T00:00:00Z"}"#)
+                    } else {
+                        reply(
+                            "500 Internal Server Error",
+                            r#"{"message":"not in this fake"}"#,
+                        )
+                    };
+                    conn.write_all(out.as_bytes()).await.ok();
+                });
+            }
+        });
+        let docker =
+            Docker::connect_with_unix(path.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        (docker, dir, seen)
+    }
+
+    #[cfg(unix)]
+    fn started(seen: &std::sync::Mutex<Vec<String>>) -> bool {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("/attach") || l.contains("/start"))
+    }
+
+    #[cfg(unix)]
+    fn rm_args() -> Vec<String> {
+        ["--rm", "img", "true"].map(String::from).to_vec()
+    }
+
+    /// `run --rm` attaches and starts only once its subscription shows live.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_run_starts_only_once_its_events_are_live() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (docker, _dir, seen) = fake_engine(Some(release.clone())).await;
+        let running = tokio::spawn(async move { run(&docker, &rm_args(), true).await });
+        tokio::time::sleep(SUBSCRIBE / 3).await;
+        assert!(!started(&seen), "started before the subscription: {seen:?}");
+        release.notify_one();
+        let _ = tokio::time::timeout(SUBSCRIBE / 2, running)
+            .await
+            .expect("run went on");
+        assert!(started(&seen), "never started: {seen:?}");
+    }
+
+    /// With the `create` never replayed, the start still goes ahead after
+    /// the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_run_starts_after_the_bound_without_a_create() {
+        let (docker, _dir, seen) = fake_engine(None).await;
+        let begun = std::time::Instant::now();
+        let running = tokio::spawn(async move { run(&docker, &rm_args(), true).await });
+        let _ = tokio::time::timeout(SUBSCRIBE * 3, running)
+            .await
+            .expect("run went on");
+        assert!(started(&seen), "never started: {seen:?}");
+        assert!(begun.elapsed() >= SUBSCRIBE);
     }
 
     /// A container stuck in removal, its `die` lost, still ends the wait.
