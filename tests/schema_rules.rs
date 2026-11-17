@@ -92,3 +92,23 @@ fn the_container_block_is_accepted_where_container_args_is() {
     ));
     assert!(!accepts("sdk:\n  container:\n    priviledged: true\n"));
 }
+
+/// Rootfs install and the image step read every field of the selected named
+/// entry, and of `target-<name>:` blocks at either level; initramfs reads
+/// neither.
+#[test]
+fn rootfs_named_entries_and_target_overrides_are_accepted() {
+    assert!(accepts(
+        "rootfs:\n  default:\n    overlay: o\n    post_install: a.sh\n    image: { type: kab }\n    target-qemux86-64: { packages: {}, overlay: o, post_install: b.sh, image: { args: x } }\n  target-qemux86-64: { packages: {}, overlay: o, image: { type: kab }, filesystem: erofs-zst, permissions: p }\n"
+    ));
+    assert!(accepts(
+        "rootfs:\n  packages: {}\n  target-qemux86-64: { packages: {}, overlay: o }\n"
+    ));
+    assert!(!accepts(
+        "rootfs:\n  default:\n    target-qemux86-64: { source: { type: path, path: p } }\n"
+    ));
+    assert!(!accepts("initramfs:\n  default: { overlay: o }\n"));
+    assert!(!accepts(
+        "initramfs:\n  packages: {}\n  target-qemux86-64: { overlay: o }\n"
+    ));
+}
