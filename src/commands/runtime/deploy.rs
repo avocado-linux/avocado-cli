@@ -69,7 +69,19 @@ impl DeviceSpec {
         };
         anyhow::ensure!(ok(&user, &[]), "Invalid user in device string '{device}'");
         anyhow::ensure!(
-            ok(&host, &[':', '%']),
+            match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                // A bracketed IPv6 address, the form that can carry a port.
+                Some(ip) => {
+                    let (addr, zone) = ip.split_once('%').unwrap_or((ip, ""));
+                    !addr.is_empty()
+                        && addr
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+                        && (zone.is_empty() != ip.contains('%'))
+                        && ok(zone, &[])
+                }
+                None => ok(&host, &[':', '%']),
+            },
             "Invalid host in device string '{device}': use a hostname or an IP address"
         );
 
@@ -1455,14 +1467,36 @@ mod tests {
         ] {
             assert!(DeviceSpec::parse(bad).is_err(), "{bad}");
         }
-        for good in [
-            "fe80::1%eth0",
-            "::1",
-            "my_host.local",
-            "deploy-user@10.0.0.1:2222",
-        ] {
+        for bad in ["[]", "[::1%]", "[::1]x", "[$(id)]", "[::1%$(id)]", "[::g]"] {
+            assert!(DeviceSpec::parse(bad).is_err(), "{bad}");
+        }
+        for good in ["fe80::1%eth0", "my_host.local", "deploy-user@10.0.0.1:2222"] {
             assert!(DeviceSpec::parse(good).is_ok(), "{good}");
         }
+    }
+
+    #[test]
+    fn test_device_spec_bracketed_ipv6() {
+        let spec = DeviceSpec::parse("root@[::1]:2222").unwrap();
+        assert_eq!(spec.host, "[::1]");
+        assert_eq!(spec.port, Some(2222));
+        let spec = DeviceSpec::parse("[fe80::1%eth0]").unwrap();
+        assert_eq!(spec.host, "[fe80::1%eth0]");
+        assert_eq!(spec.port, None);
+
+        let cmd = RuntimeDeployCommand::new(
+            "test-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            "root@[::1]:2222".to_string(),
+            None,
+            None,
+        );
+        let script = cmd.create_deploy_script("x86_64", "uuid").unwrap();
+        assert!(script.contains("SSH_DEST=\"root@[::1]\""));
+        assert!(script.contains("DEVICE_HOST=\"[::1]\""));
+        assert!(script.contains("SSH_PORT_ARGS=\"-p 2222\""));
     }
 
     #[test]
