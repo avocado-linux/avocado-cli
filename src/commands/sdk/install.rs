@@ -3156,6 +3156,11 @@ runtimes:
             "sdk.compile",
             KeyRole::Keyed(L2, "{app: {packages: {make: '*'}}}"),
         ),
+        // Read with container_args (all_container_args), so it keys the same way.
+        (
+            "sdk.container",
+            KeyRole::Keyed(L0, "{environment: {X: '1'}}"),
+        ),
         ("sdk.container_args", KeyRole::Keyed(L0, "['-e', 'X=1']")),
         (
             "sdk.dependencies",
