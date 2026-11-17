@@ -244,6 +244,7 @@ pub mod smb {
     /// `Path=<folder>`. The keys are not translated and the data is
     /// UTF-16, so this reads the same on every Windows language, unlike the
     /// text `net share` prints.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn share_path_from_registry_value(value: &[u16]) -> Option<PathBuf> {
         value
             .split(|&unit| unit == 0)
