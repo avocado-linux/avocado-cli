@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Layer sharing rule documented.** SDK layers are reused across projects
+  when the distro feed is pinned to a snapshot and every enabled custom feed
+  in `repos:` is a `path:` feed, which has a content identity (the sha256 of
+  its `repodata/repomd.xml`). A project that enables a `url:` or `org:` feed
+  keeps its layers private, and `sdk install` prints a notice naming the first
+  such feed. Run `avocado feed index` after changing a feed directory: the key
+  sees only `repomd.xml`, so an RPM replaced in place without re-indexing
+  reuses the old layer. A feed re-indexed while `sdk install` runs makes that
+  install commit nothing shared. See docs/layer-sharing.md.
 - **Release override notice.** When `AVOCADO_RELEASEVER` is exported in a
   project that has a locked pin, avocado prints
   `pin ignored: AVOCADO_RELEASEVER is set to <value>; the locked pin <pin> is not used`
