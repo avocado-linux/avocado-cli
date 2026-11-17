@@ -99,6 +99,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `1.1.0-dev` still satisfy it.
 
 ### Fixed
+- **`avocado connect` commands honor `AVOCADO_CONNECT_TOKEN` and
+  `AVOCADO_CONNECT_URL`.** They used to read only `credentials.json`, so they
+  could send the saved profile's token to the saved profile's server while
+  you meant another. Now the token, when set, replaces the saved profiles,
+  at `AVOCADO_CONNECT_URL` or else `https://connect.peridio.com`, as feeds
+  already do. A URL without a token uses only the saved profiles for that
+  server, and fails naming both servers when there are none. `auth login`,
+  `logout`, `status`, `connect init` and `deploy --connect-sign` still use
+  the saved profiles, and the env token is never written to disk.
+- **`credentials.json` is owner-only.** `avocado connect auth login` wrote
+  it `0644`, readable by every user on the host. It is now `0600` in a `0700`
+  directory, and a looser file or directory is tightened on the next save.
 - **An HTTP 429 from a package repository is now reported as one.** dnf
   reports a repository's `429 Too Many Requests` as "No more mirrors to
   try", which reads as a broken repository. When a run fails, the CLI now

@@ -680,13 +680,35 @@ pub fn load_stored_config() -> Result<Option<ConnectConfig>> {
     Ok(Some(config))
 }
 
-/// Save the full config to disk.
+/// Save the full config to disk, readable by its owner only: it holds API
+/// tokens. A file or directory left looser by an older CLI is tightened.
 pub fn save_config(config: &ConnectConfig) -> Result<()> {
     let dir = get_config_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
     let path = dir.join(CONFIG_FILE);
     let json = serde_json::to_string_pretty(config)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Failed to restrict directory: {}", dir.display()))?;
+        // Tighten before writing, so the new tokens never sit in a 0644 file.
+        if path.exists() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict config: {}", path.display()))?;
+        }
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(json.as_bytes()))
+            .with_context(|| format!("Failed to write config: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
     fs::write(&path, json)
         .with_context(|| format!("Failed to write config: {}", path.display()))?;
     Ok(())
@@ -2152,6 +2174,36 @@ mod tests {
             created_at: String::new(),
             organization_id: None,
         }
+    }
+
+    /// The saved credentials are owner-only, including a file an older CLI
+    /// left at 0644.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn saved_credentials_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", home.path());
+        let cfg =
+            ConnectConfig::new_with_profile("default", profile_at("https://connect.example", "t"));
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let saved = save_config(&cfg).and_then(|_| {
+            let path = get_config_path()?;
+            let fresh = (mode(&path), mode(path.parent().unwrap()));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755))?;
+            save_config(&cfg)?;
+            Ok((fresh, (mode(&path), mode(path.parent().unwrap()))))
+        });
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let (fresh, tightened) = saved.unwrap();
+        assert_eq!(fresh, (0o600, 0o700));
+        assert_eq!(tightened, (0o600, 0o700));
     }
 
     /// A token alone talks to the production server, as feeds do, never to
