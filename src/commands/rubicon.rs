@@ -495,11 +495,14 @@ impl RubiconCommand {
         // Before the ssh, so it drops after it: put back on every way out.
         #[cfg(unix)]
         let _term = tty.then(|| TermRestore::save(0)).flatten();
+        // Before the ssh: a signal between the spawn and the first poll of
+        // lazily registered handlers would kill the CLI and orphan the ssh.
+        let mut signals = Signals::new().context("console signal handlers")?;
         let mut child = tokio::process::Command::from(ssh)
             .kill_on_drop(true)
             .spawn()
             .context("ssh to the VM")?;
-        let st = wait_or_kill(&mut child, limit).await?;
+        let st = wait_or_kill(&mut child, limit, &mut signals).await?;
         if tty {
             eprintln!();
         }
@@ -533,12 +536,53 @@ impl Drop for TermRestore {
     }
 }
 
+/// The signals that end a console, registered as it is created so none
+/// is missed before the wait starts.
+#[cfg(unix)]
+struct Signals([tokio::signal::unix::Signal; 3]);
+
+#[cfg(unix)]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self([
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+        ]))
+    }
+
+    async fn recv(&mut self) {
+        let [int, term, hup] = &mut self.0;
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+struct Signals(tokio::signal::windows::CtrlC);
+
+#[cfg(windows)]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self(tokio::signal::windows::ctrl_c()?))
+    }
+
+    async fn recv(&mut self) {
+        self.0.recv().await;
+    }
+}
+
 /// Waits for the console's ssh; `None` once `limit` passes and it is
 /// killed. A signal kills it too: left running, an orphaned ssh keeps the
 /// board's console write lease from everyone after.
 async fn wait_or_kill(
     child: &mut tokio::process::Child,
     limit: Option<std::time::Duration>,
+    signals: &mut Signals,
 ) -> Result<Option<std::process::ExitStatus>> {
     let limit = async {
         match limit {
@@ -546,25 +590,9 @@ async fn wait_or_kill(
             None => std::future::pending::<()>().await,
         }
     };
-    #[cfg(unix)]
-    let signalled = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut int = signal(SignalKind::interrupt())?;
-        let mut term = signal(SignalKind::terminate())?;
-        let mut hup = signal(SignalKind::hangup())?;
-        tokio::select! {
-            _ = int.recv() => {}
-            _ = term.recv() => {}
-            _ = hup.recv() => {}
-        }
-        anyhow::Ok(())
-    };
-    #[cfg(not(unix))]
-    let signalled = async { Ok(tokio::signal::ctrl_c().await?) };
     tokio::select! {
         st = child.wait() => return Ok(Some(st.context("ssh to the VM")?)),
-        r = signalled => {
-            r.context("console signal handlers")?;
+        _ = signals.recv() => {
             child.kill().await.ok();
             bail!("console interrupted");
         }
@@ -848,11 +876,12 @@ mod tests {
     /// `--for` ends the session: the ssh is killed, not left holding the lease.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn console_limit_kills_the_ssh() {
         let mut child = sleeper();
-        let st = wait_or_kill(&mut child, Some(std::time::Duration::from_millis(100)))
-            .await
-            .unwrap();
+        let mut signals = Signals::new().unwrap();
+        let limit = Some(std::time::Duration::from_millis(100));
+        let st = wait_or_kill(&mut child, limit, &mut signals).await.unwrap();
         assert!(st.is_none());
         assert!(child.try_wait().unwrap().is_some(), "ssh still running");
     }
@@ -863,14 +892,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn console_sigterm_kills_the_ssh() {
+        let mut signals = Signals::new().unwrap();
         let mut child = sleeper();
         let pid = child.id().unwrap();
-        tokio::spawn(async {
-            // After wait_or_kill has its handlers in place.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
-        });
-        let err = wait_or_kill(&mut child, None).await.unwrap_err();
+        // Before the wait is polled: the handlers are already in place.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        let err = wait_or_kill(&mut child, None, &mut signals)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("interrupted"), "{err}");
         assert!(
             child.try_wait().unwrap().is_some(),
