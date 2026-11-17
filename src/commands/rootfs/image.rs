@@ -27,8 +27,8 @@ pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 /// `-H` follows `/boot` itself when it is a symlink to a directory (as the
 /// old `boot/*` glob did), but only to a directory below `$ROOTFS_WORK`: an
 /// absolute link resolves in the build container, not the image, and is
-/// refused. Only a missing `/boot` is tolerated: a refusal or `find` failure
-/// exits the build script, which runs without `set -e` in a runtime build.
+/// refused. Only a missing `/boot` is tolerated; a refusal or `find` failure
+/// exits the build script, whether or not `set -e` is in effect there.
 pub const BOOT_STRIP_KEEP_DIRS: &str = "[ ! -d \"$ROOTFS_WORK/boot\" ] || \
 case \"$(cd -P \"$ROOTFS_WORK/boot\" && pwd -P)\" in \
 \"$(cd -P \"$ROOTFS_WORK\" && pwd -P)\"/?*) find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete ;; \
@@ -1021,7 +1021,7 @@ mod tests {
             .output()
             .unwrap();
 
-        // The build script has no `set -e`: the refusal must stop it.
+        // Even without `set -e`, the refusal stops the script.
         assert!(!status.status.success());
         assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
         assert!(outside.path().join("keep").exists());
@@ -1029,7 +1029,9 @@ mod tests {
     }
 
     /// A strip that cannot delete fails the hook instead of imaging the kernel.
-    #[cfg(unix)]
+    /// Linux only: BSD find (macOS) exits 0 on a delete it was denied, while
+    /// the build runs GNU find in the SDK container.
+    #[cfg(target_os = "linux")]
     #[test]
     fn boot_strip_fails_when_find_fails() {
         use std::os::unix::fs::PermissionsExt;
@@ -1049,7 +1051,7 @@ mod tests {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // root ignores directory write bits; only judge a delete that failed.
-        // The build script has no `set -e`: the failure must stop it.
+        // Even without `set -e`, the failure stops the script.
         if blocked {
             assert!(!status.status.success());
             assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
