@@ -623,25 +623,16 @@ echo "{INSTALLED_REPORT_END}"
         );
 
         let container_helper = SdkContainer::new().verbose(self.verbose);
-        let run_config = RunConfig {
-            container_image: self.container_image.clone(),
-            target: self.target.clone(),
-            command: script,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: self.repo_url.clone(),
-            feeds: self.feeds.clone(),
-            repo_release: self.repo_release.clone(),
-            container_args: self.container_args.clone(),
-            sdk_arch: self.sdk_arch.clone(),
-            ..Default::default()
-        };
+        let run_config = self.package_group_run_config(script);
+        let (repo_url, user_agent) = crate::utils::container::rate_limit_probe_target(&run_config);
 
         let out = container_helper
             .run_in_container_capture(run_config)
             .await?;
         if !out.success {
+            // Capture skips run_in_container's 429 check, and dnf reports a
+            // 429 as "No more mirrors to try".
+            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
             return Err(anyhow::anyhow!(
                 "Failed to fetch package extension(s): {}{}",
                 entries
@@ -665,6 +656,25 @@ echo "{INSTALLED_REPORT_END}"
         }
 
         Ok(parse_installed_report(&out.stdout))
+    }
+
+    /// The container run for a package-group fetch: this fetcher's feed, so a
+    /// failed download is probed for a 429 where dnf downloaded from.
+    fn package_group_run_config(&self, script: String) -> RunConfig {
+        RunConfig {
+            container_image: self.container_image.clone(),
+            target: self.target.clone(),
+            command: script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: self.repo_url.clone(),
+            feeds: self.feeds.clone(),
+            repo_release: self.repo_release.clone(),
+            container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        }
     }
 
     /// Fetch an extension from the avocado package repository
@@ -1032,6 +1042,19 @@ pub fn missing_path_source_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed package fetch is probed for a 429 at the fetcher's own feed,
+    /// with the User-Agent its dnf sent.
+    #[test]
+    fn a_package_fetch_probes_its_own_feed_for_a_rate_limit() {
+        let fetcher = ExtensionFetcher::new("c.yaml".into(), "t".into(), "img".into(), false)
+            .with_repo_url(Some("https://feed.example/repo".into()));
+        let (url, ua) = crate::utils::container::rate_limit_probe_target(
+            &fetcher.package_group_run_config(String::new()),
+        );
+        assert_eq!(url, "https://feed.example/repo");
+        assert_eq!(ua, crate::utils::feeds::user_agent_for(None, None));
+    }
 
     /// The mistake this message exists for: the source lives at `<base>/foo`
     /// and the config says `extensions/foo`. The old text echoed the joined

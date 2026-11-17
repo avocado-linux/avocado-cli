@@ -461,12 +461,12 @@ async fn handle_tcp(
 /// counts toward idle. The VM stays awake until the call finishes.
 ///
 /// `count`-false: infrastructure (containers watcher's `/events` stream,
-/// snapshot refreshes) — does NOT wake VM and does NOT ensure the
-/// tunnel. Just connects to the existing tunnel socket; if it's down
-/// (paused VM, boot still in progress), returns a fast error. Caller
-/// backs off and retries. This is what lets hibernation actually stick
-/// when the desktop is open: the watcher's reconnect attempts can't
-/// pin the VM awake by themselves, only user activity can.
+/// snapshot refreshes) — does NOT wake the VM. With the tunnel up it
+/// connects to it; with it down it returns a fast error, and if the VM is
+/// awake it also brings the tunnel up in the background for the caller's
+/// retry. A paused VM stays paused: this is what lets hibernation actually
+/// stick when the desktop is open, since the watcher's reconnect attempts
+/// can't pin the VM awake by themselves, only user activity can.
 async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -> Result<()> {
     if count {
         state.active_conns.fetch_add(1, Ordering::Relaxed);

@@ -793,7 +793,7 @@ fn feed_user_agent(feeds: Option<&crate::utils::feeds::FeedMaterialization>) -> 
 
 /// The feed a failed run's dnf talked to and the User-Agent it sent, for the
 /// post-failure 429 check.
-fn rate_limit_probe_target(config: &RunConfig) -> (String, String) {
+pub(crate) fn rate_limit_probe_target(config: &RunConfig) -> (String, String) {
     let repo_url = config
         .repo_url
         .clone()
