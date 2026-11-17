@@ -58,7 +58,8 @@ pub const PRIVATE: &[&str] = &[
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// `false` turns stacks off (plain volumes). On by default.
+    /// `true` turns stacks on at the default root. Off by default: stacks are opt-in while they
+    /// roll out (a `root:` or `AVOCADO_STACKS` also turns them on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Stacks directory on the docker host (absolute); `DEFAULT_ROOT` when unset. `None` after
@@ -155,8 +156,9 @@ fn on(v: &str) -> bool {
     )
 }
 
-/// Settings from a config file's text and the environment, validated. Stacks are on unless
-/// `enabled: false` or `AVOCADO_STACKS=off` (or `0`, or empty).
+/// Settings from a config file's text and the environment, validated. Stacks are opt-in: on
+/// with `enabled: true`, a `root:`, or `AVOCADO_STACKS=on` (or a path); `enabled: false` or
+/// `AVOCADO_STACKS=off` (or `0`, or empty) keeps them off.
 pub fn resolve_settings(file: Option<&str>, env: &EnvSettings) -> Result<Settings> {
     let mut s: Settings = match file {
         Some(t) if !t.trim().is_empty() => {
@@ -164,14 +166,14 @@ pub fn resolve_settings(file: Option<&str>, env: &EnvSettings) -> Result<Setting
         }
         _ => Settings::default(),
     };
-    s.explicit = s.root.is_some();
+    s.explicit = s.root.is_some() || s.enabled == Some(true);
     let file_root = s.root.take().unwrap_or_else(|| DEFAULT_ROOT.to_string());
     s.root = match env.root.map(str::trim) {
         // `AVOCADO_STACKS=1` (or `on`): on, at the file's root or the default.
         Some(r) if on(r) => Some(file_root),
         Some(r) if off(r) => None,
         Some(r) => Some(r.to_string()),
-        None => (s.enabled != Some(false)).then_some(file_root),
+        None => s.enabled.unwrap_or(s.explicit).then_some(file_root),
     };
     s.explicit |= env.root.is_some();
     if let Some(h) = env.helper.filter(|h| !h.is_empty()) {
@@ -285,19 +287,13 @@ pub async fn active_root(tool: &str) -> Option<String> {
             let root = s.root.clone()?;
             match preflight(tool, &root, &s).await {
                 (Ok(()), _) => Some(root),
-                (Err(e), fresh) => {
+                (Err(e), _) => {
                     let msg = format!(
                         "Stacks at {root} cannot run on this host ({e}). Using plain volumes \
                          (`avocado stack config` checks again)."
                     );
-                    // Configured on purpose: say it every time. On by default: a note when the
-                    // check ran, not on every command after, since plain volumes are then this
-                    // host's normal path (`AVOCADO_STACKS=off` silences it).
-                    if s.explicit {
-                        print_warning(&msg, OutputLevel::Normal);
-                    } else if fresh {
-                        print_info(&msg, OutputLevel::Normal);
-                    }
+                    // Stacks are opt-in, so this host asked for them: say it every time.
+                    print_warning(&msg, OutputLevel::Normal);
                     None
                 }
             }
@@ -1396,26 +1392,48 @@ mod tests {
         );
     }
 
-    /// Stacks are the default: no file and no environment means on, at the default root, with
-    /// the release's helper image and a free-space floor; only `enabled: false` or
-    /// `AVOCADO_STACKS=off` turns them off, and `AVOCADO_STACKS=on` overrides the file.
+    /// Stacks are opt-in: no file and no environment means off. `enabled: true`, a `root:` or
+    /// `AVOCADO_STACKS=on` turns them on, at the default root with the release's helper image
+    /// and a free-space floor; `enabled: false` keeps a configured root off, and
+    /// `AVOCADO_STACKS=on` overrides the file.
     #[test]
-    fn stacks_are_on_by_default() {
-        let d = resolve_settings(None, &EnvSettings::default()).unwrap();
+    fn stacks_are_opt_in() {
+        assert_eq!(
+            resolve_settings(None, &EnvSettings::default())
+                .unwrap()
+                .root,
+            None
+        );
+        let d = resolve_settings(Some("enabled: true\n"), &EnvSettings::default()).unwrap();
         assert_eq!(d.root.as_deref(), Some(DEFAULT_ROOT));
-        assert!(!d.explicit, "a default root falls back quietly");
+        assert!(d.explicit, "opted in: a failed check warns every time");
         assert!(d.commits());
         assert!(d
             .helper_image()
             .starts_with("ghcr.io/avocado-linux/avocado-stacks:"));
         assert_eq!(d.gc.min_free.as_deref(), Some(DEFAULT_MIN_FREE));
         assert!(d.gc_args().unwrap().is_some());
-        assert!(
-            !resolve_settings(Some("commit: false\n"), &EnvSettings::default())
+        assert_eq!(
+            resolve_settings(Some("root: /srv/stacks\n"), &EnvSettings::default())
                 .unwrap()
-                .commits()
+                .root
+                .as_deref(),
+            Some("/srv/stacks")
         );
-        let disabled = "enabled: false\n";
+        assert_eq!(
+            resolve_settings(None, &env(Some("on"), None, None))
+                .unwrap()
+                .root
+                .as_deref(),
+            Some(DEFAULT_ROOT)
+        );
+        assert!(!resolve_settings(
+            Some("enabled: true\ncommit: false\n"),
+            &EnvSettings::default()
+        )
+        .unwrap()
+        .commits());
+        let disabled = "enabled: false\nroot: /srv/stacks\n";
         assert_eq!(
             resolve_settings(Some(disabled), &EnvSettings::default())
                 .unwrap()
@@ -1427,11 +1445,14 @@ mod tests {
                 .unwrap()
                 .root
                 .as_deref(),
-            Some(DEFAULT_ROOT)
+            Some("/srv/stacks")
         );
         // A configured limit replaces the default floor rather than adding to it.
-        let max =
-            resolve_settings(Some("gc:\n  max_size: 100G\n"), &EnvSettings::default()).unwrap();
+        let max = resolve_settings(
+            Some("enabled: true\ngc:\n  max_size: 100G\n"),
+            &EnvSettings::default(),
+        )
+        .unwrap();
         assert_eq!(max.gc.min_free, None);
     }
 

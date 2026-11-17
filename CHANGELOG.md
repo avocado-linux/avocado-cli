@@ -93,8 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still works and is still the place for any flag without a key; where both
   set the same thing, the block wins.
 
-- **Stacks: SDK installs shared across projects, on by default.**
-  `sdk install` builds a project's
+- **Stacks (opt-in): SDK installs shared across projects.** With
+  `enabled: true` in `<config dir>/avocado/stacks.yaml` (or
+  `AVOCADO_STACKS=on`), `sdk install` builds a project's
   `/opt/_avocado/<target>` as content-addressed layers: the SDK bootstrap,
   the target base (rootfs, initramfs and the platform SDK packages) and the
   project's own additions. Another project whose inputs match reuses them
@@ -104,11 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its private paths (extension and runtime outputs, build stamps) out of
   shared layers. Needs rootful docker that can run `--privileged` and Linux
   6.5+ (layers mount file-backed on 6.12+, through loop devices below); a
-  host that cannot run stacks uses plain volumes, with a note. Stacks live
+  host that cannot run stacks uses plain volumes, with a warning. Stacks live
   in `/var/lib/avocado/stacks` on the docker host unless `root:` in
   `<config dir>/avocado/stacks.yaml` (or `AVOCADO_STACKS`) says otherwise,
-  and keep 20 GiB free there unless `gc:` sets a limit. `enabled: false` or
-  `AVOCADO_STACKS=off` turns them off. `commit: false` (or
+  and keep 20 GiB free there unless `gc:` sets a limit. A `root:` also turns
+  them on; `enabled: false` or `AVOCADO_STACKS=off` keeps them off. `commit: false` (or
   `AVOCADO_STACKS_COMMIT=0`) reuses layers but never commits one, for jobs
   whose inputs are not trusted, such as CI building pull requests next to
   release builds on one host. A project installed on a plain volume moves
