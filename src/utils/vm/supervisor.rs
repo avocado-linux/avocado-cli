@@ -137,10 +137,13 @@ impl State {
 
     /// Halt the VM and tear down the tunnel so QEMU isn't holding any
     /// kernel-side state that the guest can't service while paused.
-    async fn pause(self: &Arc<Self>) -> Result<()> {
+    /// `false` when it turned out not to be idle any more: the idle check
+    /// ran before the lock, and a connection or an outside wake can have
+    /// come in since.
+    async fn pause(self: &Arc<Self>) -> Result<bool> {
         let _guard = self.qmp_lock.lock().await;
-        if self.paused.load(Ordering::Relaxed) {
-            return Ok(());
+        if self.paused.load(Ordering::Relaxed) || !self.idle() {
+            return Ok(false);
         }
         // Tear down tunnel first; its SSH keepalives would otherwise
         // timeout while QEMU is stopped and the child would die in
@@ -150,7 +153,39 @@ impl State {
             .await
             .context("QMP stop")?;
         self.paused.store(true, Ordering::Relaxed);
-        Ok(())
+        // An infra-lane `ensure_tunnel` that started before the flag was set
+        // can have brought one back up; it holds the tunnel lock until done.
+        self.kill_tunnel().await;
+        Ok(true)
+    }
+
+    /// No connection open and none for the idle threshold.
+    fn idle(&self) -> bool {
+        self.active_conns.load(Ordering::Relaxed) == 0
+            && now_ms() - self.last_activity_ms.load(Ordering::Relaxed) >= self.idle_threshold_ms
+    }
+
+    /// Clear a stale `paused`: something other than this supervisor (the
+    /// desktop waking a hibernated VM with its own QMP `cont`) can resume a
+    /// VM it paused. Restarts the idle clock so that VM gets its full
+    /// window before the next pause.
+    async fn sync_paused(self: &Arc<Self>) {
+        if !self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let _guard = self.qmp_lock.lock().await;
+        let running = async {
+            let mut client = QmpClient::connect(&self.qmp_socket).await.ok()?;
+            let status = client.execute("query-status", None).await.ok()?;
+            status["running"].as_bool()
+        };
+        if running.await == Some(true) {
+            // Fresh clock first, so the idle watcher never sees the VM awake
+            // with its pre-pause timestamp.
+            self.touch();
+            self.paused.store(false, Ordering::Relaxed);
+            slog!("VM was resumed outside the supervisor");
+        }
     }
 
     /// Spawn the SSH `-L` tunnel if it's not already running. Polls
@@ -158,6 +193,9 @@ impl State {
     /// to `connect()` immediately on return.
     async fn ensure_tunnel(self: &Arc<Self>) -> Result<()> {
         let mut lock = self.tunnel.lock().await;
+        if self.paused.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("VM is paused"));
+        }
         if let Some(pid) = *lock {
             if state::pid_alive(pid) && self.args.docker_socket_internal.exists() {
                 return Ok(());
@@ -440,9 +478,19 @@ async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -
             .context("bringing docker tunnel up")?;
     } else if !state.args.docker_socket_internal.exists() {
         // Infra: tunnel not currently up. Fail fast — caller (likely
-        // ContainersWatcher) backs off and retries; a future
-        // user-driven docker call will bring the tunnel up and the
-        // next retry will succeed.
+        // ContainersWatcher) backs off and retries. The VM can be awake
+        // without a tunnel (resumed by the TCP lane or by the desktop, or
+        // never asked for one since boot), so bring it up in the background
+        // for that retry. Never wake the VM for it.
+        state.sync_paused().await;
+        if !state.paused.load(Ordering::Relaxed) {
+            let s = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = s.ensure_tunnel().await {
+                    slog!("infra lane could not bring the docker tunnel up: {e:#}");
+                }
+            });
+        }
         return Err(anyhow::anyhow!(
             "docker tunnel not up (VM paused or still booting)"
         ));
@@ -490,13 +538,11 @@ async fn idle_watcher(state: Arc<State>) {
         if state.paused.load(Ordering::Relaxed) {
             continue;
         }
-        if state.active_conns.load(Ordering::Relaxed) > 0 {
-            continue;
-        }
-        let since = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
-        if since >= state.idle_threshold_ms {
+        if state.idle() {
+            let since = now_ms() - state.last_activity_ms.load(Ordering::Relaxed);
             match state.pause().await {
-                Ok(_) => slog!("paused VM after {since} ms idle"),
+                Ok(true) => slog!("paused VM after {since} ms idle"),
+                Ok(false) => {}
                 Err(e) => {
                     slog!("pause failed: {e}");
                     state.touch(); // back off
@@ -600,4 +646,87 @@ async fn wait_for_term() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("install ctrl-c handler")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    /// A QMP socket that answers `query-status` with `running`.
+    fn fake_qmp(dir: &Path, running: bool) -> PathBuf {
+        let socket = dir.join("qmp.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(rh).lines();
+            wh.write_all(b"{\"QMP\":{\"version\":{},\"capabilities\":[]}}\n")
+                .await
+                .unwrap();
+            lines.next_line().await.unwrap(); // qmp_capabilities
+            wh.write_all(b"{\"return\":{}}\n").await.unwrap();
+            lines.next_line().await.unwrap(); // query-status
+            let reply = format!("{{\"return\":{{\"running\":{running}}}}}\n");
+            wh.write_all(reply.as_bytes()).await.unwrap();
+        });
+        socket
+    }
+
+    fn paused_state(dir: &Path, qmp_socket: PathBuf) -> Arc<State> {
+        let path = |name: &str| dir.join(name);
+        Arc::new(State {
+            paused: AtomicBool::new(true),
+            active_conns: AtomicUsize::new(0),
+            last_activity_ms: AtomicI64::new(0),
+            qmp_socket: qmp_socket.clone(),
+            idle_threshold_ms: 60_000,
+            tunnel: Mutex::new(None),
+            qmp_lock: Mutex::new(()),
+            args: RunArgs {
+                user_port: 0,
+                internal_port: 0,
+                qmp_socket,
+                idle_after_secs: 60,
+                pid_file: path("pid"),
+                docker_socket: path("docker.sock"),
+                docker_socket_internal: path("docker-internal.sock"),
+                infra_port: 0,
+                docker_socket_stream: path("docker-stream.sock"),
+                ssh_key: path("key"),
+                known_hosts: path("known_hosts"),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_vm_resumed_by_someone_else_is_seen_as_awake() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = paused_state(dir.path(), fake_qmp(dir.path(), true));
+        state.sync_paused().await;
+        assert!(!state.paused.load(Ordering::Relaxed));
+        // Its idle window starts now, not at the last activity before the pause.
+        assert!(now_ms() - state.last_activity_ms.load(Ordering::Relaxed) < 5_000);
+    }
+
+    #[tokio::test]
+    async fn a_paused_vm_stays_paused_and_gets_no_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = paused_state(dir.path(), fake_qmp(dir.path(), false));
+        state.sync_paused().await;
+        assert!(state.paused.load(Ordering::Relaxed));
+        assert!(state.ensure_tunnel().await.is_err());
+        assert!(state.tunnel.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pause_queued_before_new_activity_does_not_stop_the_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        // No QMP server: reaching `stop` would be an error, not `Ok(false)`.
+        let state = paused_state(dir.path(), dir.path().join("no-qmp.sock"));
+        state.paused.store(false, Ordering::Relaxed);
+        assert!(state.idle());
+        state.touch();
+        assert!(!state.pause().await.unwrap());
+    }
 }
