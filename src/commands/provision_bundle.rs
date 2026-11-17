@@ -164,6 +164,9 @@ pub struct BundleRubicon {
     /// `rubicon.wiring`: what the board's pins are wired to, for the log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wiring: BTreeMap<String, String>,
+    /// `rubicon.analyzer`: the buses on the logic-analyzer channels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub analyzer: BTreeMap<String, crate::utils::config::RubiconBus>,
     /// `rubicon.console`: the rate and port the hub reads the console at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<crate::utils::config::RubiconConsole>,
@@ -186,10 +189,15 @@ pub fn bundle_rubicon(
         .as_ref()
         .map(|r| r.wiring.clone())
         .unwrap_or_default();
+    let analyzer = config
+        .rubicon
+        .as_ref()
+        .map(|r| r.analyzer.clone())
+        .unwrap_or_default();
     let console = config.rubicon.as_ref().and_then(|r| r.console.clone());
-    // Console settings and wiring are for the hub whether or not a profile
-    // has hooks (none: nothing runs around the provision).
-    if profiles.is_empty() && wiring.is_empty() && console.is_none() {
+    // Console settings, wiring and the analyzer are for the hub whether or
+    // not a profile has hooks (none: nothing runs around the provision).
+    if profiles.is_empty() && wiring.is_empty() && analyzer.is_empty() && console.is_none() {
         return Ok(None);
     }
     for name in profiles.keys() {
@@ -207,6 +215,7 @@ pub fn bundle_rubicon(
         profiles,
         run,
         wiring,
+        analyzer,
         console,
     }))
 }
