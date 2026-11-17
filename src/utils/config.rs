@@ -4702,27 +4702,13 @@ static OFFLINE_SKIP_PRINTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 impl Config {
-    /// Print the `--offline` skip notice unless `flag` says it already was.
+    /// Print a preflight skip notice unless `flag` says it already was.
     /// Returns true when it printed. Takes the flag so a test can use its own.
-    fn preflight_offline_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
+    fn preflight_skip_with(flag: &std::sync::atomic::AtomicBool, message: &str) -> bool {
         if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
-        crate::utils::output::print_info_stderr(
-            "skipping the feed preflight: --offline is set, so no feed is probed",
-        );
-        true
-    }
-
-    /// Print the `--runs-on` skip notice unless `flag` says it already was.
-    /// Returns true when it printed. Takes the flag so a test can use its own.
-    fn preflight_runs_on_skip_with(flag: &std::sync::atomic::AtomicBool) -> bool {
-        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return false;
-        }
-        crate::utils::output::print_info_stderr(
-            "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
-        );
+        crate::utils::output::print_info_stderr(message);
         true
     }
 
@@ -4783,11 +4769,17 @@ impl Config {
         runs_on: bool,
     ) -> Result<()> {
         if runs_on {
-            Self::preflight_runs_on_skip_with(&RUNS_ON_SKIP_PRINTED);
+            Self::preflight_skip_with(
+                &RUNS_ON_SKIP_PRINTED,
+                "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
+            );
             return Ok(());
         }
         if crate::utils::offline::is_offline() {
-            Self::preflight_offline_skip_with(&OFFLINE_SKIP_PRINTED);
+            Self::preflight_skip_with(
+                &OFFLINE_SKIP_PRINTED,
+                "skipping the feed preflight: --offline is set, so no feed is probed",
+            );
             return Ok(());
         }
         let probed = FEEDS_PROBED.get_or_init(Default::default);
@@ -15724,17 +15716,10 @@ mod invocation_feeds_tests {
     }
 
     #[test]
-    fn offline_skip_message_prints_once() {
+    fn preflight_skip_message_prints_once() {
         let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(Config::preflight_offline_skip_with(&flag));
-        assert!(!Config::preflight_offline_skip_with(&flag));
-    }
-
-    #[test]
-    fn runs_on_skip_message_prints_once() {
-        let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(Config::preflight_runs_on_skip_with(&flag));
-        assert!(!Config::preflight_runs_on_skip_with(&flag));
+        assert!(Config::preflight_skip_with(&flag, "skip"));
+        assert!(!Config::preflight_skip_with(&flag, "skip"));
     }
 }
 

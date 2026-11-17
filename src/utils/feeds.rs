@@ -385,6 +385,11 @@ impl ResolvedFeed {
             && self.placement.admits(stage)
     }
 
+    /// A Connect feed `stage` uses that has no token yet, so one must be minted.
+    fn needs_minted_token(&self, stage: FeedStage) -> bool {
+        self.kind == FeedKind::Connect && self.applies_to(stage) && self.credential.is_none()
+    }
+
     fn repo_file(&self, ca_in_container: Option<&str>) -> String {
         let mut s = format!(
             "[{name}]\nname={name}\nbaseurl={base}\nenabled=1\ngpgcheck={gpg}\n",
@@ -1256,11 +1261,7 @@ impl ResolvedFeedSet {
         // feed still needed a login and a network round trip. Later stages reuse
         // what earlier ones minted, so a feed is minted at most once per
         // invocation, and never at all if no stage needs it.
-        if !self
-            .feeds
-            .iter()
-            .any(|f| f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none())
-        {
+        if !self.feeds.iter().any(|f| f.needs_minted_token(stage)) {
             return Ok(self.minted_tier);
         }
         // A token is short-lived and minted over HTTPS, so nothing recorded can
@@ -1269,9 +1270,7 @@ impl ResolvedFeedSet {
             let names: Vec<&str> = self
                 .feeds
                 .iter()
-                .filter(|f| {
-                    f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
-                })
+                .filter(|f| f.needs_minted_token(stage))
                 .map(|f| f.name.as_str())
                 .collect();
             anyhow::bail!(
@@ -1303,9 +1302,11 @@ impl ResolvedFeedSet {
         let mut lowest: Option<u32> = self.minted_tier;
         let mut self_key_id: Option<String> = self.minted_key_id.clone();
         let mut key_seen = self.minted_key_id.is_some();
-        for feed in self.feeds.iter_mut().filter(|f| {
-            f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
-        }) {
+        for feed in self
+            .feeds
+            .iter_mut()
+            .filter(|f| f.needs_minted_token(stage))
+        {
             let org = feed.org.clone().ok_or_else(|| {
                 anyhow::anyhow!("repos.{}: a Connect feed without an org", feed.name)
             })?;

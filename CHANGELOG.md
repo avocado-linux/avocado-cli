@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once per run. The override still wins. See docs/releasever.md.
 - **`--offline` flag and `AVOCADO_OFFLINE`.** avocado skips its own
   latest-snapshot pointer lookup, the pin HEAD check and the feed preflight,
-  and uses the locked pin, printing it once. Commands whose purpose is a
-  network call, Connect login and `avocado upgrade`, still connect. An old
-  locked pin installs old packages. With no locked pin on the
+  and uses the locked pin, printing it once. It gates only those lookups, the
+  release check, the add-on check and the Connect token mint;
+  `init --reference`, `upgrade`, `vm update`, `connect` and `runtime deploy`
+  still connect. An old locked pin installs old packages. With no locked pin on the
   default repository it stops before any request and tells you to run
   `avocado update` online; another `distro.repo.url` proceeds unpinned with a
   notice. `avocado update` and an `org:` feed that needs a token fail with an
@@ -27,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
   RPMs by running the host `createrepo_c`, regenerated on every run. It fails
   with an error naming `createrepo_c` when the tool is not on PATH, and naming
-  the path when the directory is missing or not a directory. See
+  the path when the directory is missing or not a directory. A symlinked
+  directory leading back into its own path, which `createrepo_c` would follow
+  forever, fails naming the link before the tool runs. See
   `docs/feed-index.md`.
 - **Optional `provides`, `epoch` and scriptlet keys in `sdk.compile.<section>.package`.**
   `provides` adds one `Provides:` line per entry, `epoch` sets `Epoch:`, and
@@ -124,6 +127,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a volume that may belong to another daemon is kept.
 - **`avocado load --force` removes the volume it replaces.** It used to leave
   the previous build volume on disk.
+- **The offline pin, offline unpinned and `pin ignored` notices show under
+  the progress display.** `sdk install`, `ext install` and `runtime install`
+  dropped them, so an offline run gave no sign which pin it used, and an
+  overriding `AVOCADO_RELEASEVER` went unmentioned. They now print on stderr
+  above the task list.
+- **`sdk package` rejects a `requires` entry holding a newline.** The entry
+  was written into the spec unchecked, so a newline added spec lines of its
+  own. A newline or other control character now fails naming the section and
+  the entry, as `provides` already did, and a sub-package's `requires` under
+  `split` fails the same way, also naming the sub-package. A `%` macro in
+  `requires` still expands.
 
 ## [1.1.0] - 2026-11-11
 
