@@ -99,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `1.1.0-dev` still satisfy it.
 
 ### Fixed
+- **`deploy -d` refuses a device string with shell syntax in it.** The user
+  and host were pasted into the deploy script that runs in the SDK container, so
+  `-d '$(cmd)'` ran `cmd` there. The user may now hold only letters, digits,
+  `.`, `_` and `-`, and the host only those plus the `:` and `%` of an IPv6
+  address; neither may start with `-`. The script also escapes both values.
 - **An HTTP 429 from a package repository is now reported as one.** dnf
   reports a repository's `429 Too Many Requests` as "No more mirrors to
   try", which reads as a broken repository. When a run fails, the CLI now
