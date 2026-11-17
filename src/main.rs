@@ -2261,7 +2261,7 @@ async fn main() -> Result<()> {
         std::env::set_var("AVOCADO_NO_TUI", "1");
     }
 
-    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+    apply_offline(&cli);
 
     let update_handle = if should_check_for_updates(
         utils::offline::is_offline(),
@@ -5359,6 +5359,11 @@ enum HitlCommands {
     },
 }
 
+/// Set the process-wide offline mode from `--offline` or `AVOCADO_OFFLINE`.
+fn apply_offline(cli: &Cli) {
+    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+}
+
 /// Whether to spawn the background GitHub release check. `--offline` must not
 /// touch the network, and `upgrade`/`completion` have no use for the notice.
 fn should_check_for_updates(offline: bool, cmd_is_upgrade_or_completion: bool) -> bool {
@@ -5376,6 +5381,34 @@ mod tests {
         assert!(!should_check_for_updates(true, true));
         assert!(should_check_for_updates(false, false));
     }
+    #[test]
+    #[serial_test::serial(offline)]
+    fn offline_flag_and_env_reach_is_offline() {
+        // The flag is global, so it is accepted after the subcommand too.
+        let cases: [(&[&str], Option<&str>, bool); 5] = [
+            (&["avocado", "--offline", "feed", "index", "d"], None, true),
+            (&["avocado", "feed", "index", "d", "--offline"], None, true),
+            (&["avocado", "feed", "index", "d"], Some("1"), true),
+            (&["avocado", "feed", "index", "d"], Some("0"), false),
+            (&["avocado", "feed", "index", "d"], None, false),
+        ];
+        let mut seen = Vec::new();
+        for (args, env, _) in cases {
+            match env {
+                Some(v) => std::env::set_var("AVOCADO_OFFLINE", v),
+                None => std::env::remove_var("AVOCADO_OFFLINE"),
+            }
+            let parsed = Cli::try_parse_from(args).map(|cli| {
+                apply_offline(&cli);
+                utils::offline::is_offline()
+            });
+            seen.push(parsed.ok());
+        }
+        std::env::remove_var("AVOCADO_OFFLINE");
+        utils::offline::set_offline(false);
+        assert_eq!(seen, cases.map(|(_, _, want)| Some(want)).to_vec());
+    }
+
     #[test]
     fn feed_index_parses_directory() {
         let cli = Cli::try_parse_from(["avocado", "feed", "index", "/srv/rpms"]).unwrap();
