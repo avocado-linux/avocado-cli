@@ -380,6 +380,21 @@ impl Placement {
 }
 
 impl ResolvedFeed {
+    /// The feed's URL as this host reaches it, or `None` when it has none:
+    /// a path or built-in feed, a Connect feed not minted yet, or one whose
+    /// loopback host was rewritten for the container.
+    fn host_url(&self) -> Option<&str> {
+        match self.kind {
+            FeedKind::Url => Some(&self.configured_locator),
+            FeedKind::Connect
+                if !self.baseurl.starts_with("connect://") && !self.loopback_rewritten =>
+            {
+                Some(&self.baseurl)
+            }
+            _ => None,
+        }
+    }
+
     fn applies_to(&self, stage: FeedStage) -> bool {
         (self.stages.is_empty() || self.stages.contains(&stage.scope()))
             && self.placement.admits(stage)
@@ -467,6 +482,10 @@ pub struct FeedMaterialization {
     /// Key id of the credential the mint used, when it differs from the default
     /// profile's.
     pub key_id: Option<String>,
+    /// Each written feed's URL as the host reaches it (see
+    /// `ResolvedFeed::host_url`), by repo id, for probing the feed a
+    /// `--repo=` restricted run used.
+    pub host_urls: HashMap<String, String>,
     /// `--add-host` entries the container needs.
     pub add_hosts: Vec<String>,
     /// SHA-256 of the stage projection this was materialized from. Lets
@@ -1544,6 +1563,7 @@ impl ResolvedFeedSet {
         let mut env = vec![("AVOCADO_FEEDS_DIR".to_string(), container_stage_dir.clone())];
         let mut dnf_args = Vec::new();
         let mut add_hosts = Vec::new();
+        let mut host_urls = HashMap::new();
 
         if let Some(base) = self.distro_priority_base {
             env.push(("AVOCADO_DISTRO_PRIORITY_BASE".to_string(), base.to_string()));
@@ -1592,6 +1612,9 @@ impl ResolvedFeedSet {
             };
             let repo_path = dir.join(format!("{GENERATED_PREFIX}{}.repo", feed.name));
             fs::write(&repo_path, feed.repo_file(ca_in_container.as_deref()))?;
+            if let Some(url) = feed.host_url() {
+                host_urls.insert(feed.name.clone(), url.to_string());
+            }
             #[cfg(unix)]
             if feed.credential.is_some() {
                 use std::os::unix::fs::PermissionsExt;
@@ -1652,6 +1675,7 @@ impl ResolvedFeedSet {
             env,
             dnf_args,
             add_hosts,
+            host_urls,
             fingerprint,
         })
     }
@@ -1802,15 +1826,10 @@ pub async fn preflight_feeds(
                 }
                 continue;
             }
-            FeedKind::Url => feed.configured_locator.as_str(),
-            // The mint's host is only known once minted, and a loopback one has
-            // been rewritten for the container, which the host cannot reach.
-            FeedKind::Connect
-                if !feed.baseurl.starts_with("connect://") && !feed.loopback_rewritten =>
-            {
-                feed.baseurl.as_str()
-            }
-            FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
+            _ => match feed.host_url() {
+                Some(url) => url,
+                None => continue,
+            },
         };
         if !host_can_probe(locator) {
             continue;
@@ -3636,6 +3655,18 @@ distro:
                 .unwrap()
                 .unwrap();
         (c, set)
+    }
+
+    /// A materialized feed carries the URL the host reaches it at, so a
+    /// probe after a `--repo=` restricted run can ask that feed.
+    #[test]
+    fn materialization_records_each_feeds_host_url() {
+        let (_, set) = url_feed_set("https://named.example", "");
+        let m = set.materialize(FeedStage::Ext).unwrap();
+        assert_eq!(
+            m.host_urls.get("local").map(String::as_str),
+            Some("https://named.example/feed")
+        );
     }
 
     #[tokio::test]

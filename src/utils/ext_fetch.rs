@@ -279,6 +279,19 @@ fn order_repo_groups(
     ordered
 }
 
+/// The feed a failed fetch's dnf downloaded from: the named feed a
+/// `--repo=` restriction selects, when the host can reach it, else the
+/// SDK repository.
+fn probe_url(
+    repo_name: Option<&str>,
+    host_urls: Option<&std::collections::HashMap<String, String>>,
+    sdk_url: String,
+) -> String {
+    repo_name
+        .and_then(|r| host_urls?.get(r).cloned())
+        .unwrap_or(sdk_url)
+}
+
 /// Extension fetcher for downloading and installing remote extensions
 pub struct ExtensionFetcher {
     /// Path to the main configuration file
@@ -624,7 +637,12 @@ echo "{INSTALLED_REPORT_END}"
 
         let container_helper = SdkContainer::new().verbose(self.verbose);
         let run_config = self.package_group_run_config(script);
-        let (repo_url, user_agent) = crate::utils::container::rate_limit_probe_target(&run_config);
+        let (sdk_url, user_agent) = crate::utils::container::rate_limit_probe_target(&run_config);
+        let repo_url = probe_url(
+            repo_name,
+            self.feeds.as_ref().map(|f| &f.host_urls),
+            sdk_url,
+        );
 
         let out = container_helper
             .run_in_container_capture(run_config)
@@ -1054,6 +1072,24 @@ mod tests {
         );
         assert_eq!(url, "https://feed.example/repo");
         assert_eq!(ua, crate::utils::feeds::user_agent_for(None, None));
+    }
+
+    /// A `--repo=` restricted fetch is probed at that named feed, not the SDK
+    /// repository; an unrestricted or unknown one keeps the SDK URL.
+    #[test]
+    fn a_restricted_fetch_probes_the_named_feed() {
+        let urls = std::collections::HashMap::from([(
+            "vendor".to_string(),
+            "https://vendor.example/feed".to_string(),
+        )]);
+        let sdk = || "https://sdk.example/repo".to_string();
+        assert_eq!(
+            probe_url(Some("vendor"), Some(&urls), sdk()),
+            "https://vendor.example/feed"
+        );
+        assert_eq!(probe_url(None, Some(&urls), sdk()), sdk());
+        assert_eq!(probe_url(Some("other"), Some(&urls), sdk()), sdk());
+        assert_eq!(probe_url(Some("vendor"), None, sdk()), sdk());
     }
 
     /// The mistake this message exists for: the source lives at `<base>/foo`
