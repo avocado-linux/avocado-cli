@@ -611,6 +611,7 @@ mod tests {
             volume_name: "avo-previous".to_string(),
             source_path: project.display().to_string(),
             container_tool: "docker".to_string(),
+            stacks: false,
         }
         .save_to_dir(&project)
         .unwrap();
