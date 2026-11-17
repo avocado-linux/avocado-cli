@@ -373,15 +373,14 @@ fn announce_offline_pin(
     release: &str,
     channel: &str,
     snapshot: &str,
-) -> bool {
+) {
     if printed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return false;
+        return;
     }
     print_info_stderr(&format!(
         "Offline: using locked pin {release}/{channel} snapshot '{snapshot}'; \
          no newer-snapshot check was made."
     ));
-    true
 }
 
 /// What avocado itself last exported to `AVOCADO_RELEASEVER` in this process.
@@ -1180,9 +1179,11 @@ mod tests {
 
     #[test]
     fn offline_pin_line_prints_once() {
+        let tui = ActiveRenderer::new();
         let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(announce_offline_pin(&flag, "2026", "edge", "PINNED"));
-        assert!(!announce_offline_pin(&flag, "2026", "edge", "PINNED"));
+        announce_offline_pin(&flag, "2026", "edge", "ONCE");
+        announce_offline_pin(&flag, "2026", "edge", "ONCE");
+        assert_eq!(tui.count("snapshot 'ONCE'"), 1);
     }
 
     /// A test renderer registered as the process-wide active one, as
