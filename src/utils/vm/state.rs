@@ -7,7 +7,7 @@
 //! it carries the in-VM Docker volumes.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Paths under `~/.avocado/vm/`.
 #[derive(Debug, Clone)]
@@ -53,6 +53,23 @@ impl VmPaths {
     /// dir or the managed install).
     pub fn install_manifest(&self) -> PathBuf {
         self.install_dir().join("manifest.json")
+    }
+
+    /// Record `dir` as the source a bare `vm start` boots next (every
+    /// start, rebuild and update does). Absolute, so a start from another
+    /// directory finds the same dir, not one that happens to share its name.
+    pub fn record_source(&self, dir: &Path) {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let _ = std::fs::write(self.artifact_dir_file(), dir.display().to_string());
+    }
+
+    /// Select the managed install, if there is one, as the source: a
+    /// `vm update` that had nothing to download still means "boot the
+    /// managed install", as one that downloads does.
+    pub fn select_install(&self) {
+        if self.install_manifest().is_file() {
+            self.record_source(&self.install_dir());
+        }
     }
 
     /// Default artifact directory to boot from when the user didn't
@@ -333,9 +350,27 @@ mod tests {
         std::fs::write(dev.join("manifest.json"), "{}").unwrap();
         std::fs::write(paths.artifact_dir_file(), dev.display().to_string()).unwrap();
         assert_eq!(paths.default_vm_source(), Some(dev.clone()));
+        // An update that had nothing to download selects the install again.
+        paths.select_install();
+        assert_eq!(paths.default_vm_source(), Some(paths.install_dir()));
+        paths.record_source(&dev);
         // A pointer to a dir that's gone falls back to the install.
         std::fs::remove_dir_all(&dev).unwrap();
         assert_eq!(paths.default_vm_source(), Some(paths.install_dir()));
+    }
+
+    #[test]
+    fn a_relative_source_is_recorded_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path().join("vm"));
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // `--vm-source build` in project A; a later bare start runs elsewhere.
+        paths.record_source(Path::new("build"));
+        let saved = std::fs::read_to_string(paths.artifact_dir_file()).unwrap();
+        assert_eq!(
+            PathBuf::from(saved),
+            std::env::current_dir().unwrap().join("build")
+        );
     }
 
     #[test]
