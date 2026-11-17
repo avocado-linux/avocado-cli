@@ -4577,10 +4577,14 @@ fi
         script
     }
 
-    /// Parse a container argument, splitting on spaces while respecting quotes
+    /// Parse a container argument, splitting on spaces while respecting quotes.
+    /// Whitespace at a token's edges is dropped only when it is unquoted:
+    /// `PASSWORD="secret "` keeps its trailing space.
     pub(crate) fn parse_container_arg(arg: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
+        // Unquoted whitespace, kept only if more of the token follows it.
+        let mut pending = String::new();
         let mut in_quotes = false;
         let mut chars = arg.chars().peekable();
 
@@ -4590,25 +4594,33 @@ fi
                 // are a literal quote and backslash. Outside them a
                 // backslash is just a character, as in a Windows path.
                 '\\' if in_quotes && matches!(chars.peek(), Some('"' | '\\')) => {
+                    current.push_str(&std::mem::take(&mut pending));
                     current.extend(chars.next());
                 }
                 '"' => {
+                    current.push_str(&std::mem::take(&mut pending));
                     in_quotes = !in_quotes;
                 }
                 ' ' if !in_quotes => {
                     if !current.is_empty() {
-                        result.push(current.trim().to_string());
-                        current.clear();
+                        result.push(std::mem::take(&mut current));
+                    }
+                    pending.clear();
+                }
+                c if c.is_whitespace() && !in_quotes => {
+                    if !current.is_empty() {
+                        pending.push(c);
                     }
                 }
                 _ => {
+                    current.push_str(&std::mem::take(&mut pending));
                     current.push(ch);
                 }
             }
         }
 
         if !current.is_empty() {
-            result.push(current.trim().to_string());
+            result.push(current);
         }
 
         // If no spaces were found and no quotes, or if result is empty, return the original string
@@ -6891,6 +6903,15 @@ extensions:
             result,
             vec!["-e", "VAR=value with spaces", "--name", "test"]
         );
+    }
+
+    #[test]
+    fn test_parse_container_arg_trims_only_unquoted_edges() {
+        let result =
+            SdkContainer::parse_container_arg("-e \"PASSWORD=secret \"\t --network host\n");
+        assert_eq!(result, vec!["-e", "PASSWORD=secret ", "--network", "host"]);
+        let result = SdkContainer::parse_container_arg("-e \"A=\nx\n\"");
+        assert_eq!(result, vec!["-e", "A=\nx\n"]);
     }
 
     #[test]
