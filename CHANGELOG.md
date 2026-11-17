@@ -77,6 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dnf passthrough commands (`sdk dnf`, `runtime dnf`, `ext dnf` and `sdk run`)
   and `update` do not probe feeds. Where a command accepts `--runs-on`, the
   skip is reported once.
+- **The `docker` client no longer has to be installed.** `avocado` now talks
+  to the Docker daemon itself, over the Engine API, wherever it used to run
+  the `docker` command, so a host that reaches its daemon through an
+  avocado-vm needs nothing from Docker installed. `DOCKER_HOST` and the
+  current docker context are honoured as before. The `docker` command is
+  still what runs for `avocado container dev`, for `--runs-on` remotes, on
+  Windows, with a `--container-tool` other than `docker`, and when
+  `DOCKER_HOST` is an `ssh://` or TLS endpoint. Set `AVOCADO_DOCKER_CLI=1` to
+  use the `docker` command everywhere, as before.
+- **`container:` names the common container settings.** `sdk` and each
+  provision profile take a `container:` block with `privileged`,
+  `network_mode`, `volumes`, `devices`, `extra_hosts`, `cap_add` and
+  `environment`, spelled as Docker Compose spells them. `container_args`
+  still works and is still the place for any flag without a key; where both
+  set the same thing, the block wins.
 
 ### Changed
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's

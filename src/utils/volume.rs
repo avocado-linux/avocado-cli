@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
 use crate::utils::output::{print_info, OutputLevel};
@@ -154,7 +153,7 @@ pub async fn avo_abandonment_reason(
 
 /// Whether `volume_name` exists on the daemon `container_tool` talks to.
 async fn volume_exists_on(container_tool: &str, volume_name: &str) -> Result<bool> {
-    let output = AsyncCommand::new(container_tool)
+    let output = crate::utils::engine::command(container_tool)
         .args(["volume", "inspect", volume_name])
         .output()
         .await
@@ -308,7 +307,7 @@ impl VolumeManager {
 
     /// List every `avo-*` docker volume name.
     async fn list_avo_volumes(&self) -> Result<Vec<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "ls", "--format", "{{.Name}}"])
             .output()
             .await
@@ -335,7 +334,7 @@ impl VolumeManager {
     /// active project's volume as abandoned and delete it. The caller skips
     /// the volume on `Err`.
     async fn inspect_source_path_label(&self, volume_name: &str) -> Result<Option<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "inspect", volume_name])
             .output()
             .await
@@ -362,7 +361,7 @@ impl VolumeManager {
 
     /// Create a docker volume with metadata
     async fn create_volume(&self, state: &VolumeState) -> Result<()> {
-        let mut cmd = AsyncCommand::new(&self.container_tool);
+        let mut cmd = crate::utils::engine::command(&self.container_tool);
         cmd.args(["volume", "create"]);
 
         // Add label with source path metadata
@@ -399,7 +398,7 @@ impl VolumeManager {
     /// Run `volume rm` one time. Returns `None` when the volume is gone
     /// (removed now, or not there), and the daemon's stderr when it is not.
     async fn try_remove_volume(&self, volume_name: &str) -> Result<Option<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()
             .await
@@ -483,13 +482,13 @@ impl VolumeManager {
 
             for container_id in &containers {
                 // Kill the container (faster than stop)
-                let _ = AsyncCommand::new(&self.container_tool)
+                let _ = crate::utils::engine::command(&self.container_tool)
                     .args(["kill", container_id])
                     .output()
                     .await;
 
                 // Remove the container
-                let output = AsyncCommand::new(&self.container_tool)
+                let output = crate::utils::engine::command(&self.container_tool)
                     .args(["rm", "-f", container_id])
                     .output()
                     .await
@@ -521,7 +520,7 @@ impl VolumeManager {
     async fn get_containers_using_volume(&self, volume_name: &str) -> Result<Vec<String>> {
         // Use docker ps with filter to find containers using this volume
         // This includes both running and stopped containers
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args([
                 "ps",
                 "-a",
@@ -562,7 +561,7 @@ impl VolumeManager {
         // Find containers that:
         // 1. Use the specified volume
         // 2. Have a name matching the explorer pattern (avocado-explorer-*)
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args([
                 "ps",
                 "-a",
@@ -625,14 +624,14 @@ impl VolumeManager {
 
         for container_id in &containers {
             // Stop the container gracefully with short timeout
-            let _ = AsyncCommand::new(&self.container_tool)
+            let _ = crate::utils::engine::command(&self.container_tool)
                 // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "1", container_id])
                 .output()
                 .await;
 
             // Remove the container
-            let output = AsyncCommand::new(&self.container_tool)
+            let output = crate::utils::engine::command(&self.container_tool)
                 .args(["rm", "-f", container_id])
                 .output()
                 .await

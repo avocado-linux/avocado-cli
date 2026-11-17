@@ -11,7 +11,6 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use tokio::process::Command;
 
 /// Copy `<container_path>` from the SDK volume to `<host_path>`. Creates the
 /// host path's parent if missing.
@@ -35,7 +34,7 @@ pub async fn copy_volume_path_to_host(
         &format!("{volume_name}:/opt/_avocado:ro"),
         image,
     )?;
-    let result = Command::new(container_tool)
+    let result = crate::utils::engine::command(container_tool)
         .args([
             "cp",
             &format!("{cid}:{container_path}"),

@@ -439,7 +439,7 @@ impl NfsServer {
         }
 
         // Start the container
-        let output = AsyncCommand::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .args(&args)
             .output()
             .await
@@ -487,7 +487,7 @@ impl NfsServer {
         }
 
         // Verify container is running
-        let check_output = AsyncCommand::new(container_tool)
+        let check_output = crate::utils::engine::command(container_tool)
             .args(["inspect", "-f", "{{.State.Running}}", &container_name])
             .output()
             .await?;
@@ -496,7 +496,7 @@ impl NfsServer {
             || String::from_utf8_lossy(&check_output.stdout).trim() != "true"
         {
             // Get container logs for debugging
-            let logs = AsyncCommand::new(container_tool)
+            let logs = crate::utils::engine::command(container_tool)
                 .args(["logs", &container_name])
                 .output()
                 .await
@@ -548,14 +548,14 @@ impl NfsServer {
             }
 
             // Stop the container
-            let _ = AsyncCommand::new(container_tool)
+            let _ = crate::utils::engine::command(container_tool)
                 // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "2", container_name])
                 .output()
                 .await;
 
             // Remove the container (should already be removed due to --rm, but just in case)
-            let _ = AsyncCommand::new(container_tool)
+            let _ = crate::utils::engine::command(container_tool)
                 .args(["rm", "-f", container_name])
                 .output()
                 .await;
@@ -696,7 +696,7 @@ pub async fn get_docker_volume_mountpoint(
     container_tool: &str,
     volume_name: &str,
 ) -> Result<PathBuf> {
-    let output = AsyncCommand::new(container_tool)
+    let output = crate::utils::engine::command(container_tool)
         .args([
             "volume",
             "inspect",

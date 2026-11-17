@@ -486,8 +486,8 @@ impl ResolvedFeedSet {
         config_dir: &Path,
         releasever: Option<&str>,
     ) -> Result<Option<Self>> {
-        let args =
-            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        let args = Config::process_container_args(config.get_sdk_container_args().as_ref())
+            .unwrap_or_default();
         Self::resolve_with_container_args(config, target, config_dir, releasever, &args)
     }
 
@@ -528,8 +528,8 @@ impl ResolvedFeedSet {
         releasever: Option<&str>,
         loopback_isolated: bool,
     ) -> Result<Option<Self>> {
-        let args =
-            Config::process_container_args(config.get_sdk_container_args()).unwrap_or_default();
+        let args = Config::process_container_args(config.get_sdk_container_args().as_ref())
+            .unwrap_or_default();
         Self::resolve_inner(
             config,
             target,

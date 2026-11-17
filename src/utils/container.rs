@@ -6,7 +6,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
 use crate::utils::tui::{TaskId, TaskRenderer, TaskStatus};
@@ -402,7 +401,7 @@ pub async fn ensure_cross_arch_emulation(container_tool: &str, sdk_arch: &str) -
         OutputLevel::Normal,
     );
 
-    let output = AsyncCommand::new(container_tool)
+    let output = crate::utils::engine::command(container_tool)
         .args([
             "run",
             "--privileged",
@@ -1126,7 +1125,7 @@ impl SessionContainers {
     /// the name is what makes an orphan identifiable; a live pid is never
     /// touched, so concurrent invocations do not reap each other.
     pub fn sweep_abandoned(container_tool: &str) {
-        let out = std::process::Command::new(container_tool)
+        let out = crate::utils::engine::std_command(container_tool)
             .args([
                 "ps",
                 "-a",
@@ -1148,7 +1147,7 @@ impl SessionContainers {
             if pid == std::process::id() as i32 || pid_is_alive(pid) {
                 continue;
             }
-            let _ = std::process::Command::new(container_tool)
+            let _ = crate::utils::engine::std_command(container_tool)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1175,7 +1174,7 @@ impl SessionContainers {
                 names.push(name);
             } else {
                 // Started without --rm: the user wants the stopped container kept.
-                let _ = std::process::Command::new(container_tool)
+                let _ = crate::utils::engine::std_command(container_tool)
                     // stdio-flags-ok: docker stop timeout in seconds, not a tty
                     .args(["stop", "-t", "2", &name])
                     .stdout(Stdio::null())
@@ -1185,7 +1184,7 @@ impl SessionContainers {
         }
         names.extend(Self::active_names());
         for name in names {
-            let _ = std::process::Command::new(container_tool)
+            let _ = crate::utils::engine::std_command(container_tool)
                 .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1311,7 +1310,7 @@ impl SessionContainers {
         cmd.push("-c".to_string());
         cmd.push(format!("sleep {SESSION_KEEPALIVE_SECS}"));
 
-        let out = std::process::Command::new(container_tool)
+        let out = crate::utils::engine::std_command(container_tool)
             .args(&cmd)
             .output()
             .context("failed to start the session container")?;
@@ -1323,7 +1322,7 @@ impl SessionContainers {
         }
 
         if with_mounts {
-            let mount_out = std::process::Command::new(container_tool)
+            let mount_out = crate::utils::engine::std_command(container_tool)
                 .args([
                     "exec",
                     &name,
@@ -1337,7 +1336,7 @@ impl SessionContainers {
                     Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
                     Err(e) => e.to_string(),
                 };
-                let _ = std::process::Command::new(container_tool)
+                let _ = crate::utils::engine::std_command(container_tool)
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -1391,7 +1390,7 @@ impl SessionContainers {
         // starvation `block_in_place_if_async` exists to prevent for container
         // creation.
         block_in_place_if_async(|| {
-            std::process::Command::new(container_tool)
+            crate::utils::engine::std_command(container_tool)
                 .args(&argv)
                 .output()
                 .context("failed to exec in the volume session container")
@@ -1683,7 +1682,7 @@ const SESSION_KEEPALIVE_SECS: u64 = 24 * 60 * 60;
 /// container that has gone away (keepalive expired, crash, outside `rm`) before
 /// it is handed back for another `exec`.
 fn container_is_running(container_tool: &str, name: &str) -> bool {
-    let out = std::process::Command::new(container_tool)
+    let out = crate::utils::engine::std_command(container_tool)
         .args(["inspect", "-f", "{{.State.Running}}", name])
         .output();
     matches!(
@@ -3163,7 +3162,7 @@ impl SdkContainer {
         }
 
         // Execute command and capture output
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -3537,7 +3536,7 @@ impl SdkContainer {
         }
 
         if detach {
-            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
             cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
@@ -3565,7 +3564,7 @@ impl SdkContainer {
             }
         } else {
             // In non-detached mode, wait for completion with Ctrl-C handling.
-            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
             cmd.args(&container_cmd[1..]);
 
             // When a TUI renderer is globally active, pipe output instead of
@@ -3709,7 +3708,7 @@ impl SdkContainer {
         container_name: Option<&str>,
     ) {
         if let Some(name) = container_name {
-            let stop_result = AsyncCommand::new(&self.container_tool)
+            let stop_result = crate::utils::engine::command(&self.container_tool)
                 // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "2", name])
                 .stdout(Stdio::null())
@@ -3717,7 +3716,7 @@ impl SdkContainer {
                 .status()
                 .await;
             if !matches!(&stop_result, Ok(s) if s.success()) {
-                let _ = AsyncCommand::new(&self.container_tool)
+                let _ = crate::utils::engine::command(&self.container_tool)
                     .args(["kill", name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -3764,7 +3763,7 @@ impl SdkContainer {
             .renderer
             .set_status(&tui_ctx.task_id, TaskStatus::Running);
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         // Pipe stdout/stderr so we can capture output line by line.
         // The container still gets a PTY (-t flag) so programs like dnf
@@ -3818,7 +3817,7 @@ impl SdkContainer {
             _ = tokio::signal::ctrl_c() => {
                 // Stop the container gracefully
                 if let Some(name) = container_name {
-                    let _ = AsyncCommand::new(&self.container_tool)
+                    let _ = crate::utils::engine::command(&self.container_tool)
                         // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", name])
                         .stdout(Stdio::null())
@@ -3960,7 +3959,7 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -4552,10 +4551,16 @@ fi
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
-        let chars = arg.chars().peekable();
+        let mut chars = arg.chars().peekable();
 
-        for ch in chars {
+        while let Some(ch) = chars.next() {
             match ch {
+                // Inside quotes, as in a shell's double quotes, `\"` and `\\`
+                // are a literal quote and backslash. Outside them a
+                // backslash is just a character, as in a Windows path.
+                '\\' if in_quotes && matches!(chars.peek(), Some('"' | '\\')) => {
+                    current.extend(chars.next());
+                }
                 '"' => {
                     in_quotes = !in_quotes;
                 }
@@ -4636,7 +4641,7 @@ fi
             );
         }
 
-        let mut cmd = AsyncCommand::new(create_cmd[0]);
+        let mut cmd = crate::utils::engine::command(create_cmd[0]);
         cmd.args(&create_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -4669,7 +4674,7 @@ fi
                 );
             }
 
-            let mut cmd = AsyncCommand::new(cp_cmd[0]);
+            let mut cmd = crate::utils::engine::command(cp_cmd[0]);
             cmd.args(&cp_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -4713,7 +4718,7 @@ fi
             &container_name_str,
         ];
 
-        let mut cmd = AsyncCommand::new(rm_cmd[0]);
+        let mut cmd = crate::utils::engine::command(rm_cmd[0]);
         cmd.args(&rm_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -7340,7 +7345,7 @@ extensions:
             let dir = tempfile::tempdir().unwrap();
             let container = container_with_tool(stub_tool(dir.path()));
             let pid_file = dir.path().join("pid");
-            let mut child = AsyncCommand::new("sh")
+            let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
                 .spawn()
@@ -7369,7 +7374,7 @@ extensions:
         async fn a_finished_container_returns_its_status() {
             let dir = tempfile::tempdir().unwrap();
             let container = container_with_tool(stub_tool(dir.path()));
-            let mut child = AsyncCommand::new("sh")
+            let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg("exit 3")
                 .spawn()
