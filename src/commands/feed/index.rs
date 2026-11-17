@@ -313,11 +313,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn empty_path_element_is_skipped() {
-        // An empty element would resolve to the bare name, i.e. the cwd.
-        let path = OsString::from(":");
-        assert_eq!(which_on_path(TOOL, Some(&path)), None);
+        // An empty element would resolve to the bare name, i.e. the cwd, so
+        // the cwd holds an executable tool that only the skip keeps out.
+        let cwd = tempfile::tempdir().unwrap();
+        write_tool(cwd.path(), 0o755);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let found = which_on_path(TOOL, Some(&OsString::from(":")));
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]
