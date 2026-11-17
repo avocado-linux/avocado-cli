@@ -391,11 +391,18 @@ impl SdkPackageCommand {
             .map(|u| format!("URL: {u}"))
             .unwrap_or_default();
 
-        let mut dependency_lines: Vec<String> = metadata
-            .requires
-            .iter()
-            .map(|r| format!("Requires: {r}"))
-            .collect();
+        let mut dependency_lines: Vec<String> = Vec::new();
+        // `%` is left alone here: a macro in Requires is common and intended.
+        for require in &metadata.requires {
+            if require.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "Section '{}': requires entry {:?} contains a newline or control character",
+                    self.section,
+                    require
+                );
+            }
+            dependency_lines.push(format!("Requires: {require}"));
+        }
         for provide in pkg_config.provides.iter().flatten() {
             if provide.chars().any(char::is_control) {
                 anyhow::bail!(
@@ -1188,6 +1195,33 @@ sdk:
             assert!(err.contains("provides"), "{err}");
             assert!(err.contains(&format!("{bad:?}")), "{err}");
         }
+    }
+
+    #[test]
+    fn requires_with_newline_is_rejected_naming_the_section() {
+        for bad in ["foo\nProvides: evil", "foo\rbar", "foo\u{1b}bar", "foo\0"] {
+            let mut pkg = bare_pkg();
+            pkg.requires = Some(vec!["ok".to_string(), bad.to_string()]);
+            let err = gen_script(&pkg).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Section 'my-app': requires entry {bad:?} contains a newline or control character"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn requires_entry_is_emitted_verbatim() {
+        // A macro in Requires is common, so `%` stays unescaped there.
+        let mut pkg = bare_pkg();
+        pkg.requires = Some(vec!["%{name}-libs = %{version}".to_string()]);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(
+            spec.contains("\nRequires: %{name}-libs = %{version}\n"),
+            "{spec}"
+        );
     }
 
     #[test]

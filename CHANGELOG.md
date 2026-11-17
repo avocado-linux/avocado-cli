@@ -132,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped them, so an offline run gave no sign which pin it used, and an
   overriding `AVOCADO_RELEASEVER` went unmentioned. They now print on stderr
   above the task list.
+- **`sdk package` rejects a `requires` entry holding a newline.** The entry
+  was written into the spec unchecked, so a newline added spec lines of its
+  own. A newline or other control character now fails naming the section and
+  the entry, as `provides` already did. A `%` macro in `requires` still
+  expands.
 
 ## [1.1.0] - 2026-11-11
 
