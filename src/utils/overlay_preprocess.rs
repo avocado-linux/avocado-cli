@@ -24,6 +24,18 @@ use crate::utils::interpolation::{preprocess_text, AvocadoContext};
 /// scratch after the lock file moved to the top-level `avocado.lock`.
 const STAGING_SUBDIR: &str = ".avocado/overlay-staging";
 
+/// Remove every staged overlay under `project_root`, so `avocado clean`
+/// leaves no rendered (possibly secret-bearing) copy behind.
+pub fn clear_staging(project_root: &Path) -> Result<bool> {
+    let dir = project_root.join(STAGING_SUBDIR);
+    if !dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("Failed to remove overlay staging: {}", dir.display()))?;
+    Ok(true)
+}
+
 /// Parse the `overlay:` config value into `(dir, opaque)`.
 /// Accepts either a plain string (`"path/to/dir"`) or a mapping
 /// (`{ dir: "path/to/dir", mode: "opaque" | "merge" }`).

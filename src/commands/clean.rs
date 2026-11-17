@@ -132,6 +132,12 @@ impl CleanCommand {
             self.clean_state_file(&directory_path)?;
         }
 
+        // Staged overlays are rebuilt every build, so a clean never needs
+        // them, and they can hold templated secrets.
+        if crate::utils::overlay_preprocess::clear_staging(&directory_path)? {
+            print_success("Removed staged overlays.", OutputLevel::Normal);
+        }
+
         // Clean stamp files if requested
         if self.stamps {
             self.clean_stamps(&directory_path).await?;
@@ -322,6 +328,26 @@ mod tests {
     use crate::utils::lockfile::SysrootType;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Rendered overlays can hold templated secrets: a clean removes them.
+    #[tokio::test]
+    async fn clean_removes_staged_overlays() {
+        let temp_dir = TempDir::new().unwrap();
+        let staged = temp_dir.path().join(".avocado/overlay-staging/rootfs/etc");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("secret"), "s3cr3t").unwrap();
+
+        let cmd = CleanCommand::new(
+            Some(temp_dir.path().to_string_lossy().to_string()),
+            false,
+            None,
+            false,
+        );
+        cmd.execute().await.unwrap();
+
+        assert!(!temp_dir.path().join(".avocado/overlay-staging").exists());
+        assert!(temp_dir.path().join(".avocado").exists());
+    }
 
     #[tokio::test]
     async fn test_clean_no_state_file() {

@@ -99,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `1.1.0-dev` still satisfy it.
 
 ### Fixed
+- **`avocado clean` removes `.avocado/overlay-staging/`.** Preprocessed
+  overlays, which can hold rendered templated secrets, stayed on disk after a
+  clean until that overlay was next built. They are removed on every clean,
+  including with `--skip-volumes`.
 - **An HTTP 429 from a package repository is now reported as one.** dnf
   reports a repository's `429 Too Many Requests` as "No more mirrors to
   try", which reads as a broken repository. When a run fails, the CLI now
