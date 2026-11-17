@@ -5875,9 +5875,11 @@ mod tests {
                 Some(v) => std::env::set_var("AVOCADO_OFFLINE", v),
                 None => std::env::remove_var("AVOCADO_OFFLINE"),
             }
-            let parsed = Cli::try_parse_from(args).map(|cli| {
-                apply_offline(&cli);
-                utils::offline::is_offline()
+            let parsed = on_big_stack(move || {
+                Cli::try_parse_from(args).map(|cli| {
+                    apply_offline(&cli);
+                    utils::offline::is_offline()
+                })
             });
             seen.push(parsed.ok());
         }
@@ -5888,14 +5890,16 @@ mod tests {
 
     #[test]
     fn feed_index_parses_directory() {
-        let cli = Cli::try_parse_from(["avocado", "feed", "index", "/srv/rpms"]).unwrap();
-        match cli.command {
+        match parse_cli(&["avocado", "feed", "index", "/srv/rpms"]) {
             Commands::Feed {
                 command: FeedCommands::Index { dir },
             } => assert_eq!(dir, std::path::PathBuf::from("/srv/rpms")),
             _ => panic!("expected feed index"),
         }
-        assert!(Cli::try_parse_from(["avocado", "feed", "index"]).is_err());
+        assert!(on_big_stack(|| Cli::try_parse_from([
+            "avocado", "feed", "index"
+        ])
+        .is_err()));
     }
 
     #[test]
@@ -6043,13 +6047,19 @@ mod tests {
     /// build's clap parse of the full `Cli` overflows a test thread's 2 MiB.
     fn parse_cli(args: &[&str]) -> Commands {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        on_big_stack(move || {
+            Cli::try_parse_from(args)
+                .expect("args should parse")
+                .command
+        })
+    }
+
+    /// Clap's parse of the full CLI outgrows a test thread's 2 MiB stack in
+    /// debug builds; parse tests run on an 8 MiB one.
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(8 << 20)
-            .spawn(move || {
-                Cli::try_parse_from(args)
-                    .expect("args should parse")
-                    .command
-            })
+            .spawn(f)
             .unwrap()
             .join()
             .unwrap()
@@ -6104,11 +6114,14 @@ mod tests {
 
     #[test]
     fn init_minimal_conflicts_with_reference() {
-        let err = Cli::try_parse_from(["avocado", "init", "--minimal", "--reference", "x"])
-            .err()
-            .expect("--minimal has no effect on a reference project");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-        assert!(Cli::try_parse_from(["avocado", "init", "--minimal"]).is_ok());
+        let kind = on_big_stack(|| {
+            Cli::try_parse_from(["avocado", "init", "--minimal", "--reference", "x"])
+                .err()
+                .expect("--minimal has no effect on a reference project")
+                .kind()
+        });
+        assert_eq!(kind, clap::error::ErrorKind::ArgumentConflict);
+        parse_cli(&["avocado", "init", "--minimal"]);
     }
 
     #[test]
@@ -6269,11 +6282,7 @@ mod tests {
     /// read current and the next install skips dnf.
     #[test]
     fn needs_vm_routing_gates_update() {
-        let cmd = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let cmd = |args: &[&str]| parse_cli(args);
 
         assert!(
             needs_vm_routing(&cmd(&["avocado", "update"])),
@@ -6292,11 +6301,7 @@ mod tests {
     /// `update`, `fetch` propagates the error, so it fails outright.
     #[test]
     fn needs_vm_routing_gates_fetch() {
-        let cmd = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let cmd = |args: &[&str]| parse_cli(args);
 
         assert!(
             needs_vm_routing(&cmd(&["avocado", "fetch"])),
@@ -6314,11 +6319,7 @@ mod tests {
     /// success, and `load` filled a volume the next routed build never saw.
     #[test]
     fn needs_vm_routing_gates_save_and_load() {
-        let cmd = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("args should parse")
-                .command
-        };
+        let cmd = |args: &[&str]| parse_cli(args);
 
         assert!(
             needs_vm_routing(&cmd(&["avocado", "save", "-o", "state.tar.gz"])),
