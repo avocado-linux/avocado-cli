@@ -283,6 +283,9 @@ async fn exit_from_events(
     let mut events = Box::pin(docker.events(Some(options)));
     let mut ready = Some(ready);
     let mut code = None;
+    // Inspect found it removed: what the stream already holds may still
+    // carry its `die`, so read on until it goes quiet.
+    let mut gone = false;
     loop {
         // ponytail: once it has died, give the removal a minute rather than
         // hanging on a daemon that failed to remove it.
@@ -295,14 +298,17 @@ async fn exit_from_events(
                 Some(event) => event,
                 None => break,
             },
-            Err(_) if code.is_some() => break,
+            Err(_) if code.is_some() || gone => break,
             Err(_) => match exited(&docker, &id).await? {
                 Exited::Running => continue,
                 Exited::With(c) => {
                     code = Some(c);
                     continue;
                 }
-                Exited::Gone => break,
+                Exited::Gone => {
+                    gone = true;
+                    continue;
+                }
             },
         };
         match event.action.as_deref() {
@@ -346,7 +352,9 @@ async fn exited(docker: &Docker, id: &str) -> Result<Exited> {
         Ok(found) => {
             let state = found.state.unwrap_or_default();
             Ok(match state.status {
-                Some(S::EXITED | S::DEAD) => Exited::With(state.exit_code.unwrap_or(0) as i32),
+                Some(S::EXITED | S::DEAD | S::REMOVING) => {
+                    Exited::With(state.exit_code.unwrap_or(0) as i32)
+                }
                 _ => Exited::Running,
             })
         }
@@ -800,6 +808,7 @@ mod tests {
     async fn fake_daemon(
         events: &'static [&'static str],
         inspect: Option<&'static str>,
+        delay: Delay,
     ) -> (Docker, tempfile::TempDir) {
         use tokio::io::AsyncReadExt;
         let dir = tempfile::tempdir().unwrap();
@@ -819,7 +828,9 @@ mod tests {
                     }
                     let head = String::from_utf8_lossy(&head);
                     if head.contains("/events") {
-                        let mut out = String::from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
+                        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(delay.events)).await;
+                        let mut out = String::new();
                         for e in events {
                             let line = format!("{e}\n");
                             out.push_str(&format!("{:x}\r\n{line}\r\n", line.len()));
@@ -827,6 +838,7 @@ mod tests {
                         conn.write_all(out.as_bytes()).await.unwrap();
                         std::future::pending::<()>().await;
                     }
+                    tokio::time::sleep(Duration::from_millis(delay.inspect)).await;
                     let reply = match inspect {
                         Some(body) => format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
                         None => "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}".to_string(),
@@ -841,12 +853,22 @@ mod tests {
         (docker, dir)
     }
 
+    /// Milliseconds before the fake daemon sends its events, and answers an
+    /// inspect.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Default)]
+    struct Delay {
+        events: u64,
+        inspect: u64,
+    }
+
     #[cfg(unix)]
     async fn rm_exit(
         events: &'static [&'static str],
         inspect: Option<&'static str>,
+        delay: Delay,
     ) -> (Result<i32>, bool) {
-        let (docker, _dir) = fake_daemon(events, inspect).await;
+        let (docker, _dir) = fake_daemon(events, inspect, delay).await;
         let (ready, subscribed) = tokio::sync::oneshot::channel();
         let code = exit_from_events(docker, "c1".into(), "0".into(), ready).await;
         (code, subscribed.await.is_ok())
@@ -863,6 +885,7 @@ mod tests {
                 r#"{"Type":"container","Action":"destroy","Actor":{"ID":"c1"}}"#,
             ],
             None,
+            Delay::default(),
         )
         .await;
         assert_eq!(code.unwrap(), 7);
@@ -873,7 +896,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rm_exit_without_events_inspects_the_container() {
-        let (code, _) = rm_exit(&[], Some(r#"{"State":{"Status":"exited","ExitCode":3}}"#)).await;
+        let (code, _) = rm_exit(
+            &[],
+            Some(r#"{"State":{"Status":"exited","ExitCode":3}}"#),
+            Delay::default(),
+        )
+        .await;
         assert_eq!(code.unwrap(), 3);
     }
 
@@ -881,11 +909,37 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rm_exit_without_events_or_container_ends() {
-        let (code, _) = rm_exit(&[], None).await;
+        let (code, _) = rm_exit(&[], None, Delay::default()).await;
         assert!(code
             .unwrap_err()
             .to_string()
             .contains("without an exit status"));
+    }
+
+    /// Its exit arrives while a slow inspect is out, and the inspect then
+    /// finds it removed: the code still comes from the queued `die`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_reads_events_that_arrive_during_an_inspect() {
+        let events = &[
+            r#"{"Type":"container","Action":"die","Actor":{"ID":"c1","Attributes":{"exitCode":"5"}}}"#,
+            r#"{"Type":"container","Action":"destroy","Actor":{"ID":"c1"}}"#,
+        ];
+        let delay = Delay {
+            events: 80,
+            inspect: 150,
+        };
+        let (code, _) = rm_exit(events, None, delay).await;
+        assert_eq!(code.unwrap(), 5);
+    }
+
+    /// A container stuck in removal, its `die` lost, still ends the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_takes_a_removing_containers_code() {
+        let inspect = Some(r#"{"State":{"Status":"removing","ExitCode":4}}"#);
+        let (code, _) = rm_exit(&[], inspect, Delay::default()).await;
+        assert_eq!(code.unwrap(), 4);
     }
 
     fn body(args: &[&str]) -> serde_json::Value {

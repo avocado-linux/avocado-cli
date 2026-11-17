@@ -4597,8 +4597,9 @@ fi
                     current.push_str(&std::mem::take(&mut pending));
                     current.extend(chars.next());
                 }
+                // Pending whitespace joins the token only with a character
+                // after it, so an empty `""` does not keep it.
                 '"' => {
-                    current.push_str(&std::mem::take(&mut pending));
                     in_quotes = !in_quotes;
                 }
                 ' ' if !in_quotes => {
@@ -6912,6 +6913,8 @@ extensions:
         assert_eq!(result, vec!["-e", "PASSWORD=secret ", "--network", "host"]);
         let result = SdkContainer::parse_container_arg("-e \"A=\nx\n\"");
         assert_eq!(result, vec!["-e", "A=\nx\n"]);
+        let result = SdkContainer::parse_container_arg("-e VALUE=secret\t\"\"");
+        assert_eq!(result, vec!["-e", "VALUE=secret"]);
     }
 
     #[test]
