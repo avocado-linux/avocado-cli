@@ -474,7 +474,6 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
 
     let mut lock = LockFile::load(src_dir)
         .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
-    let client = build_client(config)?;
 
     let effective = match pin_status(
         lock.get_repo_snapshot(target),
@@ -492,6 +491,7 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
                     &snap.snapshot,
                 );
             } else {
+                let client = build_client(config)?;
                 verify_pin_available(&client, &repo_url, snap, target).await?;
                 if let Some(notice) =
                     newer_snapshot_notice(&client, &repo_url, &release, &channel, target, snap)
@@ -529,6 +529,7 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
                      and none is recorded. Run `avocado update` online to create one."
                 );
             }
+            let client = build_client(config)?;
             match fetch_latest(&client, &repo_url, &release, &channel, target).await? {
                 LatestResult::Unsupported => return Ok(()),
                 LatestResult::Found(pointer) => {
@@ -1125,6 +1126,28 @@ mod tests {
         env::remove_var("AVOCADO_RELEASEVER");
         assert!(PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
         assert!(seen.iter().all(|r| r == "custom/rel"), "{seen:?}");
+    }
+
+    /// An offline run makes no request, so a CA bundle it cannot read must not
+    /// stop it.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_pin_ignores_an_unreadable_repo_ca() {
+        let (_listener, url) = silent_listener();
+        let dir = pinned_dir(&url);
+        let missing = dir.path().join("no-such-ca.pem");
+        let config: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: edge\n  repo:\n    url: {url}\n    ca: {}\n",
+            missing.display()
+        ))
+        .unwrap();
+        env::remove_var("AVOCADO_REPO_CA");
+
+        let (res, release) = run_offline(&config, dir.path()).await;
+
+        res.expect("an offline run with a pin needs no CA bundle");
+        assert_eq!(release.as_deref(), Some("2026/edge/snapshots/PINNED"));
     }
 
     /// The pin avocado exports itself must be recorded, or the next command in
