@@ -25,12 +25,24 @@ use crate::utils::interpolation::{preprocess_text, AvocadoContext};
 const STAGING_SUBDIR: &str = ".avocado/overlay-staging";
 
 /// Remove every staged overlay under `project_root`, so `avocado clean`
-/// leaves no rendered (possibly secret-bearing) copy behind.
+/// leaves no rendered (possibly secret-bearing) copy behind. A symlinked
+/// staging dir is refused: builds write through it, and removing it would
+/// only drop the link and leave the rendered files at its target.
 pub fn clear_staging(project_root: &Path) -> Result<bool> {
     let dir = project_root.join(STAGING_SUBDIR);
-    if !dir.exists() {
-        return Ok(false);
-    }
+    let meta = match std::fs::symlink_metadata(&dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to read overlay staging: {}", dir.display()))
+        }
+    };
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "{} is a symlink; staged overlays were written through it. Remove its target's contents and the link by hand.",
+        dir.display()
+    );
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("Failed to remove overlay staging: {}", dir.display()))?;
     Ok(true)
@@ -989,5 +1001,37 @@ mod tests {
                 blocker == "symlink"
             );
         }
+    }
+
+    /// A symlinked staging dir is refused, and its target left for the user.
+    #[cfg(unix)]
+    #[test]
+    fn clear_staging_refuses_a_symlinked_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("secret"), "s3cr3t").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".avocado")).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join(STAGING_SUBDIR)).unwrap();
+        let err = clear_staging(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(target.join("secret").exists());
+    }
+
+    /// An unreadable `.avocado` is an error, not "nothing staged".
+    #[cfg(unix)]
+    #[test]
+    fn clear_staging_reports_an_unreadable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads through any mode
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let avo = tmp.path().join(".avocado");
+        std::fs::create_dir_all(avo.join("overlay-staging")).unwrap();
+        std::fs::set_permissions(&avo, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = clear_staging(tmp.path());
+        std::fs::set_permissions(&avo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
     }
 }

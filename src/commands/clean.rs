@@ -134,8 +134,13 @@ impl CleanCommand {
 
         // Staged overlays are rebuilt every build, so a clean never needs
         // them, and they can hold templated secrets.
-        if crate::utils::overlay_preprocess::clear_staging(&directory_path)? {
-            print_success("Removed staged overlays.", OutputLevel::Normal);
+        for root in self.staging_roots(&directory_path) {
+            if crate::utils::overlay_preprocess::clear_staging(&root)? {
+                print_success(
+                    &format!("Removed staged overlays in {}.", root.display()),
+                    OutputLevel::Normal,
+                );
+            }
         }
 
         // Clean stamp files if requested
@@ -149,6 +154,24 @@ impl CleanCommand {
         }
 
         Ok(())
+    }
+
+    /// Where builds staged overlays: the project root of the config (`-C`, or
+    /// `avocado.yaml` in the directory), which `src_dir` can move away from
+    /// the directory, and the directory itself.
+    fn staging_roots(&self, directory_path: &Path) -> Vec<PathBuf> {
+        let config_path = match &self.config_path {
+            Some(c) => PathBuf::from(c),
+            None => directory_path.join("avocado.yaml"),
+        };
+        let mut roots = vec![directory_path.to_path_buf()];
+        if let Ok(config) = Config::load(&config_path) {
+            let root = config.project_root(&config_path);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     /// Unlock (clear lock file entries) for all sysroots
@@ -347,6 +370,31 @@ mod tests {
 
         assert!(!temp_dir.path().join(".avocado/overlay-staging").exists());
         assert!(temp_dir.path().join(".avocado").exists());
+    }
+
+    /// With `src_dir` moving the project root away from the directory, the
+    /// staged overlays under that root are removed too.
+    #[tokio::test]
+    async fn clean_removes_staged_overlays_under_src_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let project = temp_dir.path().join("avocado");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("avocado.yaml"), "src_dir: ..\n").unwrap();
+        let staged = temp_dir.path().join(".avocado/overlay-staging/rootfs");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("secret"), "s3cr3t").unwrap();
+
+        CleanCommand::new(
+            Some(project.to_string_lossy().to_string()),
+            false,
+            None,
+            false,
+        )
+        .execute()
+        .await
+        .unwrap();
+
+        assert!(!temp_dir.path().join(".avocado/overlay-staging").exists());
     }
 
     #[tokio::test]
