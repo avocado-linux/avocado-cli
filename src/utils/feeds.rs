@@ -287,6 +287,28 @@ struct MintedFeedToken {
     expires_at: Option<i64>,
 }
 
+/// A feed's URL as the host reaches it, with the TLS settings and credential
+/// dnf uses for it, so a probe from the host is answered as dnf was.
+#[derive(Debug, Clone, Default)]
+pub struct FeedEndpoint {
+    pub url: String,
+    pub ca: Option<PathBuf>,
+    pub tls_verify: bool,
+    pub credential: Option<(String, String)>,
+}
+
+impl FeedEndpoint {
+    /// A feed known only by its URL: the SDK repository, verified with the
+    /// global repo TLS settings alone.
+    pub fn plain(url: String) -> Self {
+        Self {
+            url,
+            tls_verify: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// A feed after resolution: everything dnf will see, plus what the cache needs.
 /// `#[serde(skip)]` marks the fields that must never reach the canonical document.
 #[derive(Debug, Clone, Serialize)]
@@ -482,10 +504,9 @@ pub struct FeedMaterialization {
     /// Key id of the credential the mint used, when it differs from the default
     /// profile's.
     pub key_id: Option<String>,
-    /// Each written feed's URL as the host reaches it (see
-    /// `ResolvedFeed::host_url`), by repo id, for probing the feed a
-    /// `--repo=` restricted run used.
-    pub host_urls: HashMap<String, String>,
+    /// Each written feed as the host reaches it (see `ResolvedFeed::host_url`),
+    /// by repo id, for probing the feed a `--repo=` restricted run used.
+    pub host_feeds: HashMap<String, FeedEndpoint>,
     /// `--add-host` entries the container needs.
     pub add_hosts: Vec<String>,
     /// SHA-256 of the stage projection this was materialized from. Lets
@@ -1563,7 +1584,7 @@ impl ResolvedFeedSet {
         let mut env = vec![("AVOCADO_FEEDS_DIR".to_string(), container_stage_dir.clone())];
         let mut dnf_args = Vec::new();
         let mut add_hosts = Vec::new();
-        let mut host_urls = HashMap::new();
+        let mut host_feeds = HashMap::new();
 
         if let Some(base) = self.distro_priority_base {
             env.push(("AVOCADO_DISTRO_PRIORITY_BASE".to_string(), base.to_string()));
@@ -1613,7 +1634,15 @@ impl ResolvedFeedSet {
             let repo_path = dir.join(format!("{GENERATED_PREFIX}{}.repo", feed.name));
             fs::write(&repo_path, feed.repo_file(ca_in_container.as_deref()))?;
             if let Some(url) = feed.host_url() {
-                host_urls.insert(feed.name.clone(), url.to_string());
+                host_feeds.insert(
+                    feed.name.clone(),
+                    FeedEndpoint {
+                        url: url.to_string(),
+                        ca: feed.ca.clone(),
+                        tls_verify: feed.tls_verify,
+                        credential: feed.credential.clone(),
+                    },
+                );
             }
             #[cfg(unix)]
             if feed.credential.is_some() {
@@ -1675,7 +1704,7 @@ impl ResolvedFeedSet {
             env,
             dnf_args,
             add_hosts,
-            host_urls,
+            host_feeds,
             fingerprint,
         })
     }
@@ -1691,6 +1720,31 @@ struct Probe<'a> {
     ca: Option<PathBuf>,
     tls_verify: bool,
     credential: Option<&'a (String, String)>,
+}
+
+/// A feed's own CA added to a probe's client, as dnf trusts it for the feed.
+pub(crate) fn trust_feed_ca(
+    mut builder: reqwest::ClientBuilder,
+    ca: Option<&Path>,
+    subject: &str,
+) -> Result<reqwest::ClientBuilder> {
+    if let Some(ca) = ca {
+        for cert in load_ca_certificates(ca, subject)? {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    Ok(builder)
+}
+
+/// A probe request sent with the feed's credential, as dnf sends it.
+pub(crate) fn authorize_feed(
+    req: reqwest::RequestBuilder,
+    credential: Option<&(String, String)>,
+) -> reqwest::RequestBuilder {
+    match credential {
+        Some((user, pass)) => req.basic_auth(user, Some(pass)),
+        None => req,
+    }
 }
 
 /// Every certificate in the CA file. A bundle may carry several, and dnf
@@ -1720,22 +1774,14 @@ impl Probe<'_> {
             ));
             return Ok(());
         }
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(20))
             .user_agent(user_agent());
-        if let Some(ca) = &self.ca {
-            for cert in load_ca_certificates(ca, &self.subject)? {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-        let client = builder
+        let client = trust_feed_ca(builder, self.ca.as_deref(), &self.subject)?
             .build()
             .with_context(|| format!("{}: building the HTTP client", self.subject))?;
-        let mut req = client.get(&self.url);
-        if let Some((user, pass)) = self.credential {
-            req = req.basic_auth(user, Some(pass));
-        }
+        let req = authorize_feed(client.get(&self.url), self.credential);
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => bail!("{}: cannot connect to {} ({e})", self.subject, self.url),
@@ -3664,7 +3710,7 @@ distro:
         let (_, set) = url_feed_set("https://named.example", "");
         let m = set.materialize(FeedStage::Ext).unwrap();
         assert_eq!(
-            m.host_urls.get("local").map(String::as_str),
+            m.host_feeds.get("local").map(|f| f.url.as_str()),
             Some("https://named.example/feed")
         );
     }

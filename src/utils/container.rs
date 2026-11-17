@@ -2240,7 +2240,11 @@ impl SdkContainer {
         let (repo_url, user_agent) = rate_limit_probe_target(&config);
         let ok = self.run_in_container_once(config).await?;
         if !ok {
-            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
+            crate::utils::feed_limit::explain_if_rate_limited(
+                &crate::utils::feeds::FeedEndpoint::plain(repo_url),
+                &user_agent,
+            )
+            .await;
         }
         Ok(ok)
     }
@@ -2537,7 +2541,11 @@ impl SdkContainer {
         // Same 429 check as run_in_container, which shared-context runs bypass.
         if !ok {
             let (repo_url, user_agent) = rate_limit_probe_target(config);
-            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
+            crate::utils::feed_limit::explain_if_rate_limited(
+                &crate::utils::feeds::FeedEndpoint::plain(repo_url),
+                &user_agent,
+            )
+            .await;
         }
         Ok(ok)
     }

@@ -280,16 +280,16 @@ fn order_repo_groups(
 }
 
 /// The feed a failed fetch's dnf downloaded from: the named feed a
-/// `--repo=` restriction selects, when the host can reach it, else the
-/// SDK repository.
-fn probe_url(
+/// `--repo=` restriction selects (with its CA and credential), when the host
+/// can reach it, else the SDK repository.
+fn probe_feed(
     repo_name: Option<&str>,
-    host_urls: Option<&std::collections::HashMap<String, String>>,
+    host_feeds: Option<&std::collections::HashMap<String, crate::utils::feeds::FeedEndpoint>>,
     sdk_url: String,
-) -> String {
+) -> crate::utils::feeds::FeedEndpoint {
     repo_name
-        .and_then(|r| host_urls?.get(r).cloned())
-        .unwrap_or(sdk_url)
+        .and_then(|r| host_feeds?.get(r).cloned())
+        .unwrap_or_else(|| crate::utils::feeds::FeedEndpoint::plain(sdk_url))
 }
 
 /// Extension fetcher for downloading and installing remote extensions
@@ -638,9 +638,9 @@ echo "{INSTALLED_REPORT_END}"
         let container_helper = SdkContainer::new().verbose(self.verbose);
         let run_config = self.package_group_run_config(script);
         let (sdk_url, user_agent) = crate::utils::container::rate_limit_probe_target(&run_config);
-        let repo_url = probe_url(
+        let probed = probe_feed(
             repo_name,
-            self.feeds.as_ref().map(|f| &f.host_urls),
+            self.feeds.as_ref().map(|f| &f.host_feeds),
             sdk_url,
         );
 
@@ -650,7 +650,7 @@ echo "{INSTALLED_REPORT_END}"
         if !out.success {
             // Capture skips run_in_container's 429 check, and dnf reports a
             // 429 as "No more mirrors to try".
-            crate::utils::feed_limit::explain_if_rate_limited(&repo_url, &user_agent).await;
+            crate::utils::feed_limit::explain_if_rate_limited(&probed, &user_agent).await;
             return Err(anyhow::anyhow!(
                 "Failed to fetch package extension(s): {}{}",
                 entries
@@ -1078,18 +1078,26 @@ mod tests {
     /// repository; an unrestricted or unknown one keeps the SDK URL.
     #[test]
     fn a_restricted_fetch_probes_the_named_feed() {
-        let urls = std::collections::HashMap::from([(
-            "vendor".to_string(),
-            "https://vendor.example/feed".to_string(),
-        )]);
+        use crate::utils::feeds::FeedEndpoint;
+        let vendor = FeedEndpoint {
+            ca: Some("/ca.pem".into()),
+            credential: Some(("u".into(), "p".into())),
+            ..FeedEndpoint::plain("https://vendor.example/feed".into())
+        };
+        let feeds = std::collections::HashMap::from([("vendor".to_string(), vendor)]);
         let sdk = || "https://sdk.example/repo".to_string();
-        assert_eq!(
-            probe_url(Some("vendor"), Some(&urls), sdk()),
-            "https://vendor.example/feed"
-        );
-        assert_eq!(probe_url(None, Some(&urls), sdk()), sdk());
-        assert_eq!(probe_url(Some("other"), Some(&urls), sdk()), sdk());
-        assert_eq!(probe_url(Some("vendor"), None, sdk()), sdk());
+        let named = probe_feed(Some("vendor"), Some(&feeds), sdk());
+        assert_eq!(named.url, "https://vendor.example/feed");
+        assert_eq!(named.ca.as_deref(), Some(std::path::Path::new("/ca.pem")));
+        assert!(named.credential.is_some());
+        for p in [
+            probe_feed(None, Some(&feeds), sdk()),
+            probe_feed(Some("other"), Some(&feeds), sdk()),
+            probe_feed(Some("vendor"), None, sdk()),
+        ] {
+            assert_eq!(p.url, sdk());
+            assert!(p.credential.is_none() && p.ca.is_none());
+        }
     }
 
     /// The mistake this message exists for: the source lives at `<base>/foo`
