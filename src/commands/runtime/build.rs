@@ -1641,24 +1641,18 @@ echo -n '}}'
             for (ext_name_val, ext_data) in ext_config {
                 if let Some(ext_name) = ext_name_val.as_str() {
                     if all_required_extensions.contains(ext_name) {
-                        let ext_version = ext_data
-                            .get("version")
-                            .map(|v| {
-                                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                                    format!(
-                                        "{}",
-                                        v.as_i64()
-                                            .or_else(|| v.as_f64().map(|f| f as i64))
-                                            .unwrap_or(0)
-                                    )
-                                })
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Extension '{ext_name}' is missing a 'version' field. \
-                                 Check that the extension config was parsed and merged correctly."
-                                )
-                            })?;
+                        let ext_version = crate::commands::ext::effective_ext_version(
+                            config,
+                            parsed,
+                            ext_name,
+                            target_arch,
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Extension '{ext_name}' has a missing or empty 'version' field. \
+                                 A templated one like '{{{{ env.X }}}}' is empty when X is unset."
+                            )
+                        })?;
 
                         let ext_suffix = crate::utils::config::get_ext_image_type(ext_data)
                             .map(|t| {
@@ -2932,25 +2926,32 @@ export AVOCADO_OS_VERSION_ID
     async fn resolve_extension_version(
         &self,
         parsed: &serde_yaml::Value,
-        _config: &crate::utils::config::Config,
+        config: &crate::utils::config::Config,
         _config_path: &str,
         ext_name: &str,
         container_image: &str,
         target_arch: &str,
         container_args: Option<Vec<String>>,
     ) -> Result<String> {
-        // Try to get version from local [ext] section
-        if let Some(version) = parsed
-            .get("extensions")
-            .and_then(|ext_section| ext_section.as_mapping())
-            .and_then(|ext_table| ext_table.get(ext_name))
-            .and_then(|ext_config| ext_config.get("version"))
-            .and_then(|v| v.as_str())
-        {
-            if version != "*" {
-                return Ok(version.to_string());
+        // Try to get version from local [ext] section, as the target sees it:
+        // the same version the copy step names the image by.
+        let stated =
+            crate::commands::ext::resolve_remote_ext_config(config, parsed, ext_name, target_arch)
+                .filter(|ext_config| ext_config.get("version").is_some());
+        if let Some(ext_config) = stated {
+            match crate::commands::ext::ext_config_version(&ext_config) {
+                // If version is "*", fall through to query RPM
+                Some(version) if version == "*" => {}
+                Some(version) => return Ok(version),
+                // A version the config states but that came out empty is the
+                // config's problem; asking RPM would only say to install it.
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Extension '{ext_name}' has an empty 'version' field. \
+                         A templated one like '{{{{ env.X }}}}' is empty when X is unset."
+                    ))
+                }
             }
-            // If version is "*", fall through to query RPM
         }
 
         // No version found in config - this is likely a package repository extension
@@ -3642,6 +3643,39 @@ mod tests {
     /// the host under the directory the container mounts there: `src_dir`
     /// when set, else the working directory. Never the config file's
     /// directory unless one of those is it.
+
+    #[tokio::test]
+    async fn a_stated_but_empty_version_is_an_error_not_an_rpm_lookup() {
+        let yaml = r#"
+extensions:
+  app:
+    version: ''
+"#;
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let cmd = RuntimeBuildCommand::new(
+            "dev".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        // Returns before any container is started for the RPM query.
+        let err = cmd
+            .resolve_extension_version(
+                &parsed,
+                &config,
+                "avocado.yaml",
+                "app",
+                "no-image",
+                "qemux86-64",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty 'version'"), "{err}");
+    }
     #[tokio::test]
     async fn stage_into_volume_writes_under_the_mounted_src_dir() {
         let (_root, project, config_path) = src_dir_above_config_dir();
