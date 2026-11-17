@@ -124,6 +124,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a volume that may belong to another daemon is kept.
 - **`avocado load --force` removes the volume it replaces.** It used to leave
   the previous build volume on disk.
+- **The offline pin, offline unpinned and `pin ignored` notices show under
+  the progress display.** `sdk install`, `ext install` and `runtime install`
+  dropped them, so an offline run gave no sign which pin it used, and an
+  overriding `AVOCADO_RELEASEVER` went unmentioned. They now print on stderr
+  above the task list.
 
 ## [1.1.0] - 2026-11-11
 

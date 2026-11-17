@@ -34,7 +34,7 @@ use std::path::Path;
 
 use crate::utils::config::Config;
 use crate::utils::lockfile::{LockFile, RepoSnapshot};
-use crate::utils::output::{print_info, OutputLevel};
+use crate::utils::output::{print_info, print_info_stderr, OutputLevel};
 
 /// The mutable pointer published per (channel, target) naming the newest
 /// immutable snapshot. Served at
@@ -377,13 +377,10 @@ fn announce_offline_pin(
     if printed.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return false;
     }
-    print_info(
-        &format!(
-            "Offline: using locked pin {release}/{channel} snapshot '{snapshot}'; \
-             no newer-snapshot check was made."
-        ),
-        OutputLevel::Normal,
-    );
+    print_info_stderr(&format!(
+        "Offline: using locked pin {release}/{channel} snapshot '{snapshot}'; \
+         no newer-snapshot check was made."
+    ));
     true
 }
 
@@ -453,7 +450,7 @@ pub fn announce_pin_ignored(config: &Config, src_dir: &Path, target: &str) -> bo
     if PIN_IGNORED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return false;
     }
-    print_info(&msg, OutputLevel::Normal);
+    print_info_stderr(&msg);
     true
 }
 
@@ -520,13 +517,10 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
                 // erroring would make offline unusable for it.
                 if repo_url.trim_end_matches('/') != Config::DEFAULT_REPO_URL {
                     if !OFFLINE_UNPINNED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        print_info(
-                            &format!(
-                                "Offline: no locked pin for {release}/{channel} on {repo_url}; \
-                                 using the configured release unpinned"
-                            ),
-                            OutputLevel::Normal,
-                        );
+                        print_info_stderr(&format!(
+                            "Offline: no locked pin for {release}/{channel} on {repo_url}; \
+                             using the configured release unpinned"
+                        ));
                     }
                     return Ok(());
                 }
@@ -1164,5 +1158,88 @@ mod tests {
         let flag = std::sync::atomic::AtomicBool::new(false);
         assert!(announce_offline_pin(&flag, "2026", "edge", "PINNED"));
         assert!(!announce_offline_pin(&flag, "2026", "edge", "PINNED"));
+    }
+
+    /// A test renderer registered as the process-wide active one, as
+    /// `sdk install`, `ext install` and `runtime install` have before they
+    /// resolve the pin. Holds the lock the tui tests take, since the active
+    /// renderer is global.
+    struct ActiveRenderer {
+        renderer: std::sync::Arc<crate::utils::tui::TaskRenderer>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ActiveRenderer {
+        fn new() -> Self {
+            let lock = crate::utils::tui::tests::GLOBAL_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let renderer = std::sync::Arc::new(crate::utils::tui::TaskRenderer::new_test());
+            crate::utils::tui::set_active_renderer(&renderer);
+            Self {
+                renderer,
+                _lock: lock,
+            }
+        }
+
+        /// How many lines the renderer printed that contain `needle`.
+        fn count(&self, needle: &str) -> usize {
+            self.renderer
+                .get_test_output()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl Drop for ActiveRenderer {
+        fn drop(&mut self) {
+            crate::utils::tui::clear_active_renderer();
+        }
+    }
+
+    #[test]
+    fn offline_pin_line_reaches_an_active_renderer() {
+        let tui = ActiveRenderer::new();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        announce_offline_pin(&flag, "2026", "edge", "RENDERED");
+        assert_eq!(
+            tui.count("Offline: using locked pin 2026/edge snapshot 'RENDERED'"),
+            1
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn pin_ignored_notice_reaches_an_active_renderer() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let tui = ActiveRenderer::new();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        announce_pin_ignored(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        reset_notice_state();
+        assert_eq!(
+            tui.count("pin ignored: AVOCADO_RELEASEVER is set to custom/rel"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_unpinned_notice_reaches_an_active_renderer() {
+        let (_listener, url) = silent_listener();
+        let dir = tempfile::tempdir().unwrap();
+        OFFLINE_UNPINNED_PRINTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let tui = ActiveRenderer::new();
+        let (res, _) = run_offline(&offline_config(&url), dir.path()).await;
+        res.expect("a custom feed without a pin proceeds offline");
+        assert_eq!(
+            tui.count(&format!("Offline: no locked pin for 2026/edge on {url}")),
+            1
+        );
     }
 }

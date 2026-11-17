@@ -258,7 +258,7 @@ impl TaskRenderer {
             self.above_queue.lock().unwrap().push(message.to_string());
             self.notify.notify_one();
         } else {
-            eprintln!("{message}");
+            self.emit_line(message);
         }
     }
 
