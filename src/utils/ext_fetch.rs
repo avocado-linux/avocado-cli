@@ -873,7 +873,14 @@ echo "Successfully fetched extension '{ext_name}' from git"
         let success = container_helper.run_in_container(run_config).await?;
         if !success {
             return Err(anyhow::anyhow!(
-                "Failed to fetch extension '{ext_name}' from git repository"
+                "Failed to fetch extension '{ext_name}' from git repository{}",
+                git_ref
+                    .filter(|r| looks_like_short_sha(r))
+                    .map(|r| format!(
+                        ". A remote only serves a full commit hash: '{r}' looks abbreviated, \
+                         so give all 40 characters (or a branch or tag)"
+                    ))
+                    .unwrap_or_default()
             ));
         }
 
@@ -1029,8 +1036,27 @@ pub fn missing_path_source_message(
     msg
 }
 
+/// An abbreviated commit hash: 7 to 39 hex digits with at least one
+/// letter, so a date-like tag such as `20261117` is not one.
+fn looks_like_short_sha(r: &str) -> bool {
+    (7..40).contains(&r.len())
+        && r.chars().all(|c| c.is_ascii_hexdigit())
+        && r.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_short_hash_is_told_apart_from_branches_and_tags() {
+        assert!(looks_like_short_sha("3f9ab3eff1"));
+        assert!(!looks_like_short_sha(
+            "3f9ab3eff1e4c56a7b8d9e0f1a2b3c4d5e6f7a8b"
+        )); // full
+        assert!(!looks_like_short_sha("main"));
+        assert!(!looks_like_short_sha("v1.2.0"));
+        assert!(!looks_like_short_sha("20261117"));
+    }
     use super::*;
 
     /// The mistake this message exists for: the source lives at `<base>/foo`
