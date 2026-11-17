@@ -469,7 +469,8 @@ enum Commands {
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
-        /// Environment variables to pass to the provision process
+        /// Environment variables to pass to the provision process; they also fill
+        /// `{{ env.KEY }}` in avocado.yaml, ahead of the caller's environment
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
         /// Output path relative to src_dir for provisioning artifacts
@@ -1872,7 +1873,8 @@ enum RuntimeCommands {
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
-        /// Environment variables to pass to the provision process
+        /// Environment variables to pass to the provision process; they also fill
+        /// `{{ env.KEY }}` in avocado.yaml, ahead of the caller's environment
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
         /// Output path relative to src_dir for provisioning artifacts
@@ -2116,6 +2118,16 @@ fn run_with_json_lifecycle(
         "runtime": runtime,
     }));
     Some(guard)
+}
+
+/// Park the `--env` values for `{{ env.* }}` interpolation, then return them
+/// unchanged. Call before anything loads the config: the runtime is resolved
+/// from it first.
+fn park_env_flags(env_args: Option<Vec<String>>) -> Option<Vec<String>> {
+    crate::utils::interpolation::env::set_flag_overrides(
+        parse_env_vars(env_args.as_ref()).unwrap_or_default(),
+    );
+    env_args
 }
 
 /// Combine provision profile and env vars into a single HashMap
@@ -2590,6 +2602,7 @@ async fn main() -> Result<()> {
             );
             // No JSON-implies-force coercion here either (see the `Install`
             // arm above for why both of its reasons are gone).
+            let env = park_env_flags(env);
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -2889,6 +2902,7 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let env = park_env_flags(env);
                 let runtime =
                     resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
