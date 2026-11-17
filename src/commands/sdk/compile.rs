@@ -1226,6 +1226,33 @@ extensions:
         }
     }
 
+    /// The `sdk.container` block reaches the compile container as args
+    /// merged into `container_args`, so the same check sees it.
+    #[test]
+    fn section_never_skips_with_host_state_in_the_container_block() {
+        let args = |container: &str| {
+            Config::load_from_yaml_str(&format!("sdk:\n  container:\n{container}"))
+                .unwrap()
+                .merge_sdk_container_args(None)
+                .unwrap_or_default()
+        };
+        for container in [
+            "    volumes: [/home/me/src:/src]\n",
+            "    volumes: [/dev/shm:/dev/shm]\n",
+            "    devices: [/dev/ttyUSB0]\n",
+            "    cap_add: [SYS_ADMIN]\n",
+            "    extra_hosts: [feed:10.0.0.2]\n",
+            "    privileged: false\n",
+            "    environment: { CFLAGS: -O2 -g }\n",
+        ] {
+            assert!(passes_host_state(&args(container)), "{container}");
+        }
+        let args = args(
+            "    privileged: true\n    network_mode: host\n    volumes: [/dev:/dev, /sys:/sys]\n    environment: { CFLAGS: -O2 }\n",
+        );
+        assert!(!passes_host_state(&args), "{args:?}");
+    }
+
     /// Without `src_dir`, the container mounts the working directory. When
     /// that is not the tree the hash reads, nothing is skipped.
     #[test]
