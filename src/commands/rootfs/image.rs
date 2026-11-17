@@ -28,11 +28,11 @@ pub const NAMESPACE_UUID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 /// old `boot/*` glob did), but only to a directory below `$ROOTFS_WORK`: an
 /// absolute link resolves in the build container, not the image, and is
 /// refused. Only a missing `/boot` is tolerated: a refusal or `find` failure
-/// fails the hook, since runtime builds run without `set -e`.
+/// exits the build script, which runs without `set -e` in a runtime build.
 pub const BOOT_STRIP_KEEP_DIRS: &str = "[ ! -d \"$ROOTFS_WORK/boot\" ] || \
 case \"$(cd -P \"$ROOTFS_WORK/boot\" && pwd -P)\" in \
 \"$(cd -P \"$ROOTFS_WORK\" && pwd -P)\"/?*) find -H \"$ROOTFS_WORK/boot\" -mindepth 1 ! -type d -delete ;; \
-*) echo \"/boot leads outside the rootfs; not stripping it\" >&2; false ;; esac";
+*) echo \"/boot leads outside the rootfs; not stripping it\" >&2; false ;; esac || exit 1";
 
 /// Default post-install commands for the rootfs build. Run on the work
 /// directory (`$ROOTFS_WORK`) after package install + overlay, before
@@ -1016,12 +1016,14 @@ mod tests {
 
         let status = std::process::Command::new("sh")
             .arg("-c")
-            .arg(BOOT_STRIP_KEEP_DIRS)
+            .arg(format!("{BOOT_STRIP_KEEP_DIRS}\necho next-hook"))
             .env("ROOTFS_WORK", root.path())
-            .status()
+            .output()
             .unwrap();
 
-        assert!(!status.success());
+        // The build script has no `set -e`: the refusal must stop it.
+        assert!(!status.status.success());
+        assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
         assert!(outside.path().join("keep").exists());
         assert!(outside.path().join(".git/HEAD").exists());
     }
@@ -1039,16 +1041,18 @@ mod tests {
 
         let status = std::process::Command::new("sh")
             .arg("-c")
-            .arg(BOOT_STRIP_KEEP_DIRS)
+            .arg(format!("{BOOT_STRIP_KEEP_DIRS}\necho next-hook"))
             .env("ROOTFS_WORK", root.path())
-            .status()
+            .output()
             .unwrap();
         let blocked = sub.join("extlinux.conf").exists();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // root ignores directory write bits; only judge a delete that failed.
+        // The build script has no `set -e`: the failure must stop it.
         if blocked {
-            assert!(!status.success());
+            assert!(!status.status.success());
+            assert!(!String::from_utf8_lossy(&status.stdout).contains("next-hook"));
         }
     }
 
