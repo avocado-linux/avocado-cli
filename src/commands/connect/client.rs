@@ -2149,7 +2149,7 @@ mod tests {
     /// `AVOCADO_CONNECT_TOKEN` authenticates every `connect` command with no
     /// `credentials.json`, at `AVOCADO_CONNECT_URL` when that is set.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(offline)]
     fn the_env_token_stands_in_for_the_stored_profiles() {
         std::env::set_var("AVOCADO_CONNECT_TOKEN", "ci-token");
         std::env::set_var("AVOCADO_CONNECT_URL", "https://connect.example");
@@ -2178,9 +2178,11 @@ mod tests {
 
     /// The saved credentials are owner-only, including a file an older CLI
     /// left at 0644.
-    #[cfg(unix)]
+    // Linux only: XDG_CONFIG_HOME does not move ProjectDirs on macOS or
+    // Windows, so elsewhere this would rewrite the real credentials.
+    #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(offline)]
     fn saved_credentials_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -2209,7 +2211,7 @@ mod tests {
     /// A token alone talks to the production server, as feeds do, never to
     /// the stored profile's server.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(offline)]
     fn a_token_alone_uses_the_production_server() {
         std::env::set_var("AVOCADO_CONNECT_TOKEN", "ci-token");
         std::env::remove_var("AVOCADO_CONNECT_URL");
@@ -2221,8 +2223,10 @@ mod tests {
     }
 
     /// With neither env var set, commands use the stored default profile.
+    // Linux only, as for saved_credentials_are_owner_only.
+    #[cfg(target_os = "linux")]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(offline)]
     fn the_stored_profile_is_used_without_the_env() {
         let home = tempfile::tempdir().unwrap();
         let old = std::env::var_os("XDG_CONFIG_HOME");
