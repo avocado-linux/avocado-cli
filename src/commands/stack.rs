@@ -331,17 +331,21 @@ impl StackCommand {
                 dir.display()
             );
         };
-        let prefix = match target {
-            Some(t) => crate::utils::stacks::view_name(&state.volume_name, t),
-            None => format!("{}-", state.volume_name),
-        };
+        let exact = target
+            .map(|t| crate::utils::stacks::view_name(&state.volume_name, t))
+            .transpose()?;
+        let prefix = format!("{}-", state.volume_name);
         let r = h.json(&["report"]).await?;
         let mine: Vec<Value> = r["views"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|v| v["name"].as_str().is_some_and(|n| n.starts_with(&prefix)))
+            .filter(|v| {
+                v["name"]
+                    .as_str()
+                    .is_some_and(|n| drop_selects(n, &prefix, exact.as_deref()))
+            })
             .collect();
         if mine.is_empty() {
             print_info("No stack views for this project.", OutputLevel::Normal);
@@ -454,10 +458,37 @@ impl StackCommand {
     }
 }
 
+/// Whether `stack drop` selects view `name`: the given target's view exactly, else every
+/// view of the project (`prefix` is `<volume>-`). A prefix match on a target's view would
+/// also take a sibling whose target extends it (`raspberrypi4` and `raspberrypi4-64`).
+fn drop_selects(name: &str, prefix: &str, exact: Option<&str>) -> bool {
+    match exact {
+        Some(view) => name == view,
+        None => name.starts_with(prefix),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dropping_a_target_leaves_a_target_it_prefixes() {
+        let prefix = "avo-1-";
+        assert!(drop_selects(
+            "avo-1-raspberrypi4",
+            prefix,
+            Some("avo-1-raspberrypi4")
+        ));
+        assert!(!drop_selects(
+            "avo-1-raspberrypi4-64",
+            prefix,
+            Some("avo-1-raspberrypi4")
+        ));
+        assert!(drop_selects("avo-1-raspberrypi4-64", prefix, None));
+        assert!(!drop_selects("avo-10-x", prefix, None));
+    }
 
     #[test]
     fn status_shows_projects_layers_and_what_is_reclaimable() {

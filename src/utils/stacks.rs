@@ -67,8 +67,8 @@ pub struct Settings {
     #[serde(default)]
     pub root: Option<String>,
     /// `false`: reuse layers but never commit new ones; what a step builds stays private to the
-    /// project's view. For jobs whose inputs are not trusted (a CI runner building pull requests
-    /// from forks next to release builds), so they cannot publish a layer others reuse.
+    /// project's view. It only stops the CLI from committing: a job that runs the CLI also
+    /// runs the privileged helper on the shared root, so untrusted jobs need their own root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<bool>,
     /// Whether `root` came from the file or the environment (warn on fallback) rather than the
@@ -160,11 +160,14 @@ fn on(v: &str) -> bool {
 /// with `enabled: true`, a `root:`, or `AVOCADO_STACKS=on` (or a path); `enabled: false` or
 /// `AVOCADO_STACKS=off` (or `0`, or empty) keeps them off.
 pub fn resolve_settings(file: Option<&str>, env: &EnvSettings) -> Result<Settings> {
-    let mut s: Settings = match file {
-        Some(t) if !t.trim().is_empty() => {
-            serde_yaml::from_str(t).context("invalid stacks config")?
-        }
-        _ => Settings::default(),
+    let parsed = match file {
+        Some(t) if !t.trim().is_empty() => serde_yaml::from_str(t).context("invalid stacks config"),
+        _ => Ok(Settings::default()),
+    };
+    let mut s: Settings = match parsed {
+        // `AVOCADO_STACKS=off` is the way out of a broken config, so it must not need it.
+        Err(_) if env.root.map(str::trim).is_some_and(off) => Settings::default(),
+        r => r?,
     };
     s.explicit = s.root.is_some() || s.enabled == Some(true);
     let file_root = s.root.take().unwrap_or_else(|| DEFAULT_ROOT.to_string());
@@ -661,8 +664,18 @@ fn mounts_inside_volume(volume: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn view_name(volume: &str, target: &str) -> String {
-    format!("{volume}-{target}")
+pub fn view_name(volume: &str, target: &str) -> Result<String> {
+    // It becomes a directory under views/ and part of an overlay `-o` string in the root
+    // helper, and a project's default_target is untrusted input.
+    if target.is_empty()
+        || target.contains("..")
+        || !target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("target '{target}' cannot name a stack view: use only letters, digits, '.', '_' and '-'");
+    }
+    Ok(format!("{volume}-{target}"))
 }
 
 pub fn key_of(inputs: &Value) -> String {
@@ -920,7 +933,7 @@ impl Stacks {
     ) -> Result<Self> {
         let s = settings()?;
         Ok(Self {
-            view: view_name(volume, target),
+            view: view_name(volume, target)?,
             helper: Helper::new(tool, root, &s),
             commit: s.commits(),
             uncommitted: false.into(),
@@ -1396,6 +1409,33 @@ mod tests {
     /// `AVOCADO_STACKS=on` turns them on, at the default root with the release's helper image
     /// and a free-space floor; `enabled: false` keeps a configured root off, and
     /// `AVOCADO_STACKS=on` overrides the file.
+    /// `AVOCADO_STACKS=off` gets a host out of a stacks config it cannot read; anything else
+    /// still reports the bad file.
+    #[test]
+    fn off_overrides_an_unreadable_config() {
+        let bad = Some("root: [\n");
+        let s = resolve_settings(bad, &env(Some("off"), None, None)).unwrap();
+        assert_eq!(s.root, None);
+        assert!(resolve_settings(bad, &EnvSettings::default()).is_err());
+        assert!(resolve_settings(bad, &env(Some("on"), None, None)).is_err());
+    }
+
+    /// A target becomes a path under views/ and part of the root helper's overlay options.
+    #[test]
+    fn a_view_name_takes_only_a_plain_target() {
+        assert_eq!(
+            view_name("avo-1", "raspberrypi4-64").unwrap(),
+            "avo-1-raspberrypi4-64"
+        );
+        assert_eq!(
+            view_name("avo-1", "qemux86_64.v2").unwrap(),
+            "avo-1-qemux86_64.v2"
+        );
+        for bad in ["", "a,lowerdir=/", "../x", "a/b", "a..b", "a b", "a\n"] {
+            assert!(view_name("avo-1", bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn stacks_are_opt_in() {
         assert_eq!(
