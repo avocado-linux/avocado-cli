@@ -673,11 +673,51 @@ pub fn is_mounted(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A view name (or name prefix) as the helper takes it: it is joined under views/ and goes
+/// into overlay `-o` options, so only `[A-Za-z0-9._-]` and never `..`.
+pub fn check_view_name(name: &str) -> std::result::Result<String, String> {
+    if name.is_empty()
+        || name.contains("..")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "view name '{name}' must be letters, digits, '.', '_' or '-', without '..'"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Write `path` so a crash leaves the old content or the new, never an empty file: the data
+/// is synced before the rename, and the directory after it.
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", crate::uniq()));
-    fs::write(&tmp, data)?;
+    let mut f = File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, data)?;
+    f.sync_all()?;
     fs::rename(&tmp, path)?;
+    sync_dir(path)
+}
+
+/// fsync the directory holding `path`, so a rename into it survives a crash.
+fn sync_dir(path: &Path) -> Result<()> {
+    if let Some(d) = path.parent() {
+        File::open(d)?.sync_all()?;
+    }
     Ok(())
+}
+
+/// Mount points strictly under `dir`, from `/proc/self/mountinfo` content.
+fn mounts_under(mountinfo: &[u8], dir: &Path) -> Vec<PathBuf> {
+    let mut prefix = dir.as_os_str().as_bytes().to_vec();
+    prefix.push(b'/');
+    mountinfo
+        .split(|&c| c == b'\n')
+        .filter_map(|l| l.split(|&c| c == b' ').nth(4))
+        .filter(|m| m.starts_with(&prefix))
+        .map(|m| PathBuf::from(std::ffi::OsStr::from_bytes(m)))
+        .collect()
 }
 
 fn rm_rf(p: &Path) -> Result<()> {
@@ -742,6 +782,24 @@ impl Stacks {
         if unsafe { libc::syncfs(f.as_raw_fd()) } != 0 {
             return Err(std::io::Error::last_os_error()).context("syncfs");
         }
+        Ok(())
+    }
+
+    /// Empty tmp/. A helper killed between the staging EROFS mount and its unmount leaves
+    /// that read-only mount under tmp/ (the root is bind-mounted rshared, so it outlives the
+    /// container); detach such mounts first, or removing tmp/ fails on them forever.
+    pub fn clear_tmp(&self) -> Result<()> {
+        let tmp = self.root.join("tmp");
+        let mi = fs::read("/proc/self/mountinfo").unwrap_or_default();
+        // Deepest first, so a mount inside another goes before it.
+        let mut stale = mounts_under(&mi, &tmp);
+        stale.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
+        for m in stale {
+            run(Command::new("umount").arg("-l").arg(&m))
+                .with_context(|| format!("detach stale mount {}", m.display()))?;
+        }
+        rm_rf(&tmp)?;
+        fs::create_dir_all(&tmp)?;
         Ok(())
     }
 
@@ -818,8 +876,14 @@ impl Stacks {
     /// others are reflinked when the filesystem allows it, else copied.
     fn put_object(&self, src: &Path, hex: &str, movable: bool) -> Result<bool> {
         let dst = self.obj_path(hex);
-        if dst.exists() {
-            return Ok(false);
+        // Reuse only an object that is whole: a crash after its rename but before the next
+        // syncfs can leave it truncated under a valid name.
+        // ponytail: a size check, not a re-hash (that would read the store on every build);
+        // same-size corruption is what `verify` is for.
+        if let Ok(m) = fs::metadata(&dst) {
+            if m.len() == fs::metadata(src)?.len() {
+                return Ok(false);
+            }
         }
         fs::create_dir_all(dst.parent().unwrap())?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -948,6 +1012,7 @@ impl Stacks {
         };
         fs::rename(&tmp_dump, self.layer_file(key, "dump"))?;
         fs::rename(&tmp_img, self.layer_file(key, "erofs"))?;
+        sync_dir(&self.layer_file(key, "erofs"))?;
         // The record is the commit point: everything it names (objects, dump, image) must be on
         // disk first, or a power loss leaves a record pointing at truncated files.
         self.sync()?;
@@ -1121,6 +1186,7 @@ impl Stacks {
         meta: Option<serde_json::Value>,
         adopt: bool,
     ) -> Result<ViewRecord> {
+        check_view_name(name).map_err(anyhow::Error::msg)?;
         // Shared GC lock: GC clears tmp/ (where the staging mount lives) and must see the lease.
         let _gc = self.gc_lock(false)?;
         let mut v = self.view(name)?.unwrap_or(ViewRecord {
@@ -1232,6 +1298,7 @@ impl Stacks {
 
     /// Drop a view entirely (its upper too) and release its lease.
     pub fn drop_view(&self, name: &str) -> Result<()> {
+        check_view_name(name).map_err(anyhow::Error::msg)?;
         self.umount_view(name)?;
         rm_rf(&self.view_dir(name))?;
         rm_rf(&self.root.join("views").join(format!("{name}.json")))
@@ -1784,8 +1851,7 @@ impl Stacks {
         let _gc = self.gc_lock(true)?;
         // Orphans from crashed writers: tmp files, dangling aliases, layer files without a record.
         if !dry_run {
-            rm_rf(&self.root.join("tmp"))?;
-            fs::create_dir_all(self.root.join("tmp"))?;
+            self.clear_tmp()?;
         }
         for d in fs::read_dir(self.root.join("layers"))? {
             let p = d?.path();
@@ -1932,6 +1998,56 @@ pub fn write_out(v: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store without the empty layer, for tests that need no `mkcomposefs`.
+    fn bare_store() -> Stacks {
+        let root = std::env::temp_dir().join(format!("avo-stacks-bare-{}", uniq()));
+        for d in ["objects", "tmp"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        Stacks {
+            root,
+            last_mode: Mutex::new(None),
+        }
+    }
+
+    /// An object a crash left truncated under its hash is replaced, not reused.
+    #[test]
+    fn a_truncated_object_is_replaced() {
+        let st = bare_store();
+        let body = [b'x'; 4096];
+        let hex = sha256_hex(&body);
+        let src = st.root.join("src");
+        fs::write(&src, body).unwrap();
+        let dst = st.obj_path(&hex);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&dst, &body[..100]).unwrap();
+        assert!(st.put_object(&src, &hex, false).unwrap(), "rewritten");
+        assert_eq!(fs::read(&dst).unwrap(), body);
+        assert!(!st.put_object(&src, &hex, false).unwrap(), "whole: reused");
+        let _ = fs::remove_dir_all(&st.root);
+    }
+
+    /// Stale mounts under tmp/ are found (deepest handled first by the caller), and only those.
+    #[test]
+    fn stale_mounts_under_tmp_are_found() {
+        let mi = b"36 35 0:1 / / rw - x x rw\n\
+            37 36 0:2 / /srv/stacks/tmp/erofs.v.1 ro - erofs x ro\n\
+            38 36 0:3 / /srv/stacks/tmpx ro - x x ro\n\
+            39 36 0:4 / /srv/stacks/tmp ro - x x ro\n";
+        assert_eq!(
+            mounts_under(mi, Path::new("/srv/stacks/tmp")),
+            [PathBuf::from("/srv/stacks/tmp/erofs.v.1")]
+        );
+    }
+
+    #[test]
+    fn a_view_name_is_checked_before_it_reaches_a_path_or_mount() {
+        assert!(check_view_name("avo-1-raspberrypi4-64").is_ok());
+        for bad in ["", "..", "a/../b", "a,upperdir=/", "a/b", "a b"] {
+            assert!(check_view_name(bad).is_err(), "{bad:?}");
+        }
+    }
 
     /// GC evicts unprotected layers and their objects, and a pinned *alias* keeps its target.
     /// Needs `mkcomposefs` on PATH (no root: GC never mounts).

@@ -31,6 +31,7 @@ enum Cmd {
     /// One round trip for a CLI step: the view's current layer and its ancestors, whether KEY
     /// exists, and the layer KEY resolves to (aliases followed).
     Check {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
         key: String,
     },
@@ -44,6 +45,7 @@ enum Cmd {
     },
     /// Mount a view (new views start on LAYER, default the empty layer).
     Mount {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
         #[arg(long)]
         layer: Option<String>,
@@ -64,10 +66,12 @@ enum Cmd {
     },
     /// Mark VIEW's upper as holding work no layer has (a step ran without committing).
     Taint {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
     },
     /// Mount every recorded, unmounted view whose name starts with PREFIX.
     Remount {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         prefix: String,
     },
     /// Make ALIAS another name for layer KEY.
@@ -76,10 +80,12 @@ enum Cmd {
         key: String,
     },
     Umount {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
     },
     /// Unmount and delete a view and its upper (releases its lease).
     Drop {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
         /// Drop every view whose name starts with VIEW.
         #[arg(long)]
@@ -87,6 +93,7 @@ enum Cmd {
     },
     /// Switch a view to layer KEY, keeping only its private paths.
     Use {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
         key: String,
         #[arg(long)]
@@ -94,6 +101,7 @@ enum Cmd {
     },
     /// Harvest a mounted view into layer KEY and remount it there.
     Commit {
+        #[arg(value_parser = avocado_stacks::check_view_name)]
         view: String,
         key: String,
         #[arg(long, default_value = "{}")]
@@ -296,6 +304,7 @@ fn main() -> Result<()> {
             avocado_stacks::wait_stdin_eof();
         }
         Cmd::Destroy => {
+            stacks.clear_tmp()?;
             for v in stacks.views()? {
                 stacks.drop_view(&v.name)?;
             }
