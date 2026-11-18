@@ -58,7 +58,10 @@ fn base_layer_sysroot_inputs(
     };
     let mut out = serde_json::Map::new();
     for sysroot in [SysrootType::Rootfs, SysrootType::Initramfs] {
-        let packages = sysroot_packages(config, &sysroot, target, Some(parsed)).unwrap_or_default();
+        let packages = sysroot_packages(config, &sysroot, target, Some(parsed))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let inputs = compute_sysroot_install_inputs(
             &SysrootStampContext {
                 sysroot_type: &sysroot,
