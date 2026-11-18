@@ -2027,7 +2027,10 @@ mod tests {
         assert!(!st.put_object(&src, &hex, false).unwrap(), "whole: reused");
         // Same size, zeroed blocks: hashed and replaced too.
         fs::write(&dst, [0u8; 4096]).unwrap();
-        assert!(st.put_object(&src, &hex, false).unwrap(), "same size, wrong bytes");
+        assert!(
+            st.put_object(&src, &hex, false).unwrap(),
+            "same size, wrong bytes"
+        );
         assert_eq!(fs::read(&dst).unwrap(), body);
         let _ = fs::remove_dir_all(&st.root);
     }
