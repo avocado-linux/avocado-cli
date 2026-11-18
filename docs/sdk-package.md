@@ -37,6 +37,11 @@ section headers, so it would end the scriptlet. Such a line is rejected.
 
 - A provide containing a newline or other control character, or an empty
   provide, is rejected with an error naming the entry.
+- A `requires` entry containing a newline or other control character is
+  rejected with an error naming the section and the entry. The same holds for
+  a sub-package's `requires` under `split`, and the error also names the
+  sub-package. A `%` in a `requires` entry is not escaped, so a macro there
+  still expands.
 - A scriptlet containing a line exactly equal to `SPEC_EOF` is rejected.
 - A scriptlet containing a line whose first non-blank character is `%` is
   rejected with the line quoted. Start the line with another character.

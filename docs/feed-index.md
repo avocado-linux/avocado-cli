@@ -21,6 +21,10 @@ writes an identical `repomd.xml`. Adding, removing or changing an RPM changes
 - `createrepo_c` not on PATH: the error names `createrepo_c` and says how to
   install it.
 - The directory does not exist or is not a directory: the error names the path.
+- A symlinked directory leads back into its own path, such as `a -> .` or a
+  link to a parent: the error names the link, and `createrepo_c` is not run.
+  `createrepo_c` follows symlinked directories and never finishes on such a
+  link. A link to a directory outside the feed is followed and indexed.
 
 ## Using the result as a feed
 

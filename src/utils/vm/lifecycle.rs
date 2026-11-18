@@ -140,10 +140,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
 
     // Record the artifact dir so Avocado.app (which inherits a sanitized
     // env from LaunchServices on macOS) can find it without AVOCADO_VM_DIR.
-    let _ = std::fs::write(
-        paths.artifact_dir_file(),
-        artifact_dir.display().to_string(),
-    );
+    paths.record_source(&artifact_dir);
 
     qemu::ensure_qemu_available(&manifest)?;
     ensure_ssh_key(&paths)?;
