@@ -38,6 +38,7 @@ pub enum RubiconAction {
     Console {
         board: Option<String>,
         read_only: bool,
+        for_secs: Option<u64>,
     },
     Logs {
         board: Option<String>,
@@ -141,12 +142,17 @@ impl RubiconCommand {
                 .await
             }
             RubiconAction::Run { board, profile } => self.run(board, profile).await,
-            RubiconAction::Console { board, read_only } => {
+            RubiconAction::Console {
+                board,
+                read_only,
+                for_secs,
+            } => {
                 let b = self.board(board).await?;
                 let token =
                     remote::local_token(&b, "rubicon_console", self.connect_profile.as_deref())
                         .await?;
-                self.console(&b, !read_only, true, true, token)
+                let limit = for_secs.map(std::time::Duration::from_secs);
+                self.console(&b, !read_only, true, true, token, limit).await
             }
             RubiconAction::Update {
                 board,
@@ -203,7 +209,7 @@ impl RubiconCommand {
                 } else {
                     None
                 };
-                self.console(&b, false, true, *follow, token)
+                self.console(&b, false, true, *follow, token, None).await
             }
         }
     }
@@ -419,14 +425,16 @@ impl RubiconCommand {
     }
 
     /// The board's serial console through this machine's VM: interactive
-    /// (`write`), or its history and then (`follow`) what it prints.
-    fn console(
+    /// (`write`; piped stdin when there is no terminal), or its history and
+    /// then (`follow`) what it prints. `limit` ends the session after that long.
+    async fn console(
         &self,
         b: &Board,
         write: bool,
         history: bool,
         follow: bool,
         token: Option<String>,
+        limit: Option<std::time::Duration>,
     ) -> Result<()> {
         if !matches!(b.hub, Hub::Local) {
             bail!(
@@ -468,11 +476,15 @@ impl RubiconCommand {
         }
         let mut ssh = Command::new("ssh");
         ssh.args(target.base_args());
-        if write {
-            use crate::utils::interactivity::{ContainerStdio, StdioCapabilities};
-            if !ContainerStdio::decide(true, &StdioCapabilities::detect()).allocates_tty() {
-                bail!("an interactive console needs a terminal; `avocado rubicon logs -f` watches without one");
-            }
+        use crate::utils::interactivity::{ContainerStdio, StdioCapabilities};
+        let tty = write
+            && match ContainerStdio::decide(true, &StdioCapabilities::detect()) {
+                ContainerStdio::StdinAndTty => true,
+                // Scripted: stdin's bytes go to the DUT as they are.
+                ContainerStdio::StdinOnly => false,
+                _ => bail!("console input needs a terminal or piped stdin; `avocado rubicon logs -f` watches without either"),
+            };
+        if tty {
             eprintln!("[console of {}; Ctrl-] to leave]", b.describe());
             // A remote tty in raw mode: keys go to the DUT as typed.
             ssh.args(["-o", "RequestTTY=force"])
@@ -480,15 +492,114 @@ impl RubiconCommand {
         } else {
             ssh.arg(cmd);
         }
-        let st = ssh.status().context("ssh to the VM")?;
-        if write {
+        // Before the ssh, so it drops after it: put back on every way out.
+        #[cfg(unix)]
+        let _term = tty.then(|| TermRestore::save(0)).flatten();
+        // Before the ssh: a signal between the spawn and the first poll of
+        // lazily registered handlers would kill the CLI and orphan the ssh.
+        let mut signals = Signals::new().context("console signal handlers")?;
+        let mut child = tokio::process::Command::from(ssh)
+            .kill_on_drop(true)
+            .spawn()
+            .context("ssh to the VM")?;
+        let st = wait_or_kill(&mut child, limit, &mut signals).await?;
+        if tty {
             eprintln!();
         }
-        if !st.success() {
-            bail!("console session ended with {st}");
+        match st {
+            Some(st) if !st.success() => bail!("console session ended with {st}"),
+            _ => Ok(()),
         }
-        Ok(())
     }
+}
+
+/// A terminal's settings, put back on drop. ssh sets the local terminal
+/// raw for an interactive console, and a killed ssh never restores it.
+#[cfg(unix)]
+struct TermRestore(i32, libc::termios);
+
+#[cfg(unix)]
+impl TermRestore {
+    fn save(fd: i32) -> Option<Self> {
+        let mut t = std::mem::MaybeUninit::uninit();
+        // SAFETY: tcgetattr fills `t` when it returns 0.
+        (unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } == 0)
+            .then(|| Self(fd, unsafe { t.assume_init() }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TermRestore {
+    fn drop(&mut self) {
+        // SAFETY: a termios that tcgetattr filled.
+        unsafe { libc::tcsetattr(self.0, libc::TCSANOW, &self.1) };
+    }
+}
+
+/// The signals that end a console, registered as it is created so none
+/// is missed before the wait starts.
+#[cfg(unix)]
+struct Signals([tokio::signal::unix::Signal; 3]);
+
+#[cfg(unix)]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self([
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+        ]))
+    }
+
+    async fn recv(&mut self) {
+        let [int, term, hup] = &mut self.0;
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+struct Signals(tokio::signal::windows::CtrlC);
+
+#[cfg(windows)]
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self(tokio::signal::windows::ctrl_c()?))
+    }
+
+    async fn recv(&mut self) {
+        self.0.recv().await;
+    }
+}
+
+/// Waits for the console's ssh; `None` once `limit` passes and it is
+/// killed. A signal kills it too: left running, an orphaned ssh keeps the
+/// board's console write lease from everyone after.
+async fn wait_or_kill(
+    child: &mut tokio::process::Child,
+    limit: Option<std::time::Duration>,
+    signals: &mut Signals,
+) -> Result<Option<std::process::ExitStatus>> {
+    let limit = async {
+        match limit {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        st = child.wait() => return Ok(Some(st.context("ssh to the VM")?)),
+        _ = signals.recv() => {
+            child.kill().await.ok();
+            bail!("console interrupted");
+        }
+        _ = limit => {}
+    }
+    child.kill().await.ok();
+    Ok(None)
 }
 
 /// A signed Rubicon image.
@@ -754,6 +865,48 @@ fn job_id(queue: &[Value], wanted: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// `--for` ends the session: the ssh is killed, not left holding the lease.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn console_limit_kills_the_ssh() {
+        let mut child = sleeper();
+        let mut signals = Signals::new().unwrap();
+        let limit = Some(std::time::Duration::from_millis(100));
+        let st = wait_or_kill(&mut child, limit, &mut signals).await.unwrap();
+        assert!(st.is_none());
+        assert!(child.try_wait().unwrap().is_some(), "ssh still running");
+    }
+
+    /// A SIGTERM to the CLI takes its ssh down with it instead of orphaning
+    /// it (and its console write lease) to init.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn console_sigterm_kills_the_ssh() {
+        let mut signals = Signals::new().unwrap();
+        let mut child = sleeper();
+        let pid = child.id().unwrap();
+        // Before the wait is polled: the handlers are already in place.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        let err = wait_or_kill(&mut child, None, &mut signals)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "ssh {pid} still running"
+        );
+    }
+
     fn command(config_path: &str, target: Option<&str>) -> RubiconCommand {
         RubiconCommand {
             action: RubiconAction::List,
@@ -876,5 +1029,35 @@ mod tests {
     fn quoting_survives_odd_addresses() {
         assert_eq!(sh_quote("10.0.0.1"), "'10.0.0.1'");
         assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+    }
+
+    /// A raw terminal is cooked again once the guard drops, as after a
+    /// killed ssh.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_raw_terminal_is_put_back() {
+        let (mut m, mut s) = (0, 0);
+        let null = std::ptr::null_mut();
+        // SAFETY: openpty writes the two fds.
+        let r = unsafe { libc::openpty(&mut m, &mut s, null, std::ptr::null(), std::ptr::null()) };
+        assert_eq!(r, 0);
+        let attrs = || {
+            let mut t = std::mem::MaybeUninit::uninit();
+            // SAFETY: as in TermRestore::save.
+            assert_eq!(unsafe { libc::tcgetattr(s, t.as_mut_ptr()) }, 0);
+            unsafe { t.assume_init() }
+        };
+        let cooked = attrs().c_lflag & (libc::ICANON | libc::ECHO);
+        assert_ne!(cooked, 0);
+        let guard = TermRestore::save(s).unwrap();
+        // What ssh does to the local terminal.
+        let mut raw = attrs();
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(unsafe { libc::tcsetattr(s, libc::TCSANOW, &raw) }, 0);
+        assert_eq!(attrs().c_lflag & (libc::ICANON | libc::ECHO), 0);
+        drop(guard);
+        assert_eq!(attrs().c_lflag & (libc::ICANON | libc::ECHO), cooked);
+        unsafe { libc::close(m) };
+        unsafe { libc::close(s) };
     }
 }
