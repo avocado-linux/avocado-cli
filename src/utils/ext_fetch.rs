@@ -279,6 +279,19 @@ fn order_repo_groups(
     ordered
 }
 
+/// The feed a failed fetch's dnf downloaded from: the named feed a
+/// `--repo=` restriction selects (with its CA and credential), when the host
+/// can reach it, else the SDK repository.
+fn probe_feed(
+    repo_name: Option<&str>,
+    host_feeds: Option<&std::collections::HashMap<String, crate::utils::feeds::FeedEndpoint>>,
+    sdk_url: String,
+) -> crate::utils::feeds::FeedEndpoint {
+    repo_name
+        .and_then(|r| host_feeds?.get(r).cloned())
+        .unwrap_or_else(|| crate::utils::feeds::FeedEndpoint::plain(sdk_url))
+}
+
 /// Extension fetcher for downloading and installing remote extensions
 pub struct ExtensionFetcher {
     /// Path to the main configuration file
@@ -623,25 +636,21 @@ echo "{INSTALLED_REPORT_END}"
         );
 
         let container_helper = SdkContainer::new().verbose(self.verbose);
-        let run_config = RunConfig {
-            container_image: self.container_image.clone(),
-            target: self.target.clone(),
-            command: script,
-            verbose: self.verbose,
-            source_environment: true,
-            interactive: false,
-            repo_url: self.repo_url.clone(),
-            feeds: self.feeds.clone(),
-            repo_release: self.repo_release.clone(),
-            container_args: self.container_args.clone(),
-            sdk_arch: self.sdk_arch.clone(),
-            ..Default::default()
-        };
+        let run_config = self.package_group_run_config(script);
+        let (sdk_url, user_agent) = crate::utils::container::rate_limit_probe_target(&run_config);
+        let probed = probe_feed(
+            repo_name,
+            self.feeds.as_ref().map(|f| &f.host_feeds),
+            sdk_url,
+        );
 
         let out = container_helper
             .run_in_container_capture(run_config)
             .await?;
         if !out.success {
+            // Capture skips run_in_container's 429 check, and dnf reports a
+            // 429 as "No more mirrors to try".
+            crate::utils::feed_limit::explain_if_rate_limited(&probed, &user_agent).await;
             return Err(anyhow::anyhow!(
                 "Failed to fetch package extension(s): {}{}",
                 entries
@@ -665,6 +674,25 @@ echo "{INSTALLED_REPORT_END}"
         }
 
         Ok(parse_installed_report(&out.stdout))
+    }
+
+    /// The container run for a package-group fetch: this fetcher's feed, so a
+    /// failed download is probed for a 429 where dnf downloaded from.
+    fn package_group_run_config(&self, script: String) -> RunConfig {
+        RunConfig {
+            container_image: self.container_image.clone(),
+            target: self.target.clone(),
+            command: script,
+            verbose: self.verbose,
+            source_environment: true,
+            interactive: false,
+            repo_url: self.repo_url.clone(),
+            feeds: self.feeds.clone(),
+            repo_release: self.repo_release.clone(),
+            container_args: self.container_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        }
     }
 
     /// Fetch an extension from the avocado package repository
@@ -1058,6 +1086,45 @@ mod tests {
         assert!(!looks_like_short_sha("20261117"));
     }
     use super::*;
+
+    /// A failed package fetch is probed for a 429 at the fetcher's own feed,
+    /// with the User-Agent its dnf sent.
+    #[test]
+    fn a_package_fetch_probes_its_own_feed_for_a_rate_limit() {
+        let fetcher = ExtensionFetcher::new("c.yaml".into(), "t".into(), "img".into(), false)
+            .with_repo_url(Some("https://feed.example/repo".into()));
+        let (url, ua) = crate::utils::container::rate_limit_probe_target(
+            &fetcher.package_group_run_config(String::new()),
+        );
+        assert_eq!(url, "https://feed.example/repo");
+        assert_eq!(ua, crate::utils::feeds::user_agent_for(None, None));
+    }
+
+    /// A `--repo=` restricted fetch is probed at that named feed, not the SDK
+    /// repository; an unrestricted or unknown one keeps the SDK URL.
+    #[test]
+    fn a_restricted_fetch_probes_the_named_feed() {
+        use crate::utils::feeds::FeedEndpoint;
+        let vendor = FeedEndpoint {
+            ca: Some("/ca.pem".into()),
+            credential: Some(("u".into(), "p".into())),
+            ..FeedEndpoint::plain("https://vendor.example/feed".into())
+        };
+        let feeds = std::collections::HashMap::from([("vendor".to_string(), vendor)]);
+        let sdk = || "https://sdk.example/repo".to_string();
+        let named = probe_feed(Some("vendor"), Some(&feeds), sdk());
+        assert_eq!(named.url, "https://vendor.example/feed");
+        assert_eq!(named.ca.as_deref(), Some(std::path::Path::new("/ca.pem")));
+        assert!(named.credential.is_some());
+        for p in [
+            probe_feed(None, Some(&feeds), sdk()),
+            probe_feed(Some("other"), Some(&feeds), sdk()),
+            probe_feed(Some("vendor"), None, sdk()),
+        ] {
+            assert_eq!(p.url, sdk());
+            assert!(p.credential.is_none() && p.ca.is_none());
+        }
+    }
 
     /// The mistake this message exists for: the source lives at `<base>/foo`
     /// and the config says `extensions/foo`. The old text echoed the joined

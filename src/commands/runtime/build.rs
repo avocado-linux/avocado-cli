@@ -3682,11 +3682,6 @@ mod tests {
             .collect()
     }
 
-    /// The copy script reads `/opt/src/<staging>/`, so the files must be on
-    /// the host under the directory the container mounts there: `src_dir`
-    /// when set, else the working directory. Never the config file's
-    /// directory unless one of those is it.
-
     #[tokio::test]
     async fn a_stated_but_empty_version_is_an_error_not_an_rpm_lookup() {
         let yaml = r#"
@@ -3719,6 +3714,11 @@ extensions:
             .unwrap_err();
         assert!(err.to_string().contains("empty 'version'"), "{err}");
     }
+
+    /// The copy script reads `/opt/src/<staging>/`, so the files must be on
+    /// the host under the directory the container mounts there: `src_dir`
+    /// when set, else the working directory. Never the config file's
+    /// directory unless one of those is it.
     #[tokio::test]
     async fn stage_into_volume_writes_under_the_mounted_src_dir() {
         let (_root, project, config_path) = src_dir_above_config_dir();
