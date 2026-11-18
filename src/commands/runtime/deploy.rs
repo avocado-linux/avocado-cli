@@ -464,7 +464,7 @@ impl RuntimeDeployCommand {
 
             if self.connect_sign {
                 // Route Phase 2 through the Connect signing endpoint.
-                let connect_config = connect_client::load_config()?
+                let connect_config = connect_client::load_stored_config()?
                     .ok_or_else(|| anyhow::anyhow!(Self::connect_sign_login_message()))?;
                 let org_hint = config.connect.as_ref().and_then(|c| c.org.as_deref());
                 let (_, profile) = connect_config.resolve_profile(None, org_hint)?;
