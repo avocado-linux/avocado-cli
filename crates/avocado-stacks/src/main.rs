@@ -304,17 +304,22 @@ fn main() -> Result<()> {
             avocado_stacks::wait_stdin_eof();
         }
         Cmd::Destroy => {
+            // Exclusive, as gc takes it: every writer (import, mount, use, commit) holds it
+            // shared while its staging mount lives in tmp/ and its objects are half written,
+            // and no new one starts until the teardown is done.
+            let _gc = stacks.gc_lock(true)?;
             stacks.clear_tmp()?;
             for v in stacks.views()? {
                 stacks.drop_view(&v.name)?;
             }
-            for d in ["objects", "layers", "views", "locks", "pins", "tmp"] {
+            // locks/ and gc.lock stay: a helper waiting on a lock file that is unlinked would
+            // take a lock on the old inode while the next one locks a new file.
+            for d in ["objects", "layers", "views", "pins", "tmp"] {
                 let p = cli.root.join(d);
                 if p.exists() {
                     std::fs::remove_dir_all(&p)?;
                 }
             }
-            let _ = std::fs::remove_file(cli.root.join("gc.lock"));
         }
     }
     Ok(())

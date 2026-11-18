@@ -876,12 +876,12 @@ impl Stacks {
     /// others are reflinked when the filesystem allows it, else copied.
     fn put_object(&self, src: &Path, hex: &str, movable: bool) -> Result<bool> {
         let dst = self.obj_path(hex);
-        // Reuse only an object that is whole: a crash after its rename but before the next
-        // syncfs can leave it truncated under a valid name.
-        // ponytail: a size check, not a re-hash (that would read the store on every build);
-        // same-size corruption is what `verify` is for.
+        // Reuse only an object whose content is its name: a crash after its rename but before
+        // the next syncfs can leave it truncated or with unwritten blocks under a valid hash.
+        // Only an object this import would reuse is hashed (the size check skips the read for
+        // most bad ones), never the rest of the store.
         if let Ok(m) = fs::metadata(&dst) {
-            if m.len() == fs::metadata(src)?.len() {
+            if m.len() == fs::metadata(src)?.len() && sha256_file(&dst)? == hex {
                 return Ok(false);
             }
         }
@@ -2011,7 +2011,7 @@ mod tests {
         }
     }
 
-    /// An object a crash left truncated under its hash is replaced, not reused.
+    /// An object a crash left truncated or zeroed under its hash is replaced, not reused.
     #[test]
     fn a_truncated_object_is_replaced() {
         let st = bare_store();
@@ -2025,6 +2025,10 @@ mod tests {
         assert!(st.put_object(&src, &hex, false).unwrap(), "rewritten");
         assert_eq!(fs::read(&dst).unwrap(), body);
         assert!(!st.put_object(&src, &hex, false).unwrap(), "whole: reused");
+        // Same size, zeroed blocks: hashed and replaced too.
+        fs::write(&dst, [0u8; 4096]).unwrap();
+        assert!(st.put_object(&src, &hex, false).unwrap(), "same size, wrong bytes");
+        assert_eq!(fs::read(&dst).unwrap(), body);
         let _ = fs::remove_dir_all(&st.root);
     }
 
