@@ -124,8 +124,13 @@ impl UpdateCommand {
             }
             // Print the "what's available" summary so --check is useful
             // even when nothing's new.
+            // Also what a failed or disabled poll reports: selecting the
+            // install either way is what `vm update` meant before.
             VmUpdateStatus::NoUpdate => {
-                return print_up_to_date(installed_version.as_deref(), &channel_name, self.output)
+                if !self.check_only {
+                    paths.select_install();
+                }
+                return print_up_to_date(installed_version.as_deref(), &channel_name, self.output);
             }
         };
 
@@ -194,6 +199,7 @@ impl UpdateCommand {
             .with_context(|| format!("creating install dir {}", install_dir.display()))?;
         let downloads = plan_downloads(&new_manifest, installed.as_ref(), &install_dir);
         if downloads.is_empty() {
+            paths.select_install();
             println!("avocado vm update: nothing to download (all artifacts already current).");
             return Ok(());
         }
@@ -349,9 +355,8 @@ impl UpdateCommand {
         // existing status / start paths) in sync with the install.
         std::fs::copy(&manifest_path, paths.manifest()).ok();
 
-        // Drop the artifact-dir pointer so `vm start` (no --vm-source)
-        // boots from the managed install.
-        let _ = std::fs::write(paths.artifact_dir_file(), install_dir.display().to_string());
+        // Point `vm start` (no --vm-source) at the managed install.
+        paths.record_source(&install_dir);
 
         stage.cleanup();
 

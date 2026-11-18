@@ -5086,9 +5086,9 @@ enum VmCommands {
     /// Boot the avocado-vm (fails if it is already running).
     Start {
         /// Directory containing `direct` profile output (manifest.json + artifacts).
-        /// Resolution order when unset: $AVOCADO_VM_DIR → ~/.avocado/vm/install/
-        /// (populated by `avocado vm update`) → last `vm start`/`vm rebuild`
-        /// dir → error.
+        /// Resolution order when unset: $AVOCADO_VM_DIR → the source the last
+        /// `vm start`/`vm rebuild`/`vm update` used → ~/.avocado/vm/install/
+        /// (populated by `avocado vm update`) → error.
         #[arg(long)]
         vm_source: Option<std::path::PathBuf>,
         /// Memory in MiB. Resolution order: this flag → `runtime.memory_mib`
