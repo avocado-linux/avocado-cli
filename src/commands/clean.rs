@@ -171,13 +171,9 @@ impl CleanCommand {
         if !config_path.exists() {
             return roots;
         }
-        match Config::load_composed(&config_path, self.target.as_deref()) {
-            Ok(composed) => {
-                let root = composed.config.project_root(&config_path);
-                if !roots.contains(&root) {
-                    roots.push(root);
-                }
-            }
+        match staged_src_dir(&config_path, self.target.as_deref()) {
+            Ok(Some(root)) if !roots.contains(&root) => roots.push(root),
+            Ok(_) => {}
             // A broken config must not block a clean, but say what was skipped.
             Err(e) => print_warning(
                 &format!(
@@ -359,6 +355,25 @@ fi
 
         Ok(())
     }
+}
+
+/// The `src_dir` a build for `target` stages under, read from the config
+/// with the build's interpolation but nothing else: composing the config
+/// would discover remote extensions through the volume, which can start a
+/// session that holds it, or recreate one a clean is removing.
+fn staged_src_dir(config_path: &Path, target: Option<&str>) -> Result<Option<PathBuf>> {
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(config_path)?)?;
+    crate::utils::interpolation::interpolate_config(&mut value, target, None)?;
+    let Some(src_dir) = value.get("src_dir").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let path = Path::new(src_dir);
+    if path.is_absolute() {
+        return Ok(Some(path.to_path_buf()));
+    }
+    // Resolved as Config::get_resolved_src_dir resolves it.
+    let joined = crate::utils::config::config_file_dir(config_path).join(path);
+    Ok(Some(joined.canonicalize().unwrap_or(joined)))
 }
 
 #[cfg(test)]
