@@ -36,7 +36,7 @@ impl ConnectInitCommand {
         let _json_guard = self.output.is_json().then(JsonOutputGuard::enable);
 
         // 1. Verify login
-        let mut config = client::load_config()?
+        let mut config = client::load_stored_config()?
             .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'avocado connect auth login'"))?;
         let (_, initial_profile) = config.resolve_profile(self.profile.as_deref(), None)?;
         let mut client = ConnectClient::from_profile(initial_profile)?;

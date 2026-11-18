@@ -12,6 +12,8 @@
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+
+use crate::utils::feeds::FeedEndpoint;
 use reqwest::StatusCode;
 
 /// `Retry-After` in seconds. The edge sends delta-seconds; an HTTP-date or
@@ -45,8 +47,10 @@ pub(crate) fn rate_limit_message(retry_after: Option<u64>, identified: bool) -> 
 }
 
 /// Whether the repository is answering this client 429 right now: one HEAD
-/// with the User-Agent dnf sent and the repo TLS settings dnf uses
-/// (`AVOCADO_REPO_CA`, `AVOCADO_REPO_INSECURE`). `Some(retry_after)` on a 429,
+/// with the User-Agent dnf sent, the repo TLS settings dnf uses
+/// (`AVOCADO_REPO_CA`, `AVOCADO_REPO_INSECURE`), and a named feed's own CA,
+/// TLS setting and credential, so a feed that authenticates before it rate
+/// limits answers the probe as it answered dnf. `Some(retry_after)` on a 429,
 /// `None` for any other answer or no answer. Rate limits are counted per client
 /// rather than per object, so the repository root is as good a probe as the
 /// object dnf failed on.
@@ -54,12 +58,13 @@ pub(crate) fn rate_limit_message(retry_after: Option<u64>, identified: bool) -> 
 // leave through the same address (the normal case). With `--runs-on` or a VM
 // on another egress, an anonymous per-address 429 goes unexplained and dnf's
 // own message stands. Probe from inside the container if that case matters.
-pub(crate) async fn probe(repo_url: &str, user_agent: &str) -> Option<Option<u64>> {
+pub(crate) async fn probe(feed: &FeedEndpoint, user_agent: &str) -> Option<Option<u64>> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .user_agent(user_agent);
-    if std::env::var("AVOCADO_REPO_INSECURE")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    if !feed.tls_verify
+        || std::env::var("AVOCADO_REPO_INSECURE")
+            .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
     {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -71,9 +76,12 @@ pub(crate) async fn probe(repo_url: &str, user_agent: &str) -> Option<Option<u64
             builder = builder.add_root_certificate(cert);
         }
     }
-    let client = builder.build().ok()?;
-    let resp = client
-        .head(format!("{}/", repo_url.trim_end_matches('/')))
+    let client = crate::utils::feeds::trust_feed_ca(builder, feed.ca.as_deref(), "feed")
+        .ok()?
+        .build()
+        .ok()?;
+    let req = client.head(format!("{}/", feed.url.trim_end_matches('/')));
+    let resp = crate::utils::feeds::authorize_feed(req, feed.credential.as_ref())
         .send()
         .await
         .ok()?;
@@ -87,12 +95,12 @@ static EXPLAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// After a failed run: if the repository is answering 429, say so, once.
 /// `user_agent` is the run's `AVOCADO_FEED_UA`: the edge counts limits per
 /// identity, so probing with any other one can read a different counter.
-pub(crate) async fn explain_if_rate_limited(repo_url: &str, user_agent: &str) {
+pub(crate) async fn explain_if_rate_limited(feed: &FeedEndpoint, user_agent: &str) {
     use std::sync::atomic::Ordering;
     if EXPLAINED.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(retry_after) = probe(repo_url, user_agent).await {
+    if let Some(retry_after) = probe(feed, user_agent).await {
         if EXPLAINED.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -128,6 +136,10 @@ mod tests {
     use std::net::TcpListener;
 
     const UA: &str = "avocado-cli/test";
+
+    fn at(url: &str) -> FeedEndpoint {
+        FeedEndpoint::plain(url.to_string())
+    }
 
     fn headers(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -173,13 +185,13 @@ mod tests {
     async fn probe_reports_429_with_its_retry_after() {
         let url =
             serve("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 42\r\nContent-Length: 0\r\n\r\n");
-        assert_eq!(probe(&url, UA).await, Some(Some(42)));
+        assert_eq!(probe(&at(&url), UA).await, Some(Some(42)));
     }
 
     #[tokio::test]
     async fn probe_reports_429_without_retry_after() {
         let url = serve("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n");
-        assert_eq!(probe(&url, UA).await, Some(None));
+        assert_eq!(probe(&at(&url), UA).await, Some(None));
     }
 
     #[tokio::test]
@@ -189,7 +201,7 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n",
         ] {
-            assert_eq!(probe(&serve(resp), UA).await, None, "{resp}");
+            assert_eq!(probe(&at(&serve(resp)), UA).await, None, "{resp}");
         }
     }
 
@@ -214,11 +226,11 @@ mod tests {
             }
         });
         assert_eq!(
-            probe(&url, "avocado-cli/test;key/minted;tier/3").await,
+            probe(&at(&url), "avocado-cli/test;key/minted;tier/3").await,
             Some(None)
         );
         assert_eq!(
-            probe(&url, "avocado-cli/test;key/default;tier/1").await,
+            probe(&at(&url), "avocado-cli/test;key/default;tier/1").await,
             None
         );
     }
@@ -253,12 +265,16 @@ mod tests {
         std::fs::write(ca.path(), tls.ca_cert_pem()).unwrap();
 
         std::env::remove_var("AVOCADO_REPO_CA");
-        assert_eq!(probe(&url, UA).await, None, "untrusted CA must not verify");
+        assert_eq!(
+            probe(&at(&url), UA).await,
+            None,
+            "untrusted CA must not verify"
+        );
         std::env::set_var("AVOCADO_REPO_CA", ca.path());
-        let trusted = probe(&url, UA).await;
+        let trusted = probe(&at(&url), UA).await;
         std::env::remove_var("AVOCADO_REPO_CA");
         std::env::set_var("AVOCADO_REPO_INSECURE", "1");
-        let insecure = probe(&url, UA).await;
+        let insecure = probe(&at(&url), UA).await;
         std::env::remove_var("AVOCADO_REPO_INSECURE");
         assert_eq!(trusted, Some(None));
         assert_eq!(insecure, Some(None));
@@ -272,6 +288,81 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        assert_eq!(probe(&format!("http://127.0.0.1:{port}"), UA).await, None);
+        assert_eq!(
+            probe(&at(&format!("http://127.0.0.1:{port}")), UA).await,
+            None
+        );
+    }
+
+    /// A named feed that authenticates before it rate limits: without its
+    /// credential the probe reads a 401 and the 429 goes unexplained.
+    #[tokio::test]
+    async fn probe_sends_a_named_feeds_credential() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                // "user:pass" in base64.
+                let authed = String::from_utf8_lossy(&buf[..n])
+                    .to_ascii_lowercase()
+                    .contains("authorization: basic dxnlcjpwyxnz");
+                let status = if authed {
+                    "429 Too Many Requests"
+                } else {
+                    "401 Unauthorized"
+                };
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        assert_eq!(probe(&at(&url), UA).await, None);
+        let feed = FeedEndpoint {
+            credential: Some(("user".into(), "pass".into())),
+            ..at(&url)
+        };
+        assert_eq!(probe(&feed, UA).await, Some(None));
+    }
+
+    /// A named feed under its own private CA (`repos.<name>.ca`) is verified
+    /// with that CA, not only the global AVOCADO_REPO_CA.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn probe_trusts_a_named_feeds_own_ca() {
+        let tls = crate::utils::container_dev::tls::TlsMaterial::generate("feed", &[]).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok(mut s) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = s.shutdown().await;
+            }
+        });
+        let ca = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca.path(), tls.ca_cert_pem()).unwrap();
+        std::env::remove_var("AVOCADO_REPO_CA");
+        std::env::remove_var("AVOCADO_REPO_INSECURE");
+        assert_eq!(
+            probe(&at(&url), UA).await,
+            None,
+            "untrusted CA must not verify"
+        );
+        let feed = FeedEndpoint {
+            ca: Some(ca.path().to_path_buf()),
+            ..at(&url)
+        };
+        assert_eq!(probe(&feed, UA).await, Some(None));
     }
 }

@@ -25,11 +25,12 @@ pub struct StartCommand {
 
 impl StartCommand {
     pub async fn execute(self) -> Result<()> {
-        // Resolution order: explicit CLI flag → AVOCADO_VM_DIR →
-        // managed install dir (populated by `avocado vm update`) →
-        // last `vm start` / `vm rebuild` artifact-dir pointer. Helps
-        // the common end-user flow where you just `avocado vm update`
-        // and then `avocado vm start` without juggling flags or env.
+        // Resolution order: explicit CLI flag → AVOCADO_VM_DIR → the
+        // dir the last `vm start` / `vm rebuild` / `vm update` used →
+        // managed install dir. A bare `vm start` boots what was last
+        // chosen, so `vm update` then `vm start` needs no flags, and a
+        // restart after `--vm-source <dir>` doesn't fall back to an
+        // older install.
         let paths_default = VmPaths::resolve()?;
         let vm_source = match self.vm_source {
             Some(p) => p,

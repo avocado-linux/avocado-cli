@@ -469,7 +469,8 @@ enum Commands {
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
-        /// Environment variables to pass to the provision process
+        /// Environment variables to pass to the provision process; they also fill
+        /// `{{ env.KEY }}` in avocado.yaml, ahead of the caller's environment
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
         /// Output path relative to src_dir for provisioning artifacts
@@ -1872,7 +1873,8 @@ enum RuntimeCommands {
         /// Provision profile to use
         #[arg(long = "profile")]
         provision_profile: Option<String>,
-        /// Environment variables to pass to the provision process
+        /// Environment variables to pass to the provision process; they also fill
+        /// `{{ env.KEY }}` in avocado.yaml, ahead of the caller's environment
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
         /// Output path relative to src_dir for provisioning artifacts
@@ -2118,6 +2120,16 @@ fn run_with_json_lifecycle(
     Some(guard)
 }
 
+/// Park the `--env` values for `{{ env.* }}` interpolation, then return them
+/// unchanged. Call before anything loads the config: the runtime is resolved
+/// from it first.
+fn park_env_flags(env_args: Option<Vec<String>>) -> Option<Vec<String>> {
+    crate::utils::interpolation::env::set_flag_overrides(
+        parse_env_vars(env_args.as_ref()).unwrap_or_default(),
+    );
+    env_args
+}
+
 /// Combine provision profile and env vars into a single HashMap
 fn build_env_vars(
     provision_profile: Option<&String>,
@@ -2261,7 +2273,7 @@ async fn main() -> Result<()> {
         std::env::set_var("AVOCADO_NO_TUI", "1");
     }
 
-    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+    apply_offline(&cli);
 
     let update_handle = if should_check_for_updates(
         utils::offline::is_offline(),
@@ -2590,6 +2602,7 @@ async fn main() -> Result<()> {
             );
             // No JSON-implies-force coercion here either (see the `Install`
             // arm above for why both of its reasons are gone).
+            let env = park_env_flags(env);
             let runtime = resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
             let provision_cmd =
@@ -2889,6 +2902,7 @@ async fn main() -> Result<()> {
                 container_args,
                 dnf_args,
             } => {
+                let env = park_env_flags(env);
                 let runtime =
                     resolve_runtime_at_path(&config, name.as_deref().or(runtime.as_deref()))?;
 
@@ -3210,6 +3224,7 @@ async fn main() -> Result<()> {
                 verbose,
                 target,
                 runtime,
+                skip_compile,
                 container_args,
                 dnf_args,
             } => {
@@ -3226,7 +3241,8 @@ async fn main() -> Result<()> {
                     dnf_args,
                 )
                 .with_sdk_arch(cli.sdk_arch.clone())
-                .with_runtime(resolved_runtime);
+                .with_runtime(resolved_runtime)
+                .with_skip_compile(skip_compile);
                 clean_cmd.execute().await?;
                 Ok(())
             }
@@ -4800,6 +4816,9 @@ enum ExtCommands {
         /// when no runtime resolves.
         #[arg(short = 'r', long)]
         runtime: Option<String>,
+        /// Skip cleaning the compile sections the extension uses (they are cleaned by default)
+        #[arg(long)]
+        skip_compile: bool,
         /// Additional arguments to pass to the container runtime
         #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
         container_args: Option<Vec<String>>,
@@ -5067,9 +5086,9 @@ enum VmCommands {
     /// Boot the avocado-vm (fails if it is already running).
     Start {
         /// Directory containing `direct` profile output (manifest.json + artifacts).
-        /// Resolution order when unset: $AVOCADO_VM_DIR → ~/.avocado/vm/install/
-        /// (populated by `avocado vm update`) → last `vm start`/`vm rebuild`
-        /// dir → error.
+        /// Resolution order when unset: $AVOCADO_VM_DIR → the source the last
+        /// `vm start`/`vm rebuild`/`vm update` used → ~/.avocado/vm/install/
+        /// (populated by `avocado vm update`) → error.
         #[arg(long)]
         vm_source: Option<std::path::PathBuf>,
         /// Memory in MiB. Resolution order: this flag → `runtime.memory_mib`
@@ -5359,6 +5378,11 @@ enum HitlCommands {
     },
 }
 
+/// Set the process-wide offline mode from `--offline` or `AVOCADO_OFFLINE`.
+fn apply_offline(cli: &Cli) {
+    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+}
+
 /// Whether to spawn the background GitHub release check. `--offline` must not
 /// touch the network, and `upgrade`/`completion` have no use for the notice.
 fn should_check_for_updates(offline: bool, cmd_is_upgrade_or_completion: bool) -> bool {
@@ -5376,6 +5400,34 @@ mod tests {
         assert!(!should_check_for_updates(true, true));
         assert!(should_check_for_updates(false, false));
     }
+    #[test]
+    #[serial_test::serial(offline)]
+    fn offline_flag_and_env_reach_is_offline() {
+        // The flag is global, so it is accepted after the subcommand too.
+        let cases: [(&[&str], Option<&str>, bool); 5] = [
+            (&["avocado", "--offline", "feed", "index", "d"], None, true),
+            (&["avocado", "feed", "index", "d", "--offline"], None, true),
+            (&["avocado", "feed", "index", "d"], Some("1"), true),
+            (&["avocado", "feed", "index", "d"], Some("0"), false),
+            (&["avocado", "feed", "index", "d"], None, false),
+        ];
+        let mut seen = Vec::new();
+        for (args, env, _) in cases {
+            match env {
+                Some(v) => std::env::set_var("AVOCADO_OFFLINE", v),
+                None => std::env::remove_var("AVOCADO_OFFLINE"),
+            }
+            let parsed = Cli::try_parse_from(args).map(|cli| {
+                apply_offline(&cli);
+                utils::offline::is_offline()
+            });
+            seen.push(parsed.ok());
+        }
+        std::env::remove_var("AVOCADO_OFFLINE");
+        utils::offline::set_offline(false);
+        assert_eq!(seen, cases.map(|(_, _, want)| Some(want)).to_vec());
+    }
+
     #[test]
     fn feed_index_parses_directory() {
         let cli = Cli::try_parse_from(["avocado", "feed", "index", "/srv/rpms"]).unwrap();
@@ -5528,6 +5580,27 @@ mod tests {
             .expect("--minimal has no effect on a reference project");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(Cli::try_parse_from(["avocado", "init", "--minimal"]).is_ok());
+    }
+
+    #[test]
+    fn ext_clean_skip_compile_is_opt_in() {
+        let skip_compile = |args: &[&str]| match Cli::try_parse_from(args)
+            .expect("args should parse")
+            .command
+        {
+            Commands::Ext {
+                command: ExtCommands::Clean { skip_compile, .. },
+            } => skip_compile,
+            _ => panic!("expected ext clean"),
+        };
+        assert!(!skip_compile(&["avocado", "ext", "clean", "app"]));
+        assert!(skip_compile(&[
+            "avocado",
+            "ext",
+            "clean",
+            "app",
+            "--skip-compile"
+        ]));
     }
 
     #[test]

@@ -3,13 +3,15 @@
 //! Provides interpolation for `{{ env.VAR_NAME }}` templates.
 //!
 //! **Behavior:**
-//! - Looks up environment variables from the caller's environment
+//! - Looks up `--env KEY=VALUE` values first, then the caller's environment
 //! - Outputs a warning if the variable is not set
 //! - Replaces with empty string when variable is missing
 
 use anyhow::Result;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
+use std::sync::{Mutex, OnceLock};
 
 use crate::utils::output::{print_warning, OutputLevel};
 
@@ -26,6 +28,17 @@ pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
     let out = f();
     let reads = READS.with(|reads| reads.borrow_mut().take());
     (out, reads.unwrap_or_default())
+}
+
+static FLAG_OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Make a command's `--env KEY=VALUE` values visible to `{{ env.KEY }}`,
+/// ahead of the caller's environment. `--env` otherwise reaches only the
+/// container, so a run whose shell does not also export the variable (a
+/// Rubicon hub replaying a provision with the caller's `--env`) rendered it
+/// empty.
+pub fn set_flag_overrides(vars: HashMap<String, String>) {
+    *FLAG_OVERRIDES.get_or_init(Default::default).lock().unwrap() = vars;
 }
 
 /// Resolve an environment variable template.
@@ -45,7 +58,10 @@ pub fn record_reads<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
 /// std::env::remove_var("TEST_VAR");
 /// ```
 pub fn resolve(var_name: &str) -> Result<Option<String>> {
-    match env::var(var_name) {
+    let flagged = FLAG_OVERRIDES
+        .get()
+        .and_then(|m| m.lock().unwrap().get(var_name).cloned());
+    match flagged.map_or_else(|| env::var(var_name), Ok) {
         Ok(value) => {
             READS.with(|reads| {
                 if let Some(reads) = reads.borrow_mut().as_mut() {
@@ -83,6 +99,23 @@ mod tests {
         let result = resolve("TEST_ENV_VAR").unwrap();
         assert_eq!(result, Some("test_value".to_string()));
         env::remove_var("TEST_ENV_VAR");
+    }
+
+    #[test]
+    #[serial]
+    fn a_flag_value_wins_over_the_environment() {
+        env::set_var("FLAGGED_ENV_VAR", "shell");
+        env::remove_var("FLAG_ONLY_ENV_VAR");
+        set_flag_overrides(HashMap::from([
+            ("FLAGGED_ENV_VAR".to_string(), "flag".to_string()),
+            ("FLAG_ONLY_ENV_VAR".to_string(), "0.2.0".to_string()),
+        ]));
+        let flagged = resolve("FLAGGED_ENV_VAR").unwrap();
+        let flag_only = resolve("FLAG_ONLY_ENV_VAR").unwrap();
+        set_flag_overrides(HashMap::new());
+        env::remove_var("FLAGGED_ENV_VAR");
+        assert_eq!(flagged, Some("flag".to_string()));
+        assert_eq!(flag_only, Some("0.2.0".to_string()));
     }
 
     #[test]

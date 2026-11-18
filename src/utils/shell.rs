@@ -9,6 +9,17 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Join a user-supplied argv into one shell-safe command string.
+///
+/// The result is spliced into a shell script inside the container, so each
+/// element must be quoted or the container shell re-splits it.
+pub(crate) fn join_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| shell_escape(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Escape a string for use inside a double-quoted shell word.
 ///
 /// Inside double quotes only `\`, `"`, `$` and the backtick are special, so a
