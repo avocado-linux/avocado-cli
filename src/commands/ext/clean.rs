@@ -21,6 +21,9 @@ pub struct ExtCleanCommand {
     /// scoped extension sysroot tree via `AVOCADO_RUNTIME` in the
     /// container env. When `None`, legacy per-target behavior.
     runtime: Option<String>,
+    /// Leave the compile sections the extension uses alone: do not run their
+    /// clean scripts, and keep their stamps.
+    skip_compile: bool,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
 }
@@ -43,6 +46,7 @@ impl ExtCleanCommand {
             dnf_args,
             sdk_arch: None,
             runtime: None,
+            skip_compile: false,
             composed_config: None,
         }
     }
@@ -56,6 +60,12 @@ impl ExtCleanCommand {
     /// Set the runtime context. See [`super::build::ExtBuildCommand::with_runtime`].
     pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Set whether to leave the extension's compile sections alone
+    pub fn with_skip_compile(mut self, skip_compile: bool) -> Self {
+        self.skip_compile = skip_compile;
         self
     }
 
@@ -106,16 +116,26 @@ impl ExtCleanCommand {
 
         // Execute clean scripts for compile dependencies BEFORE cleaning the extension
         // This allows clean scripts to access build artifacts if needed
-        self.execute_compile_clean_scripts(
-            config,
-            &ext_config,
-            &container_image,
-            &target,
-            ext_script_workdir.as_deref(),
-        )
-        .await?;
+        if !self.skip_compile {
+            self.execute_compile_clean_scripts(
+                config,
+                &ext_config,
+                &container_image,
+                &target,
+                ext_script_workdir.as_deref(),
+            )
+            .await?;
+        }
 
-        self.clean_extension(&container_image, &target).await
+        // Without --skip-compile, every section the extension names compiles
+        // again on the next build, whether or not it has a clean script.
+        let compile_sections = if self.skip_compile {
+            Vec::new()
+        } else {
+            compile_sections_of(&ext_config)
+        };
+        self.clean_extension(&container_image, &target, &compile_sections)
+            .await
     }
 
     /// Get extension configuration from the composed/merged config
@@ -254,13 +274,17 @@ impl ExtCleanCommand {
 
             // Build clean command with optional workdir prefix
             // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext>/ instead of /opt/src
+            // The section stamp goes first: a cleaned section must compile again.
+            let remove_stamp = crate::utils::stamps::remove_own_stamp_line(
+                &StampRequirement::sdk_compile(&section_name),
+            );
             let clean_command = if let Some(workdir) = ext_script_workdir {
                 format!(
-                    r#"cd "{workdir}" && if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                    r#"{remove_stamp}cd "{workdir}" && if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
                 )
             } else {
                 format!(
-                    r#"if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
+                    r#"{remove_stamp}if [ -f '{clean_script}' ]; then echo 'Running clean script: {clean_script}'; AVOCADO_SDK_PREFIX=$AVOCADO_SDK_PREFIX bash '{clean_script}'; else echo 'Clean script {clean_script} not found, skipping.'; fi"#
                 )
             };
 
@@ -381,7 +405,12 @@ impl ExtCleanCommand {
             })
     }
 
-    async fn clean_extension(&self, container_image: &str, target: &str) -> Result<()> {
+    async fn clean_extension(
+        &self,
+        container_image: &str,
+        target: &str,
+        compile_sections: &[String],
+    ) -> Result<()> {
         print_info(
             &format!("Cleaning extension '{}'...", self.extension),
             OutputLevel::Normal,
@@ -389,21 +418,7 @@ impl ExtCleanCommand {
 
         let container_helper = SdkContainer::new();
 
-        // Clean sysroot, output files, and stamps
-        let clean_command = format!(
-            r#"
-# Clean extension sysroot
-rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
-
-# Clean extension output files (built images and any dm-verity sidecars)
-rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw "$AVOCADO_PREFIX/output/extensions/{ext}"-*.kab \
-      "$AVOCADO_PREFIX/output/extensions/{ext}"-*.verity "$AVOCADO_PREFIX/output/extensions/{ext}"-*.roothash
-
-# Clean extension stamps (install and build)
-rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
-"#,
-            ext = self.extension
-        );
+        let clean_command = clean_extension_command(&self.extension, compile_sections);
 
         if self.verbose {
             print_info(
@@ -464,8 +479,84 @@ rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
     }
 }
 
+/// The `sdk.compile` sections an extension's packages name.
+fn compile_sections_of(ext_config: &serde_yaml::Value) -> Vec<String> {
+    let mut sections: Vec<String> = ext_config
+        .get("packages")
+        .and_then(|v| v.as_mapping())
+        .map(|deps| {
+            deps.values()
+                .filter_map(|spec| spec.get("compile").and_then(|c| c.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    sections.sort();
+    sections.dedup();
+    sections
+}
+
+/// Shell that removes an extension's sysroot, built images and stamps, and the
+/// stamps of the `compile_sections` it names.
+fn clean_extension_command(ext: &str, compile_sections: &[String]) -> String {
+    let remove_section_stamps: String = compile_sections
+        .iter()
+        .map(|s| crate::utils::stamps::remove_own_stamp_line(&StampRequirement::sdk_compile(s)))
+        .collect();
+    format!(
+        r#"
+# Clean extension sysroot
+rm -rf "$AVOCADO_EXT_SYSROOTS/{ext}"
+
+# Clean extension output files (built images and any dm-verity sidecars)
+rm -f "$AVOCADO_PREFIX/output/extensions/{ext}"-*.raw "$AVOCADO_PREFIX/output/extensions/{ext}"-*.kab \
+      "$AVOCADO_PREFIX/output/extensions/{ext}"-*.verity "$AVOCADO_PREFIX/output/extensions/{ext}"-*.roothash
+
+# Clean extension stamps (install and build)
+rm -rf "$AVOCADO_PREFIX/.stamps/ext/{ext}"
+
+# Clean the stamps of the compile sections it uses
+{remove_section_stamps}"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Every section the extension names loses its stamp on a default clean,
+    /// with or without a `clean:` script.
+    #[test]
+    fn clean_removes_the_stamp_of_every_named_compile_section() {
+        let ext: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+packages:
+  app:
+    compile: app-compile
+    install: install.sh
+  lib:
+    compile: lib-compile
+  curl: "*"
+"#,
+        )
+        .unwrap();
+        let sections = compile_sections_of(&ext);
+        assert_eq!(sections, vec!["app-compile", "lib-compile"]);
+
+        let command = clean_extension_command("my-ext", &sections);
+        for section in &sections {
+            let stamp = StampRequirement::sdk_compile(section).relative_path();
+            assert!(command.contains(&stamp), "{stamp} missing from:\n{command}");
+        }
+        assert!(command.contains("rm -rf \"$AVOCADO_PREFIX/.stamps/ext/my-ext\""));
+    }
+
+    /// `--skip-compile` passes no sections, so no section stamp is removed.
+    #[test]
+    fn skip_compile_keeps_the_compile_section_stamps() {
+        let command = clean_extension_command("my-ext", &[]);
+        assert!(!command.contains("/compile/"), "{command}");
+        assert!(command.contains("rm -rf \"$AVOCADO_EXT_SYSROOTS/my-ext\""));
+    }
     use super::*;
 
     /// A `target-<name>:` override on a remote/path-sourced extension must be

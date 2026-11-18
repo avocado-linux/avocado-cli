@@ -315,7 +315,7 @@ impl RuntimeDnfCommand {
 
     fn build_dnf_command(&self) -> String {
         let installroot = format!("$AVOCADO_PREFIX/runtimes/{}", self.runtime);
-        let command_args_str = self.command.join(" ");
+        let command_args_str = crate::utils::shell::join_argv(&self.command);
         let dnf_args_str = if let Some(args) = &self.dnf_args {
             format!(" {} ", args.join(" "))
         } else {
@@ -341,6 +341,21 @@ $DNF_SDK_HOST \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dnf_command_keeps_argv_boundaries() {
+        let cmd = RuntimeDnfCommand::new(
+            "avocado.yaml".to_string(),
+            "dev".to_string(),
+            vec!["install".to_string(), "a b; $X*".to_string()],
+            false,
+            None,
+            None,
+            None,
+        );
+        let script = cmd.build_dnf_command();
+        assert!(script.contains("    'install' 'a b; $X*'\n"), "{script}");
+    }
 
     #[test]
     fn test_new() {
@@ -400,7 +415,7 @@ mod tests {
         let dnf_command = cmd.build_dnf_command();
 
         assert!(dnf_command.contains("--installroot=$AVOCADO_PREFIX/runtimes/test-runtime"));
-        assert!(dnf_command.contains("list installed"));
+        assert!(dnf_command.contains("'list' 'installed'"));
         assert!(dnf_command.contains("--nogpgcheck"));
         assert!(dnf_command.contains("RPM_ETCCONFIGDIR"));
         assert!(dnf_command.contains("$DNF_SDK_HOST"));
@@ -421,7 +436,7 @@ mod tests {
         let dnf_command = cmd.build_dnf_command();
 
         assert!(dnf_command.contains("--installroot=$AVOCADO_PREFIX/runtimes/my-runtime"));
-        assert!(dnf_command.contains("search python"));
+        assert!(dnf_command.contains("'search' 'python'"));
         assert!(!dnf_command.contains("--nogpgcheck"));
     }
 }

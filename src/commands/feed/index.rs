@@ -39,7 +39,8 @@ fn index_argv(dir: &Path, revision: u64) -> Vec<OsString> {
 /// it alone, and removing the newest one lowers it. `repomd.xml` still changes
 /// through the data checksums, which is what a client compares. 0 when the
 /// directory holds no RPM. Symlinked directories are not followed, so a link
-/// back to an ancestor cannot loop the walk.
+/// back to an ancestor cannot loop this walk. createrepo_c does follow them,
+/// which is why [`run_with`] refuses a [`symlink_cycle`] before spawning it.
 fn newest_rpm_mtime(dir: &Path) -> u64 {
     let mut newest = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -70,6 +71,56 @@ fn newest_rpm_mtime(dir: &Path) -> u64 {
     newest
 }
 
+/// The first symlinked directory under `dir` that leads back to a directory on
+/// its own path: the feed directory, one of its ancestors, or a directory
+/// entered through an earlier link. createrepo_c follows symlinked directories
+/// and walks such a link forever (its `--skip-symlinks` hangs too), so the
+/// cycle has to be found before it runs. A link that leads anywhere else is
+/// walked here as createrepo_c would walk it, so a cycle behind it is found
+/// too; a link to the same directory twice is a repeat, not a cycle.
+fn symlink_cycle(dir: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(dir).ok()?;
+    // Every ancestor is on the path: a link to one re-enters the feed.
+    let mut chain: Vec<PathBuf> = root.ancestors().map(Path::to_path_buf).collect();
+    cycle_under(dir, &root, &mut chain)
+}
+
+/// [`symlink_cycle`] below `real`, naming entries under `shown`. `chain` holds
+/// the canonical directories on the path from the root to `real`. It
+/// terminates because every link target entered is pushed onto `chain` and
+/// there are finitely many directories to push.
+fn cycle_under(shown: &Path, real: &Path, chain: &mut Vec<PathBuf>) -> Option<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(real) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let shown_child = shown.join(entry.file_name());
+        let target = if kind.is_symlink() {
+            match std::fs::canonicalize(entry.path()) {
+                Ok(t) if t.is_dir() => t,
+                _ => continue,
+            }
+        } else if kind.is_dir() {
+            entry.path()
+        } else {
+            continue;
+        };
+        if chain.contains(&target) {
+            return Some(shown_child);
+        }
+        chain.push(target.clone());
+        let found = cycle_under(&shown_child, &target, chain);
+        chain.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -97,9 +148,9 @@ fn which_on_path(bin: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     None
 }
 
-/// Core of `run` with PATH and the spawner injected. The directory check comes
-/// first so a bad path fails before the tool is resolved or anything is
-/// spawned. `spawn` returns whether the tool exited successfully.
+/// Core of `run` with PATH and the spawner injected. The directory and cycle
+/// checks come first so a bad path fails before the tool is resolved or
+/// anything is spawned. `spawn` returns whether the tool exited successfully.
 fn run_with<F>(dir: &Path, path: Option<&OsStr>, spawn: F) -> Result<()>
 where
     F: FnOnce(&Path, &[OsString]) -> std::io::Result<bool>,
@@ -108,6 +159,13 @@ where
         bail!(
             "cannot index '{}': it does not exist or is not a directory",
             dir.display()
+        );
+    }
+    if let Some(link) = symlink_cycle(dir) {
+        bail!(
+            "cannot index '{}': '{}' is a symlink back into its own path, and {TOOL} would follow it forever; remove it or point it outside the directory",
+            dir.display(),
+            link.display()
         );
     }
     let Some(tool) = which_on_path(TOOL, path) else {
@@ -255,11 +313,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn empty_path_element_is_skipped() {
-        // An empty element would resolve to the bare name, i.e. the cwd.
-        let path = OsString::from(":");
-        assert_eq!(which_on_path(TOOL, Some(&path)), None);
+        // An empty element would resolve to the bare name, i.e. the cwd, so
+        // the cwd holds an executable tool that only the skip keeps out.
+        let cwd = tempfile::tempdir().unwrap();
+        write_tool(cwd.path(), 0o755);
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let found = which_on_path(TOOL, Some(&OsString::from(":")));
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]
@@ -292,5 +358,61 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("no-such-dir"), "{err}");
         assert!(!spawned.get());
+    }
+
+    /// Runs `run_with` over `dir` with an executable tool on PATH and reports
+    /// the result and whether the tool was spawned.
+    #[cfg(unix)]
+    fn run_with_tool(dir: &Path) -> (Result<()>, bool) {
+        let bin = tempfile::tempdir().unwrap();
+        write_tool(bin.path(), 0o755);
+        let spawned = Cell::new(false);
+        let res = run_with(dir, Some(bin.path().as_os_str()), |_, _| {
+            spawned.set(true);
+            Ok(true)
+        });
+        (res, spawned.get())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_to_the_feed_directory_fails_naming_it_without_spawning() {
+        // createrepo_c follows symlinked directories, so `a -> .` never ends.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let link = tmp.path().join("sub").join("a");
+        std::os::unix::fs::symlink("..", &link).unwrap();
+        let (res, spawned) = run_with_tool(tmp.path());
+        let err = res.expect_err("a cycle must be refused").to_string();
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(!spawned, "the tool was spawned over a cycle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_to_an_ancestor_fails_naming_it_without_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed = tmp.path().join("feed");
+        std::fs::create_dir(&feed).unwrap();
+        let link = feed.join("up");
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+        let (res, spawned) = run_with_tool(&feed);
+        let err = res.expect_err("a cycle must be refused").to_string();
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(!spawned, "the tool was spawned over a cycle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_to_a_directory_outside_the_feed_still_indexes() {
+        let feed = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("x.rpm"), "x").unwrap();
+        std::os::unix::fs::symlink(other.path(), feed.path().join("ext")).unwrap();
+        // A second link to the same directory is a repeat, not a cycle.
+        std::os::unix::fs::symlink(other.path(), feed.path().join("ext2")).unwrap();
+        let (res, spawned) = run_with_tool(feed.path());
+        res.expect("a link that leads out of the feed is not a cycle");
+        assert!(spawned, "the tool was not spawned");
     }
 }
