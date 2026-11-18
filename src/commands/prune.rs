@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, print_success, print_warning, OutputLevel};
 use crate::utils::volume::avo_abandonment_reason;
@@ -161,7 +160,7 @@ impl PruneCommand {
 
     /// List all Avocado-related volumes
     async fn list_avocado_volumes(&self) -> Result<Vec<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "ls", "--format", "{{.Name}}"])
             .output()
             .await
@@ -204,10 +203,12 @@ impl PruneCommand {
     /// These are state volumes for avocado configs. Check:
     /// 1. If source_path directory exists
     /// 2. If .avocado-state file exists in that directory
-    /// 3. If the state file links back to this volume's UUID
+    /// 3. If that state file names a different volume that exists on this
+    ///    daemon (one that is not here can be on another daemon, so this
+    ///    volume is kept)
     async fn classify_avo_volume(&self, volume_name: &str) -> Result<VolumeStatus> {
-        // Read the recorded source_path label, then delegate the on-disk
-        // decision to the shared classifier so `prune` and the init-time
+        // Read the recorded source_path label, then delegate the decision
+        // to the shared classifier so `prune` and the init-time
         // reap agree on what "abandoned" means.
         let volume_info = self.inspect_volume(volume_name).await?;
         let source_path = volume_info
@@ -216,7 +217,8 @@ impl PruneCommand {
             .and_then(|labels| labels.get("avocado.source_path"))
             .map(String::as_str);
 
-        Ok(match avo_abandonment_reason(volume_name, source_path) {
+        let reason = avo_abandonment_reason(&self.container_tool, volume_name, source_path).await;
+        Ok(match reason {
             Some(reason) => VolumeStatus::Abandoned(reason),
             None => VolumeStatus::Active,
         })
@@ -253,7 +255,7 @@ impl PruneCommand {
 
     /// Inspect a volume and return its info
     async fn inspect_volume(&self, volume_name: &str) -> Result<VolumeInspectInfo> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "inspect", volume_name])
             .output()
             .await
@@ -276,7 +278,7 @@ impl PruneCommand {
 
     /// Get list of container IDs using a specific volume
     async fn get_containers_using_volume(&self, volume_name: &str) -> Result<Vec<String>> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args([
                 "ps",
                 "-a",
@@ -305,7 +307,7 @@ impl PruneCommand {
 
     /// Check if a container is running
     async fn is_container_running(&self, container_id: &str) -> Result<bool> {
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["inspect", "--format", "{{.State.Running}}", container_id])
             .output()
             .await
@@ -337,13 +339,13 @@ impl PruneCommand {
             }
 
             // Kill the container (in case it's running)
-            let _ = AsyncCommand::new(&self.container_tool)
+            let _ = crate::utils::engine::command(&self.container_tool)
                 .args(["kill", container_id])
                 .output()
                 .await;
 
             // Remove the container
-            let output = AsyncCommand::new(&self.container_tool)
+            let output = crate::utils::engine::command(&self.container_tool)
                 .args(["rm", "-f", container_id])
                 .output()
                 .await
@@ -363,7 +365,7 @@ impl PruneCommand {
         }
 
         // Remove the volume
-        let output = AsyncCommand::new(&self.container_tool)
+        let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "rm", volume_name])
             .output()
             .await

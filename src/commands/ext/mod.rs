@@ -90,8 +90,121 @@ pub(crate) fn resolve_remote_ext_config(
     ))
 }
 
+/// An extension config's `version` as a string: a number is printed whole.
+/// An empty one is no version: an unset `{{ env.X }}` renders empty, and a
+/// bare `version:` is null.
+pub(crate) fn ext_config_version(ext_config: &serde_yaml::Value) -> Option<String> {
+    let version = match ext_config.get("version")? {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))?
+            .to_string(),
+        _ => return None,
+    };
+    (!version.is_empty()).then_some(version)
+}
+
+/// [`ext_config_version`] of the extension as `target` sees it, with its
+/// target overrides applied.
+pub(crate) fn effective_ext_version(
+    config: &crate::utils::config::Config,
+    parsed: &serde_yaml::Value,
+    extension_name: &str,
+    target: &str,
+) -> Option<String> {
+    resolve_remote_ext_config(config, parsed, extension_name, target)
+        .as_ref()
+        .and_then(ext_config_version)
+}
+
+/// Every extension whose node names `sdk.compile.<section>` (in a package,
+/// under an override, anywhere), each with its config resolved for `target`
+/// the way `ext build` resolves it. `caller` comes first, with the node `ext
+/// build` already resolved for it.
+///
+/// The compile section stamp is keyed by the section, so it must hash the
+/// sources of every extension that builds it, not only the caller's. `None`
+/// when one of them cannot be resolved: the section then always runs.
+pub(crate) fn extensions_naming_compile_section(
+    config: &crate::utils::config::Config,
+    parsed: &serde_yaml::Value,
+    config_path: &str,
+    caller: (&str, &serde_yaml::Value),
+    section: &str,
+    target: &str,
+    target_board: Option<&str>,
+) -> Option<Vec<(String, serde_yaml::Value)>> {
+    fn names(node: &serde_yaml::Value, section: &str) -> bool {
+        node.as_mapping().is_some_and(|m| {
+            m.iter().any(|(k, v)| {
+                (k.as_str() == Some("compile") && v.as_str() == Some(section)) || names(v, section)
+            })
+        })
+    }
+    let mut out = vec![(caller.0.to_string(), caller.1.clone())];
+    let others = parsed
+        .get("extensions")
+        .and_then(|e| e.as_mapping())
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str()?, v)))
+        .filter(|(name, node)| *name != caller.0 && names(node, section));
+    for (name, _) in others {
+        let resolved = match config
+            .find_extension_in_dependency_tree(config_path, name, target)
+            .ok()??
+        {
+            crate::utils::config::ExtensionLocation::Remote { .. } => {
+                resolve_remote_ext_config(config, parsed, name, target)?
+            }
+            crate::utils::config::ExtensionLocation::Local { config_path, .. } => config
+                .get_merged_ext_config_with_board(name, target, &config_path, target_board)
+                .ok()??,
+        };
+        out.push((name.to_string(), resolved));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_version_is_read_with_the_target_overrides_applied() {
+        let yaml = r#"
+extensions:
+  from-target:
+    version: ''
+    qemux86-64:
+      version: '1.2.0'
+  emptied-by-target:
+    version: '1.0.0'
+    qemux86-64:
+      version: ''
+"#;
+        let config = crate::utils::config::Config::load_from_str(yaml).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let version = |name| super::effective_ext_version(&config, &parsed, name, "qemux86-64");
+        assert_eq!(version("from-target"), Some("1.2.0".to_string()));
+        assert_eq!(version("emptied-by-target"), None);
+        // Another target sees the base version.
+        assert_eq!(
+            super::effective_ext_version(&config, &parsed, "emptied-by-target", "qemuarm64"),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_version_is_no_version() {
+        let version = |y: &str| super::ext_config_version(&serde_yaml::from_str(y).unwrap());
+        assert_eq!(version("version: '1.2.0'"), Some("1.2.0".to_string()));
+        assert_eq!(version("version: 3"), Some("3".to_string()));
+        assert_eq!(version("version: ''"), None);
+        assert_eq!(version("version:"), None);
+        assert_eq!(version("version: null"), None);
+        assert_eq!(version("name: x"), None);
+    }
+
     use super::*;
 
     fn make_config(yaml: &str) -> serde_yaml::Value {

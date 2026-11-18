@@ -6,7 +6,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::output::{print_error, print_info, OutputLevel};
 use crate::utils::tui::{TaskId, TaskRenderer, TaskStatus};
@@ -402,7 +401,7 @@ pub async fn ensure_cross_arch_emulation(container_tool: &str, sdk_arch: &str) -
         OutputLevel::Normal,
     );
 
-    let output = AsyncCommand::new(container_tool)
+    let output = crate::utils::engine::command(container_tool)
         .args([
             "run",
             "--privileged",
@@ -783,6 +782,25 @@ pub fn inject_repo_tls_env(env_vars: &mut std::collections::HashMap<String, Stri
     }
 }
 
+/// The User-Agent a run's dnf sends (`AVOCADO_FEED_UA`): the materialized
+/// feed's key id and minted tier, else the default credential's.
+fn feed_user_agent(feeds: Option<&crate::utils::feeds::FeedMaterialization>) -> String {
+    crate::utils::feeds::user_agent_for(
+        feeds.and_then(|f| f.key_id.as_deref()),
+        feeds.and_then(|f| f.tier),
+    )
+}
+
+/// The feed a failed run's dnf talked to and the User-Agent it sent, for the
+/// post-failure 429 check.
+pub(crate) fn rate_limit_probe_target(config: &RunConfig) -> (String, String) {
+    let repo_url = config
+        .repo_url
+        .clone()
+        .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string());
+    (repo_url, feed_user_agent(config.feeds.as_ref()))
+}
+
 /// Inject the named-feeds env (see FEEDS_SETUP_SNIPPET) and fold the feeds'
 /// dnf args into `AVOCADO_DNF_ARGS`, which every `$DNF_SDK_HOST` call carries.
 pub fn inject_feed_env(
@@ -793,13 +811,7 @@ pub fn inject_feed_env(
     // mint when there was one: a hard-coded tier/1 put every authenticated client
     // in the same rate-limit bucket regardless of what Connect actually issued,
     // which made the tier in the mint response decorative.
-    env_vars.insert(
-        "AVOCADO_FEED_UA".to_string(),
-        crate::utils::feeds::user_agent_for(
-            feeds.and_then(|f| f.key_id.as_deref()),
-            feeds.and_then(|f| f.tier),
-        ),
-    );
+    env_vars.insert("AVOCADO_FEED_UA".to_string(), feed_user_agent(feeds));
     let Some(feeds) = feeds else { return };
     for (k, v) in &feeds.env {
         env_vars.insert(k.clone(), v.clone());
@@ -878,6 +890,58 @@ pub fn inject_kernel_cmdline(
         env_vars.insert("AVOCADO_KERNEL_CMDLINE_EXTRA".to_string(), extra);
     }
     Ok(())
+}
+
+/// Host networking as the container will actually see it, for the distro
+/// feed's loopback decision. It reads the run's own `container_args`, the list
+/// docker receives: variables expanded, the target's `container_args` merged
+/// and a command-line `--container-arg` replacing the config's, so the rewrite
+/// and the host entry cannot disagree with the real network mode.
+fn run_config_has_host_network(config: &RunConfig) -> bool {
+    run_config_has_host_network_with(
+        config,
+        crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+    )
+}
+
+/// [`run_config_has_host_network`] with the environment probe injected.
+fn run_config_has_host_network_with(config: &RunConfig, loopback_isolated: bool) -> bool {
+    crate::utils::feeds::host_network_shares_loopback(
+        config.container_args.as_deref().unwrap_or(&[]),
+        loopback_isolated,
+    )
+}
+
+/// The distro repository URL the container's `AVOCADO_SDK_REPO_URL` carries.
+/// No `ResolvedFeed` is in scope here, so the loopback rewrite follows the
+/// host-networking decision alone; `repos.*.rewrite_loopback` does not apply to
+/// the distro feed.
+fn distro_repo_url_for_container(config: &RunConfig) -> String {
+    distro_repo_url_for_container_with(
+        config,
+        crate::utils::feeds::host_network_is_isolated_from_developer_loopback(),
+    )
+}
+
+/// [`distro_repo_url_for_container`] with the environment probe injected.
+fn distro_repo_url_for_container_with(config: &RunConfig, loopback_isolated: bool) -> String {
+    crate::utils::feeds::rewrite_loopback_reported(
+        &config
+            .repo_url
+            .clone()
+            .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
+        run_config_has_host_network_with(config, loopback_isolated),
+    )
+}
+
+/// True when the rewritten loopback distro URL needs the host-gateway alias
+/// added as a route.
+fn distro_needs_host_entry(config: &RunConfig, host_network: bool) -> bool {
+    !host_network
+        && config
+            .repo_url
+            .as_deref()
+            .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
 }
 
 /// Configuration for running commands in containers
@@ -1074,7 +1138,7 @@ impl SessionContainers {
     /// the name is what makes an orphan identifiable; a live pid is never
     /// touched, so concurrent invocations do not reap each other.
     pub fn sweep_abandoned(container_tool: &str) {
-        let out = std::process::Command::new(container_tool)
+        let out = crate::utils::engine::std_command(container_tool)
             .args([
                 "ps",
                 "-a",
@@ -1096,7 +1160,7 @@ impl SessionContainers {
             if pid == std::process::id() as i32 || pid_is_alive(pid) {
                 continue;
             }
-            let _ = std::process::Command::new(container_tool)
+            let _ = crate::utils::engine::std_command(container_tool)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1123,7 +1187,7 @@ impl SessionContainers {
                 names.push(name);
             } else {
                 // Started without --rm: the user wants the stopped container kept.
-                let _ = std::process::Command::new(container_tool)
+                let _ = crate::utils::engine::std_command(container_tool)
                     // stdio-flags-ok: docker stop timeout in seconds, not a tty
                     .args(["stop", "-t", "2", &name])
                     .stdout(Stdio::null())
@@ -1133,7 +1197,7 @@ impl SessionContainers {
         }
         names.extend(Self::active_names());
         for name in names {
-            let _ = std::process::Command::new(container_tool)
+            let _ = crate::utils::engine::std_command(container_tool)
                 .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1259,7 +1323,7 @@ impl SessionContainers {
         cmd.push("-c".to_string());
         cmd.push(format!("sleep {SESSION_KEEPALIVE_SECS}"));
 
-        let out = std::process::Command::new(container_tool)
+        let out = crate::utils::engine::std_command(container_tool)
             .args(&cmd)
             .output()
             .context("failed to start the session container")?;
@@ -1271,7 +1335,7 @@ impl SessionContainers {
         }
 
         if with_mounts {
-            let mount_out = std::process::Command::new(container_tool)
+            let mount_out = crate::utils::engine::std_command(container_tool)
                 .args([
                     "exec",
                     &name,
@@ -1285,7 +1349,7 @@ impl SessionContainers {
                     Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
                     Err(e) => e.to_string(),
                 };
-                let _ = std::process::Command::new(container_tool)
+                let _ = crate::utils::engine::std_command(container_tool)
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -1339,7 +1403,7 @@ impl SessionContainers {
         // starvation `block_in_place_if_async` exists to prevent for container
         // creation.
         block_in_place_if_async(|| {
-            std::process::Command::new(container_tool)
+            crate::utils::engine::std_command(container_tool)
                 .args(&argv)
                 .output()
                 .context("failed to exec in the volume session container")
@@ -1414,13 +1478,29 @@ fn take_git_config_args_with(
     let mut kept = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
-        if let Some((used, operand)) = docker_env_flag(args, i) {
+        // A short flag clustered with `-e` (`-de K=V`) is read as its leading
+        // flags plus the env flag, so only the setting is taken out of it.
+        let cluster = unpack_env_cluster(&args[i]);
+        let owned: Vec<String>;
+        let window: &[String] = match &cluster {
+            Some((_, env)) => {
+                owned = std::iter::once(env.clone())
+                    .chain(args.get(i + 1).cloned())
+                    .collect();
+                &owned
+            }
+            None => &args[i..],
+        };
+        if let Some((used, operand)) = docker_env_flag(window, 0) {
             let (key, value) = match operand.split_once('=') {
                 Some((k, v)) => (k, Some(v.to_string())),
                 None => (operand, None),
             };
             if key == KEY {
                 values.extend(value.or_else(|| host_env(KEY)));
+                if let Some((flags, _)) = cluster {
+                    kept.extend(flags);
+                }
                 i += used;
                 continue;
             }
@@ -1432,13 +1512,116 @@ fn take_git_config_args_with(
     (!values.is_empty()).then(|| values.join(" "))
 }
 
+/// Remove every env flag setting one of `keys` from raw container args, in any
+/// form [`docker_env_flag`] reads, including a bare `-e K` that would pass the
+/// host's value. Raw args may hold a flag and its operand in one string, so
+/// they are split as `build_container_command` splits them. With no match the
+/// args come back unchanged; otherwise as split tokens, a token with a space
+/// re-quoted so the later split keeps it whole.
+pub(crate) fn strip_env_args(args: &[String], keys: &[&str]) -> Vec<String> {
+    let tokens = split_env_tokens(args);
+    let mut kept = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Some((used, operand)) = docker_env_flag(&tokens, i) {
+            let key = operand.split_once('=').map_or(operand, |(k, _)| k);
+            if keys.contains(&key) {
+                i += used;
+                continue;
+            }
+        }
+        kept.push(tokens[i].clone());
+        i += 1;
+    }
+    if kept.len() == tokens.len() {
+        return args.to_vec();
+    }
+    kept.into_iter()
+        .map(|t| {
+            if t.contains(' ') {
+                format!("\"{t}\"")
+            } else {
+                t
+            }
+        })
+        .collect()
+}
+
+/// Split raw container args into tokens, as `build_container_command` does,
+/// and unpack short flags clustered with `-e` (`-ie K=V`, `-ieK=V`) into
+/// `-i`, `-e K=V`, so [`docker_env_flag`] sees the env flag and the rest of
+/// the cluster stays a separate flag. Only the boolean short flags docker
+/// takes without a value may precede the `e`; any other letter (`-v`, `-p`,
+/// `-w`) takes the rest of the token as its own operand, so such a token is
+/// left alone.
+fn split_env_tokens(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for tok in args
+        .iter()
+        .flat_map(|a| SdkContainer::parse_container_arg(a))
+    {
+        match unpack_env_cluster(&tok) {
+            Some((flags, env)) => {
+                out.extend(flags);
+                out.push(env);
+            }
+            None => out.push(tok),
+        }
+    }
+    out
+}
+
+/// Split a short-flag cluster that ends in `e` into its separate boolean flags
+/// (`-d`, `-i`) and the env flag with the rest of the token (`-eK=V` or a bare
+/// `-e`). `None` when the token is not such a cluster.
+fn unpack_env_cluster(tok: &str) -> Option<(Vec<String>, String)> {
+    const BOOL_SHORT: &str = "dPqit";
+    let rest = tok
+        .strip_prefix('-')
+        .filter(|r| !r.starts_with('-') && !r.is_empty())?;
+    let at = rest.find('e')?;
+    let flags = &rest[..at];
+    (!flags.is_empty() && flags.chars().all(|c| BOOL_SHORT.contains(c))).then(|| {
+        (
+            flags.chars().map(|c| format!("-{c}")).collect(),
+            format!("-{}", &rest[at..]),
+        )
+    })
+}
+
+/// What raw container args set in the container's environment: each env flag
+/// as `(key, value)` (`None` for a bare `-e K`, which passes the host's
+/// value), and whether a `--env-file` is present. Args are split as
+/// [`strip_env_args`] splits them.
+pub(crate) fn scan_env_args(args: &[String]) -> (Vec<(String, Option<String>)>, bool) {
+    let tokens = split_env_tokens(args);
+    let mut set = Vec::new();
+    let mut env_file = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "--env-file" || tokens[i].starts_with("--env-file=") {
+            env_file = true;
+        }
+        if let Some((used, operand)) = docker_env_flag(&tokens, i) {
+            set.push(match operand.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (operand.to_string(), None),
+            });
+            i += used;
+            continue;
+        }
+        i += 1;
+    }
+    (set, env_file)
+}
+
 /// The env flag at `args[i]`, in any form docker accepts: `-e X`, `--env X`,
 /// `-eX`, `-e=X`, `--env=X`. Returns how many args it takes and its operand,
 /// `K=V` or a bare `K` (docker then passes the CLI's own value for `K`).
 ///
 /// Not handled: `--env-file`, which docker reads itself (an explicit `-e`
-/// wins over it, so the generated git settings still apply), and short
-/// flags packed together with `-e` (`-ie K=V`).
+/// wins over it, so the generated git settings still apply). Short flags
+/// packed with `-e` (`-ie K=V`) must be unpacked first by [`split_env_tokens`].
 fn docker_env_flag(args: &[String], i: usize) -> Option<(usize, &str)> {
     let a = args.get(i)?.as_str();
     if a == "-e" || a == "--env" {
@@ -1512,7 +1695,7 @@ const SESSION_KEEPALIVE_SECS: u64 = 24 * 60 * 60;
 /// container that has gone away (keepalive expired, crash, outside `rm`) before
 /// it is handed back for another `exec`.
 fn container_is_running(container_tool: &str, name: &str) -> bool {
-    let out = std::process::Command::new(container_tool)
+    let out = crate::utils::engine::std_command(container_tool)
         .args(["inspect", "-f", "{{.State.Running}}", name])
         .output();
     matches!(
@@ -2050,8 +2233,23 @@ impl SdkContainer {
         .context("Failed to setup remote execution context")
     }
 
-    /// Run a command in the container
+    /// Run a command in the container. A failed run is checked once against
+    /// the feed's rate limit, because dnf reports a 429 as "No more mirrors
+    /// to try" and gives no hint that waiting or logging in would fix it.
     pub async fn run_in_container(&self, config: RunConfig) -> Result<bool> {
+        let (repo_url, user_agent) = rate_limit_probe_target(&config);
+        let ok = self.run_in_container_once(config).await?;
+        if !ok {
+            crate::utils::feed_limit::explain_if_rate_limited(
+                &crate::utils::feeds::FeedEndpoint::plain(repo_url),
+                &user_agent,
+            )
+            .await;
+        }
+        Ok(ok)
+    }
+
+    async fn run_in_container_once(&self, config: RunConfig) -> Result<bool> {
         // Check if we should run on a remote host
         if let Some(ref runs_on) = config.runs_on {
             return self.run_in_container_remote(&config, runs_on).await;
@@ -2098,12 +2296,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(&config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -2341,9 +2534,20 @@ impl SdkContainer {
             anyhow::bail!("RunsOnContext is not active (already torn down)");
         }
 
-        self.execute_remote_command(context, config)
+        let ok = self
+            .execute_remote_command(context, config)
             .await
-            .context("Remote container execution failed")
+            .context("Remote container execution failed")?;
+        // Same 429 check as run_in_container, which shared-context runs bypass.
+        if !ok {
+            let (repo_url, user_agent) = rate_limit_probe_target(config);
+            crate::utils::feed_limit::explain_if_rate_limited(
+                &crate::utils::feeds::FeedEndpoint::plain(repo_url),
+                &user_agent,
+            )
+            .await;
+        }
+        Ok(ok)
     }
 
     /// Execute a command on a remote host using an existing RunsOnContext
@@ -2367,12 +2571,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -2703,11 +2902,7 @@ impl SdkContainer {
         }
         // A loopback distro feed (`distro.repo.url: http://localhost:…`) is
         // rewritten to the host-gateway alias in the env; the alias needs a route.
-        if config
-            .repo_url
-            .as_deref()
-            .is_some_and(|u| crate::utils::feeds::rewrite_loopback(u).1)
-        {
+        if distro_needs_host_entry(config, run_config_has_host_network(config)) {
             add_hosts.push(crate::utils::feeds::host_gateway_add_host(
                 is_vm_routing_active(),
             ));
@@ -2876,12 +3071,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(&config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -3011,7 +3201,7 @@ impl SdkContainer {
         }
 
         // Execute command and capture output
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -3293,12 +3483,7 @@ impl SdkContainer {
         // of truth is Config::DEFAULT_REPO_URL.
         env_vars.insert(
             "AVOCADO_SDK_REPO_URL".to_string(),
-            crate::utils::feeds::rewrite_loopback_reported(
-                &config
-                    .repo_url
-                    .clone()
-                    .unwrap_or_else(|| crate::utils::config::Config::DEFAULT_REPO_URL.to_string()),
-            ),
+            distro_repo_url_for_container(config),
         );
         if let Some(release) = &config.repo_release {
             env_vars.insert("AVOCADO_SDK_REPO_RELEASE".to_string(), release.clone());
@@ -3390,7 +3575,7 @@ impl SdkContainer {
         }
 
         if detach {
-            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
             cmd.args(&container_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
@@ -3418,7 +3603,7 @@ impl SdkContainer {
             }
         } else {
             // In non-detached mode, wait for completion with Ctrl-C handling.
-            let mut cmd = AsyncCommand::new(&container_cmd[0]);
+            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
             cmd.args(&container_cmd[1..]);
 
             // When a TUI renderer is globally active, pipe output instead of
@@ -3562,7 +3747,7 @@ impl SdkContainer {
         container_name: Option<&str>,
     ) {
         if let Some(name) = container_name {
-            let stop_result = AsyncCommand::new(&self.container_tool)
+            let stop_result = crate::utils::engine::command(&self.container_tool)
                 // stdio-flags-ok: docker stop timeout in seconds, not a tty
                 .args(["stop", "-t", "2", name])
                 .stdout(Stdio::null())
@@ -3570,7 +3755,7 @@ impl SdkContainer {
                 .status()
                 .await;
             if !matches!(&stop_result, Ok(s) if s.success()) {
-                let _ = AsyncCommand::new(&self.container_tool)
+                let _ = crate::utils::engine::command(&self.container_tool)
                     .args(["kill", name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -3617,7 +3802,7 @@ impl SdkContainer {
             .renderer
             .set_status(&tui_ctx.task_id, TaskStatus::Running);
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         // Pipe stdout/stderr so we can capture output line by line.
         // The container still gets a PTY (-t flag) so programs like dnf
@@ -3671,7 +3856,7 @@ impl SdkContainer {
             _ = tokio::signal::ctrl_c() => {
                 // Stop the container gracefully
                 if let Some(name) = container_name {
-                    let _ = AsyncCommand::new(&self.container_tool)
+                    let _ = crate::utils::engine::command(&self.container_tool)
                         // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", name])
                         .stdout(Stdio::null())
@@ -3813,7 +3998,7 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_cmd[0]);
+        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
         cmd.args(&container_cmd[1..]);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -4401,14 +4586,20 @@ fi
     }
 
     /// Parse a container argument, splitting on spaces while respecting quotes
-    fn parse_container_arg(arg: &str) -> Vec<String> {
+    pub(crate) fn parse_container_arg(arg: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
-        let chars = arg.chars().peekable();
+        let mut chars = arg.chars().peekable();
 
-        for ch in chars {
+        while let Some(ch) = chars.next() {
             match ch {
+                // Inside quotes, as in a shell's double quotes, `\"` and `\\`
+                // are a literal quote and backslash. Outside them a
+                // backslash is just a character, as in a Windows path.
+                '\\' if in_quotes && matches!(chars.peek(), Some('"' | '\\')) => {
+                    current.extend(chars.next());
+                }
                 '"' => {
                     in_quotes = !in_quotes;
                 }
@@ -4489,7 +4680,7 @@ fi
             );
         }
 
-        let mut cmd = AsyncCommand::new(create_cmd[0]);
+        let mut cmd = crate::utils::engine::command(create_cmd[0]);
         cmd.args(&create_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -4522,7 +4713,7 @@ fi
                 );
             }
 
-            let mut cmd = AsyncCommand::new(cp_cmd[0]);
+            let mut cmd = crate::utils::engine::command(cp_cmd[0]);
             cmd.args(&cp_cmd[1..]);
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -4566,7 +4757,7 @@ fi
             &container_name_str,
         ];
 
-        let mut cmd = AsyncCommand::new(rm_cmd[0]);
+        let mut cmd = crate::utils::engine::command(rm_cmd[0]);
         cmd.args(&rm_cmd[1..]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -4644,6 +4835,58 @@ async fn read_output_stream<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every docker env-flag form that sets a stripped key is removed, whether
+    /// the flag and its operand arrive as one container arg or two.
+    #[test]
+    fn strip_env_args_removes_every_form_of_a_listed_key() {
+        for form in [
+            &["-e K=1"][..],
+            &["-e", "K=1"],
+            &["--env K=1"],
+            &["--env", "K=1"],
+            &["--env=K=1"],
+            &["-e=K=1"],
+            &["-eK=1"],
+            &["-e K"],
+            &["--env=K"],
+        ] {
+            let mut args = strings(form);
+            args.push("--privileged".to_string());
+            assert_eq!(strip_env_args(&args, &["K"]), ["--privileged"], "{form:?}");
+        }
+    }
+
+    #[test]
+    fn strip_env_args_keeps_other_keys_and_a_longer_name() {
+        let args = strings(&["-e K_OTHER=1", "--env=J=2"]);
+        assert_eq!(strip_env_args(&args, &["K"]), args);
+    }
+
+    /// When nothing matches, the args come back unchanged, quoting included,
+    /// so the remote paths that do not re-split them see the same argv.
+    #[test]
+    fn strip_env_args_without_a_match_returns_args_verbatim() {
+        let args = strings(&["-v \"/a b:/c\"", "--privileged"]);
+        assert_eq!(strip_env_args(&args, &["K"]), args);
+    }
+
+    /// A kept value with a space must survive the re-split that
+    /// `build_container_command` applies to every container arg.
+    #[test]
+    fn strip_env_args_keeps_a_spaced_value_intact_after_a_strip() {
+        let args = strings(&["-e K=1 -e \"J=a b\""]);
+        let kept = strip_env_args(&args, &["K"]);
+        let resplit: Vec<String> = kept
+            .iter()
+            .flat_map(|a| SdkContainer::parse_container_arg(a))
+            .collect();
+        assert_eq!(resplit, ["-e", "J=a b"]);
+    }
 
     /// Every container start site must check the avocado-vm workspace mount
     /// first. If Avocado.app starts QEMU, or the share is unmounted, the
@@ -6039,6 +6282,33 @@ extensions:
         assert_eq!(args.len(), 4);
     }
 
+    /// A short flag clustered with `-e` (`-de K=V`, `-deK=V`) is an env flag to
+    /// docker, so the git settings in it are taken out and merged, and the
+    /// other flags of the cluster stay.
+    #[test]
+    fn clustered_short_env_flags_are_taken_out_of_git_config_args() {
+        let host = |k: &str| (k == "GIT_CONFIG_PARAMETERS").then(|| "'h.x'='9'".to_string());
+        let forms: &[(&[&str], &str)] = &[
+            (&["-de", "GIT_CONFIG_PARAMETERS=V"], "V"),
+            (&["-deGIT_CONFIG_PARAMETERS=V"], "V"),
+            (&["-de", "GIT_CONFIG_PARAMETERS"], "'h.x'='9'"),
+        ];
+        for (form, want) in forms {
+            let mut args: Vec<String> = form.iter().map(|s| s.to_string()).collect();
+            args.push("--privileged".to_string());
+            assert_eq!(
+                take_git_config_args_with(&mut args, host).as_deref(),
+                Some(*want),
+                "{form:?}"
+            );
+            assert_eq!(args, ["-d", "--privileged"], "{form:?}");
+        }
+        // A cluster for another variable is kept whole.
+        let mut args: Vec<String> = ["-de", "OTHER=1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(take_git_config_args_with(&mut args, host), None);
+        assert_eq!(args, ["-de", "OTHER=1"]);
+    }
+
     /// The session split takes env flags in every docker form, so a compact
     /// `-eK=V` from container args goes to the exec, not into the shape.
     #[test]
@@ -6879,7 +7149,7 @@ extensions:
             std::fs::write(
                 &tool,
                 format!(
-                    "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
+                    "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\necho \"$@\" >> '{log}'\nif [ \"$1\" = stop ]; then kill \"$(cat '{pid}')\"; fi\n",
                     log = dir.join("log").display(),
                     pid = dir.join("pid").display(),
                 ),
@@ -6890,7 +7160,35 @@ extensions:
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            runnable(&tool);
             tool.display().to_string()
+        }
+
+        /// Wait until the script just written at `p` can be executed. Another
+        /// test thread that forked while it was open for writing holds a copy
+        /// until that child execs, and an exec meanwhile fails with ETXTBSY.
+        /// The code under test reads a failed spawn as "never called" or "not
+        /// running", so the race would fail the test without saying why.
+        /// Once one run gets through, nothing still holds the file open.
+        fn runnable(p: &Path) {
+            const ETXTBSY: i32 = 26;
+            for _ in 0..100 {
+                match std::process::Command::new(p).arg("--probe").status() {
+                    Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    // A nonzero exit is fine (`gone` exits 1); any other spawn
+                    // error fails here rather than inside the test.
+                    status => {
+                        status.unwrap();
+                        return;
+                    }
+                }
+            }
+            std::process::Command::new(p)
+                .arg("--probe")
+                .status()
+                .unwrap();
         }
 
         fn container_with_tool(tool: String) -> SdkContainer {
@@ -6908,6 +7206,7 @@ extensions:
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            runnable(&p);
             p.display().to_string()
         }
 
@@ -7085,7 +7384,7 @@ extensions:
             let dir = tempfile::tempdir().unwrap();
             let container = container_with_tool(stub_tool(dir.path()));
             let pid_file = dir.path().join("pid");
-            let mut child = AsyncCommand::new("sh")
+            let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))
                 .spawn()
@@ -7114,7 +7413,7 @@ extensions:
         async fn a_finished_container_returns_its_status() {
             let dir = tempfile::tempdir().unwrap();
             let container = container_with_tool(stub_tool(dir.path()));
-            let mut child = AsyncCommand::new("sh")
+            let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg("exit 3")
                 .spawn()
@@ -7135,13 +7434,16 @@ extensions:
         }
 
         #[test]
+        #[serial_test::serial]
         fn shutdown_removes_a_foreground_run_in_progress() {
             let dir = tempfile::tempdir().unwrap();
             let tool = stub_tool(dir.path());
             let run = ForegroundRun::register(Some("avocado-run-shutdown-t"), true);
             SessionContainers::shutdown(&tool);
             drop(run);
-            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_else(|e| {
+                panic!("stub tool log missing in {}: {e}", dir.path().display())
+            });
             assert!(
                 log.contains("rm -f avocado-run-shutdown-t"),
                 "tool calls: {log}"
@@ -7154,13 +7456,16 @@ extensions:
         }
 
         #[test]
+        #[serial_test::serial]
         fn shutdown_stops_a_foreground_run_started_without_rm() {
             let dir = tempfile::tempdir().unwrap();
             let tool = stub_tool(dir.path());
             let run = ForegroundRun::register(Some("avocado-run-keep-t"), false);
             SessionContainers::shutdown(&tool);
             drop(run);
-            let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+            let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_else(|e| {
+                panic!("stub tool log missing in {}: {e}", dir.path().display())
+            });
             assert!(
                 log.contains("stop -t 2 avocado-run-keep-t"),
                 "tool calls: {log}"
@@ -7170,5 +7475,167 @@ extensions:
                 "a run without --rm must keep its container: {log}"
             );
         }
+    }
+
+    #[test]
+    fn distro_repo_url_follows_the_container_args_the_run_uses() {
+        let url = |args: Option<Vec<&str>>, isolated: bool| {
+            let cfg = RunConfig {
+                repo_url: Some("http://localhost:9000".to_string()),
+                container_args: args.map(|a| a.into_iter().map(String::from).collect()),
+                ..Default::default()
+            };
+            (
+                distro_repo_url_for_container_with(&cfg, isolated),
+                run_config_has_host_network_with(&cfg, isolated),
+            )
+        };
+        // Host networking in effect: loopback is shared, URL stays.
+        let (kept, hn) = url(Some(vec!["--network=host"]), false);
+        assert_eq!(kept, "http://localhost:9000");
+        assert!(hn);
+        // Docker receives the single-element form as two arguments.
+        let (kept, hn) = url(Some(vec!["--network host"]), false);
+        assert_eq!(kept, "http://localhost:9000");
+        assert!(hn);
+        // No host networking: the URL is rewritten to the gateway alias.
+        for args in [None, Some(vec![]), Some(vec!["--network=bridge"])] {
+            let (rewritten, hn) = url(args.clone(), false);
+            assert!(
+                rewritten.contains("host.docker.internal") && !hn,
+                "{args:?}: {rewritten}"
+            );
+        }
+        // Docker Desktop / VM routing: host networking is not in effect.
+        let (rewritten, hn) = url(Some(vec!["--network=host"]), true);
+        assert!(rewritten.contains("host.docker.internal") && !hn);
+    }
+
+    fn host_entry_config(repo_url: &str, container_args: Option<Vec<String>>) -> RunConfig {
+        RunConfig {
+            container_image: "test-image".to_string(),
+            target: "test-target".to_string(),
+            rm: true,
+            repo_url: Some(repo_url.to_string()),
+            container_args,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn host_entry_is_needed_only_without_host_networking() {
+        let cfg = host_entry_config("http://localhost:9000", None);
+        assert!(distro_needs_host_entry(&cfg, false));
+        assert!(!distro_needs_host_entry(&cfg, true));
+        let remote = host_entry_config("https://repo.example.com", None);
+        assert!(!distro_needs_host_entry(&remote, false));
+    }
+
+    /// The composed config for a project whose `sdk:` section is `sdk_body`.
+    fn load_sdk_project(
+        sdk_body: &str,
+    ) -> (
+        tempfile::TempDir,
+        String,
+        crate::utils::config::ComposedConfig,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            format!("default_target: qemux86-64\nsdk:\n  image: test\n{sdk_body}"),
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let composed = crate::utils::config::Config::load_composed(
+            std::path::Path::new(&path),
+            Some("qemux86-64"),
+        )
+        .unwrap();
+        (dir, path, composed)
+    }
+
+    /// Asserts, for a loopback distro URL and the args docker receives, that
+    /// the URL rewrite and the `--add-host` route agree with `host_networked`.
+    /// Docker Desktop and the VM never share loopback, so there the URL is
+    /// always rewritten and the route always added.
+    fn assert_loopback_decision(effective: Option<Vec<String>>, host_networked: bool) {
+        use crate::utils::volume::VolumeState;
+        let (_restore, _vm_sock) = vm_routing_env();
+        let isolated = crate::utils::feeds::host_network_is_isolated_from_developer_loopback();
+        let shared = host_networked && !isolated;
+        let cfg = host_entry_config("http://localhost:9000", effective);
+        let url = distro_repo_url_for_container_with(&cfg, isolated);
+        assert_eq!(url == "http://localhost:9000", shared, "url: {url}");
+        let container = SdkContainer::new();
+        let volume_state = VolumeState::new(std::env::current_dir().unwrap(), "docker".to_string());
+        let cmd = container
+            .build_container_command(&cfg, &["true".to_string()], &HashMap::new(), &volume_state)
+            .unwrap();
+        let host_entry = format!(
+            "--add-host={}",
+            crate::utils::feeds::host_gateway_add_host(is_vm_routing_active())
+        );
+        assert_eq!(cmd.contains(&host_entry), !shared, "args: {cmd:?}");
+    }
+
+    // Serial in the next five tests: they clear DOCKER_HOST through
+    // `vm_routing_env` and the first sets AVOCADO_NET, both process-wide.
+    #[test]
+    #[serial_test::serial]
+    fn a_loopback_distro_url_gets_the_host_entry_without_host_networking() {
+        let (_d, _p, composed) = load_sdk_project("  container_args:\n    - --cap-add=NET_ADMIN\n");
+        assert_loopback_decision(composed.config.merge_sdk_container_args(None), false);
+        let (_d, _p, composed) = load_sdk_project("");
+        assert_loopback_decision(composed.config.merge_sdk_container_args(None), false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn host_networking_given_through_an_expanded_variable_is_honoured() {
+        let _restore = RestoreEnv(vec![("AVOCADO_NET", std::env::var_os("AVOCADO_NET"))]);
+        std::env::set_var("AVOCADO_NET", "host");
+        let (_d, _p, composed) =
+            load_sdk_project("  container_args:\n    - --network=${AVOCADO_NET}\n");
+        assert_loopback_decision(composed.config.merge_sdk_container_args(None), true);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn host_networking_from_the_target_section_is_honoured() {
+        // `sdk run` merges `sdk.<target>.container_args` over the base list.
+        let (_d, path, composed) =
+            load_sdk_project("  qemux86-64:\n    container_args:\n      - --net=host\n");
+        let merged = composed
+            .config
+            .get_merged_sdk_config("qemux86-64", &path)
+            .unwrap();
+        let effective =
+            crate::utils::config::Config::process_container_args(merged.container_args.as_ref());
+        assert_loopback_decision(effective, true);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_command_line_container_arg_replacing_config_host_networking_drops_it() {
+        // `ext fetch` hands the command line's list to docker instead of the
+        // config's, so the config's `--network=host` never reaches docker.
+        let (_d, _p, composed) = load_sdk_project("  container_args:\n    - --network=host\n");
+        let cli = Some(vec!["--cap-add=NET_ADMIN".to_string()]);
+        let effective = if cli.is_some() {
+            cli
+        } else {
+            composed.config.merge_sdk_container_args(None)
+        };
+        assert_loopback_decision(effective, false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_command_line_only_host_network_is_honoured() {
+        let (_d, _p, composed) = load_sdk_project("");
+        let cli = vec!["--network=host".to_string()];
+        let effective = composed.config.merge_sdk_container_args(Some(&cli));
+        assert_loopback_decision(effective, true);
     }
 }

@@ -204,6 +204,28 @@ impl InstallCommand {
         // channel snapshot — auto-pinning on first fetch, reusing the pin after.
         crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &_target).await?;
 
+        // Probe the feeds before the first download. The SDK install step runs
+        // the same hook, which is a no-op once this has passed. Only an extension
+        // fetched from the extension repository (a package `source`) needs it, and
+        // `enabled: false` does not exempt one: it is fetched regardless of the flag.
+        let required = self.find_required_extensions(&composed, &_target)?;
+        let needs_extension_repo = Config::extensions_need_extension_repo(
+            _parsed,
+            required.iter().map(|e| {
+                let ExtensionDependency::Local(name) = e;
+                name.as_str()
+            }),
+        )?;
+        config
+            .preflight_feeds_once(
+                &_target,
+                &self.config_path,
+                crate::utils::feeds::FeedStage::ALL,
+                needs_extension_repo,
+                self.runs_on.is_some(),
+            )
+            .await?;
+
         // Compute target runtimes early so we can show a useful start message.
         let initial_runtimes = self.find_target_relevant_runtimes(config, _parsed, &_target)?;
         if initial_runtimes.len() == 1 {
@@ -1040,6 +1062,51 @@ extensions:
             map.is_empty(),
             "single-runtime project must not seed per-runtime copies: {map:?}"
         );
+    }
+
+    /// Ruling 1.4: a shipped-but-off (`enabled: false`) extension is still in
+    /// the install command's own extension list, so it is still fetched.
+    #[test]
+    fn test_install_required_extensions_follow_ruling() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - on-ext
+        - shipped-off:
+            enabled: false
+extensions:
+  on-ext:
+    version: "1.0.0"
+  shipped-off:
+    version: "1.0.0"
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let cmd = InstallCommand::new(
+            config_path.to_string(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let names: Vec<String> = cmd
+            .find_required_extensions(&composed, "qemux86-64")
+            .expect("required extensions")
+            .into_iter()
+            .map(|ExtensionDependency::Local(n)| n)
+            .collect();
+        assert_eq!(names, vec!["on-ext", "shipped-off"]);
     }
 
     #[test]

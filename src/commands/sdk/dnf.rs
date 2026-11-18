@@ -180,7 +180,7 @@ fn sdk_dnf_command(dnf_args_str: &str, command: &[String]) -> String {
         "{}RPM_CONFIGDIR=$AVOCADO_SDK_PREFIX/usr/lib/rpm $DNF_SDK_HOST $DNF_SDK_HOST_OPTS $DNF_SDK_COMBINED_REPO_CONF {} {}",
         crate::commands::sdk::install::sdk_host_scriptlet_env(),
         dnf_args_str,
-        command.join(" ")
+        crate::utils::shell::join_argv(command)
     )
 }
 
@@ -208,10 +208,16 @@ mod tests {
     /// `sdk dnf install` runs nativesdk scriptlets, so it needs the same SDK
     /// host scriptlet env as the SDK packages install.
     #[test]
+    fn test_sdk_dnf_command_keeps_argv_boundaries() {
+        let command = sdk_dnf_command("", &["install".to_string(), "a b; $X*".to_string()]);
+        assert!(command.ends_with(" 'install' 'a b; $X*'"), "{command}");
+    }
+
+    #[test]
     fn test_sdk_dnf_command_uses_sdk_host_scriptlet_env() {
         let command = sdk_dnf_command("", &["install".to_string(), "nativesdk-bc".to_string()]);
         assert!(command.starts_with(crate::commands::sdk::install::sdk_host_scriptlet_env()));
-        assert!(command.ends_with(" install nativesdk-bc"));
+        assert!(command.ends_with(" 'install' 'nativesdk-bc'"));
     }
 
     #[tokio::test]

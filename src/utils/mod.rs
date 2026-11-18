@@ -6,15 +6,18 @@ pub mod container_dev;
 pub mod device_tree_overlay;
 #[cfg(target_os = "macos")]
 pub mod disk_writer;
+pub mod engine;
 pub mod ext_deps;
 pub mod ext_fetch;
 pub mod ext_source_reader;
 pub mod ext_version_source;
+pub mod feed_limit;
 pub mod feeds;
 pub mod git_worktree;
 #[cfg(all(test, unix))]
 pub(crate) mod gnu_test_tools;
 pub mod host_copy;
+pub mod host_mounts;
 pub mod image_signing;
 pub mod install_method;
 pub mod interactivity;
@@ -25,6 +28,7 @@ pub mod kernel_resolver;
 pub mod kernel_version;
 pub mod lockfile;
 pub mod nfs_server;
+pub mod offline;
 pub mod output;
 pub mod output_format;
 pub mod overlay_preprocess;

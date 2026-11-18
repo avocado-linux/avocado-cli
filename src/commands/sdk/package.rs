@@ -391,12 +391,71 @@ impl SdkPackageCommand {
             .map(|u| format!("URL: {u}"))
             .unwrap_or_default();
 
-        let requires_lines: String = metadata
-            .requires
-            .iter()
-            .map(|r| format!("Requires: {r}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut dependency_lines: Vec<String> = Vec::new();
+        // `%` is left alone here: a macro in Requires is common and intended.
+        for require in &metadata.requires {
+            if require.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "Section '{}': requires entry {:?} contains a newline or control character",
+                    self.section,
+                    require
+                );
+            }
+            dependency_lines.push(format!("Requires: {require}"));
+        }
+        for provide in pkg_config.provides.iter().flatten() {
+            if provide.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "Section '{}': provides entry {:?} contains a newline or control character",
+                    self.section,
+                    provide
+                );
+            }
+            if provide.trim().is_empty() {
+                anyhow::bail!(
+                    "Section '{}': provides entry is empty; remove it or name a capability",
+                    self.section
+                );
+            }
+            dependency_lines.push(format!("Provides: {}", escape_spec_percent(provide)));
+        }
+        let requires_lines = dependency_lines.join("\n");
+
+        let epoch_line = pkg_config
+            .epoch
+            .map(|e| format!("\nEpoch: {e}"))
+            .unwrap_or_default();
+
+        let mut scriptlet_sections = String::new();
+        for (tag, body) in [
+            ("%pre", &pkg_config.pre_install),
+            ("%post", &pkg_config.post_install),
+            ("%preun", &pkg_config.pre_uninstall),
+            ("%postun", &pkg_config.post_uninstall),
+        ] {
+            let Some(body) = body else { continue };
+            // The spec travels in a quoted heredoc: `$` and backticks are inert,
+            // but a line equal to the terminator would end it early.
+            if body.contains('\0') || body.lines().any(|l| l == "SPEC_EOF") {
+                anyhow::bail!(
+                    "Section '{}': {} scriptlet contains a NUL byte or a line equal to the spec terminator SPEC_EOF",
+                    self.section,
+                    tag
+                );
+            }
+            // rpmbuild expands macros on each line before it looks for section
+            // headers, so a `%%files` line (our escaped `%files`) still opens a
+            // section and cuts the scriptlet short. Doubling cannot prevent it.
+            if let Some(line) = body.lines().find(|l| l.trim_start().starts_with('%')) {
+                anyhow::bail!(
+                    "Section '{}': {} scriptlet line {:?} starts with '%', which rpm reads as a spec section; start the line with another character",
+                    self.section,
+                    tag,
+                    line
+                );
+            }
+            scriptlet_sections.push_str(&format!("\n\n{tag}\n{}", escape_spec_percent(body)));
+        }
 
         // Collect RPM filenames to expect
         let main_rpm = format!("{name}-{version}-{release}.{arch}.rpm");
@@ -404,7 +463,7 @@ impl SdkPackageCommand {
 
         // Build sub-package spec sections and partition script
         let (split_spec_sections, partition_script) = if let Some(split) = &pkg_config.split {
-            let spec = self.generate_split_spec_sections(split, name, version, arch);
+            let spec = self.generate_split_spec_sections(split, name, version, arch)?;
             let script = self.generate_partition_script(split);
             // Add sub-package RPM filenames
             for subpkg_name in split.keys() {
@@ -436,6 +495,8 @@ impl SdkPackageCommand {
 /*"#
             .to_string()
         };
+
+        let main_files_section = format!("{main_files_section}{scriptlet_sections}");
 
         let install_script = &pkg_config.install;
         let install_script_escaped = install_script.replace('\'', "'\\''");
@@ -483,7 +544,7 @@ cat > "$TMPDIR/SPECS/package.spec" << 'SPEC_EOF'
 %define _buildhost reproducible
 AutoReqProv: no
 
-Name: {name}
+Name: {name}{epoch_line}
 Version: {version}
 Release: {release}
 Summary: {summary}
@@ -531,7 +592,7 @@ rm -rf "$TMPDIR"
         parent_name: &str,
         version: &str,
         arch: &str,
-    ) -> String {
+    ) -> Result<String> {
         let mut sections = String::new();
 
         // Sort for deterministic output
@@ -552,14 +613,20 @@ rm -rf "$TMPDIR"
                 .clone()
                 .unwrap_or_else(|| format!("Sub-package {full_name}"));
 
-            let requires_lines: String = subpkg
-                .requires
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|r| format!("Requires: {r}"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // `%` is left alone, as for the main package's requires.
+            let mut requires = Vec::new();
+            for require in subpkg.requires.as_deref().unwrap_or(&[]) {
+                if require.chars().any(char::is_control) {
+                    anyhow::bail!(
+                        "Section '{}': sub-package '{}' requires entry {:?} contains a newline or control character",
+                        self.section,
+                        subpkg_name,
+                        require
+                    );
+                }
+                requires.push(format!("Requires: {require}"));
+            }
+            let requires_lines = requires.join("\n");
 
             // %files section for this sub-package uses the patterns from config
             let files_list: String = subpkg.files.join("\n");
@@ -583,7 +650,7 @@ Summary: {summary}
             let _ = (version, arch); // suppress unused warnings
         }
 
-        sections
+        Ok(sections)
     }
 
     /// Generate file partitioning script for split packages.
@@ -640,7 +707,7 @@ Summary: {summary}
             );
         }
 
-        let copy_output = tokio::process::Command::new(container_tool)
+        let copy_output = crate::utils::engine::command(container_tool)
             .arg("cp")
             .arg(&docker_cp_source)
             .arg(&docker_cp_dest)
@@ -648,7 +715,7 @@ Summary: {summary}
             .await
             .context("Failed to execute docker cp")?;
 
-        let _ = tokio::process::Command::new(container_tool)
+        let _ = crate::utils::engine::command(container_tool)
             .arg("rm")
             .arg("-f")
             .arg(&temp_container_id)
@@ -669,7 +736,7 @@ Summary: {summary}
         container_tool: &str,
         volume_name: &str,
     ) -> Result<String> {
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .arg("create")
             .arg("-v")
             .arg(format!("{volume_name}:/opt/_avocado:ro"))
@@ -688,6 +755,11 @@ Summary: {summary}
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+}
+
+/// Double every `%` so rpm reads the text literally instead of as a macro.
+fn escape_spec_percent(text: &str) -> String {
+    text.replace('%', "%%")
 }
 
 #[cfg(test)]
@@ -816,6 +888,12 @@ mod tests {
             url: None,
             arch: None,
             requires: None,
+            provides: None,
+            epoch: None,
+            pre_install: None,
+            post_install: None,
+            pre_uninstall: None,
+            post_uninstall: None,
             files: None,
             split: None,
         };
@@ -849,6 +927,12 @@ mod tests {
             url: Some("https://example.com".to_string()),
             arch: Some("noarch".to_string()),
             requires: Some(vec!["glibc >= 2.17".to_string()]),
+            provides: None,
+            epoch: None,
+            pre_install: None,
+            post_install: None,
+            pre_uninstall: None,
+            post_uninstall: None,
             files: None,
             split: None,
         };
@@ -884,6 +968,12 @@ mod tests {
             url: None,
             arch: None,
             requires: None,
+            provides: None,
+            epoch: None,
+            pre_install: None,
+            post_install: None,
+            pre_uninstall: None,
+            post_uninstall: None,
             files: None,
             split: None,
         };
@@ -996,5 +1086,233 @@ sdk:
 
         let dev = pkg.split.as_ref().unwrap().get("dev").unwrap();
         assert_eq!(dev.files, vec!["/usr/include/**"]);
+    }
+
+    fn bare_pkg() -> PackageConfig {
+        PackageConfig {
+            install: "install.sh".to_string(),
+            version: "1.0.0".to_string(),
+            name: None,
+            release: None,
+            license: None,
+            summary: Some("sum".to_string()),
+            description: Some("desc".to_string()),
+            vendor: None,
+            url: None,
+            arch: None,
+            requires: None,
+            provides: None,
+            epoch: None,
+            pre_install: None,
+            post_install: None,
+            pre_uninstall: None,
+            post_uninstall: None,
+            files: None,
+            split: None,
+        }
+    }
+
+    fn gen_script(pkg: &PackageConfig) -> Result<String> {
+        let cmd = make_cmd();
+        let meta = cmd.extract_rpm_metadata(pkg, "aarch64-unknown-linux-gnu")?;
+        cmd.generate_rpm_build_script(&meta, pkg, "aarch64-unknown-linux-gnu")
+            .map(|(s, _)| s)
+    }
+
+    /// The spec text between the heredoc markers.
+    fn spec_of(script: &str) -> String {
+        let start_marker = "<< 'SPEC_EOF'\n";
+        let start = script.find(start_marker).unwrap() + start_marker.len();
+        let end = script[start..].find("\nSPEC_EOF\n").unwrap() + start;
+        script[start..end].to_string()
+    }
+
+    #[test]
+    fn spec_without_new_keys_is_unchanged() {
+        let spec = spec_of(&gen_script(&bare_pkg()).unwrap());
+        let expected = "%define _buildhost reproducible\nAutoReqProv: no\n\nName: my-app\nVersion: 1.0.0\nRelease: 1\nSummary: sum\nLicense: Unspecified\nVendor: Unspecified\n\n\n\n%description\ndesc\n\n\n\n%install\nmkdir -p %{buildroot}\ncp -a %{staging_dir}/. %{buildroot}/\n\n%files\n%defattr(-,root,root,-)\n/*\n\n%clean\n%changelog";
+        assert_eq!(spec, expected);
+        assert!(!spec.contains("Epoch:"));
+        assert!(!spec.contains("%post"));
+        assert!(!spec.contains("Provides:"));
+    }
+
+    #[test]
+    fn spec_emits_provides_and_epoch() {
+        let mut pkg = bare_pkg();
+        pkg.requires = Some(vec!["glibc".to_string()]);
+        pkg.provides = Some(vec!["foo = 1.0".to_string(), "bar".to_string()]);
+        pkg.epoch = Some(2);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(spec.contains("\nEpoch: 2\n"), "{spec}");
+        assert!(
+            spec.contains("\nProvides: foo = 1.0\nProvides: bar\n"),
+            "{spec}"
+        );
+        assert!(spec.contains("Requires: glibc\n"), "{spec}");
+        assert!(spec.contains("AutoReqProv: no"));
+        // Epoch sits in the header, before Version.
+        assert!(spec.find("Epoch: 2").unwrap() < spec.find("Version:").unwrap());
+    }
+
+    #[test]
+    fn scriptlet_percent_is_escaped() {
+        let mut pkg = bare_pkg();
+        pkg.post_install = Some("echo 100%s %{buildroot}".to_string());
+        pkg.provides = Some(vec!["x = %{v}".to_string()]);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(
+            spec.contains("\n%post\necho 100%%s %%{buildroot}"),
+            "{spec}"
+        );
+        assert!(spec.contains("Provides: x = %%{v}"), "{spec}");
+        assert!(!spec.contains("100%s"));
+    }
+
+    #[test]
+    fn scriptlets_emit_all_four_sections() {
+        let mut pkg = bare_pkg();
+        pkg.pre_install = Some("a".to_string());
+        pkg.post_install = Some("b".to_string());
+        pkg.pre_uninstall = Some("c".to_string());
+        pkg.post_uninstall = Some("d".to_string());
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        for (sec, body) in [
+            ("%pre", "a"),
+            ("%post", "b"),
+            ("%preun", "c"),
+            ("%postun", "d"),
+        ] {
+            assert!(
+                spec.contains(&format!("\n{sec}\n{body}\n")),
+                "{sec}: {spec}"
+            );
+        }
+        assert!(spec.find("%files").unwrap() < spec.find("\n%pre\n").unwrap());
+        assert!(spec.find("\n%postun\n").unwrap() < spec.find("%clean").unwrap());
+    }
+
+    #[test]
+    fn provides_with_newline_is_rejected() {
+        for bad in ["foo\nRequires: evil", "foo\rbar", "foo\u{1b}bar", "foo\0"] {
+            let mut pkg = bare_pkg();
+            pkg.provides = Some(vec!["ok".to_string(), bad.to_string()]);
+            let err = gen_script(&pkg).unwrap_err().to_string();
+            assert!(err.contains("provides"), "{err}");
+            assert!(err.contains(&format!("{bad:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn requires_with_newline_is_rejected_naming_the_section() {
+        for bad in ["foo\nProvides: evil", "foo\rbar", "foo\u{1b}bar", "foo\0"] {
+            let mut pkg = bare_pkg();
+            pkg.requires = Some(vec!["ok".to_string(), bad.to_string()]);
+            let err = gen_script(&pkg).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Section 'my-app': requires entry {bad:?} contains a newline or control character"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn requires_entry_is_emitted_verbatim() {
+        // A macro in Requires is common, so `%` stays unescaped there.
+        let mut pkg = bare_pkg();
+        pkg.requires = Some(vec!["%{name}-libs = %{version}".to_string()]);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(
+            spec.contains("\nRequires: %{name}-libs = %{version}\n"),
+            "{spec}"
+        );
+    }
+
+    fn pkg_with_split_requires(requires: &[&str]) -> PackageConfig {
+        let mut pkg = bare_pkg();
+        let sub = SplitPackageConfig {
+            summary: None,
+            description: None,
+            requires: Some(requires.iter().map(|r| r.to_string()).collect()),
+            files: vec!["/usr/include/*".to_string()],
+        };
+        pkg.split = Some(HashMap::from([("dev".to_string(), sub)]));
+        pkg
+    }
+
+    #[test]
+    fn split_requires_with_newline_is_rejected_naming_the_subpackage() {
+        for bad in ["foo\nProvides: evil", "foo\rbar", "foo\u{1b}bar", "foo\0"] {
+            let err = gen_script(&pkg_with_split_requires(&["ok", bad]))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Section 'my-app': sub-package 'dev' requires entry {bad:?} contains a newline or control character"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn split_requires_entry_is_emitted_verbatim() {
+        let pkg = pkg_with_split_requires(&["%{name} = %{version}"]);
+        let spec = spec_of(&gen_script(&pkg).unwrap());
+        assert!(
+            spec.contains("\nSummary: my-app-dev package\nRequires: %{name} = %{version}\n"),
+            "{spec}"
+        );
+    }
+
+    #[test]
+    fn scriptlet_survives_the_shell_heredoc() {
+        // The heredoc is single-quoted, so $ and backticks reach rpm verbatim.
+        let mut pkg = bare_pkg();
+        pkg.post_install = Some("echo $HOME `id` $(whoami)".to_string());
+        let script = gen_script(&pkg).unwrap();
+        assert!(script.contains("<< 'SPEC_EOF'"));
+        assert!(spec_of(&script).contains("echo $HOME `id` $(whoami)"));
+
+        // A line equal to the terminator would end the heredoc early: rejected.
+        let mut pkg = bare_pkg();
+        pkg.post_install = Some("echo hi\nSPEC_EOF\ntouch /pwned".to_string());
+        let err = gen_script(&pkg).unwrap_err().to_string();
+        assert!(err.contains("SPEC_EOF"), "{err}");
+    }
+
+    #[test]
+    fn scriptlet_line_starting_with_percent_is_rejected() {
+        // rpmbuild expands `%%files` back to `%files` before it looks for section
+        // headers, so doubling the `%` does not keep the line inside the scriptlet.
+        for bad in [
+            "echo a\n%files\n/usr/bin/x",
+            "echo a\n%%build\necho b",
+            "echo a\n   %package -n evil",
+            "echo a\n\t%if 1",
+        ] {
+            let mut pkg = bare_pkg();
+            pkg.post_install = Some(bad.to_string());
+            let err = gen_script(&pkg).unwrap_err().to_string();
+            assert!(err.contains("%post"), "{err}");
+            assert!(err.contains("starts with '%'"), "{err}");
+        }
+        // A `%` inside a line stays legal and is escaped.
+        let mut pkg = bare_pkg();
+        pkg.post_install = Some("printf '%s\\n' x".to_string());
+        assert!(spec_of(&gen_script(&pkg).unwrap()).contains("printf '%%s\\n' x"));
+    }
+
+    #[test]
+    fn blank_provides_entry_is_rejected_by_name() {
+        for bad in ["", "   "] {
+            let mut pkg = bare_pkg();
+            pkg.provides = Some(vec!["ok".to_string(), bad.to_string()]);
+            let err = gen_script(&pkg).unwrap_err().to_string();
+            assert!(err.contains("provides"), "{err}");
+            assert!(err.contains("empty"), "{err}");
+        }
     }
 }

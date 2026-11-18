@@ -169,12 +169,12 @@ impl Drop for TuiGuard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Serialize tests that touch the global ACTIVE_RENDERER.
     /// Tests run in parallel by default; the global static causes races.
-    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Create a test renderer in Passthrough mode (doesn't need a terminal).
     fn test_renderer() -> Arc<TaskRenderer> {

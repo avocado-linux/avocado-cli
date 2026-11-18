@@ -253,7 +253,9 @@ impl ExtImageCommand {
 
         // Resolve the effective filesystem for this extension early — needed for stamp hashing.
         // If the extension explicitly sets `filesystem`, use that; otherwise inherit from rootfs.
-        let rootfs_fs = config.get_rootfs_filesystem();
+        let rootfs_fs = crate::utils::config::rootfs_filesystem(
+            config.resolve_rootfs(parsed, &target, None)?.as_ref(),
+        );
         let effective_fs = parsed
             .get("extensions")
             .and_then(|e| e.get(&self.extension))
@@ -529,9 +531,10 @@ impl ExtImageCommand {
         let config_version = ext_config
             .get("version")
             .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Extension '{}' is missing required 'version' field",
+                    "Extension '{}' has a missing or empty 'version' field",
                     self.extension
                 )
             })?;
@@ -850,13 +853,13 @@ impl ExtImageCommand {
         let docker_cp_source = format!("{temp_container_id}:{container_image_path}");
         let docker_cp_dest = host_output_dir.join(image_filename);
 
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .args(["cp", &docker_cp_source, docker_cp_dest.to_str().unwrap()])
             .output()
             .await
             .context("Failed to run docker cp")?;
 
-        let _ = tokio::process::Command::new(container_tool)
+        let _ = crate::utils::engine::command(container_tool)
             .args(["rm", "-f", &temp_container_id])
             .output()
             .await;
@@ -874,7 +877,7 @@ impl ExtImageCommand {
         container_tool: &str,
         volume_name: &str,
     ) -> Result<String> {
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .args([
                 "create",
                 "--rm",

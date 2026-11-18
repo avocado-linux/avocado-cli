@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::process::Command as AsyncCommand;
 
 use crate::utils::{
     config::{ComposedConfig, Config},
@@ -89,6 +88,18 @@ impl FetchCommand {
         // metadata, so `fetch` caches the pinned snapshot's repodata (and
         // auto-pins on first run) rather than the advancing live head.
         crate::utils::snapshot::resolve_and_apply_for(config, &self.config_path, &target_arch)
+            .await?;
+
+        // Probe the feeds before the first dnf or download work. `fetch`
+        // refreshes metadata only and has no `--runs-on`.
+        config
+            .preflight_feeds_once(
+                &target_arch,
+                &self.config_path,
+                &[crate::utils::feeds::FeedStage::Ext],
+                false,
+                false,
+            )
             .await?;
 
         // Get container configuration from interpolated config
@@ -716,7 +727,7 @@ $DNF_SDK_HOST \
             );
         }
 
-        let mut cmd = AsyncCommand::new(&container_tool);
+        let mut cmd = crate::utils::engine::command(&container_tool);
         cmd.arg("pull").arg(container_image);
 
         let output = cmd.output().await?;

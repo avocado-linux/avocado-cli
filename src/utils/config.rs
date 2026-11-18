@@ -49,6 +49,12 @@ pub(crate) fn config_file_dir(config_path: &Path) -> &Path {
 /// Mixing forms (some keys are field names, some are not) is a hard error —
 /// it almost always indicates a typo and silently dropping unknown keys
 /// would produce confusing partial-singleton state.
+///
+/// `override_keys_are_entries` decides what a `target-*` / `kernel-*` key
+/// beside named entries is. `kernel:` names entries that way (`kernel-lts`),
+/// so there they are entries. `rootfs:` passes `false`: there they are
+/// override blocks, never entries, so they are neither counted toward a lone
+/// entry nor selectable by a runtime ref.
 mod named_or_single_deserializer {
     use serde::de::{self, Deserializer};
     use serde::Deserialize;
@@ -58,6 +64,7 @@ mod named_or_single_deserializer {
         deserializer: D,
         field_names: &[&str],
         kind_label: &str,
+        override_keys_are_entries: bool,
     ) -> Result<Option<HashMap<String, T>>, D::Error>
     where
         D: Deserializer<'de>,
@@ -83,13 +90,22 @@ mod named_or_single_deserializer {
             .filter_map(|(k, _)| k.as_str())
             .filter(|s| known.contains(s))
             .count();
+        let is_override_key =
+            |k: &serde_yaml::Value| k.as_str().is_some_and(super::is_override_key);
 
         if field_key_count == 0 {
-            // Named-map form: none of the top-level keys are config fields, so
-            // every key is an entry name — including names that happen to start
-            // with `target-`/`kernel-` (e.g. a `kernel: { kernel-lts: ... }` map
-            // referenced elsewhere by name). Don't treat those as overrides here;
-            // that reserved-prefix handling only applies inside singleton form.
+            // Named-map form: none of the top-level keys are config fields.
+            // Override blocks beside the entries are resolved later on the raw
+            // composed value, like the singleton form's.
+            if !override_keys_are_entries && mapping.keys().any(is_override_key) {
+                mapping.retain(|k, _| !is_override_key(k));
+                if mapping.is_empty() {
+                    // Override blocks alone: one block with no base fields.
+                    let single: T = serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+                        .map_err(de::Error::custom)?;
+                    return Ok(Some(HashMap::from([("default".to_string(), single)])));
+                }
+            }
             let named: HashMap<String, T> =
                 serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
                     .map_err(de::Error::custom)?;
@@ -102,11 +118,6 @@ mod named_or_single_deserializer {
         // count as unknown singleton fields and falsely trip the mixed-form
         // guard below. Probe first so the common override-free config skips the
         // mutation entirely.
-        let is_override_key = |k: &serde_yaml::Value| {
-            k.as_str()
-                .map(|s| s.starts_with("target-") || s.starts_with("kernel-"))
-                .unwrap_or(false)
-        };
         if mapping.keys().any(is_override_key) {
             mapping.retain(|k, _| !is_override_key(k));
         }
@@ -150,6 +161,13 @@ fn format_unresolved_ref_error<T>(
             names.join(", ")
         })
         .unwrap_or_default();
+    if field == "rootfs" && is_override_key(ref_name) {
+        return format!(
+            "runtime '{runtime_name}' references rootfs '{ref_name}', which is a per-target \
+             override block under `rootfs:`, not a rootfs entry; reference an entry instead. \
+             Available: {available}"
+        );
+    }
     if available.is_empty() {
         format!(
             "runtime '{runtime_name}' references {field} '{ref_name}', but no top-level \
@@ -168,12 +186,16 @@ fn format_unresolved_ref_error<T>(
 /// where the deserializer happened to produce a non-`default`-keyed entry —
 /// rare, but lets old fixture-style configs round-trip cleanly).
 fn get_default_or_singleton<T>(map: Option<&HashMap<String, T>>) -> Option<&T> {
+    get_default_or_singleton_entry(map).map(|(_, value)| value)
+}
+
+fn get_default_or_singleton_entry<T>(map: Option<&HashMap<String, T>>) -> Option<(&String, &T)> {
     let map = map?;
-    if let Some(value) = map.get("default") {
-        return Some(value);
+    if let Some(entry) = map.get_key_value("default") {
+        return Some(entry);
     }
     if map.len() == 1 {
-        return map.values().next();
+        return map.iter().next();
     }
     None
 }
@@ -195,6 +217,7 @@ where
         // KernelConfig".
         KERNEL_CONFIG_FIELDS,
         "kernel",
+        true,
     )
 }
 
@@ -211,6 +234,141 @@ pub const KERNEL_CONFIG_FIELDS: &[&str] = &[
     "cmdline_extra",
 ];
 
+/// Every field of `ImageConfig`, by name: what tells one anonymous `rootfs:`
+/// or `initramfs:` block from a map of named entries.
+const IMAGE_CONFIG_FIELDS: &[&str] = &[
+    "packages",
+    "dependencies",
+    "filesystem",
+    "overlay",
+    "image",
+    "post_install",
+    "permissions",
+];
+
+/// A `target-<name>:` / `kernel-<spec>:` override block key.
+fn is_override_key(key: &str) -> bool {
+    key.starts_with("target-") || key.starts_with("kernel-")
+}
+
+/// Keys a rootfs override replaces whole instead of merging into: a long-form
+/// `overlay` must not inherit the base's `mode`, nor an inline `permissions`
+/// profile the base's users.
+const ROOTFS_REPLACED_KEYS: &[&str] = &["overlay", "permissions"];
+
+/// Whether one block under an image section spells its package map
+/// `dependencies` and another `packages`.
+fn mixes_packages_spellings(value: &serde_yaml::Value) -> bool {
+    fn walk(value: &serde_yaml::Value, seen: &mut (bool, bool)) {
+        let Some(map) = value.as_mapping() else {
+            return;
+        };
+        for (key, child) in map {
+            match key.as_str() {
+                Some("dependencies") => seen.0 = true,
+                Some("packages") => seen.1 = true,
+                Some(k) if !IMAGE_CONFIG_FIELDS.contains(&k) => walk(child, seen),
+                _ => {}
+            }
+        }
+    }
+    let mut seen = (false, false);
+    walk(value, &mut seen);
+    seen.0 && seen.1
+}
+
+/// Rename the `dependencies` alias to `packages` in an image block and in
+/// every entry or override block under it, so a base and a target override
+/// that spell it differently merge as one package map rather than
+/// deserializing as a duplicate field.
+fn normalize_packages_alias(value: &mut serde_yaml::Value) {
+    let Some(map) = value.as_mapping_mut() else {
+        return;
+    };
+    if let Some(deps) = map.remove("dependencies") {
+        let merged = match (deps, map.remove("packages")) {
+            (serde_yaml::Value::Mapping(mut deps), Some(serde_yaml::Value::Mapping(packages))) => {
+                deps.extend(packages);
+                serde_yaml::Value::Mapping(deps)
+            }
+            (deps, packages) => packages.unwrap_or(deps),
+        };
+        map.insert("packages".into(), merged);
+    }
+    for (key, child) in map.iter_mut() {
+        if key
+            .as_str()
+            .is_some_and(|k| !IMAGE_CONFIG_FIELDS.contains(&k))
+        {
+            normalize_packages_alias(child);
+        }
+    }
+}
+
+/// The named-entry form of a `rootfs:` mapping, by the deserializer's rule:
+/// no config-field key, and at least one key that is not an override block.
+fn rootfs_is_named_form(map: &serde_yaml::Mapping) -> bool {
+    let keys = || map.keys().filter_map(|k| k.as_str());
+    !keys().any(|k| IMAGE_CONFIG_FIELDS.contains(&k)) && keys().any(|k| !is_override_key(k))
+}
+
+/// `kernel-<spec>:` blocks [`Config::resolve_rootfs`] never applies: on the
+/// section itself, and on the selected entry.
+fn rootfs_kernel_override_paths(raw: &serde_yaml::Value, selected: Option<&str>) -> Vec<String> {
+    let keys = |node: Option<&serde_yaml::Value>, prefix: String| {
+        node.and_then(|n| n.as_mapping())
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, _)| k.as_str())
+            .filter(|k| k.starts_with("kernel-"))
+            .map(move |k| format!("{prefix}.{k}"))
+            .collect::<Vec<_>>()
+    };
+    let mut paths = keys(Some(raw), "rootfs".to_string());
+    if let Some(name) = selected {
+        paths.extend(keys(raw.get(name), format!("rootfs.{name}")));
+    }
+    paths
+}
+
+fn warn_ignored_rootfs_kernel_overrides(raw: &serde_yaml::Value, selected: Option<&str>) {
+    // Every rootfs reader resolves, so once per process.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let paths = rootfs_kernel_override_paths(raw, selected);
+    if paths.is_empty() {
+        return;
+    }
+    WARNED.call_once(|| {
+        print_warning(
+            &format!(
+                "`kernel-<spec>:` overrides in `rootfs:` are ignored (the kernel version isn't \
+                 known when the rootfs is resolved); only `target-<name>:` overrides are \
+                 honored: {}",
+                paths.join(", ")
+            ),
+            OutputLevel::Normal,
+        )
+    });
+}
+
+/// The rootfs a build reads; see [`Config::resolve_rootfs`].
+#[derive(Debug, Clone)]
+pub struct ResolvedRootfs {
+    /// The selected entry with its overrides applied: what install and the
+    /// image step read, and what the image stamp hashes.
+    pub node: serde_yaml::Value,
+    /// `node`, typed, except that a runtime's inline `rootfs:` block supplies
+    /// `permissions`.
+    pub config: ImageConfig,
+}
+
+/// The rootfs image filesystem: `erofs-lz4` when unset or without a rootfs.
+pub fn rootfs_filesystem(rootfs: Option<&ResolvedRootfs>) -> String {
+    rootfs
+        .and_then(|r| r.config.filesystem.clone())
+        .unwrap_or_else(|| "erofs-lz4".to_string())
+}
+
 /// Custom deserializer for top-level `rootfs:` field.
 fn deserialize_rootfs_map<'de, D>(
     deserializer: D,
@@ -218,19 +376,7 @@ fn deserialize_rootfs_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(
-        deserializer,
-        &[
-            "packages",
-            "dependencies",
-            "filesystem",
-            "overlay",
-            "image",
-            "post_install",
-            "permissions",
-        ],
-        "rootfs",
-    )
+    named_or_single_deserializer::deserialize(deserializer, IMAGE_CONFIG_FIELDS, "rootfs", false)
 }
 
 /// Custom deserializer for top-level `initramfs:` field.
@@ -240,19 +386,7 @@ fn deserialize_initramfs_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(
-        deserializer,
-        &[
-            "packages",
-            "dependencies",
-            "filesystem",
-            "overlay",
-            "image",
-            "post_install",
-            "permissions",
-        ],
-        "initramfs",
-    )
+    named_or_single_deserializer::deserialize(deserializer, IMAGE_CONFIG_FIELDS, "initramfs", true)
 }
 
 /// Custom deserializer for top-level `permissions:` field. Accepts either a
@@ -265,7 +399,12 @@ fn deserialize_permissions_map<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    named_or_single_deserializer::deserialize(deserializer, &["users", "groups"], "permissions")
+    named_or_single_deserializer::deserialize(
+        deserializer,
+        &["users", "groups"],
+        "permissions",
+        true,
+    )
 }
 
 /// Custom deserializer module for container_args
@@ -805,6 +944,150 @@ pub struct RuntimeConfig {
     pub container_dev: Option<ContainerDevConfig>,
 }
 
+/// Container settings by name, in Docker Compose's spelling. The structured
+/// form of `container_args`, which stays for whatever has no key here.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerConfig {
+    pub privileged: Option<bool>,
+    pub network_mode: Option<String>,
+    pub volumes: Option<Vec<String>>,
+    pub devices: Option<Vec<String>>,
+    pub extra_hosts: Option<Vec<String>>,
+    pub cap_add: Option<Vec<String>>,
+    pub environment: Option<BTreeMap<String, serde_yaml::Value>>,
+}
+
+impl ContainerConfig {
+    /// The block as `docker run` flags.
+    fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        match self.privileged {
+            Some(true) => args.push("--privileged".to_string()),
+            // Spelled out, so it overrides an earlier `--privileged` in a merge.
+            Some(false) => args.push("--privileged=false".to_string()),
+            None => {}
+        }
+        if let Some(network) = &self.network_mode {
+            args.push(format!("--network={network}"));
+        }
+        for (flag, values) in [
+            ("-v", &self.volumes),
+            ("--device", &self.devices),
+            ("--add-host", &self.extra_hosts),
+            ("--cap-add", &self.cap_add),
+        ] {
+            for value in values.iter().flatten() {
+                args.extend([flag.to_string(), atom(value)]);
+            }
+        }
+        for (name, value) in self.environment.iter().flatten() {
+            let value = value_to_string(value);
+            args.extend(["-e".to_string(), atom(&format!("{name}={value}"))]);
+        }
+        args
+    }
+
+    /// `container_args` followed by the `container` block. Where both name
+    /// one setting the block's is kept: docker refuses a second `--network`
+    /// or a second mount on one path rather than taking the later one.
+    // ponytail: only the network, privileged and mounts are taken out of
+    // `container_args`. The block's other keys add to it, as docker does with
+    // repeated devices, hosts and caps; repeated env takes the later value.
+    fn with_args(args: &Option<Vec<String>>, block: &Option<Self>) -> Option<Vec<String>> {
+        let Some(block) = block else {
+            return args.clone();
+        };
+        let args = args.clone().unwrap_or_default();
+        // Walk every argument of every entry, as the entries are split for
+        // docker, so a value in the next entry still pairs with its flag.
+        let tokens: Vec<(usize, String)> = args
+            .iter()
+            .enumerate()
+            .flat_map(|(i, entry)| {
+                crate::utils::container::SdkContainer::parse_container_arg(entry)
+                    .into_iter()
+                    .map(move |token| (i, token))
+            })
+            .collect();
+        let mut replaced = vec![false; tokens.len()];
+        let mut k = 0;
+        while k < tokens.len() {
+            let token = tokens[k].1.as_str();
+            let (flag, inline) = match token.split_once('=') {
+                Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+                _ if token.starts_with("-v") && token.len() > 2 => ("-v", Some(&token[2..])),
+                _ => (token, None),
+            };
+            let value = inline.or(tokens.get(k + 1).map(|(_, t)| t.as_str()));
+            let (hit, valued) = match flag {
+                "--privileged" => (block.privileged.is_some(), false),
+                "--network" | "--net" => (block.network_mode.is_some(), true),
+                "-v" | "--volume" => (value.is_some_and(|v| block.mounts_on(v)), true),
+                _ => (false, false),
+            };
+            let width = if valued && inline.is_none() { 2 } else { 1 };
+            if hit {
+                let end = (k + width).min(tokens.len());
+                replaced[k..end].fill(true);
+            }
+            k += if hit { width } else { 1 };
+        }
+        // An entry nothing was taken from stays exactly as written.
+        let mut kept = Vec::new();
+        for (i, entry) in args.iter().enumerate() {
+            let mine = || {
+                tokens
+                    .iter()
+                    .zip(&replaced)
+                    .filter(move |((at, _), _)| *at == i)
+            };
+            if mine().all(|(_, gone)| !gone) {
+                kept.push(entry.clone());
+                continue;
+            }
+            let rest: Vec<String> = mine()
+                .filter(|(_, gone)| !**gone)
+                .map(|((_, token), _)| atom(token))
+                .collect();
+            if !rest.is_empty() {
+                kept.push(rest.join(" "));
+            }
+        }
+        kept.extend(block.to_args());
+        Some(kept)
+    }
+
+    /// Whether one of the block's volumes mounts where `volume` does.
+    fn mounts_on(&self, volume: &str) -> bool {
+        let target = |v: &str| v.split(':').nth(1).map(str::to_string);
+        target(volume).is_some_and(|t| {
+            self.volumes
+                .iter()
+                .flatten()
+                .any(|v| target(v).as_ref() == Some(&t))
+        })
+    }
+}
+
+/// One argument as a `container_args` entry. The entries are split on spaces
+/// outside double quotes, and a bare `"` toggles quoting, so a value with
+/// either is quoted, its quotes and backslashes escaped as in a shell.
+fn atom(value: &str) -> String {
+    if !value.contains(|c: char| c.is_whitespace() || c == '"') {
+        return value.to_string();
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+impl SdkConfig {
+    /// `container_args` followed by the `container` block.
+    pub fn all_container_args(&self) -> Option<Vec<String>> {
+        ContainerConfig::with_args(&self.container_args, &self.container)
+    }
+}
+
 /// SDK configuration section
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SdkConfig {
@@ -816,6 +1099,7 @@ pub struct SdkConfig {
     pub repo_release: Option<String>,
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
+    pub container: Option<ContainerConfig>,
     pub disable_weak_dependencies: Option<bool>,
     /// Host UID for bindfs permission translation (overrides libc::getuid())
     pub host_uid: Option<u32>,
@@ -860,6 +1144,18 @@ pub struct PackageConfig {
     pub arch: Option<String>,
     /// RPM Requires dependencies
     pub requires: Option<Vec<String>>,
+    /// RPM Provides entries (e.g. "foo = 1.0")
+    pub provides: Option<Vec<String>>,
+    /// RPM epoch (omitted from the spec when not set)
+    pub epoch: Option<u32>,
+    /// Script run before the package is installed (%pre)
+    pub pre_install: Option<String>,
+    /// Script run after the package is installed (%post)
+    pub post_install: Option<String>,
+    /// Script run before the package is removed (%preun)
+    pub pre_uninstall: Option<String>,
+    /// Script run after the package is removed (%postun)
+    pub post_uninstall: Option<String>,
     /// Glob patterns for files included in main package (all staged files if omitted)
     pub files: Option<Vec<String>>,
     /// Sub-package definitions (Yocto-inspired splitting)
@@ -951,6 +1247,7 @@ pub struct PermissionsConfig {
 pub struct ProvisionProfileConfig {
     #[serde(default, deserialize_with = "container_args_deserializer::deserialize")]
     pub container_args: Option<Vec<String>>,
+    pub container: Option<ContainerConfig>,
     /// Path to state file relative to src_dir for persisting state between provision runs.
     /// Defaults to `.avocado/provision-{profile}.state` when not specified.
     /// The state file is copied into the container before provisioning and copied back after.
@@ -1080,6 +1377,8 @@ pub struct RepoDef {
     pub password: Option<String>,
     pub ca: Option<String>,
     pub tls_verify: Option<bool>,
+    /// Rewrite a loopback host in `url` to one the build container can reach.
+    pub rewrite_loopback: Option<bool>,
 }
 
 /// Reference to a Docker image for priming on the var partition at build time.
@@ -1837,7 +2136,11 @@ impl Config {
         let rt = self.runtimes.as_ref()?.get(runtime_name)?;
         match rt.rootfs.as_ref()? {
             ImageRef::Inline(c) => Some(c.as_ref()),
-            ImageRef::Named(name) => self.rootfs.as_ref()?.get(name),
+            ImageRef::Named(_) => self
+                .select_rootfs_entry(Some(runtime_name))
+                .ok()
+                .flatten()
+                .map(|(_, c)| c),
         }
     }
 
@@ -2177,7 +2480,6 @@ impl Config {
         // Promote config-file repo TLS settings (distro.repo.ca / tls_verify) to the process
         // env so the container env-builders pick them up the same as the env-var form.
         config.promote_repo_tls_env();
-
         Ok(ComposedConfig {
             config,
             merged_value: main_config,
@@ -3359,6 +3661,105 @@ impl Config {
             (_, target_value) => target_value,
         }
     }
+    /// [`Self::merge_values`], except a `replaced` key the override sets
+    /// replaces the base's value whole instead of merging into it.
+    fn merge_override(
+        &self,
+        mut base: serde_yaml::Value,
+        over: serde_yaml::Value,
+        replaced: &[&str],
+    ) -> serde_yaml::Value {
+        if let (Some(base_map), Some(over_map)) = (base.as_mapping_mut(), over.as_mapping()) {
+            for key in replaced {
+                if over_map.contains_key(*key) {
+                    base_map.remove(*key);
+                }
+            }
+        }
+        self.merge_values(base, over)
+    }
+
+    /// The one place a rootfs entry is chosen: the entry `runtime` names with
+    /// `rootfs: <name>`, else the `default` entry, else the only one. A flat
+    /// `rootfs:` block is the implicit `default`. `None` when no entry is
+    /// selectable; an unresolved runtime ref is an error.
+    fn select_rootfs_entry(&self, runtime: Option<&str>) -> Result<Option<(&str, &ImageConfig)>> {
+        let entry = match runtime.zip(self.runtime_rootfs_ref(runtime)) {
+            Some((rt, ImageRef::Named(name))) => Some(
+                self.rootfs
+                    .as_ref()
+                    .and_then(|m| m.get_key_value(name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(format_unresolved_ref_error(
+                            rt,
+                            "rootfs",
+                            name,
+                            self.rootfs.as_ref(),
+                        ))
+                    })?,
+            ),
+            _ => get_default_or_singleton_entry(self.rootfs.as_ref()),
+        };
+        Ok(entry.map(|(name, config)| (name.as_str(), config)))
+    }
+
+    fn runtime_rootfs_ref(&self, runtime: Option<&str>) -> Option<&ImageRef> {
+        self.runtimes.as_ref()?.get(runtime?)?.rootfs.as_ref()
+    }
+
+    /// The rootfs `runtime` builds for `target` (the default or only entry
+    /// when `runtime` is `None` or names no entry). Every rootfs reader goes
+    /// through this, so install, the image step and both stamps agree on the
+    /// entry and on its overrides. `None` when there is no `rootfs:` section.
+    ///
+    /// Precedence, lowest first: the entry, a `target-<name>:` block beside
+    /// the named entries, the entry's own `target-<name>:` block. Package maps
+    /// and `image:` blocks merge key by key; `overlay`, `permissions` and
+    /// scalar fields replace. The `dependencies` alias is folded into `packages` only when
+    /// the section spells it both ways, so a flat section hashes as before.
+    pub fn resolve_rootfs(
+        &self,
+        composed: &serde_yaml::Value,
+        target: &str,
+        runtime: Option<&str>,
+    ) -> Result<Option<ResolvedRootfs>> {
+        let mut raw = match composed.get("rootfs") {
+            None | Some(serde_yaml::Value::Null) => return Ok(None),
+            Some(raw) => raw.clone(),
+        };
+        if mixes_packages_spellings(&raw) {
+            normalize_packages_alias(&mut raw);
+        }
+        let selected = self.select_rootfs_entry(runtime)?.map(|(name, _)| name);
+        warn_ignored_rootfs_kernel_overrides(&raw, selected);
+        let node = match raw.as_mapping_mut() {
+            Some(map) if rootfs_is_named_form(map) => {
+                let entry = selected
+                    .and_then(|name| map.get(name).cloned())
+                    .filter(|entry| !entry.is_null())
+                    .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+                map.retain(|k, _| k.as_str().is_some_and(is_override_key));
+                let enclosing = self.resolve_overrides_replacing(
+                    raw,
+                    target,
+                    None,
+                    "rootfs",
+                    ROOTFS_REPLACED_KEYS,
+                );
+                self.merge_override(entry, enclosing, ROOTFS_REPLACED_KEYS)
+            }
+            _ => raw,
+        };
+        let node =
+            self.resolve_overrides_replacing(node, target, None, "rootfs", ROOTFS_REPLACED_KEYS);
+        let mut config: ImageConfig = serde_yaml::from_value(node.clone())
+            .context("Failed to read the resolved rootfs configuration")?;
+        if let Some(ImageRef::Inline(inline)) = self.runtime_rootfs_ref(runtime) {
+            config.permissions = inline.permissions.clone();
+        }
+        Ok(Some(ResolvedRootfs { node, config }))
+    }
+
     /// Pull a top-level image section (`rootfs` / `initramfs` / `kernel`) out of
     /// a composed value and fold in its `target-<name>:` overrides for `target`.
     ///
@@ -3430,6 +3831,19 @@ impl Config {
         current_target: &str,
         resolved_kver: Option<&str>,
         section_path: &str,
+    ) -> serde_yaml::Value {
+        self.resolve_overrides_replacing(value, current_target, resolved_kver, section_path, &[])
+    }
+
+    /// [`Self::resolve_overrides_in_value`], with `replaced` keys taken whole
+    /// from a matched block (see [`Self::merge_override`]).
+    fn resolve_overrides_replacing(
+        &self,
+        value: serde_yaml::Value,
+        current_target: &str,
+        resolved_kver: Option<&str>,
+        section_path: &str,
+        replaced: &[&str],
     ) -> serde_yaml::Value {
         let mut map = match value {
             serde_yaml::Value::Mapping(m) => m,
@@ -3507,23 +3921,29 @@ impl Config {
         }
 
         let mut merged = serde_yaml::Value::Mapping(map);
+        let resolve = |v| {
+            self.resolve_overrides_replacing(
+                v,
+                current_target,
+                resolved_kver,
+                section_path,
+                replaced,
+            )
+        };
         if let Some(v) = legacy_target_match {
             // Recurse so override keys nested inside the target block (e.g.
             // kernel-<spec>:) resolve against the same target + kernel instead
             // of leaking through as literal keys.
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         if let Some(v) = target_match {
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         for v in kernel_matches {
             // Same recursion as the target blocks above: a matched kernel block
             // may nest its own override keys (target-<name>:, or a narrower
             // kernel-<spec>:), which must resolve rather than leak.
-            let v = self.resolve_overrides_in_value(v, current_target, resolved_kver, section_path);
-            merged = self.merge_values(merged, v);
+            merged = self.merge_override(merged, resolve(v), replaced);
         }
         merged
     }
@@ -3840,15 +4260,11 @@ impl Config {
                 None
             }
         });
-        let rootfs_ref = self.rootfs.as_ref().and_then(|m| {
-            if m.contains_key("default") {
-                Some(ImageRef::Named("default".to_string()))
-            } else if m.len() == 1 {
-                Some(ImageRef::Named(m.keys().next().unwrap().clone()))
-            } else {
-                None
-            }
-        });
+        let rootfs_ref = self
+            .select_rootfs_entry(None)
+            .ok()
+            .flatten()
+            .map(|(name, _)| ImageRef::Named(name.to_string()));
         let initramfs_ref = self.initramfs.as_ref().and_then(|m| {
             if m.contains_key("default") {
                 Some(ImageRef::Named("default".to_string()))
@@ -4522,7 +4938,151 @@ async fn invocation_feeds(
     .cloned()
 }
 
+/// The stages whose feeds one target's probes covered, and whether they covered
+/// the extension repository too.
+type FeedsProbed = (
+    std::collections::BTreeSet<crate::utils::feeds::FeedStage>,
+    bool,
+);
+
+/// Targets whose feed repositories this process has already probed.
+static FEEDS_PROBED: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, FeedsProbed>>> =
+    std::sync::OnceLock::new();
+
+/// Set once the `--runs-on` preflight skip has been announced, so the
+/// per-extension and per-runtime install tasks do not repeat it.
+static RUNS_ON_SKIP_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the `--offline` preflight skip has been announced.
+static OFFLINE_SKIP_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Config {
+    /// Print a preflight skip notice unless `flag` says it already was.
+    /// Returns true when it printed. Takes the flag so a test can use its own.
+    fn preflight_skip_with(flag: &std::sync::atomic::AtomicBool, message: &str) -> bool {
+        if flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        crate::utils::output::print_info_stderr(message);
+        true
+    }
+
+    /// Whether any of the `active` extensions is fetched from the extension
+    /// repository: one declaring a package `source` without `repo_name`. A local
+    /// extension (no `source`, as `avocado init --minimal` keeps), a git or path
+    /// source, and a package source with `repo_name` (dnf then runs `--repo=<name>`
+    /// and never reads that repository) never touch it, so a feed without one must
+    /// not be refused for them.
+    /// `enabled: false` does not exempt a sourced extension; it is fetched anyway.
+    ///
+    /// `parsed` must already be interpolated.
+    pub fn extensions_need_extension_repo<'a>(
+        parsed: &serde_yaml::Value,
+        active: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
+        let packages: std::collections::HashSet<String> =
+            Self::discover_remote_extensions_from_value(parsed)?
+                .into_iter()
+                .filter(|(_, source)| {
+                    matches!(
+                        source,
+                        ExtensionSource::Package {
+                            repo_name: None,
+                            ..
+                        }
+                    )
+                })
+                .map(|(name, _)| name)
+                .collect();
+        Ok(active.into_iter().any(|name| packages.contains(name)))
+    }
+
+    /// Fail before the first download when a feed repository is unreachable.
+    ///
+    /// `install`, `sdk install`, `ext install`, `runtime install`, `rootfs
+    /// install`, `initramfs install`, `fetch` and `ext fetch` call this on the
+    /// way in, and `install` runs several of them, so the probes are keyed by
+    /// target and run once per invocation. The lock is held across the probes so
+    /// two concurrent callers do not both run them. Only a pass is recorded; a
+    /// failure ends the command.
+    /// Only feeds that apply to one of `stages` are probed. A later call that
+    /// names a stage, or needs the extension repository, which no earlier pass
+    /// covered runs again, so the second caller is not told yes on the first's
+    /// narrower check.
+    /// Resolution is repeated here rather than shared with `materialize_feeds`,
+    /// which runs later and needs the mint this check must precede.
+    ///
+    /// With `runs_on` the probes are skipped: dnf runs on the remote runner,
+    /// which may reach feeds this host cannot. With `--offline` they are skipped
+    /// too, before anything is recorded, so no feed is asked about at all.
+    pub async fn preflight_feeds_once(
+        &self,
+        target: &str,
+        config_path: &str,
+        stages: &[crate::utils::feeds::FeedStage],
+        needs_extension_repo: bool,
+        runs_on: bool,
+    ) -> Result<()> {
+        if runs_on {
+            Self::preflight_skip_with(
+                &RUNS_ON_SKIP_PRINTED,
+                "skipping the feed preflight: with --runs-on, dnf runs on the remote runner, which this host cannot probe for",
+            );
+            return Ok(());
+        }
+        if crate::utils::offline::is_offline() {
+            Self::preflight_skip_with(
+                &OFFLINE_SKIP_PRINTED,
+                "skipping the feed preflight: --offline is set, so no feed is probed",
+            );
+            return Ok(());
+        }
+        let probed = FEEDS_PROBED.get_or_init(Default::default);
+        let mut done = probed.lock().await;
+        if let Some((stages_probed, ext_probed)) = done.get(target) {
+            if stages.iter().all(|s| stages_probed.contains(s))
+                && (*ext_probed || !needs_extension_repo)
+            {
+                return Ok(());
+            }
+        }
+        let project_root = self.project_root(config_path);
+        let container_args = self.feed_container_args(target, config_path);
+        let set = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?;
+        crate::utils::feeds::preflight_feeds(
+            self,
+            set.as_ref(),
+            target,
+            stages,
+            needs_extension_repo,
+        )
+        .await?;
+        let entry = done.entry(target.to_string()).or_default();
+        entry.0.extend(stages.iter().copied());
+        entry.1 |= needs_extension_repo;
+        Ok(())
+    }
+
+    /// The project's container arguments as docker receives them for `target`:
+    /// `sdk.<target>.container_args` replacing the base list, then the
+    /// `container:` block, variables expanded. An unreadable config file falls back to the base list, since
+    /// the loaded `Config` already parsed it once.
+    fn feed_container_args(&self, target: &str, config_path: &str) -> Vec<String> {
+        let args = match self.get_merged_sdk_config(target, config_path) {
+            Ok(merged) => merged.all_container_args(),
+            Err(_) => self.get_sdk_container_args(),
+        };
+        Self::process_container_args(args.as_ref()).unwrap_or_default()
+    }
+
     /// Resolve, record, and materialize the named feeds for one container run.
     /// `None` when the project declares no feeds — the zero-cost path. The first
     /// call for a target writes the canonical document to
@@ -4543,8 +5103,14 @@ impl Config {
         // sets `src_dir` would otherwise get its feed document beside the config
         // file while the rest of its build state sits somewhere else.
         let project_root = self.project_root(config_path);
-        let Some(set) =
-            crate::utils::feeds::ResolvedFeedSet::resolve(self, target, &project_root, None)?
+        let container_args = self.feed_container_args(target, config_path);
+        let Some(set) = crate::utils::feeds::ResolvedFeedSet::resolve_with_container_args(
+            self,
+            target,
+            &project_root,
+            None,
+            &container_args,
+        )?
         else {
             // No named feeds. Still a fact worth recording, because it is the fact
             // that removes a set the lock may still be carrying from a config that
@@ -4670,9 +5236,10 @@ impl Config {
         self.get_distro_release()
     }
 
-    /// Get the SDK container args from configuration
-    pub fn get_sdk_container_args(&self) -> Option<&Vec<String>> {
-        self.sdk.as_ref()?.container_args.as_ref()
+    /// Get the SDK container args from configuration: `sdk.container_args`
+    /// followed by the `sdk.container` block.
+    pub fn get_sdk_container_args(&self) -> Option<Vec<String>> {
+        self.sdk.as_ref()?.all_container_args()
     }
 
     /// Get the disable_weak_dependencies setting from SDK configuration
@@ -4688,7 +5255,10 @@ impl Config {
     /// `default`, or — when only one entry exists — that single entry).
     /// Returns `None` when no rootfs is defined.
     pub fn rootfs_default(&self) -> Option<&ImageConfig> {
-        get_default_or_singleton(self.rootfs.as_ref())
+        self.select_rootfs_entry(None)
+            .ok()
+            .flatten()
+            .map(|(_, c)| c)
     }
 
     /// Get the default initramfs definition from top-level config.
@@ -4711,8 +5281,14 @@ impl Config {
         &self,
         parsed: Option<&serde_yaml::Value>,
         target: &str,
-    ) -> HashMap<String, serde_yaml::Value> {
-        let mut packages = match self.rootfs_default().and_then(|r| r.packages.clone()) {
+    ) -> Result<HashMap<String, serde_yaml::Value>> {
+        let declared = match parsed {
+            Some(parsed) => self
+                .resolve_rootfs(parsed, target, None)?
+                .and_then(|r| r.config.packages),
+            None => self.rootfs_default().and_then(|r| r.packages.clone()),
+        };
+        let mut packages = match declared {
             Some(packages) => packages,
             None => {
                 let mut default = HashMap::new();
@@ -4729,7 +5305,7 @@ impl Config {
                 .entry("cryptsetup-var-udev".to_string())
                 .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
-        packages
+        Ok(packages)
     }
 
     /// Runtimes built for `target` that opt into `var.encrypt: true`.
@@ -4855,14 +5431,6 @@ impl Config {
                 .or_insert_with(|| serde_yaml::Value::String("*".to_string()));
         }
         packages
-    }
-
-    /// Get rootfs filesystem format from top-level config.
-    /// Defaults to `"erofs-lz4"` when the section or field is absent.
-    pub fn get_rootfs_filesystem(&self) -> String {
-        self.rootfs_default()
-            .and_then(|r| r.filesystem.clone())
-            .unwrap_or_else(|| "erofs-lz4".to_string())
     }
 
     /// Get initramfs filesystem format from top-level config.
@@ -5092,11 +5660,12 @@ impl Config {
         self.provision_profiles.as_ref()?.get(profile_name)
     }
 
-    /// Get container args from provision profile
-    pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<&Vec<String>> {
-        self.get_provision_profile(profile_name)?
-            .container_args
-            .as_ref()
+    /// Get container args from provision profile, on their own; the merge
+    /// applies the profile's block over the SDK's args as well.
+    #[cfg(test)]
+    pub fn get_provision_profile_container_args(&self, profile_name: &str) -> Option<Vec<String>> {
+        let profile = self.get_provision_profile(profile_name)?;
+        ContainerConfig::with_args(&profile.container_args, &profile.container)
     }
 
     /// Get the state file path for a provision profile.
@@ -5783,7 +6352,7 @@ impl Config {
     pub fn merge_sdk_container_args(&self, cli_args: Option<&Vec<String>>) -> Option<Vec<String>> {
         let config_args = self.get_sdk_container_args();
 
-        match (config_args, cli_args) {
+        match (config_args.as_ref(), cli_args) {
             (Some(config), Some(cli)) => {
                 let mut merged = Self::process_container_args(Some(config)).unwrap_or_default();
                 merged.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
@@ -5804,20 +6373,24 @@ impl Config {
         provision_profile: Option<&str>,
         cli_args: Option<&Vec<String>>,
     ) -> Option<Vec<String>> {
-        let sdk_args = self.get_sdk_container_args();
-        let profile_args = provision_profile
-            .and_then(|profile| self.get_provision_profile_container_args(profile));
-
-        // Collect all args in order: SDK first, then provision profile, then CLI
-        let mut all_args: Vec<String> = Vec::new();
-
-        if let Some(sdk) = sdk_args {
-            all_args.extend(Self::process_container_args(Some(sdk)).unwrap_or_default());
+        // SDK first, then the profile's `container_args`, then its block, which
+        // replaces what it names in both: a profile's network or mount must
+        // not end up beside the SDK's, which docker refuses.
+        let profile = provision_profile.and_then(|name| self.get_provision_profile(name));
+        let mut inherited = self.get_sdk_container_args();
+        if let Some(args) = profile.and_then(|p| p.container_args.as_ref()) {
+            inherited
+                .get_or_insert_with(Vec::new)
+                .extend(args.iter().cloned());
         }
+        let inherited = match profile {
+            Some(profile) => ContainerConfig::with_args(&inherited, &profile.container),
+            None => inherited,
+        };
 
-        if let Some(profile) = profile_args {
-            all_args.extend(Self::process_container_args(Some(profile)).unwrap_or_default());
-        }
+        // Then CLI
+        let mut all_args: Vec<String> =
+            Self::process_container_args(inherited.as_ref()).unwrap_or_default();
 
         if let Some(cli) = cli_args {
             all_args.extend(Self::process_container_args(Some(cli)).unwrap_or_default());
@@ -6474,6 +7047,9 @@ fn merge_sdk_configs(mut base: SdkConfig, target: SdkConfig) -> SdkConfig {
     }
     if target.container_args.is_some() {
         base.container_args = target.container_args;
+    }
+    if target.container.is_some() {
+        base.container = target.container;
     }
     if target.host_uid.is_some() {
         base.host_uid = target.host_uid;
@@ -7988,6 +8564,184 @@ runtimes:
 
         let config = Config::load_from_str(config_content).unwrap();
         assert_eq!(config.default_target_board, None);
+    }
+
+    #[test]
+    fn container_block_replaces_only_what_it_names_in_any_spelling() {
+        let args = |yaml: &str| {
+            Config::load_from_str(yaml)
+                .unwrap()
+                .get_sdk_container_args()
+        };
+        let got = args(
+            r#"
+sdk:
+  container_args:
+    - --network host
+    - --pid host --ipc host
+    - --group-add
+    - a
+    - --group-add b
+    - -v /dev:/dev:ro
+    - --privileged
+    - --net
+    - bridge
+    - --network bridge --init -v/dev:/dev --shm-size 1g
+  container:
+    privileged: false
+    network_mode: none
+    volumes: ["/dev:/dev"]
+    environment:
+      GREETING: hello world
+"#,
+        );
+        assert_eq!(
+            got.unwrap(),
+            [
+                "--pid host --ipc host",
+                "--group-add",
+                "a",
+                "--group-add b",
+                "--init --shm-size 1g",
+                "--privileged=false",
+                "--network=none",
+                "-v",
+                "/dev:/dev",
+                "-e",
+                "\"GREETING=hello world\"",
+            ]
+        );
+        // The quoted value survives the split the entries get on the way to
+        // docker.
+        assert_eq!(
+            crate::utils::container::SdkContainer::parse_container_arg("\"GREETING=hello world\""),
+            ["GREETING=hello world"]
+        );
+    }
+
+    #[test]
+    fn a_profile_block_replaces_what_the_sdk_set() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container_args: ["--network bridge"]
+  container:
+    volumes: ["/tmp:/data:ro"]
+provision_profiles:
+  usb:
+    container:
+      network_mode: host
+      volumes: ["/tmp:/data:rw"]
+"#,
+        )
+        .unwrap();
+        let merged = config
+            .merge_provision_container_args(Some("usb"), None)
+            .unwrap();
+        assert_eq!(merged, ["--network=host", "-v", "/tmp:/data:rw"]);
+    }
+
+    #[test]
+    fn quotes_in_a_block_value_reach_the_container_intact() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container:
+    environment:
+      PAYLOAD: '{"name":"x y"}'
+      WIN: 'C:\dir\'
+"#,
+        )
+        .unwrap();
+        // The entries as `build_container_command` splits them for docker.
+        let argv: Vec<String> = config
+            .get_sdk_container_args()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| crate::utils::container::SdkContainer::parse_container_arg(entry))
+            .collect();
+        assert_eq!(
+            argv,
+            ["-e", r#"PAYLOAD={"name":"x y"}"#, "-e", r"WIN=C:\dir\"]
+        );
+    }
+
+    #[test]
+    fn a_profile_can_turn_privileged_off() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container_args: ["--privileged"]
+provision_profiles:
+  safe:
+    container:
+      privileged: false
+"#,
+        )
+        .unwrap();
+        let merged = config
+            .merge_provision_container_args(Some("safe"), None)
+            .unwrap();
+        assert_eq!(merged, ["--privileged=false"]);
+    }
+
+    #[test]
+    fn container_block_overrides_container_args() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  image: "sdk"
+  container_args: ["--network=bridge", "--init", "-v /dev:/dev"]
+  container:
+    privileged: true
+    network_mode: host
+    volumes: ["/dev:/dev"]
+    devices: ["/dev/ttyUSB0"]
+    extra_hosts: ["feed:10.0.0.1"]
+    cap_add: ["NET_ADMIN"]
+    environment:
+      DEBUG: 1
+      NAME: value
+provision_profiles:
+  usb:
+    container:
+      volumes: ["/sys:/sys:ro"]
+"#,
+        )
+        .unwrap();
+
+        // The block's network and its restated mount replace the ones in
+        // `container_args`; docker would refuse the run with both.
+        let expected = [
+            "--init",
+            "--privileged",
+            "--network=host",
+            "-v",
+            "/dev:/dev",
+            "--device",
+            "/dev/ttyUSB0",
+            "--add-host",
+            "feed:10.0.0.1",
+            "--cap-add",
+            "NET_ADMIN",
+            "-e",
+            "DEBUG=1",
+            "-e",
+            "NAME=value",
+        ];
+        assert_eq!(config.get_sdk_container_args().unwrap(), expected);
+        assert_eq!(
+            config.get_provision_profile_container_args("usb").unwrap(),
+            ["-v", "/sys:/sys:ro"]
+        );
+        // The profile's block reaches the merge.
+        let merged = config
+            .merge_provision_container_args(Some("usb"), None)
+            .unwrap();
+        assert!(merged.contains(&"/sys:/sys:ro".to_string()));
+
+        // A key that is not a setting is a mistake, not something to drop.
+        assert!(Config::load_from_str("sdk:\n  container:\n    priviledged: true\n").is_err());
     }
 
     #[test]
@@ -13088,6 +13842,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(!config
             .get_rootfs_packages(None, "jetson-orin-nx")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
     }
 
@@ -13123,6 +13878,7 @@ runtimes:
         assert_eq!(
             config
                 .get_rootfs_packages(None, "jetson-orin-nx")
+                .unwrap()
                 .get("cryptsetup-var-udev"),
             Some(&serde_yaml::Value::String("*".to_string()))
         );
@@ -13196,6 +13952,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(!config
             .get_rootfs_packages(None, "qemux86-64")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
         assert!(config
             .get_initramfs_packages(None, "jetson-orin-nx")
@@ -13297,6 +14054,7 @@ runtimes:
             .contains_key("cryptsetup-var"));
         assert!(config
             .get_rootfs_packages(Some(&parsed), "jetson-orin-nx")
+            .unwrap()
             .contains_key("cryptsetup-var-udev"));
 
         // An override for another target does not leak in, and the typed
@@ -13324,6 +14082,46 @@ runtimes:
         assert!(config
             .var_encrypt_runtimes(Some(&parsed), "jetson-orin-nx")
             .is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn feed_container_args_merge_the_target_section_and_expand_variables() {
+        let prior = std::env::var_os("FEED_ARGS_TEST_NET");
+        std::env::set_var("FEED_ARGS_TEST_NET", "host");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container_args:\n    - --network=${FEED_ARGS_TEST_NET}\n  other-target:\n    container_args:\n      - --net=bridge\n  qemux86-64:\n    container_args:\n      - --cap-add=NET_ADMIN\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let config = Config::load(&path).unwrap();
+        let base = config.feed_container_args("unlisted-target", &path_str);
+        let targeted = config.feed_container_args("qemux86-64", &path_str);
+        match prior {
+            Some(v) => std::env::set_var("FEED_ARGS_TEST_NET", v),
+            None => std::env::remove_var("FEED_ARGS_TEST_NET"),
+        }
+        assert_eq!(base, vec!["--network=host".to_string()]);
+        assert_eq!(targeted, vec!["--cap-add=NET_ADMIN".to_string()]);
+    }
+
+    /// The `container:` block reaches the feed's view of the arguments, so
+    /// `network_mode: host` keeps a loopback feed URL as written.
+    #[test]
+    fn feed_container_args_include_the_container_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(
+            &path,
+            "default_target: qemux86-64\nsdk:\n  image: test\n  container:\n    network_mode: host\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let args = config.feed_container_args("qemux86-64", &path.to_string_lossy());
+        assert_eq!(args, vec!["--network=host".to_string()]);
     }
 
     /// `avocado build` and `avocado install` load exclusively through
@@ -13652,8 +14450,9 @@ rootfs:
         assert!(config.rootfs.as_ref().unwrap().contains_key("default"));
         let rfs = config.rootfs_default().unwrap();
         assert_eq!(rfs.filesystem.as_deref(), Some("erofs-lz4"));
-        // Existing accessors keep working.
-        assert_eq!(config.get_rootfs_filesystem(), "erofs-lz4");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml_single).unwrap();
+        let resolved = config.resolve_rootfs(&parsed, "qemux86-64", None).unwrap();
+        assert_eq!(rootfs_filesystem(resolved.as_ref()), "erofs-lz4");
 
         // Named-map form
         let yaml_named = r#"
@@ -13806,12 +14605,80 @@ kernel:
         assert!(kernel.contains_key("kernel-mainline"));
     }
 
+    /// Beside named rootfs entries, `target-*` / `kernel-*` keys are override
+    /// blocks to the typed config as to the resolver: never entries, never a
+    /// runtime's `rootfs:` ref.
+    #[test]
+    fn regression_rootfs_override_keys_are_not_entries() {
+        let yaml = "rootfs:\n  custom: {filesystem: erofs-zst}\n  target-qemux86-64: {packages: {extra: '*'}}\n  kernel-6.6: {packages: {k: '*'}}\nruntimes:\n  dev:\n    rootfs: target-qemux86-64\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let entries: Vec<&String> = config.rootfs.as_ref().unwrap().keys().collect();
+        assert_eq!(entries, vec!["custom"]);
+        let err = config.validate_runtime_refs().unwrap_err().to_string();
+        assert!(err.contains("per-target override block"), "{err}");
+        assert!(err.contains("Available: custom"), "{err}");
+    }
+
+    #[test]
+    fn rootfs_kernel_overrides_are_reported() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(
+            "default: {kernel-6.6: {}, target-x: {}}\nother: {kernel-6.1: {}}\nkernel-6.6: {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rootfs_kernel_override_paths(&raw, Some("default")),
+            vec!["rootfs.kernel-6.6", "rootfs.default.kernel-6.6"]
+        );
+        let flat: serde_yaml::Value = serde_yaml::from_str("packages: {}\ntarget-x: {}\n").unwrap();
+        assert!(rootfs_kernel_override_paths(&flat, Some("default")).is_empty());
+    }
+
+    /// The selected entry, its overrides, and the inline runtime block's
+    /// permissions all come from `resolve_rootfs`.
+    #[test]
+    fn resolve_rootfs_selects_per_runtime() {
+        let yaml = "rootfs:\n  default:\n    filesystem: erofs-lz4\n    post_install: a.sh\n  minimal:\n    filesystem: erofs-zst\n    target-qemux86-64: {post_install: m.sh}\n  target-qemux86-64: {post_install: beside.sh, packages: {extra: '*'}}\nruntimes:\n  dev: {rootfs: minimal}\n  inline:\n    rootfs: {permissions: ops}\n  plain: {}\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let resolve = |rt: Option<&str>, target: &str| {
+            config.resolve_rootfs(&parsed, target, rt).unwrap().unwrap()
+        };
+        let dev = resolve(Some("dev"), "qemux86-64");
+        assert_eq!(get_post_install(Some(&dev.node)).as_deref(), Some("m.sh"));
+        assert_eq!(rootfs_filesystem(Some(&dev)), "erofs-zst");
+        assert!(dev.config.packages.unwrap().contains_key("extra"));
+        let arm = resolve(Some("dev"), "qemuarm64");
+        assert_eq!(get_post_install(Some(&arm.node)), None);
+        for rt in [None, Some("plain"), Some("inline")] {
+            let r = resolve(rt, "qemux86-64");
+            assert_eq!(
+                get_post_install(Some(&r.node)).as_deref(),
+                Some("beside.sh")
+            );
+        }
+        assert!(matches!(
+            resolve(Some("inline"), "qemux86-64").config.permissions,
+            Some(PermissionsRef::Named(ref p)) if p == "ops"
+        ));
+        assert!(resolve(None, "qemux86-64").config.permissions.is_none());
+    }
+
+    /// `dependencies` is folded into `packages` only when the section spells
+    /// it both ways; a consistent flat section is hashed as written.
+    #[test]
+    fn resolve_rootfs_keeps_a_consistent_alias_as_written() {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str("rootfs:\n  dependencies: {base: '*'}\n").unwrap();
+        let config: Config = serde_yaml::from_value(parsed.clone()).unwrap();
+        let r = config.resolve_rootfs(&parsed, "x", None).unwrap().unwrap();
+        assert_eq!(r.node, parsed["rootfs"]);
+        assert!(r.config.packages.unwrap().contains_key("base"));
+    }
+
     #[test]
     fn test_per_target_only_section_parses() {
-        // A section with only `target-<name>:` sub-keys and no shared base field
-        // has no recognized config fields, so it parses as a named map (matching
-        // pre-override behavior) rather than hard-erroring. The image commands
-        // still resolve the per-target override on the raw composed value.
+        // A rootfs section with only `target-<name>:` sub-keys is one block
+        // with no base fields: the override keys are never entries.
         let yaml = r#"
 rootfs:
   target-qemux86-64:
@@ -13823,8 +14690,18 @@ rootfs:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let rootfs = config.rootfs.as_ref().unwrap();
-        assert_eq!(rootfs.len(), 2);
-        assert!(rootfs.contains_key("target-qemux86-64"));
+        assert_eq!(rootfs.len(), 1);
+        assert!(rootfs.contains_key("default"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let node = config
+            .resolve_rootfs(&parsed, "qemuarm64", None)
+            .unwrap()
+            .unwrap()
+            .node;
+        assert_eq!(
+            get_ext_image_args(&node).as_deref(),
+            Some("-b -t kos.layer.rootfs --tag qemu-arm64")
+        );
     }
 
     #[test]
@@ -14496,7 +15373,8 @@ rootfs:
         let composed = Config::load_composed(&main_path, Some("raspberrypi4")).unwrap();
         let pkgs = composed
             .config
-            .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4");
+            .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4")
+            .unwrap();
         assert!(
             pkgs.contains_key("avocado-pkg-rootfs"),
             "fragment's rootfs.packages must merge in"
@@ -14505,8 +15383,12 @@ rootfs:
             pkgs.contains_key("packagegroup-kos-rootfs"),
             "fragment's rootfs.packages must merge in"
         );
+        let resolved = composed
+            .config
+            .resolve_rootfs(&composed.merged_value, "raspberrypi4", None)
+            .unwrap();
         assert_eq!(
-            composed.config.get_rootfs_filesystem(),
+            rootfs_filesystem(resolved.as_ref()),
             "erofs-lz4",
             "fragment's filesystem must merge in"
         );
@@ -14561,10 +15443,15 @@ rootfs:
             composed
                 .config
                 .get_rootfs_packages(Some(&composed.merged_value), "raspberrypi4")
+                .unwrap()
                 .contains_key("avocado-pkg-rootfs"),
             "rootfs source.path must resolve relative to src_dir (repo root), not the config dir"
         );
-        assert_eq!(composed.config.get_rootfs_filesystem(), "erofs-lz4");
+        let resolved = composed
+            .config
+            .resolve_rootfs(&composed.merged_value, "raspberrypi4", None)
+            .unwrap();
+        assert_eq!(rootfs_filesystem(resolved.as_ref()), "erofs-lz4");
     }
 
     #[test]
@@ -14859,6 +15746,7 @@ mod kernel_cmdline_tests {
 #[cfg(test)]
 mod invocation_feeds_tests {
     use super::*;
+    use crate::utils::feeds::FeedStage;
 
     /// The feeds dir is a docker bind source, so under the avocado-vm it must sit
     /// in the VM workspace, outside the project. Elsewhere it stays in `$TMPDIR`.
@@ -14944,6 +15832,245 @@ mod invocation_feeds_tests {
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(&format!("avocado-feeds-{}-", std::process::id())));
         assert!(FEED_DIRS.lock().unwrap().iter().any(|d| d == path));
+    }
+
+    /// `install` and `sdk install` both call the hook on the way to the first
+    /// download; the feeds must be asked about once between them.
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn probe_runs_once_per_invocation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("avocado.yaml");
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\nrepos:\n  local:\n    url: http://{addr}/feed\n"
+        ))
+        .unwrap();
+        let cfg = cfg.to_str().unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        c.preflight_feeds_once("probe-once-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loopback server answering every request with `status`, counting requests.
+    async fn serve_counting(
+        status: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn repo_config(url: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  repo:\n    url: {url}\n"
+        ))
+        .unwrap()
+    }
+
+    const MINIMAL: &str = "extensions:\n  app:\n    version: '1.0.0'\n";
+    const SOURCED: &str = "extensions:\n  app:\n    version: '1.0.0'\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n  git-ext:\n    version: '*'\n    source:\n      type: git\n      url: https://example.com/x.git\n";
+
+    fn needs(yaml: &str, active: &[&str]) -> bool {
+        let v: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        Config::extensions_need_extension_repo(&v, active.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn only_an_active_package_sourced_extension_needs_the_extension_repo() {
+        assert!(
+            !needs(MINIMAL, &["app"]),
+            "a local extension is not fetched"
+        );
+        assert!(needs(SOURCED, &["app", "avocado-ext-dev"]));
+        assert!(!needs(SOURCED, &["app"]), "an inactive sourced extension");
+        assert!(!needs(SOURCED, &["git-ext"]), "a git source skips the repo");
+        assert!(!needs(SOURCED, &[]));
+    }
+
+    #[test]
+    fn a_package_source_with_repo_name_does_not_need_the_extension_repo() {
+        let yaml = "extensions:\n  vendor-ext:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n      repo_name: vendor\n";
+        assert!(!needs(yaml, &["vendor-ext"]));
+    }
+
+    #[test]
+    fn enabled_false_does_not_exempt_a_sourced_extension() {
+        let yaml = "runtimes:\n  r:\n    extensions:\n      - avocado-ext-dev:\n          enabled: false\nextensions:\n  avocado-ext-dev:\n    version: '*'\n    source:\n      type: package\n      version: '*'\n";
+        // Activity ignores `enabled`; the helper only sees the active names.
+        assert!(needs(yaml, &["avocado-ext-dev"]));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn minimal_project_against_a_feed_without_an_extension_repo_passes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(MINIMAL, &["app"]);
+        c.preflight_feeds_once(
+            "minimal-no-ext-repo",
+            "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
+            need,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn sourced_extension_against_a_feed_without_an_extension_repo_fails_naming_it() {
+        let (base, _) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let need = needs(SOURCED, &["avocado-ext-dev"]);
+        let e = c
+            .preflight_feeds_once(
+                "sourced-no-ext-repo",
+                "/nonexistent/avocado.yaml",
+                FeedStage::ALL,
+                need,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'avocado' extension repository"), "{e}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn a_later_call_needing_the_extension_repo_still_probes_it() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("ext-key-test", cfg, FeedStage::ALL, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("extension repository"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn a_later_call_for_another_stage_still_probes_its_feeds() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [sdkonly]\nrepos:\n  sdkonly:\n    url: {base}/feed\n    stages: [sdk]\n"
+        ))
+        .unwrap();
+        let cfg = "/nonexistent/avocado.yaml";
+        c.preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Rootfs], false, false)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let e = c
+            .preflight_feeds_once("stage-key-test", cfg, &[FeedStage::Sdk], false, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("feed 'sdkonly'"), "{e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runs_on_skips_the_local_probes() {
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        c.preflight_feeds_once(
+            "runs-on-test",
+            "/nonexistent/avocado.yaml",
+            FeedStage::ALL,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(offline)]
+    async fn offline_skips_feed_preflight() {
+        use std::sync::atomic::Ordering;
+        let (base, hits) = serve_counting("404 Not Found").await;
+        let c = repo_config(&base);
+        let cfg = "/nonexistent/avocado.yaml";
+
+        crate::utils::offline::set_offline(true);
+        let skipped = c
+            .preflight_feeds_once("offline-skip-test", cfg, FeedStage::ALL, true, false)
+            .await;
+        crate::utils::offline::set_offline(false);
+        skipped.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "offline must make no request"
+        );
+
+        // Control: the same call online does probe, so the zero above is the
+        // skip, and the skip recorded nothing that lets this call pass.
+        let online = c
+            .preflight_feeds_once("offline-skip-test", cfg, FeedStage::ALL, true, false)
+            .await;
+        assert!(online.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preflight_skip_message_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(Config::preflight_skip_with(&flag, "skip"));
+        assert!(!Config::preflight_skip_with(&flag, "skip"));
     }
 }
 
@@ -15208,5 +16335,121 @@ supported_targets: [raspberrypi0-2w, raspberrypi4]
         let got = composed.config.get_sdk_repo_release();
         std::env::remove_var("AVOCADO_RELEASEVER");
         assert_eq!(got.as_deref(), Some("env/rv"));
+    }
+}
+
+#[cfg(test)]
+mod enabled_flag_ruling_tests {
+    use super::*;
+
+    const YAML: &str = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  only:
+    target-qemux86-64:
+      extensions:
+        - on-ext
+        - shipped-off:
+            enabled: false
+extensions:
+  on-ext:
+    version: "1.0.0"
+  shipped-off:
+    version: "1.0.0"
+"#;
+
+    /// Ruling 1.4: `enabled: false` keeps current semantics. The flag only
+    /// controls whether an extension ships in the runtime image; the extension
+    /// is still fetched at SDK install, so the active set includes it.
+    #[test]
+    fn test_find_active_extensions_follows_ruling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, YAML).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).expect("composes");
+
+        let active = find_active_extensions(
+            &composed.config,
+            &composed.merged_value,
+            "qemux86-64",
+            config_path,
+            None,
+        )
+        .expect("active extensions");
+
+        let mut names: Vec<_> = active.into_iter().collect();
+        names.sort();
+        assert_eq!(names, vec!["on-ext", "shipped-off"]);
+    }
+}
+#[cfg(test)]
+mod package_section_metadata_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+sdk:
+  image: "docker.io/avocadolinux/sdk:dev"
+  compile:
+    my-app:
+      compile: build.sh
+      package:
+        install: install.sh
+        version: "1.0.0"
+"#;
+
+    fn yaml_with(extra: &str) -> String {
+        format!("{BASE}{extra}")
+    }
+
+    #[test]
+    fn package_section_accepts_provides_epoch_scriptlets() {
+        let yaml = yaml_with(
+            r#"        provides:
+          - "foo = 1.0"
+          - "bar"
+        epoch: 2
+        pre_install: "echo pre"
+        post_install: "echo post"
+        pre_uninstall: "echo preun"
+        post_uninstall: "echo postun"
+"#,
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            crate::utils::config_lint::ignored_keys(&doc),
+            Vec::<String>::new()
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, &yaml).unwrap();
+        let config = Config::load(&path).unwrap();
+        let compile = config.sdk.unwrap().compile.unwrap();
+        let pkg = compile.get("my-app").unwrap().package.as_ref().unwrap();
+        assert_eq!(
+            pkg.provides.as_deref(),
+            Some(&["foo = 1.0".to_string(), "bar".to_string()][..])
+        );
+        assert_eq!(pkg.epoch, Some(2));
+        assert_eq!(pkg.pre_install.as_deref(), Some("echo pre"));
+        assert_eq!(pkg.post_install.as_deref(), Some("echo post"));
+        assert_eq!(pkg.pre_uninstall.as_deref(), Some("echo preun"));
+        assert_eq!(pkg.post_uninstall.as_deref(), Some("echo postun"));
+    }
+
+    #[test]
+    fn package_section_rejects_unknown_key() {
+        let yaml = yaml_with("        post_instal: \"echo typo\"\n");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let warnings = crate::utils::config_lint::ignored_keys(&doc);
+        assert_eq!(
+            warnings,
+            vec![
+                "unknown key 'sdk.compile.my-app.package.post_instal' is ignored; did you mean 'post_install'?"
+            ]
+        );
     }
 }

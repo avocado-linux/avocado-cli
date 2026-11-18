@@ -34,7 +34,7 @@ use std::path::Path;
 
 use crate::utils::config::Config;
 use crate::utils::lockfile::{LockFile, RepoSnapshot};
-use crate::utils::output::{print_info, OutputLevel};
+use crate::utils::output::{print_info, print_info_stderr, OutputLevel};
 
 /// The mutable pointer published per (channel, target) naming the newest
 /// immutable snapshot. Served at
@@ -53,17 +53,29 @@ pub struct SnapshotPointer {
 pub enum PinStatus {
     /// No pin recorded for this target.
     None,
-    /// Pin matches the configured release+channel — reuse it.
+    /// Pin matches the configured release+channel+repo URL — reuse it.
     Matches,
-    /// Pin is for a different release/channel than the config now names.
+    /// Pin is for a different release/channel/repo URL than the config now names.
     Mismatch,
 }
 
 /// Classify a recorded pin against the configured feed. Pure — unit-tested.
-pub fn pin_status(pin: Option<&RepoSnapshot>, release: &str, channel: &str) -> PinStatus {
+/// A pin recorded without a URL (older lock files) matches any URL.
+pub fn pin_status(
+    pin: Option<&RepoSnapshot>,
+    release: &str,
+    channel: &str,
+    repo_url: &str,
+) -> PinStatus {
+    let url_matches = |p: &RepoSnapshot| match &p.repo_url {
+        None => true,
+        Some(recorded) => recorded.trim_end_matches('/') == repo_url.trim_end_matches('/'),
+    };
     match pin {
         None => PinStatus::None,
-        Some(p) if p.release == release && p.channel == channel => PinStatus::Matches,
+        Some(p) if p.release == release && p.channel == channel && url_matches(p) => {
+            PinStatus::Matches
+        }
         Some(_) => PinStatus::Mismatch,
     }
 }
@@ -186,6 +198,15 @@ async fn fetch_latest(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(LatestResult::Unsupported);
     }
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!(
+            "{}",
+            crate::utils::feed_limit::rate_limit_message(
+                crate::utils::feed_limit::retry_after_secs(resp.headers()),
+                crate::utils::feeds::is_identified(),
+            )
+        );
+    }
     let resp = resp
         .error_for_status()
         .with_context(|| format!("Snapshot pointer request failed: {url}"))?;
@@ -224,6 +245,11 @@ pub async fn resolve_latest(config: &Config, target: &str) -> Result<Option<Repo
     else {
         return Ok(None);
     };
+    if crate::utils::offline::is_offline() {
+        anyhow::bail!(
+            "--offline: `avocado update` looks up the channel's latest snapshot over the network; run it without --offline"
+        );
+    }
     let repo_url = config.effective_repo_url();
     let client = build_client(config)?;
     match fetch_latest(&client, &repo_url, &release, &channel, target).await? {
@@ -266,6 +292,167 @@ async fn verify_pin_available(
     }
 }
 
+/// Warning for a pin that no longer applies. When release and channel are
+/// unchanged the URL is the only difference, so say that rather than claiming
+/// the config names a different release/channel.
+fn mismatch_warning(snap: &RepoSnapshot, release: &str, channel: &str, repo_url: &str) -> String {
+    let tail = "Tracking the live channel head; run 'avocado update' to re-pin.";
+    if snap.release == release && snap.channel == channel {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot '{}' for {}/{} on a different feed URL than \
+             the config now names ({}). {tail}",
+            snap.snapshot, release, channel, repo_url
+        )
+    } else {
+        format!(
+            "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. {tail}",
+            snap.release, snap.channel, release, channel
+        )
+    }
+}
+
+/// One line naming the pinned and latest snapshots when they differ. Tolerant:
+/// any fetch or parse failure, a feed without snapshots, or an up-to-date pin
+/// yields `None`, so an advisory never fails or slows a pinned rebuild.
+async fn newer_snapshot_notice(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+) -> Option<String> {
+    newer_snapshot_notice_within(
+        client,
+        repo_url,
+        release,
+        channel,
+        target,
+        pinned,
+        NEWER_SNAPSHOT_NOTICE_LIMIT,
+    )
+    .await
+}
+
+/// The notice is advisory, so a slow feed must not hold up a pinned rebuild.
+const NEWER_SNAPSHOT_NOTICE_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn newer_snapshot_notice_within(
+    client: &reqwest::Client,
+    repo_url: &str,
+    release: &str,
+    channel: &str,
+    target: &str,
+    pinned: &RepoSnapshot,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let latest = tokio::time::timeout(
+        limit,
+        fetch_latest(client, repo_url, release, channel, target),
+    )
+    .await
+    .ok()?;
+    match latest {
+        Ok(LatestResult::Found(latest)) if latest.id != pinned.snapshot => Some(format!(
+            "Pinned to snapshot '{}'; latest for {release}/{channel} is '{}'. \
+             Run 'avocado update' to move the pin.",
+            pinned.snapshot, latest.id
+        )),
+        _ => None,
+    }
+}
+
+/// Set once the offline pin line has been printed.
+static OFFLINE_PIN_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Print which pin an offline run uses, once per process. The line says no
+/// newer-snapshot check was made so a stale pin is never silent.
+fn announce_offline_pin(
+    printed: &std::sync::atomic::AtomicBool,
+    release: &str,
+    channel: &str,
+    snapshot: &str,
+) {
+    if printed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    print_info_stderr(&format!(
+        "Offline: using locked pin {release}/{channel} snapshot '{snapshot}'; \
+         no newer-snapshot check was made."
+    ));
+}
+
+/// What avocado itself last exported to `AVOCADO_RELEASEVER` in this process.
+/// Exporter and consumer share a process, so a value differing from this one
+/// was set by the user.
+static EXPORTED_RELEASEVER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Set once the offline "no pin, custom feed" line has been printed.
+static OFFLINE_UNPINNED_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the "pin ignored" line has been printed.
+static PIN_IGNORED_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn set_exported_record(value: Option<String>) {
+    *EXPORTED_RELEASEVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = value;
+}
+
+/// The notice for a user-set `AVOCADO_RELEASEVER` that shadows a locked pin.
+/// `None` when the variable is unset, equals avocado's own export, or no
+/// locked pin applies to this config.
+fn pin_ignored_notice(config: &Config, src_dir: &Path, target: &str) -> Option<String> {
+    let value = env::var("AVOCADO_RELEASEVER").ok()?;
+    let own = EXPORTED_RELEASEVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if own.as_deref() == Some(value.as_str()) {
+        return None;
+    }
+    let release = config.get_distro_release()?;
+    let channel = config.get_distro_channel()?;
+    let repo_url = config.effective_repo_url();
+    let lock = LockFile::load(src_dir).ok()?;
+    let snap = lock.get_repo_snapshot(target);
+    if !matches!(
+        pin_status(snap, &release, &channel, &repo_url),
+        PinStatus::Matches
+    ) {
+        return None;
+    }
+    let snap = snap?;
+    let pin = effective_releasever(&snap.release, &snap.channel, &snap.snapshot);
+    if value == pin {
+        return None;
+    }
+    Some(format!(
+        "pin ignored: AVOCADO_RELEASEVER is set to {value}; the locked pin {pin} is not used"
+    ))
+}
+
+/// Print the [`pin_ignored_notice`] once per process. Returns true when it
+/// printed. Reads the lock file and the environment only and opens no
+/// connection, so a command that never resolves a pin, such as `ext fetch`,
+/// can announce an override without adding a snapshot request.
+pub fn announce_pin_ignored(config: &Config, src_dir: &Path, target: &str) -> bool {
+    if !releasever_is_overridden(config) {
+        return false;
+    }
+    let Some(msg) = pin_ignored_notice(config, src_dir, target) else {
+        return false;
+    };
+    if PIN_IGNORED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    print_info_stderr(&msg);
+    true
+}
+
 /// Resolve the snapshot pin for `target` and, when one applies, expose it via
 /// `AVOCADO_RELEASEVER` so every downstream `get_releasever()` fetches against
 /// the frozen snapshot subtree. Auto-pins (and persists) on first fetch.
@@ -274,6 +461,7 @@ async fn verify_pin_available(
 /// in-process install task graph (children see the parent's env and no-op).
 pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) -> Result<()> {
     if releasever_is_overridden(config) {
+        announce_pin_ignored(config, src_dir, target);
         return Ok(());
     }
     let (Some(release), Some(channel)) = (config.get_distro_release(), config.get_distro_channel())
@@ -285,27 +473,62 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
 
     let mut lock = LockFile::load(src_dir)
         .with_context(|| format!("Failed to load lock file from {}", src_dir.display()))?;
-    let client = build_client(config)?;
 
-    let effective = match pin_status(lock.get_repo_snapshot(target), &release, &channel) {
+    let effective = match pin_status(
+        lock.get_repo_snapshot(target),
+        &release,
+        &channel,
+        &repo_url,
+    ) {
         PinStatus::Matches => {
             let snap = lock.get_repo_snapshot(target).expect("matched");
-            verify_pin_available(&client, &repo_url, snap, target).await?;
+            if crate::utils::offline::is_offline() {
+                announce_offline_pin(
+                    &OFFLINE_PIN_PRINTED,
+                    &snap.release,
+                    &snap.channel,
+                    &snap.snapshot,
+                );
+            } else {
+                let client = build_client(config)?;
+                verify_pin_available(&client, &repo_url, snap, target).await?;
+                if let Some(notice) =
+                    newer_snapshot_notice(&client, &repo_url, &release, &channel, target, snap)
+                        .await
+                {
+                    print_info(&notice, OutputLevel::Normal);
+                }
+            }
             effective_releasever(&snap.release, &snap.channel, &snap.snapshot)
         }
         PinStatus::Mismatch => {
             let snap = lock.get_repo_snapshot(target).expect("mismatch");
             print_info(
-                &format!(
-                    "[WARNING] Lock file is pinned to snapshot for {}/{} but config now names {}/{}. \
-                     Tracking the live channel head; run 'avocado update' to re-pin.",
-                    snap.release, snap.channel, release, channel
-                ),
+                &mismatch_warning(snap, &release, &channel, &repo_url),
                 OutputLevel::Normal,
             );
             return Ok(());
         }
         PinStatus::None => {
+            if crate::utils::offline::is_offline() {
+                // Only the default avocado feed is known to publish snapshots;
+                // a custom feed that serves none can never have a pin, so
+                // erroring would make offline unusable for it.
+                if repo_url.trim_end_matches('/') != Config::DEFAULT_REPO_URL {
+                    if !OFFLINE_UNPINNED_PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        print_info_stderr(&format!(
+                            "Offline: no locked pin for {release}/{channel} on {repo_url}; \
+                             using the configured release unpinned"
+                        ));
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "--offline needs a locked snapshot pin for {release}/{channel} on '{target}', \
+                     and none is recorded. Run `avocado update` online to create one."
+                );
+            }
+            let client = build_client(config)?;
             match fetch_latest(&client, &repo_url, &release, &channel, target).await? {
                 LatestResult::Unsupported => return Ok(()),
                 LatestResult::Found(pointer) => {
@@ -324,6 +547,7 @@ pub async fn resolve_and_apply(config: &Config, src_dir: &Path, target: &str) ->
         }
     };
 
+    set_exported_record(Some(effective.clone()));
     env::set_var("AVOCADO_RELEASEVER", effective);
     Ok(())
 }
@@ -341,7 +565,7 @@ pub fn pinned_releasever(config: &Config, lock: &LockFile, target: &str) -> Opti
     }
     let (release, channel) = (config.get_distro_release()?, config.get_distro_channel()?);
     let snap = lock.get_repo_snapshot(target)?;
-    match pin_status(Some(snap), &release, &channel) {
+    match pin_status(Some(snap), &release, &channel, &config.effective_repo_url()) {
         PinStatus::Matches => Some(effective_releasever(
             &snap.release,
             &snap.channel,
@@ -367,6 +591,20 @@ pub async fn resolve_and_apply_for(config: &Config, config_path: &str, target: &
 #[cfg(test)]
 mod tests {
 
+    #[tokio::test]
+    async fn rate_limited_pointer_explains_instead_of_a_bare_http_error() {
+        let url = crate::utils::feed_limit::serve(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+        );
+        let client = reqwest::Client::new();
+        let err = match fetch_latest(&client, &url, "2026", "edge", "qemux86-64").await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a 429 must not resolve a snapshot"),
+        };
+        assert!(err.contains("HTTP 429"), "{err}");
+        assert!(err.contains("30 s"), "{err}");
+    }
+
     /// Snapshot resolution reaches the feed without going through
     /// `ResolvedFeedSet`, so it needs its own copy of the no-credentials-in-the-URL
     /// rule. This one is the worse leak of the two: the resolved URL is written
@@ -388,15 +626,17 @@ mod tests {
     }
     use super::*;
 
-    fn snap(release: &str, channel: &str, id: &str) -> RepoSnapshot {
+    fn snap(release: &str, channel: &str, id: &str, url: Option<&str>) -> RepoSnapshot {
         RepoSnapshot {
             release: release.to_string(),
             channel: channel.to_string(),
             snapshot: id.to_string(),
-            repo_url: None,
+            repo_url: url.map(str::to_string),
             created: None,
         }
     }
+
+    const URL: &str = "https://repo.example.com";
 
     #[test]
     fn effective_releasever_injects_snapshot_segment() {
@@ -408,7 +648,7 @@ mod tests {
 
     #[test]
     fn pin_status_none_when_unpinned() {
-        assert_eq!(pin_status(None, "2026", "edge"), PinStatus::None);
+        assert_eq!(pin_status(None, "2026", "edge", URL), PinStatus::None);
     }
 
     /// The pin that `Config::load_composed` reads from the lock is not an
@@ -427,15 +667,43 @@ mod tests {
 
     #[test]
     fn pin_status_matches_same_feed() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "edge"), PinStatus::Matches);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+        let slashed = format!("{URL}/");
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", &slashed),
+            PinStatus::Matches
+        );
+        let unrecorded = snap("2026", "edge", "X", None);
+        assert_eq!(
+            pin_status(Some(&unrecorded), "2026", "edge", URL),
+            PinStatus::Matches
+        );
+    }
+
+    #[test]
+    fn pin_with_other_url_is_not_matching() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "edge", "https://mirror.example.com"),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
     fn pin_status_mismatch_on_channel_change() {
-        let p = snap("2026", "edge", "X");
-        assert_eq!(pin_status(Some(&p), "2026", "stable"), PinStatus::Mismatch);
-        assert_eq!(pin_status(Some(&p), "2027", "edge"), PinStatus::Mismatch);
+        let p = snap("2026", "edge", "X", Some(URL));
+        assert_eq!(
+            pin_status(Some(&p), "2026", "stable", URL),
+            PinStatus::Mismatch
+        );
+        assert_eq!(
+            pin_status(Some(&p), "2027", "edge", URL),
+            PinStatus::Mismatch
+        );
     }
 
     #[test]
@@ -456,6 +724,548 @@ mod tests {
         assert_eq!(
             repomd_url("https://r.io", "2026", "edge", "qemux86-64", "SNAP"),
             "https://r.io/2026/edge/snapshots/SNAP/target/qemux86-64/repodata/repomd.xml"
+        );
+    }
+
+    #[test]
+    fn url_only_change_does_not_claim_release_or_channel_changed() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "edge", "https://mirror.example.com");
+        assert!(msg.contains("different feed URL"), "{msg}");
+        assert!(msg.contains("https://mirror.example.com"), "{msg}");
+        assert!(!msg.contains("config now names 2026/edge"), "{msg}");
+    }
+
+    #[test]
+    fn channel_change_still_names_both_feeds() {
+        let p = snap("2026", "edge", "X", Some(URL));
+        let msg = mismatch_warning(&p, "2026", "stable", URL);
+        assert!(
+            msg.contains("pinned to snapshot for 2026/edge but config now names 2026/stable"),
+            "{msg}"
+        );
+    }
+
+    /// Serve one canned HTTP response on a loopback port, then return its base URL.
+    fn serve_once(status: &str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn newer_latest_names_pinned_latest_and_update_command() {
+        let url = serve_once("200 OK", r#"{"id":"NEW"}"#);
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await
+        .expect("a differing latest yields a notice");
+        assert!(msg.contains("'OLD'") && msg.contains("'NEW'"), "{msg}");
+        assert!(msg.contains("avocado update"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn latest_equal_to_pin_prints_nothing() {
+        let url = serve_once("200 OK", r#"{"id":"SAME"}"#);
+        let p = snap("2026", "edge", "SAME", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn unreachable_latest_prints_nothing() {
+        // Bind then drop, so the port is closed when the client connects.
+        let url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let msg = newer_snapshot_notice(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+        )
+        .await;
+        assert_eq!(msg, None);
+    }
+
+    #[tokio::test]
+    async fn hung_latest_endpoint_is_abandoned_within_the_limit() {
+        // Accepts the connection and never answers.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let p = snap("2026", "edge", "OLD", Some(&url));
+        let started = std::time::Instant::now();
+        let msg = newer_snapshot_notice_within(
+            &reqwest::Client::new(),
+            &url,
+            "2026",
+            "edge",
+            "qemux86-64",
+            &p,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(msg, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "advisory held the command for {:?}",
+            started.elapsed()
+        );
+        drop(l);
+    }
+
+    /// A listener that records connections without answering. A connection made
+    /// before this is polled sits in the accept backlog, so a nonblocking
+    /// `accept` afterwards proves whether anything dialed it.
+    fn silent_listener() -> (std::net::TcpListener, String) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        (l, url)
+    }
+
+    fn offline_config(url: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: edge\n  repo:\n    url: {url}\n"
+        ))
+        .unwrap()
+    }
+
+    /// Runs `resolve_and_apply` offline and always restores the global flag and
+    /// the env var it exports, so a failing assertion cannot leak either.
+    async fn run_offline(config: &Config, dir: &Path) -> (Result<()>, Option<String>) {
+        env::remove_var("AVOCADO_RELEASEVER");
+        env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+        crate::utils::offline::set_offline(true);
+        let res = resolve_and_apply(config, dir, "qemux86-64").await;
+        crate::utils::offline::set_offline(false);
+        let release = env::var("AVOCADO_RELEASEVER").ok();
+        env::remove_var("AVOCADO_RELEASEVER");
+        (res, release)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn resolve_and_apply_offline_uses_lock_pin() {
+        let (listener, url) = silent_listener();
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = LockFile::load(dir.path()).unwrap();
+        lock.set_repo_snapshot("qemux86-64", snap("2026", "edge", "PINNED", Some(&url)));
+        lock.save(dir.path()).unwrap();
+
+        let (res, release) = run_offline(&offline_config(&url), dir.path()).await;
+
+        res.expect("an offline run with a pin succeeds");
+        assert_eq!(
+            release.as_deref(),
+            Some("2026/edge/snapshots/PINNED"),
+            "the locked pin is the release in use"
+        );
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "offline made a request"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn update_lookup_refuses_offline_before_any_request() {
+        let (listener, url) = silent_listener();
+        crate::utils::offline::set_offline(true);
+        let res = resolve_latest(&offline_config(&url), "qemux86-64").await;
+        crate::utils::offline::set_offline(false);
+        let err = res.expect_err("update needs the network").to_string();
+        assert!(err.contains("--offline"), "{err}");
+        assert!(err.contains("avocado update"), "{err}");
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "offline made a request"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn update_lookup_offline_with_overridden_releasever_needs_no_network() {
+        // An override means there is nothing to look up, so offline is irrelevant.
+        let config: Config = serde_yaml::from_str(
+            "distro:\n  release: 2026\n  channel: edge\n  repo:\n    releasever: 2026/next\n",
+        )
+        .unwrap();
+        crate::utils::offline::set_offline(true);
+        let res = resolve_latest(&config, "qemux86-64").await;
+        crate::utils::offline::set_offline(false);
+        assert!(res.expect("override needs no lookup").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_without_pin_names_the_pin() {
+        // The default avocado repo always publishes snapshots, so a missing pin
+        // is a real gap that `avocado update` can fill.
+        let config: Config =
+            serde_yaml::from_str("distro:\n  release: 2026\n  channel: edge\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let (res, release) = run_offline(&config, dir.path()).await;
+
+        let err = res.expect_err("no pin offline must fail").to_string();
+        assert!(err.contains("pin"), "{err}");
+        assert!(err.contains("avocado update"), "{err}");
+        assert_eq!(release, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_without_pin_on_custom_feed_proceeds() {
+        // A custom feed may publish no snapshots, so no pin can ever exist.
+        let (listener, url) = silent_listener();
+        let dir = tempfile::tempdir().unwrap();
+
+        let (res, release) = run_offline(&offline_config(&url), dir.path()).await;
+
+        res.expect("a custom feed without a pin proceeds offline");
+        assert_eq!(release, None, "no pin is exported");
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "offline made a request"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn release_equal_to_pin_prints_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(msg, None);
+    }
+
+    /// Lock with a pin for `qemux86-64` in a fresh dir.
+    fn pinned_dir(url: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = LockFile::load(dir.path()).unwrap();
+        lock.set_repo_snapshot("qemux86-64", snap("2026", "edge", "PINNED", Some(url)));
+        lock.save(dir.path()).unwrap();
+        dir
+    }
+
+    fn reset_notice_state() {
+        env::remove_var("AVOCADO_RELEASEVER");
+        env::remove_var("AVOCADO_SDK_REPO_RELEASE");
+        set_exported_record(None);
+        PIN_IGNORED_PRINTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn user_releasever_prints_pin_ignored_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(
+            msg.as_deref(),
+            Some(
+                "pin ignored: AVOCADO_RELEASEVER is set to custom/rel; the locked pin \
+                 2026/edge/snapshots/PINNED is not used"
+            )
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn own_export_prints_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        // Differs from the pin, so only the export record can silence it.
+        set_exported_record(Some("2026/edge/snapshots/OLDER".into()));
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/OLDER");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        set_exported_record(None);
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn no_pin_no_notice() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let msg = pin_ignored_notice(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert_eq!(msg, None);
+    }
+
+    /// `ext fetch` never calls `resolve_and_apply`, so it needs a notice-only
+    /// entry that reads the lock and the environment and opens no connection.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_prints_once_for_an_override() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let first = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        let second = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert!(first, "the first call prints the notice");
+        assert!(!second, "the once-guard suppresses the second call");
+        assert!(PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_is_silent_for_own_export_and_equal_pin() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+
+        set_exported_record(Some("2026/edge/snapshots/PINNED".into()));
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let own = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        set_exported_record(None);
+
+        env::set_var("AVOCADO_RELEASEVER", "2026/edge/snapshots/PINNED");
+        let equal = announce_pin_ignored(&config, dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+
+        assert!(!own, "avocado's own export is not an override");
+        assert!(!equal, "a value equal to the pin changes nothing");
+        assert!(!PIN_IGNORED_PRINTED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn announce_pin_ignored_is_silent_without_a_pin() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        let printed = announce_pin_ignored(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        assert!(!printed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn override_release_unchanged_by_notice() {
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let config = offline_config(url);
+        reset_notice_state();
+        let tui = ActiveRenderer::new();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+            resolve_and_apply(&config, dir.path(), "qemux86-64")
+                .await
+                .expect("override never refuses");
+            seen.push((
+                env::var("AVOCADO_RELEASEVER").unwrap(),
+                tui.count("pin ignored: AVOCADO_RELEASEVER is set to custom/rel"),
+            ));
+        }
+        reset_notice_state();
+        // The release stays the override, and the notice prints on the first
+        // call only.
+        assert_eq!(
+            seen,
+            [1, 1, 1].map(|n| ("custom/rel".to_string(), n)).to_vec()
+        );
+    }
+
+    /// An offline run makes no request, so a CA bundle it cannot read must not
+    /// stop it.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_pin_ignores_an_unreadable_repo_ca() {
+        let (_listener, url) = silent_listener();
+        let dir = pinned_dir(&url);
+        let missing = dir.path().join("no-such-ca.pem");
+        let config: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: edge\n  repo:\n    url: {url}\n    ca: {}\n",
+            missing.display()
+        ))
+        .unwrap();
+        env::remove_var("AVOCADO_REPO_CA");
+
+        let (res, release) = run_offline(&config, dir.path()).await;
+
+        res.expect("an offline run with a pin needs no CA bundle");
+        assert_eq!(release.as_deref(), Some("2026/edge/snapshots/PINNED"));
+    }
+
+    /// The pin avocado exports itself must be recorded, or the next command in
+    /// the same process would read it back as a user override.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn own_pin_export_is_not_reported_as_override() {
+        reset_notice_state();
+        let (_listener, url) = silent_listener();
+        let dir = pinned_dir(&url);
+        let config = offline_config(&url);
+        crate::utils::offline::set_offline(true);
+        let res = resolve_and_apply(&config, dir.path(), "qemux86-64").await;
+        crate::utils::offline::set_offline(false);
+        res.unwrap();
+        let exported = env::var("AVOCADO_RELEASEVER").ok();
+        // Shift the pin so only the export record, not value == pin, can
+        // silence the notice.
+        let mut lock = LockFile::load(dir.path()).unwrap();
+        lock.set_repo_snapshot("qemux86-64", snap("2026", "edge", "NEWER", Some(&url)));
+        lock.save(dir.path()).unwrap();
+        let msg = pin_ignored_notice(&config, dir.path(), "qemux86-64");
+        reset_notice_state();
+        assert_eq!(exported.as_deref(), Some("2026/edge/snapshots/PINNED"));
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn offline_pin_line_prints_once() {
+        let tui = ActiveRenderer::new();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        announce_offline_pin(&flag, "2026", "edge", "ONCE");
+        announce_offline_pin(&flag, "2026", "edge", "ONCE");
+        assert_eq!(tui.count("snapshot 'ONCE'"), 1);
+    }
+
+    /// A test renderer registered as the process-wide active one, as
+    /// `sdk install`, `ext install` and `runtime install` have before they
+    /// resolve the pin. Holds the lock the tui tests take, since the active
+    /// renderer is global.
+    struct ActiveRenderer {
+        renderer: std::sync::Arc<crate::utils::tui::TaskRenderer>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ActiveRenderer {
+        fn new() -> Self {
+            let lock = crate::utils::tui::tests::GLOBAL_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let renderer = std::sync::Arc::new(crate::utils::tui::TaskRenderer::new_test());
+            crate::utils::tui::set_active_renderer(&renderer);
+            Self {
+                renderer,
+                _lock: lock,
+            }
+        }
+
+        /// How many lines the renderer printed that contain `needle`.
+        fn count(&self, needle: &str) -> usize {
+            self.renderer
+                .get_test_output()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl Drop for ActiveRenderer {
+        fn drop(&mut self) {
+            crate::utils::tui::clear_active_renderer();
+        }
+    }
+
+    #[test]
+    fn offline_pin_line_reaches_an_active_renderer() {
+        let tui = ActiveRenderer::new();
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        announce_offline_pin(&flag, "2026", "edge", "RENDERED");
+        assert_eq!(
+            tui.count("Offline: using locked pin 2026/edge snapshot 'RENDERED'"),
+            1
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    fn pin_ignored_notice_reaches_an_active_renderer() {
+        reset_notice_state();
+        let url = "http://127.0.0.1:1";
+        let dir = pinned_dir(url);
+        let tui = ActiveRenderer::new();
+        env::set_var("AVOCADO_RELEASEVER", "custom/rel");
+        announce_pin_ignored(&offline_config(url), dir.path(), "qemux86-64");
+        env::remove_var("AVOCADO_RELEASEVER");
+        reset_notice_state();
+        assert_eq!(
+            tui.count("pin ignored: AVOCADO_RELEASEVER is set to custom/rel"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(offline)]
+    async fn offline_unpinned_notice_reaches_an_active_renderer() {
+        let (_listener, url) = silent_listener();
+        let dir = tempfile::tempdir().unwrap();
+        OFFLINE_UNPINNED_PRINTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let tui = ActiveRenderer::new();
+        let (res, _) = run_offline(&offline_config(&url), dir.path()).await;
+        res.expect("a custom feed without a pin proceeds offline");
+        assert_eq!(
+            tui.count(&format!("Offline: no locked pin for 2026/edge on {url}")),
+            1
         );
     }
 }

@@ -540,9 +540,10 @@ fi
         let version = ext_config
             .get("version")
             .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Extension '{}' is missing required 'version' field for RPM packaging",
+                    "Extension '{}' has a missing or empty 'version' field for RPM packaging",
                     self.extension
                 )
             })?
@@ -1094,7 +1095,7 @@ rm -rf "$TMPDIR"
         }
 
         // Use tokio::process::Command directly like checkout does
-        let copy_output = tokio::process::Command::new(container_tool)
+        let copy_output = crate::utils::engine::command(container_tool)
             .arg("cp")
             .arg(&docker_cp_source)
             .arg(&docker_cp_dest)
@@ -1103,7 +1104,7 @@ rm -rf "$TMPDIR"
             .context("Failed to execute docker cp")?;
 
         // Clean up temporary container
-        let _ = tokio::process::Command::new(container_tool)
+        let _ = crate::utils::engine::command(container_tool)
             .arg("rm")
             .arg("-f")
             .arg(&temp_container_id)
@@ -1131,7 +1132,7 @@ rm -rf "$TMPDIR"
         container_tool: &str,
         volume_name: &str,
     ) -> Result<String> {
-        let output = tokio::process::Command::new(container_tool)
+        let output = crate::utils::engine::command(container_tool)
             .arg("create")
             .arg("-v")
             .arg(format!("{volume_name}:/opt/_avocado:ro"))
@@ -1690,7 +1691,7 @@ extensions:
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("missing required 'version' field"));
+            .contains("missing or empty 'version' field"));
     }
 
     #[test]

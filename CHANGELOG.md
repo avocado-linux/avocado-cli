@@ -7,6 +7,212 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Release override notice.** When `AVOCADO_RELEASEVER` is exported in a
+  project that has a locked pin, avocado prints
+  `pin ignored: AVOCADO_RELEASEVER is set to <value>; the locked pin <pin> is not used`
+  once per run. The override still wins. See docs/releasever.md.
+- **`--offline` flag and `AVOCADO_OFFLINE`.** avocado skips its own
+  latest-snapshot pointer lookup, the pin HEAD check and the feed preflight,
+  and uses the locked pin, printing it once. It gates only those lookups, the
+  release check, the add-on check and the Connect token mint;
+  `init --reference`, `upgrade`, `vm update`, `connect` and `runtime deploy`
+  still connect. An old locked pin installs old packages. With no locked pin on the
+  default repository it stops before any request and tells you to run
+  `avocado update` online; another `distro.repo.url` proceeds unpinned with a
+  notice. `avocado update` and an `org:` feed that needs a token fail with an
+  error naming `--offline` instead of connecting. `AVOCADO_OFFLINE` accepts
+  `1`, `true` or `yes`. It does not
+  make the package manager inside the SDK container work offline: an install
+  that needs a remote feed still needs the network. See `docs/offline.md`.
+- **`avocado feed index <dir>`.** Writes `<dir>/repodata/` for a directory of
+  RPMs by running the host `createrepo_c`, regenerated on every run. It fails
+  with an error naming `createrepo_c` when the tool is not on PATH, and naming
+  the path when the directory is missing or not a directory. A symlinked
+  directory leading back into its own path, which `createrepo_c` would follow
+  forever, fails naming the link before the tool runs. See
+  `docs/feed-index.md`.
+- **Optional `provides`, `epoch` and scriptlet keys in `sdk.compile.<section>.package`.**
+  `provides` adds one `Provides:` line per entry, `epoch` sets `Epoch:`, and
+  `pre_install`, `post_install`, `pre_uninstall` and `post_uninstall` emit
+  `%pre`, `%post`, `%preun` and `%postun`. A `%` is escaped so rpm reads it
+  literally. See `docs/sdk-package.md`.
+- **A snapshot pin identity covers the feed URL, and a pinned rebuild
+  mentions newer snapshots.** A recorded pin now remembers the repository URL
+  it came from (trailing slashes ignored), so pointing the config at a mirror
+  or another feed with the same release and channel warns that the pin does not
+  match instead of reusing a snapshot ID that repository never issued. When
+  only the URL changed, the warning names the new feed URL. Lock files written
+  before the URL was recorded still match. A pinned rebuild also prints one
+  line naming the pinned and latest snapshots and pointing at `avocado update`
+  when the channel has moved on; a failed lookup prints nothing.
+- **`rewrite_loopback` on a package feed.** Setting it to `true` on a
+  `repos:` feed served from `localhost` or `127.0.0.1` maps the loopback host
+  to an address the build container can reach. The CLI detects host networking
+  from the container arguments the run uses: when the container shares the
+  host's loopback, the URL is kept as written. Detection ignores
+  `--network=host` on Docker Desktop and under the avocado VM, where loopback
+  is the VM's own, so the rewrite still applies there. The per-feed key
+  overrides detection, and the distro feed and built-in feeds refuse it. The
+  distro feed's address and the host-gateway entry follow the arguments docker
+  actually receives, so a `--network=host` given only on the command line keeps
+  a loopback distro URL, and a `--container-arg` that replaces the config's
+  arguments drops a `--network=host` set there. Variables in the arguments are
+  expanded and `sdk.<target>.container_args` is honoured. A package feed reads
+  the same arguments from the project configuration, without the command line,
+  so install and build keep stamping the same address.
+- **`avocado init --minimal` for feeds that lack the default extensions.** The
+  generated project leaves out the `avocado-ext-dev`, `avocado-ext-sshd-dev`
+  and board BSP remote extensions and keeps only the local application
+  extension, so a first build against such a feed does not fail on dependency
+  resolution. Plain `avocado init` is unchanged.
+- **`avocado install` and `avocado sdk install` check feeds before
+  downloading.** A feed preflight probes each URL feed's repository metadata
+  (and the extension repository when an extension needs it) from the host
+  before anything is fetched. An unreachable feed or one with no metadata fails
+  fast with an error naming the feed and the reason, instead of a dnf error
+  from inside the container. A path feed is checked on disk. The probes run
+  once per target even though `install` also runs the SDK install, and are
+  skipped with `--runs-on`, where dnf runs on the remote runner. A feed with
+  TLS verification disabled is not probed, and a warning says so. `fetch`,
+  `ext fetch`, `ext install`, `runtime install`, `rootfs install` and
+  `initramfs install` run the same check before they download. The
+  dnf passthrough commands (`sdk dnf`, `runtime dnf`, `ext dnf` and `sdk run`)
+  and `update` do not probe feeds. Where a command accepts `--runs-on`, the
+  skip is reported once.
+- **The `docker` client no longer has to be installed.** `avocado` now talks
+  to the Docker daemon itself, over the Engine API, wherever it used to run
+  the `docker` command, so a host that reaches its daemon through an
+  avocado-vm needs nothing from Docker installed. `DOCKER_HOST` and the
+  current docker context are honoured as before. The `docker` command is
+  still what runs for `avocado container dev`, for `--runs-on` remotes, on
+  Windows, with a `--container-tool` other than `docker`, and when
+  `DOCKER_HOST` is an `ssh://` or TLS endpoint. Set `AVOCADO_DOCKER_CLI=1` to
+  use the `docker` command everywhere, as before.
+- **`container:` names the common container settings.** `sdk` and each
+  provision profile take a `container:` block with `privileged`,
+  `network_mode`, `volumes`, `devices`, `extra_hosts`, `cap_add` and
+  `environment`, spelled as Docker Compose spells them. `container_args`
+  still works and is still the place for any flag without a key; where both
+  set the same thing, the block wins.
+- **`avocado ext clean --skip-compile`.** Cleans the extension sysroot and
+  its stamps, and leaves the `sdk.compile` sections it uses as they are. By
+  default `ext clean` still runs the clean script of each section.
+
+### Changed
+- **New projects require CLI 1.0.0 or later.** The `avocado init` template's
+  `cli_requirement` is now `>=1.0.0` (was `>=0.41.0`). Pre-release builds such
+  as `1.1.0-dev` still satisfy it.
+- **`sdk dnf`, `ext dnf` and `runtime dnf` pass each argument to dnf as
+  given.** They were joined with spaces and run by the container shell, which
+  split them again and expanded them. An argument containing `$VAR`, a glob or
+  `&&` now reaches dnf literally instead of being interpreted, as `sdk run`
+  already does.
+
+### Fixed
+- **`avocado connect` commands honor `AVOCADO_CONNECT_TOKEN` and
+  `AVOCADO_CONNECT_URL`.** They used to read only `credentials.json`, so they
+  could send the saved profile's token to the saved profile's server while
+  you meant another. Now the token, when set, replaces the saved profiles,
+  at `AVOCADO_CONNECT_URL` or else `https://connect.peridio.com`, as feeds
+  already do. A URL without a token uses only the saved profiles for that
+  server, and fails naming both servers when there are none. `auth login`,
+  `logout`, `status`, `connect init` and `deploy --connect-sign` still use
+  the saved profiles, and the env token is never written to disk.
+- **`credentials.json` is owner-only.** `avocado connect auth login` wrote
+  it `0644`, readable by every user on the host. It is now `0600` in a `0700`
+  directory, and a looser file or directory is tightened on the next save.
+- **An HTTP 429 from a package repository is now reported as one.** dnf
+  reports a repository's `429 Too Many Requests` as "No more mirrors to
+  try", which reads as a broken repository. When a run fails, the CLI now
+  checks once whether the repository is answering 429 and, if it is, says so
+  with how long to wait. A failed package-extension fetch is checked the
+  same way. Resolving the latest snapshot reports a 429 the same way instead
+  of as a bare HTTP error.
+- **A failed run's summary no longer calls the steps it never reached "up to
+  date".** After `sdk bootstrap` failed, for example, `sdk packages` and
+  `rootfs install` printed with a check mark and `(up to date)`. Steps after
+  the first failed one now print `(skipped: earlier step failed)` with no
+  check mark; steps before it keep `(up to date)`. Steps that had started
+  but not finished when a step failed, which printed no line at all, now
+  print `(not finished: a step failed)`.
+- **Build volumes survive Docker daemon changes.** Commands refuse when the
+  volume recorded in `.avocado-state` is missing from the current daemon,
+  instead of silently starting over in an empty volume. The error says the
+  volume was either deleted (for example by `avocado vm reset` or a Docker
+  data purge) or is on a different daemon, names the daemon (the avocado-vm
+  under VM routing), and points at `avocado clean` to start the project over.
+  `avocado vm reset` and `avocado vm rebuild --reset-data` print the same
+  `avocado clean` advice. Cleanup removes a volume whose project's state file
+  names a different volume only when that volume exists on the same daemon,
+  so a volume that may belong to another daemon is kept.
+- **`avocado load --force` removes the volume it replaces.** It used to leave
+  the previous build volume on disk.
+- **The offline pin, offline unpinned and `pin ignored` notices show under
+  the progress display.** `sdk install`, `ext install` and `runtime install`
+  dropped them, so an offline run gave no sign which pin it used, and an
+  overriding `AVOCADO_RELEASEVER` went unmentioned. They now print on stderr
+  above the task list.
+- **`sdk package` rejects a `requires` entry holding a newline.** The entry
+  was written into the spec unchecked, so a newline added spec lines of its
+  own. A newline or other control character now fails naming the section and
+  the entry, as `provides` already did, and a sub-package's `requires` under
+  `split` fails the same way, also naming the sub-package. A `%` macro in
+  `requires` still expands.
+- **An unchanged compile section no longer runs on each extension build.**
+  `ext build` writes a stamp for each `sdk.compile` section it runs, at
+  `.stamps/sdk/<arch>/compile/<section>.stamp`, and skips the section when
+  the stamp is current and the section's build directory exists. The stamp
+  hashes the section config, the compile script, the `package_files` of
+  every extension that names the section (with their target overrides
+  resolved), the SDK settings and the repo the container uses, the SDK
+  install and compile-deps stamps, and the lock pins of the SDK and the
+  target sysroot. The skip needs `package_files` on each of those
+  extensions: without a list of sources, an edit to a source file would not
+  move the hash. A section always compiles, as before, when an extension
+  that names it has no `package_files`, when a `package_files` path or glob
+  directory is or holds a symlink, when a glob matches nothing (such as
+  `./src/*.c`), when `sdk.container_args` or the `sdk.container` block
+  passes anything other than `--privileged`, `--network=host`,
+  `-v /dev:/dev`, `-v /sys:/sys` and env flags with a value
+  (`-e CFLAGS=-O2`), when there is no lock file, or when the CLI runs from
+  a directory other than the project and there is no `src_dir`. With `-v`,
+  the build says how to get the skip when `package_files` is missing.
+  `avocado sdk compile` always runs, and `--no-stamps`, `ext clean` and
+  `sdk clean <section>` remove the section stamp.
+- **`ext build` no longer skips over inputs it cannot hash.** An extension
+  with a package that has both `compile` and `install` is always rebuilt,
+  and its compile step decides whether the compile can be skipped. The `ext
+  build` hash does not read the SDK image, the lock pins or the host state
+  the container args pass, so its skip could ship a binary built against an
+  old library. An extension with a `post_build` hook is rebuilt when a
+  `package_files` path or glob directory is or holds a symlink, when a glob
+  matches nothing, when an override sets `package_files` or `source`, or
+  when the CLI runs from a directory other than the project and there is no
+  `src_dir`.
+- **Named rootfs entries and `target-<name>:` overrides apply everywhere the
+  rootfs is read.** A rootfs written as named entries
+  (`rootfs: { default: { overlay: ... } }`) had its `overlay` ignored at
+  install, its `post_install` hook and `image:` settings ignored at the image
+  step, and a lone entry not named `default` lost its `filesystem` and
+  `permissions` when a `target-<name>:` block sat beside it.
+  `target-<name>:` blocks under `rootfs:` changed the image but not the
+  installed packages or overlay. Every rootfs reader (install packages and
+  overlay, the image step's filesystem, hook, permissions and `image:`
+  settings, and the install, image and runtime build stamps) now reads one
+  resolved node: install takes the default (or only) entry, and a runtime's
+  image step takes the entry its `rootfs: <name>` names. A `target-<name>:`
+  block beside the named entries applies over the selected entry, and the
+  entry's own `target-<name>:` block applies over both; package maps and
+  `image:` merge key by key, while `overlay` and `permissions` replace the
+  base's whole, so a target's long-form overlay no longer inherits the base's
+  `mode`. Package maps merge whether they are spelled `packages` or
+  `dependencies`. A `target-*` or `kernel-*` key beside named entries is never
+  an entry, so a runtime referencing one is rejected; `kernel-<spec>:` blocks
+  under `rootfs:` are flagged as ignored. The config schema and
+  `avocado config validate` accept these rootfs shapes. A flat `rootfs:`
+  section without matching target overrides hashes exactly as before.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added
@@ -540,7 +746,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - **`cryptoki` 0.12.1 for RUSTSEC-2026-0286** (out-of-bounds read decoding
-  `CKA_ALLOWED_MECHANISMS`). Lockfile bump only. (#278)
+  the PKCS#11 allowed-mechanisms attribute). Lockfile bump only. (#278)
 - **The extension source symlink guard is armed on the default config path.**
   `ExtSourceReader` requires a resolved symlink to stay under the extension
   root, because a `type: git` tree is third-party content. With the empty
@@ -1134,7 +1340,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land in the runtime manifest (`root_hash`, with the tree stored as
   `<image_id>.verity`); the rootfs root hash goes into the boot FIT as
   `avocado,roothash` and the tree into the machine's per-slot hash partition.
-  Requires `veritysetup` in the SDK and `CONFIG_DM_VERITY` on the target.
+  Requires `veritysetup` in the SDK and the dm-verity kernel option on the target.
   Provisioning carries everything; `avocado deploy` and `avocado connect
   upload` refuse a runtime with verity extensions until they publish the
   trees too.
@@ -1265,7 +1471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warns and the field is left off, so a server that does not read it yet
   (ENG-2284) sees today's request unchanged. If the server refuses the call
   in a way that means this body was refused, the upload retries once without
-  it — gated on the status, via a new `HttpStatus` error type, rather than on
+  it — gated on the status, via a new HTTP status error type, rather than on
   message text. That is `400` and `413`, not any 4xx: the likeliest refusal is
   `413 Payload Too Large`, since ~400 packages of SPDX is megabytes into a body
   that is otherwise kilobytes, while `401`, `403`, `409`, `422` and `429` are

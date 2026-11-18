@@ -215,8 +215,8 @@
     },
     "rootfs": {
       "title": "Root filesystem",
-      "$ref": "#/definitions/imageSection",
-      "description": "Root filesystem image configuration. Either one configuration, which becomes the implicit 'default', or a map of named configurations. When no 'packages' are set, installs 'avocado-pkg-rootfs'. In the named-map form only the 'default' (or sole) entry is built, and its 'overlay', 'post_install' and 'image' are not read."
+      "$ref": "#/definitions/rootfsSection",
+      "description": "Root filesystem image configuration. Either one configuration, which becomes the implicit 'default', or a map of named configurations. When no 'packages' are set, installs 'avocado-pkg-rootfs'. In the named-map form, install reads the 'default' (or sole) entry, and a runtime's image step reads the entry its 'rootfs: <name>' names, else that same entry. A 'target-<name>:' block beside the named entries applies over the selected entry, and the entry's own 'target-<name>:' block applies over both."
     },
     "initramfs": {
       "title": "Initramfs",
@@ -386,6 +386,62 @@
         "--privileged --network=host"
       ]
     },
+    "containerConfig": {
+      "title": "Container settings",
+      "type": "object",
+      "description": "Settings for the container, by name, spelled as Docker Compose spells them. Applied after 'container_args', which stays for anything that has no key here. Supports environment variable expansion using ${VAR_NAME} syntax.",
+      "properties": {
+        "privileged": {
+          "type": "boolean",
+          "description": "Run the container privileged."
+        },
+        "network_mode": {
+          "type": "string",
+          "description": "Network the container joins.",
+          "examples": [
+            "host"
+          ]
+        },
+        "volumes": {
+          "$ref": "#/definitions/stringList",
+          "description": "Bind mounts and volumes, as 'source:target[:options]'.",
+          "examples": [
+            [
+              "/dev:/dev"
+            ]
+          ]
+        },
+        "devices": {
+          "$ref": "#/definitions/stringList",
+          "description": "Host devices to pass through.",
+          "examples": [
+            [
+              "/dev/ttyUSB0"
+            ]
+          ]
+        },
+        "extra_hosts": {
+          "$ref": "#/definitions/stringList",
+          "description": "Extra /etc/hosts entries, as 'host:ip'."
+        },
+        "cap_add": {
+          "$ref": "#/definitions/stringList",
+          "description": "Linux capabilities to add."
+        },
+        "environment": {
+          "type": "object",
+          "description": "Environment variables to set in the container.",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "distroConfig": {
       "title": "Distribution configuration",
       "type": "object",
@@ -505,7 +561,7 @@
     "repoDef": {
       "title": "Package feed",
       "type": "object",
-      "description": "A named package feed with exactly one locator: 'url' (a remote repository), 'org' (a Peridio Connect private feed) or 'path' (a local RPM directory). 'username' and 'password' go together. An entry used as the distribution feed accepts only 'url', 'release', 'channel', 'releasever', 'ca' and 'tls_verify', and its url must not contain '$releasever' or '$target'.",
+      "description": "A named package feed with exactly one locator: 'url' (a remote repository), 'org' (a Peridio Connect private feed) or 'path' (a local RPM directory). 'username' and 'password' go together. An entry used as the distribution feed accepts only 'url', 'release', 'channel', 'releasever', 'ca' and 'tls_verify' ('rewrite_loopback' is not offered there), and its url must not contain '$releasever' or '$target'.",
       "properties": {
         "url": {
           "type": "string",
@@ -579,6 +635,10 @@
         "tls_verify": {
           "type": "boolean",
           "description": "Whether to verify the feed's TLS certificate. Defaults to true."
+        },
+        "rewrite_loopback": {
+          "type": "boolean",
+          "description": "Rewrite a loopback host (localhost, 127.0.0.1) in 'url' to an address the build container can reach. Not accepted on the distribution feed."
         }
       },
       "additionalProperties": false
@@ -710,6 +770,9 @@
         },
         "container_args": {
           "$ref": "#/definitions/containerArgs"
+        },
+        "container": {
+          "$ref": "#/definitions/containerConfig"
         },
         "disable_weak_dependencies": {
           "title": "Disable weak dependencies",
@@ -850,6 +913,36 @@
               "glibc"
             ]
           ]
+        },
+        "provides": {
+          "$ref": "#/definitions/stringList",
+          "description": "RPM Provides entries for the package.",
+          "examples": [
+            [
+              "foo = 1.0"
+            ]
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "RPM epoch. Omitted from the generated spec when not set."
+        },
+        "pre_install": {
+          "type": "string",
+          "description": "Script run before the package is installed (%pre scriptlet)."
+        },
+        "post_install": {
+          "type": "string",
+          "description": "Script run after the package is installed (%post scriptlet)."
+        },
+        "pre_uninstall": {
+          "type": "string",
+          "description": "Script run before the package is removed (%preun scriptlet)."
+        },
+        "post_uninstall": {
+          "type": "string",
+          "description": "Script run after the package is removed (%postun scriptlet)."
         },
         "files": {
           "$ref": "#/definitions/stringList",
@@ -1363,7 +1456,7 @@
     "imageConfig": {
       "title": "Image configuration",
       "type": "object",
-      "description": "A rootfs or initramfs image configuration.",
+      "description": "An initramfs image configuration.",
       "properties": {
         "packages": {
           "$ref": "#/definitions/packages",
@@ -1426,6 +1519,75 @@
           "description": "Named image configurations.",
           "additionalProperties": {
             "$ref": "#/definitions/namedImageConfig"
+          }
+        }
+      ]
+    },
+    "rootfsConfig": {
+      "title": "Root filesystem configuration",
+      "type": "object",
+      "description": "A rootfs image configuration.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "image": {
+          "$ref": "#/definitions/imageConfig/properties/image"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        },
+        "source": {
+          "$ref": "#/definitions/imageConfig/properties/source"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride",
+          "description": "Per-target override, applied over this block when building for that target."
+        },
+        "^kernel-.+$": {
+          "type": "object",
+          "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+          "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+        }
+      },
+      "additionalProperties": false,
+      "x-avocado-target-overrides": true
+    },
+    "rootfsSection": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/rootfsConfig"
+        },
+        {
+          "type": "object",
+          "description": "Named rootfs configurations.",
+          "patternProperties": {
+            "^target-.+$": {
+              "$ref": "#/definitions/rootfsTargetOverride",
+              "description": "Per-target override, applied over the selected entry."
+            },
+            "^kernel-.+$": {
+              "type": "object",
+              "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+              "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+            }
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/namedRootfsConfig"
           }
         }
       ]
@@ -1722,6 +1884,9 @@
       "properties": {
         "container_args": {
           "$ref": "#/definitions/containerArgs"
+        },
+        "container": {
+          "$ref": "#/definitions/containerConfig"
         },
         "state_file": {
           "title": "State file",
@@ -2164,7 +2329,7 @@
         },
         "package_files": {
           "$ref": "#/definitions/stringList",
-          "description": "Glob patterns for the files 'avocado ext package' ships. Replaces the default set (the config file, overlays, compile and install scripts); the version file is always added."
+          "description": "Glob patterns for the files 'avocado ext package' ships. Replaces the default set (the config file, overlays, compile and install scripts); the version file is always added. For an extension with a compile package, these are also the declared sources of the build: 'avocado build' skips its sdk.compile sections only while these files, the scripts, the config, the SDK and the lock pins do not change. Without this list, the compile sections run on every extension build."
         },
         "release": {
           "type": "string",
@@ -2296,6 +2461,40 @@
       },
       "additionalProperties": false
     },
+    "rootfsTargetOverride": {
+      "title": "Rootfs per-target override",
+      "type": "object",
+      "description": "Settings applied over the enclosing rootfs block, or over the selected named entry, when building for that target. 'packages' and 'image' merge key by key with the base; 'overlay', 'permissions', 'post_install' and 'filesystem' replace the base's value.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "image": {
+          "$ref": "#/definitions/imageOptions"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride"
+        }
+      },
+      "additionalProperties": false
+    },
     "kernelEntry": {
       "title": "Kernel entry",
       "type": "object",
@@ -2337,7 +2536,7 @@
     "namedImageConfig": {
       "title": "Named image entry",
       "type": "object",
-      "description": "A named rootfs or initramfs entry. Only the 'default' (or sole) entry is built, and 'overlay', 'post_install', 'image' and 'source' are read only in the single-entry form.",
+      "description": "A named initramfs entry. Only the 'default' (or sole) entry is built, and 'overlay', 'post_install', 'image' and 'source' are read only in the single-entry form.",
       "properties": {
         "packages": {
           "$ref": "#/definitions/imageConfig/properties/packages"
@@ -2353,6 +2552,47 @@
         }
       },
       "additionalProperties": false
+    },
+    "namedRootfsConfig": {
+      "title": "Named rootfs entry",
+      "type": "object",
+      "description": "A named rootfs entry. Install reads the 'default' (or sole) entry; a runtime's image step reads the entry its 'rootfs: <name>' names, else that one. 'source' is read only in the single-entry form.",
+      "properties": {
+        "packages": {
+          "$ref": "#/definitions/imageConfig/properties/packages"
+        },
+        "dependencies": {
+          "$ref": "#/definitions/imageConfig/properties/dependencies"
+        },
+        "filesystem": {
+          "$ref": "#/definitions/imageConfig/properties/filesystem"
+        },
+        "overlay": {
+          "$ref": "#/definitions/imageConfig/properties/overlay"
+        },
+        "image": {
+          "$ref": "#/definitions/imageConfig/properties/image"
+        },
+        "post_install": {
+          "$ref": "#/definitions/imageConfig/properties/post_install"
+        },
+        "permissions": {
+          "$ref": "#/definitions/imageConfig/properties/permissions"
+        }
+      },
+      "patternProperties": {
+        "^target-.+$": {
+          "$ref": "#/definitions/rootfsTargetOverride",
+          "description": "Per-target override, applied over this entry and over a 'target-<name>:' block beside the entries."
+        },
+        "^kernel-.+$": {
+          "type": "object",
+          "description": "Not applied: rootfs reads only 'target-<name>:' overrides.",
+          "x-avocado-warning": "is ignored; rootfs applies 'target-<name>:' overrides only, not 'kernel-<spec>:'"
+        }
+      },
+      "additionalProperties": false,
+      "x-avocado-target-overrides": true
     },
     "runtimeImageRef": {
       "title": "Runtime image block",

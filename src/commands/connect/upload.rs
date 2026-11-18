@@ -954,7 +954,7 @@ impl ConnectUploadCommand {
 
             // Spawn a lightweight named container to stream the file via stdout
             let cat_container_name = format!("avocado-upload-{}", uuid::Uuid::new_v4());
-            let mut cmd = tokio::process::Command::new(&container.container_tool);
+            let mut cmd = crate::utils::engine::command(&container.container_tool);
             cmd.args([
                 "run",
                 "--rm",
@@ -1091,7 +1091,7 @@ impl ConnectUploadCommand {
             let completed_parts = match upload_result {
                 Ok(parts) => parts,
                 Err(e) => {
-                    let _ = tokio::process::Command::new(&container_tool)
+                    let _ = crate::utils::engine::command(&container_tool)
                         // stdio-flags-ok: docker stop timeout in seconds, not a tty
                         .args(["stop", "-t", "2", &container_name_ref])
                         .stdout(Stdio::null())
