@@ -110,9 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<config dir>/avocado/stacks.yaml` (or `AVOCADO_STACKS`) says otherwise,
   and keep 20 GiB free there unless `gc:` sets a limit. A `root:` also turns
   them on; `enabled: false` or `AVOCADO_STACKS=off` keeps them off. `commit: false` (or
-  `AVOCADO_STACKS_COMMIT=0`) reuses layers but never commits one, for jobs
-  whose inputs are not trusted, such as CI building pull requests next to
-  release builds on one host. A project installed on a plain volume moves
+  `AVOCADO_STACKS_COMMIT=0`) reuses layers but stops the CLI from committing
+  any. It is not a trust boundary: a job that runs the CLI also runs the
+  privileged helper against the shared root and can change its own
+  environment, so a job whose inputs are untrusted (CI building pull
+  requests) needs a stacks root of its own, not this setting. A project installed on a plain volume moves
   over on its next install: its outputs move into its view, and the old
   SDK tree is deleted rather than left hidden under it.
 - **`avocado stack`: see and reclaim the space stacks use.** `status`
