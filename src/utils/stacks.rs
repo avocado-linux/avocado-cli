@@ -39,13 +39,13 @@ pub fn default_helper_image() -> String {
 /// images live) are here, so secrets cannot reach a shared layer. The stamps here describe
 /// this project's builds, not the layer: the SDK and sysroot install stamps stay in layers,
 /// because they describe the tree they sit in. `dir/*` = every directory directly under
-/// `dir` (the per-runtime image stamps).
+/// `dir` (the per-runtime image stamps). `kernel/<kver>` is not here: `rootfs install` stages
+/// the packaged kernel there and pins it in the lock, so a layer hit must carry it.
 pub const PRIVATE: &[&str] = &[
     "includes",
     "extensions",
     "runtimes",
     "output",
-    "kernel",
     "var-staging",
     ".stamps/ext",
     ".stamps/runtime",
@@ -309,13 +309,47 @@ pub async fn active_root(tool: &str) -> Option<String> {
 /// kernel, image and root in `<config dir>/stacks-preflight.json`: a day when it worked, an hour
 /// when the host answered no, so hosts that cannot run stacks do not pay for it on every
 /// command. Transient failures (a pull, a daemon hiccup, no answer) are not remembered. The
-/// second value says whether the check ran now (false: from the cache).
+/// second value says whether the check ran now (false: from the cache). The whole check,
+/// docker probes included, has one deadline: a stalled daemon means plain volumes, not a hang.
 async fn preflight(
     tool: &str,
     root: &str,
     s: &Settings,
 ) -> (std::result::Result<(), String>, bool) {
-    let info = Command::new(tool)
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+    match tokio::time::timeout(LIMIT, preflight_within(tool, root, s)).await {
+        Ok(r) => r,
+        // Not remembered: nothing answered.
+        Err(_) => (
+            Err("the stacks preflight did not finish within 5 minutes".to_string()),
+            true,
+        ),
+    }
+}
+
+/// Docker refused to start the helper for a reason of this host's setup, which stays true
+/// until someone changes it, rather than a passing condition (a full disk, a restarting
+/// daemon) that may be gone on the next command.
+fn host_rejection(stderr: &str) -> bool {
+    let e = stderr.to_ascii_lowercase();
+    [
+        "privileged",
+        "rshared",
+        "shared mount",
+        "mount propagation",
+        "rootless",
+        "userns",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
+}
+
+async fn preflight_within(
+    tool: &str,
+    root: &str,
+    s: &Settings,
+) -> (std::result::Result<(), String>, bool) {
+    let info = crate::utils::engine::command(tool)
         .args(["info", "-f", "{{.ID}} {{.KernelVersion}}"])
         .output()
         .await
@@ -354,44 +388,49 @@ async fn preflight(
             return (r, false);
         }
     }
-    let bounded = |c: &mut Command| {
-        let o = c.kill_on_drop(true).output();
-        tokio::time::timeout(std::time::Duration::from_secs(300), o)
-    };
+    // The caller's deadline drops these futures, and the processes with them.
+    let bounded = |c: &mut Command| c.kill_on_drop(true).output();
     // A tag can move (`:edge`, a re-pushed release): refresh it with each real check, so a
     // newer CLI never drives an engine pulled long ago. An image with no registry (a local
     // build) is used as it is.
     if image.contains('/') && !image.contains("@sha256:") {
-        let _ = bounded(Command::new(tool).args(["pull", "-q", &image])).await;
+        let _ = bounded(crate::utils::engine::command(tool).args(["pull", "-q", &image])).await;
     }
     let image_present = || async {
-        Command::new(tool)
+        crate::utils::engine::command(tool)
             .args(["image", "inspect", &image])
             .output()
             .await
             .is_ok_and(|o| o.status.success())
     };
-    let mut a = match Helper::new(tool, root, s).args() {
-        Ok(a) => a,
-        Err(e) => return (Err(format!("{e:#}")), true),
+    // `args` asks docker for its data root synchronously: off the async threads, so the
+    // deadline still fires if that call stalls.
+    let h = Helper::new(tool, root, s);
+    let mut a = match tokio::task::spawn_blocking(move || h.args()).await {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => return (Err(format!("{e:#}")), true),
+        Err(e) => return (Err(format!("stacks preflight: {e}")), true),
     };
     a.push("preflight".into());
-    let (r, remember) = match bounded(Command::new(&a[0]).args(&a[1..]).stdin(Stdio::null())).await
+    let (r, remember) = match bounded(
+        crate::utils::engine::command(&a[0])
+            .args(&a[1..])
+            .stdin(Stdio::null()),
+    )
+    .await
     {
-        Ok(Ok(o)) if o.status.success() => (Ok(()), true),
-        Ok(Ok(o)) => {
+        Ok(o) if o.status.success() => (Ok(()), true),
+        Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            // The helper answered no (exit 1), or docker refused to run it with the image at
-            // hand (privileged containers or the bind mounts not allowed): this host's answer.
-            // A missing image is a pull problem, which may pass.
-            let answer = o.status.code() == Some(1) || image_present().await;
+            // This host's answer: the helper said no (exit 1), or docker refused to run it,
+            // with the image at hand, for a reason of its setup (privileged containers or the
+            // bind mounts not allowed). Anything else, a missing image or a container docker
+            // could not create just now, may pass and is not remembered.
+            let answer =
+                o.status.code() == Some(1) || (host_rejection(&err) && image_present().await);
             (Err(err), answer)
         }
-        Ok(Err(e)) => (Err(format!("run the stacks helper: {e}")), false),
-        Err(_) => (
-            Err("the helper did not answer within 5 minutes".to_string()),
-            false,
-        ),
+        Err(e) => (Err(format!("run the stacks helper: {e}")), false),
     };
     // Only what a known docker host answered: without `info`, nothing is known about it.
     if remember && !info.is_empty() {
@@ -470,7 +509,7 @@ impl Helper {
     pub async fn output(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut a = self.args()?;
         a.extend(args.iter().map(|s| s.to_string()));
-        Command::new(&a[0])
+        crate::utils::engine::command(&a[0])
             .args(&a[1..])
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -500,7 +539,7 @@ impl Helper {
             a.insert(2 + i, f.to_string());
         }
         a.extend(["hold".into(), name.into()]);
-        let mut child = Command::new(&a[0])
+        let mut child = crate::utils::engine::command(&a[0])
             .args(&a[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -532,7 +571,7 @@ fn volumes_dir(tool: &str) -> Result<String> {
     static DIR: std::sync::OnceLock<std::result::Result<String, String>> =
         std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let o = std::process::Command::new(tool)
+        let o = crate::utils::engine::std_command(tool)
             .args(["info", "-f", "{{.DockerRootDir}}"])
             .output()
             .map_err(|e| format!("{tool} info: {e}"))?;
@@ -846,14 +885,14 @@ pub fn orphan_reason(
 /// same image.
 pub async fn image_id(tool: &str, image: &str) -> Result<String> {
     let inspect = || async {
-        Command::new(tool)
+        crate::utils::engine::command(tool)
             .args(["image", "inspect", "--format", "{{.Id}}", image])
             .output()
             .await
     };
     let mut o = inspect().await?;
     if !o.status.success() {
-        let p = Command::new(tool)
+        let p = crate::utils::engine::command(tool)
             .args(["pull", "-q", image])
             .output()
             .await?;
@@ -947,7 +986,7 @@ impl Stacks {
 
     /// Mount (creating if new) this project's view at `<volume>/_data/<target>`.
     pub async fn ensure_view(&self) -> Result<()> {
-        let o = Command::new(&self.helper.tool)
+        let o = crate::utils::engine::command(&self.helper.tool)
             .args(["volume", "inspect", "-f", "{{.Mountpoint}}", &self.volume])
             .output()
             .await?;
@@ -1004,7 +1043,7 @@ impl Stacks {
         // This process's own parked session containers would keep the old tree: drop them
         // (they restart on demand). Anyone else's means another command is working here.
         crate::utils::container::SessionContainers::release_sessions(&self.helper.tool);
-        let o = Command::new(&self.helper.tool)
+        let o = crate::utils::engine::command(&self.helper.tool)
             .args([
                 "ps",
                 "--filter",
@@ -1130,6 +1169,9 @@ impl Stacks {
         if !self.commit {
             return self.build_uncommitted(label, key, step).await;
         }
+        // Dirty until the commit clears it: a step that changes the upper and then fails must
+        // not leave the view recorded as clean on `parent`.
+        self.helper.json(&["taint", &self.view]).await?;
         let lock = step().await?;
         let rec = self
             .helper
@@ -1409,6 +1451,21 @@ mod tests {
     /// `AVOCADO_STACKS=on` turns them on, at the default root with the release's helper image
     /// and a free-space floor; `enabled: false` keeps a configured root off, and
     /// `AVOCADO_STACKS=on` overrides the file.
+    /// Only a refusal that names this host's setup is remembered; a full disk is not.
+    #[test]
+    fn only_setup_refusals_are_cached() {
+        assert!(host_rejection(
+            "docker: Error response from daemon: privileged mode is incompatible with user namespaces."
+        ));
+        assert!(host_rejection(
+            "path /srv/stacks is mounted on / but it is not a shared mount"
+        ));
+        assert!(!host_rejection(
+            "docker: Error response from daemon: mkdir /var/lib/docker/overlay2/x: no space left on device."
+        ));
+        assert!(!host_rejection("Cannot connect to the Docker daemon"));
+    }
+
     /// `AVOCADO_STACKS=off` gets a host out of a stacks config it cannot read; anything else
     /// still reports the bad file.
     #[test]

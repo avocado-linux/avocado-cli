@@ -238,7 +238,7 @@ impl StackCommand {
     /// `Some(true/false)` when docker answered whether `volume` exists, `None` when it could
     /// not (daemon down, timeout): a view is never dropped on a non-answer.
     async fn volume_present(&self, volume: &str) -> Option<bool> {
-        let o = tokio::process::Command::new(&self.container_tool)
+        let o = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "inspect", volume])
             .output()
             .await

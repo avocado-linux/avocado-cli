@@ -1173,7 +1173,7 @@ impl SessionContainers {
     /// the project volume's mounts and would keep seeing the layer the view just left.
     pub fn release_sessions(container_tool: &str) {
         for name in Self::active_names() {
-            let _ = std::process::Command::new(container_tool)
+            let _ = crate::utils::engine::std_command(container_tool)
                 .args(["rm", "-f", &name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
