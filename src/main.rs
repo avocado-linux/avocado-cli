@@ -479,8 +479,9 @@ enum Commands {
         /// Output path relative to src_dir for provisioning artifacts
         #[arg(long = "out")]
         out: Option<String>,
-        /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        /// Additional arguments to pass to the container runtime. Not with
+        /// `--bundle`: a replay runs with the bundled config's container args.
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append, conflicts_with = "bundle")]
         container_args: Option<Vec<String>>,
         /// Additional arguments to pass to DNF commands
         #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
@@ -6129,6 +6130,30 @@ mod tests {
         assert!(matches!(
             parse_cli(&["avocado", "provision", "--dry-run"]),
             Commands::Provision { dry_run: true, .. }
+        ));
+    }
+
+    /// A replay would drop `--container-arg`: refuse it rather than ignore it.
+    #[test]
+    fn provision_bundle_refuses_container_args() {
+        let refused = on_big_stack(|| {
+            Cli::try_parse_from([
+                "avocado",
+                "provision",
+                "--bundle",
+                "b",
+                "--container-arg",
+                "--privileged",
+            ])
+            .is_err()
+        });
+        assert!(refused);
+        assert!(matches!(
+            parse_cli(&["avocado", "provision", "--container-arg", "--privileged"]),
+            Commands::Provision {
+                container_args: Some(_),
+                ..
+            }
         ));
     }
 

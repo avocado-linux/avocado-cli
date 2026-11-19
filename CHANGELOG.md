@@ -110,6 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **A runtime's `stone_manifest` in the project can be bundled.** `provision
+  --pack`, `connect upload --provisionable` and `--rubicon` refused it as
+  outside `$AVOCADO_PREFIX`. The bundle now carries the file and the replay
+  writes it back at the same path.
+- **A bundle pins the runtime it was packed for.** A runtime picked with
+  `AVOCADO_RUNTIME` was lost on the hub, so `{{ avocado.runtime }}` resolved
+  to `default_runtime` there and named other extensions. The bundled config
+  sets `default_runtime` to the packed runtime.
+- **`provision --bundle` refuses `--container-arg`.** The replay runs with the
+  bundled config's container args and dropped the flag without a word.
 - **Whitespace at the edges of a quoted container value is kept.** A
   `container.environment` value such as `PASSWORD: 'secret '` reached the
   container as `PASSWORD=secret`. Only unquoted whitespace around an entry is
