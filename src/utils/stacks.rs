@@ -580,10 +580,15 @@ impl Helper {
     }
 }
 
+/// Cached per container tool, not once per process: production has one tool, but tests run
+/// stand-ins for it side by side, and the first one asked must not answer for the rest.
 fn volumes_dir(tool: &str) -> Result<String> {
-    static DIR: std::sync::OnceLock<std::result::Result<String, String>> =
-        std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
+    static DIRS: Mutex<Vec<(String, std::result::Result<String, String>)>> = Mutex::new(Vec::new());
+    let mut dirs = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, r)) = dirs.iter().find(|(t, _)| t == tool) {
+        return r.clone().map_err(|e| anyhow::anyhow!(e));
+    }
+    let r = (|| {
         let o = crate::utils::engine::std_command(tool)
             .args(["info", "-f", "{{.DockerRootDir}}"])
             .output()
@@ -596,9 +601,9 @@ fn volumes_dir(tool: &str) -> Result<String> {
             ));
         }
         Ok(format!("{dir}/volumes"))
-    })
-    .clone()
-    .map_err(|e| anyhow::anyhow!(e))
+    })();
+    dirs.push((tool.to_string(), r.clone()));
+    r.map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Volumes whose views this process has already remounted.
@@ -756,22 +761,44 @@ pub fn key_of(inputs: &Value) -> String {
     crate::utils::signing_keys::hex::encode(&Sha256::digest(inputs.to_string().as_bytes()))
 }
 
-/// Whether a key may be shared with other projects: only when every package source is
-/// immutable, i.e. the lock pins the distro feed to a snapshot, the releasever in force is
-/// exactly that snapshot (not a user override naming a moving channel), and the project
-/// declares no `repos:` of its own (URLs and paths that can change under the same name).
-pub fn shareable(
+/// The distro feed is pinned to a snapshot and the releasever in force is exactly that
+/// snapshot (not a user override naming a moving channel).
+pub fn snapshot_pin_holds(
     snapshot: Option<&crate::utils::lockfile::RepoSnapshot>,
     releasever: Option<&str>,
-    has_custom_repos: bool,
 ) -> bool {
     let Some(s) = snapshot else { return false };
-    !has_custom_repos
-        && releasever
-            == Some(
-                crate::utils::snapshot::effective_releasever(&s.release, &s.channel, &s.snapshot)
-                    .as_str(),
-            )
+    releasever
+        == Some(
+            crate::utils::snapshot::effective_releasever(&s.release, &s.channel, &s.snapshot)
+                .as_str(),
+        )
+}
+
+/// Why this project's layers may not be shared with other projects, or `None` when they may
+/// be. Sharing needs every package source to be immutable: the snapshot pin holds for the
+/// distro feed, and no enabled custom feed lacks a recorded content identity (`first_unpinned`,
+/// from [`crate::utils::feeds::first_unpinned_feed`]); a URL can change under the same name.
+pub fn private_layers_notice(
+    snapshot: Option<&crate::utils::lockfile::RepoSnapshot>,
+    releasever: Option<&str>,
+    first_unpinned: Option<&str>,
+) -> Option<String> {
+    let unpinned = |name: &str| {
+        format!("the feed '{name}' has no recorded content identity (only a path: feed has one)")
+    };
+    let why = match (snapshot_pin_holds(snapshot, releasever), first_unpinned) {
+        (true, None) => return None,
+        (true, Some(name)) => unpinned(name),
+        (false, None) => "the distro feed is not pinned to a snapshot".to_string(),
+        (false, Some(name)) => format!(
+            "the distro feed is not pinned to a snapshot and {}",
+            unpinned(name)
+        ),
+    };
+    Some(format!(
+        "Stacks: {why}, so this project's layers are not shared."
+    ))
 }
 
 /// Whether the view already holds `key`'s tree: it is on that layer, or on one built on top
@@ -988,6 +1015,8 @@ pub struct Stacks {
     /// A step ran without committing: the view's tree is no longer any layer's, so every later
     /// step builds on it as it is (no hits, no switches).
     uncommitted: std::sync::atomic::AtomicBool,
+    /// The content-addressed feeds the layer keys hashed, re-checked before a shareable commit.
+    content_pins: Vec<crate::utils::feeds::ContentPin>,
 }
 
 /// Holds a build lock (a helper container blocked on our stdin); dropping it releases.
@@ -1010,12 +1039,18 @@ impl Stacks {
             helper: Helper::new(tool, root, &s),
             commit: s.commits(),
             uncommitted: false.into(),
+            content_pins: Vec::new(),
             volume: volume.to_string(),
             target: target.to_string(),
             project: project.to_path_buf(),
             shareable,
             steps: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The content-addressed feeds the layer keys were computed from (see `content_pins`).
+    pub fn guard_content(&mut self, pins: Vec<crate::utils::feeds::ContentPin>) {
+        self.content_pins = pins;
     }
 
     /// Mount (creating if new) this project's view at `<volume>/_data/<target>`.
@@ -1161,10 +1196,11 @@ impl Stacks {
             .push((parent.to_string(), inputs.clone(), key.clone()));
         let c = self.helper.json(&["check", &self.view, &key]).await?;
         if already_in_view(&c, &key) {
-            print_info(
-                &format!("Stacks: {label} {} already in the view.", &key[..12]),
-                OutputLevel::Normal,
-            );
+            // Not `print_info`, for the same reason as the hit and committed lines below.
+            crate::utils::output::print_info_stderr(&format!(
+                "Stacks: {label} already in the view {}.",
+                &key[..12]
+            ));
             // The project's lock may have lost pins the view's tree still has (an `unlock`
             // whose re-run lands on the same layer): give them back.
             let lock = match self.helper.json(&["record", &key]).await {
@@ -1185,14 +1221,13 @@ impl Stacks {
             && self.helper.json(&["use", &self.view, &key]).await.is_ok()
         {
             let rec = self.helper.json(&["record", &key]).await?;
-            print_info(
-                &format!(
-                    "Stacks: {label} hit {} ({:.1}s).",
-                    &key[..12],
-                    t.elapsed().as_secs_f64()
-                ),
-                OutputLevel::Normal,
-            );
+            // Not `print_info`: under `avocado install` the TUI renderer makes that a
+            // no-op, and whether a layer was reused is the point of the line.
+            crate::utils::output::print_info_stderr(&format!(
+                "Stacks: {label} hit {} ({:.1}s).",
+                &key[..12],
+                t.elapsed().as_secs_f64()
+            ));
             return Ok(StepResult {
                 key,
                 outcome: Outcome::Hit,
@@ -1207,6 +1242,26 @@ impl Stacks {
         // not leave the view recorded as clean on `parent`.
         self.helper.json(&["taint", &self.view]).await?;
         let lock = step().await?;
+        // The key carries each path feed's digest as resolved at the start of the invocation.
+        // A feed re-indexed since then put other RPMs in this tree: committed under this key,
+        // projects still on the old digest would reuse them.
+        if self.shareable {
+            if let Some(name) = crate::utils::feeds::first_moved_feed(&self.content_pins) {
+                // The view stays dirty: it was tainted before the step and no commit clears it.
+                self.uncommitted
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::utils::output::print_info_stderr(&format!(
+                    "Stacks: {label} built in the view, not committed: the feed '{name}' \
+                     changed after this install computed its layer keys. Run the install \
+                     again to share its layers."
+                ));
+                return Ok(StepResult {
+                    key,
+                    outcome: Outcome::Built,
+                    lock: Value::Null,
+                });
+            }
+        }
         let rec = self
             .helper
             .json(&[
@@ -1218,18 +1273,15 @@ impl Stacks {
                     .to_string(),
             ])
             .await?;
-        print_info(
-            &format!(
-                "Stacks: {label} committed {} ({} files, {} new objects, {} new; commit {:.1}s, step total {:.1}s).",
-                &key[..12],
-                rec["files"],
-                rec["new_objects"],
-                human_bytes(rec["new_bytes"].as_u64().unwrap_or(0)),
-                rec["secs"].as_f64().unwrap_or(0.0),
-                t.elapsed().as_secs_f64()
-            ),
-            OutputLevel::Normal,
-        );
+        crate::utils::output::print_info_stderr(&format!(
+            "Stacks: {label} committed {} ({} files, {} new objects, {} new; commit {:.1}s, step total {:.1}s).",
+            &key[..12],
+            rec["files"],
+            rec["new_objects"],
+            human_bytes(rec["new_bytes"].as_u64().unwrap_or(0)),
+            rec["secs"].as_f64().unwrap_or(0.0),
+            t.elapsed().as_secs_f64()
+        ));
         Ok(StepResult {
             key,
             outcome: Outcome::Built,
@@ -1254,7 +1306,10 @@ impl Stacks {
         self.helper.json(&["taint", &self.view]).await?;
         step().await?;
         print_info(
-            &format!("Stacks: {label} built in the view, not committed (commit: false)."),
+            &format!(
+                "Stacks: {label} built in the view, not committed{}.",
+                if self.commit { "" } else { " (commit: false)" }
+            ),
             OutputLevel::Normal,
         );
         Ok(StepResult {
@@ -1321,17 +1376,205 @@ mod tests {
         }
     }
 
+    const NOT_PINNED: &str =
+        "Stacks: the distro feed is not pinned to a snapshot, so this project's layers are not shared.";
+
     #[test]
     fn only_snapshot_pinned_feeds_are_shareable() {
         let s = snap();
         let pinned = crate::utils::snapshot::effective_releasever("2026", "edge", "20261027-1");
-        assert!(shareable(Some(&s), Some(&pinned), false));
+        assert_eq!(private_layers_notice(Some(&s), Some(&pinned), None), None);
         // A moving channel exported by hand, or no pin at all.
-        assert!(!shareable(Some(&s), Some("2026/edge"), false));
-        assert!(!shareable(None, Some(&pinned), false));
-        assert!(!shareable(Some(&s), None, false));
-        // Project feeds (URLs, paths) can change under the same name.
-        assert!(!shareable(Some(&s), Some(&pinned), true));
+        for (snapshot, releasever) in [
+            (Some(&s), Some("2026/edge")),
+            (None, Some(pinned.as_str())),
+            (Some(&s), None),
+        ] {
+            assert_eq!(
+                private_layers_notice(snapshot, releasever, None).as_deref(),
+                Some(NOT_PINNED)
+            );
+        }
+    }
+
+    #[test]
+    fn notice_names_the_first_unpinned_feed() {
+        let s = snap();
+        let pinned = crate::utils::snapshot::effective_releasever("2026", "edge", "20261027-1");
+        assert_eq!(
+            private_layers_notice(Some(&s), Some(&pinned), Some("mirror")).as_deref(),
+            Some(
+                "Stacks: the feed 'mirror' has no recorded content identity (only a path: feed \
+                 has one), so this project's layers are not shared."
+            )
+        );
+        // No snapshot pin either: both reasons, the feed still named.
+        assert_eq!(
+            private_layers_notice(None, Some(&pinned), Some("mirror")).as_deref(),
+            Some(
+                "Stacks: the distro feed is not pinned to a snapshot and the feed 'mirror' has \
+                 no recorded content identity (only a path: feed has one), so this project's \
+                 layers are not shared."
+            )
+        );
+    }
+
+    /// A `Stacks` whose helper is a script standing in for docker: it logs each helper
+    /// subcommand to `<dir>/calls` and answers `check` with a miss, or with the asked key
+    /// in the view when `in_view` is set.
+    fn fake_stacks(
+        dir: &Path,
+        in_view: bool,
+        pins: Vec<crate::utils::feeds::ContentPin>,
+    ) -> Stacks {
+        let check = if in_view {
+            r#"echo "{\"current\":\"$3\",\"canonical\":\"$3\",\"ancestors\":[]}""#
+        } else {
+            r#"echo '{"current":null,"canonical":"x","ancestors":[]}'"#
+        };
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = info ]; then echo /fake; exit 0; fi
+if [ "$1" != run ]; then exit 0; fi
+while [ "$1" != --root ]; do shift; done
+shift 2
+echo "$*" >> '{calls}'
+case "$1" in
+  check) {check} ;;
+  has) exit 1 ;;
+  hold) echo "held 0"; cat >/dev/null ;;
+  commit) echo '{{"files":1,"new_objects":1,"new_bytes":1,"secs":0.1}}' ;;
+  record) echo '{{"inputs":{{"lock":{{"a":"1"}}}}}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            calls = dir.join("calls").display()
+        );
+        let tool = dir.join("docker");
+        std::fs::write(&tool, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread that forked while the script was open for writing holds it
+        // until that child execs; running it meanwhile fails with ETXTBSY.
+        const ETXTBSY: i32 = 26;
+        for _ in 0..100 {
+            match std::process::Command::new(&tool).arg("info").output() {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                r => {
+                    r.unwrap();
+                    break;
+                }
+            }
+        }
+        Stacks {
+            view: "v".into(),
+            helper: Helper {
+                tool: tool.to_string_lossy().into(),
+                root: dir.to_string_lossy().into(),
+                image: "img".into(),
+            },
+            volume: "vol".into(),
+            target: "t".into(),
+            project: dir.to_path_buf(),
+            shareable: true,
+            steps: Mutex::new(Vec::new()),
+            commit: true,
+            uncommitted: false.into(),
+            content_pins: pins,
+        }
+    }
+
+    fn helper_calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// A path feed re-indexed after the layer key was derived (here: while the step runs)
+    /// would commit the new RPMs under the old digest's key, which projects still on the old
+    /// digest would then reuse. The step must stay uncommitted instead.
+    #[tokio::test]
+    async fn a_feed_that_moved_since_the_key_was_derived_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = dir.path().join("feed");
+        std::fs::create_dir_all(feed.join("repodata")).unwrap();
+        std::fs::write(feed.join("repodata/repomd.xml"), "<repomd>one</repomd>").unwrap();
+        let pin = crate::utils::feeds::ContentPin {
+            name: "local".into(),
+            dir: feed.clone(),
+            digest: crate::utils::signing_keys::hex::encode(&Sha256::digest(
+                b"<repomd>one</repomd>",
+            )),
+        };
+        let s = fake_stacks(dir.path(), false, vec![pin.clone()]);
+        let r = s
+            .step("L0 sdk bootstrap", "empty", &json!({"a": 1}), || async {
+                std::fs::write(feed.join("repodata/repomd.xml"), "<repomd>two</repomd>")?;
+                Ok(json!({}))
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.outcome, Outcome::Built);
+        let calls = helper_calls(dir.path());
+        assert_eq!(
+            calls.iter().filter(|c| *c == "taint").count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(!calls.contains(&"commit".to_string()), "{calls:?}");
+
+        // The control: an unchanged feed commits.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(feed.join("repodata/repomd.xml"), "<repomd>one</repomd>").unwrap();
+        let s = fake_stacks(dir.path(), false, vec![pin]);
+        s.step("L0 sdk bootstrap", "empty", &json!({"a": 1}), || async {
+            Ok(json!({}))
+        })
+        .await
+        .unwrap();
+        let calls = helper_calls(dir.path());
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("commit"),
+            "{calls:?}"
+        );
+    }
+
+    /// `avocado install` runs `sdk install` under its task renderer, which swallows
+    /// `print_info`. A re-run whose layers are all in the view must still say so, like the
+    /// hit and committed lines do.
+    #[test]
+    fn the_in_view_line_shows_under_the_install_renderer() {
+        use crate::utils::tui::{self, TaskRenderer};
+        let g = tui::TEST_RENDERER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let s = fake_stacks(dir.path(), true, Vec::new());
+        let r = std::sync::Arc::new(TaskRenderer::new_test());
+        tui::set_active_renderer(&r);
+        let res = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(s.step("L1 target base", "p", &json!({"a": 1}), || async {
+                bail!("a step already in the view must not run")
+            }));
+        tui::clear_active_renderer();
+        // Released before asserting: a failure here must not poison the lock for tui's tests.
+        drop(g);
+        let res = res.unwrap();
+        assert_eq!(res.outcome, Outcome::InView);
+        let line = format!(
+            "\x1b[94m[INFO]\x1b[0m Stacks: L1 target base already in the view {}.",
+            &res.key[..12]
+        );
+        let out = r.get_test_output();
+        assert!(out.contains(&line), "{out:?}");
     }
 
     #[test]

@@ -859,28 +859,38 @@ impl SdkInstallCommand {
                 .get_or_create_volume(&container_helper.cwd)
                 .await?;
                 let project = config.project_root(&self.config_path);
-                let shareable = crate::utils::stacks::shareable(
-                    LockFile::load(&project)?.get_repo_snapshot(&target),
-                    std::env::var("AVOCADO_RELEASEVER").ok().as_deref(),
-                    config.repos.as_ref().is_some_and(|r| !r.is_empty()),
+                let lock = LockFile::load(&project)?;
+                let releasever = std::env::var("AVOCADO_RELEASEVER").ok();
+                // From the feed set this invocation pinned, which the layer keys hash: a
+                // fresh resolve re-reads each path feed and can describe other digests.
+                let notice = crate::utils::stacks::private_layers_notice(
+                    lock.get_repo_snapshot(&target),
+                    releasever.as_deref(),
+                    feeds
+                        .as_ref()
+                        .and_then(|f| f.first_unpinned_feed.as_deref()),
                 );
                 // The volume's own source path (absolute, the one the volume reaper trusts),
                 // not the config-relative project root: `avocado stack prune` judges the view
                 // by it from any directory.
-                let s = crate::utils::stacks::Stacks::new(
+                let mut s = crate::utils::stacks::Stacks::new(
                     &root,
                     &container_helper.container_tool,
                     &vs.volume_name,
                     &target,
                     std::path::Path::new(&vs.source_path),
-                    shareable,
+                    notice.is_none(),
                 )?;
-                if !shareable {
-                    print_info(
-                        "Stacks: the feed is not pinned to a snapshot (or the project declares \
-                         its own repos), so this project's layers are not shared.",
-                        OutputLevel::Normal,
-                    );
+                s.guard_content(
+                    feeds
+                        .as_ref()
+                        .map(|f| f.content_pins.clone())
+                        .unwrap_or_default(),
+                );
+                if let Some(notice) = &notice {
+                    // Not `print_info`: under `avocado install` the TUI renderer makes
+                    // that a no-op, and the user needs to know sharing is off.
+                    crate::utils::output::print_info_stderr(notice);
                 }
                 // One install at a time per view: the steps switch the view's layer.
                 _install_lock = Some(s.lock_install().await?);
@@ -3159,6 +3169,42 @@ runtimes:
         Section,
     }
 
+    /// One enabled feed, `extra`, of each shape a `repos.extra.*` field is checked against.
+    const URL_FEED: &[(&str, &str)] = &[
+        ("distro.feeds", "[extra]"),
+        (
+            "repos.extra",
+            "{url: 'https://example.com/extra/$releasever'}",
+        ),
+    ];
+    const RELEASE_FEED: &[(&str, &str)] = &[
+        ("distro.feeds", "[extra]"),
+        (
+            "repos.extra",
+            "{url: 'https://example.com/extra/$releasever', release: '2024', channel: stable}",
+        ),
+    ];
+    const CREDENTIAL_FEED: &[(&str, &str)] = &[
+        ("distro.feeds", "[extra]"),
+        (
+            "repos.extra",
+            "{url: 'https://example.com/extra/$releasever', username: me, password: secret}",
+        ),
+    ];
+    const PATH_FEED: &[(&str, &str)] = &[
+        ("distro.feeds", "[extra]"),
+        ("repos.extra", "{path: ./feed-a}"),
+    ];
+    const ORG_FEED: &[(&str, &str)] =
+        &[("distro.feeds", "[extra]"), ("repos.extra", "{org: acme}")];
+    const LOOPBACK_FEED: &[(&str, &str)] = &[
+        ("distro.feeds", "[extra]"),
+        (
+            "repos.extra",
+            "{url: 'http://localhost:8080/r', rewrite_loopback: false}",
+        ),
+    ];
+
     /// Every field of the config schema, top level and inside the sections `sdk install` reads.
     /// A field added to the schema fails `every_config_field_is_classified_for_stack_keys` until
     /// it is classified here, so nobody adds an install input that silently shares layers
@@ -3188,8 +3234,7 @@ runtimes:
         ("distro.channel", KeyRole::Keyed(L0, "next")),
         (
             "distro.feeds",
-            // A declared repo alone already makes layers private; enabling it must move the
-            // key on top of that.
+            // A declared repo is only a definition; enabling it must move the key.
             KeyRole::KeyedOver(
                 L1,
                 &[(
@@ -3276,12 +3321,64 @@ runtimes:
             "provision_profiles",
             KeyRole::Unread("provisioning, after install"),
         ),
+        // Each field of one enabled feed, `extra` (see `schema_fields`).
+        ("repos", KeyRole::Section),
         (
-            "repos",
-            KeyRole::Unread(
-                "definitions only: distro.feeds enables them (keyed); declaring any makes the \
-                 project's layers private (stacks::shareable)",
-            ),
+            "repos.extra.ca",
+            KeyRole::Unread("TLS trust for the fetch, not what is fetched"),
+        ),
+        (
+            "repos.extra.channel",
+            KeyRole::KeyedOver(L0, RELEASE_FEED, "beta"),
+        ),
+        (
+            "repos.extra.gpgcheck",
+            KeyRole::KeyedOver(L0, URL_FEED, "true"),
+        ),
+        (
+            "repos.extra.gpgkey",
+            KeyRole::KeyedOver(L0, URL_FEED, "'file:///k.asc'"),
+        ),
+        ("repos.extra.org", KeyRole::KeyedOver(L0, ORG_FEED, "other")),
+        (
+            "repos.extra.password",
+            KeyRole::Unread("a secret; the username's identity is keyed"),
+        ),
+        (
+            "repos.extra.path",
+            KeyRole::KeyedOver(L0, PATH_FEED, "./feed-b"),
+        ),
+        (
+            "repos.extra.release",
+            KeyRole::KeyedOver(L0, RELEASE_FEED, "'2099'"),
+        ),
+        (
+            "repos.extra.releasever",
+            KeyRole::KeyedOver(L0, URL_FEED, "'2099/beta'"),
+        ),
+        (
+            "repos.extra.rewrite_loopback",
+            KeyRole::KeyedOver(L0, LOOPBACK_FEED, "true"),
+        ),
+        (
+            "repos.extra.stages",
+            KeyRole::KeyedOver(L0, URL_FEED, "[rootfs]"),
+        ),
+        (
+            "repos.extra.targets",
+            KeyRole::KeyedOver(L0, URL_FEED, "[other]"),
+        ),
+        (
+            "repos.extra.tls_verify",
+            KeyRole::KeyedOver(L0, URL_FEED, "false"),
+        ),
+        (
+            "repos.extra.url",
+            KeyRole::KeyedOver(L0, URL_FEED, "'https://example.com/other/$releasever'"),
+        ),
+        (
+            "repos.extra.username",
+            KeyRole::KeyedOver(L0, CREDENTIAL_FEED, "someone"),
         ),
         ("rootfs", KeyRole::Section),
         (
@@ -3385,13 +3482,12 @@ runtimes:
         let root = config.project_root(&path);
         let lock = LockFile::load(&root)?;
         let lock_json = serde_json::to_value(lock.targets.get(target))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        // A fresh resolve per config, not `materialize_feeds`: that pins the first feed set
+        // for the process, so every later config would hash the same feeds.
         let feeds = |stage| -> anyhow::Result<Option<String>> {
-            Ok(rt
-                .block_on(config.materialize_feeds(target, stage, &path))?
-                .map(|f| f.fingerprint))
+            crate::utils::feeds::ResolvedFeedSet::resolve(config, target, &root, None)?
+                .map(|set| set.layer_key_fingerprint(stage))
+                .transpose()
         };
         let (sdk_feeds, target_dev_feeds) = (feeds(FeedStage::Sdk)?, feeds(FeedStage::SdkTarget)?);
         let (repo_url, repo_release) = (config.get_sdk_repo_url(), config.get_sdk_repo_release());
@@ -3587,8 +3683,14 @@ runtimes:
                 .iter()
                 .any(|(f, r)| f == top && matches!(r, KeyRole::Section));
             if is_section {
-                if let Some(props) = resolve(node, &defs)["properties"].as_object() {
+                let node = resolve(node, &defs);
+                if let Some(props) = node["properties"].as_object() {
                     out.extend(props.keys().map(|k| format!("{top}.{k}")));
+                } else if let Some(props) =
+                    resolve(&node["additionalProperties"], &defs)["properties"].as_object()
+                {
+                    // A map of named entries (`repos`): the fields of one entry, `extra`.
+                    out.extend(props.keys().map(|k| format!("{top}.extra.{k}")));
                 }
             }
         }
@@ -3620,6 +3722,14 @@ runtimes:
             "#!/bin/sh\nexit 0\n",
         )
         .unwrap();
+        for feed in ["feed-a", "feed-b"] {
+            std::fs::create_dir_all(t.path().join(feed).join("repodata")).unwrap();
+            std::fs::write(
+                t.path().join(feed).join("repodata/repomd.xml"),
+                format!("<repomd>{feed}</repomd>"),
+            )
+            .unwrap();
+        }
         let base_config = key_roles_config();
         let base = stack_layer_keys(t.path(), &base_config).unwrap();
         let (mut unmoved, mut invalid) = (Vec::new(), Vec::new());
