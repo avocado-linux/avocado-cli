@@ -113,13 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A runtime's `stone_manifest` in the project can be bundled.** `provision
   --pack`, `connect upload --provisionable` and `--rubicon` refused it as
   outside `$AVOCADO_PREFIX`. The bundle now carries the file and the replay
-  writes it back at the same path.
-- **A bundle pins the runtime it was packed for.** A runtime picked with
+  writes it back at the same path, never through a symlink.
+- **A bundle pins the runtime its pack resolved.** A runtime picked with
   `AVOCADO_RUNTIME` was lost on the hub, so `{{ avocado.runtime }}` resolved
   to `default_runtime` there and named other extensions. The bundled config
-  sets `default_runtime` to the packed runtime.
-- **`provision --bundle` refuses `--container-arg`.** The replay runs with the
-  bundled config's container args and dropped the flag without a word.
+  sets `default_runtime` to the runtime the pack resolved.
+- **`provision --bundle` refuses `--container-arg`, `--dnf-arg`, `--out`,
+  `--force` and `--target`.** The replay carries none of them and dropped
+  them without a word.
 - **`deploy -d` refuses a device string with shell syntax in it.** The user
   and host were pasted into the deploy script that runs in the SDK container, so
   `-d '$(cmd)'` ran `cmd` there. The user may now hold only letters, digits,

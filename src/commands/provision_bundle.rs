@@ -489,7 +489,6 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
     let (ext_sources, avocado_yaml) = pack_ext_sources(
         p.config_path,
         p.target,
-        p.runtime,
         &required_extensions(p.composed, p.target)?,
         &stage.join("blobs"),
     )?;
@@ -602,7 +601,6 @@ pub fn required_extensions(composed: &ComposedConfig, target: &str) -> Result<Ha
 pub fn pack_ext_sources(
     config_path: &Path,
     target: &str,
-    runtime: &str,
     required: &HashSet<String>,
     blobs: &Path,
 ) -> Result<(Vec<ExtSourceArchive>, String)> {
@@ -658,14 +656,17 @@ pub fn pack_ext_sources(
     if let Some(board) = &ctx.target_board {
         pin_board(&mut doc, board);
     }
-    // The runtime may have been chosen by `AVOCADO_RUNTIME`, which the hub
-    // does not have: `{{ avocado.runtime }}` must resolve to it there too.
-    if doc
-        .get("runtimes")
-        .and_then(|r| r.as_mapping())
-        .is_some_and(|r| r.contains_key(runtime))
-    {
-        doc["default_runtime"] = runtime.into();
+    // Pin the runtime this pack resolved `{{ avocado.runtime }}` with (often
+    // from `AVOCADO_RUNTIME`, which the hub does not have), so the hub
+    // resolves the same extensions the bundle carries. Checked against the
+    // interpolated runtime names: a key may itself be templated.
+    if let Some(rt) = ctx.runtime.clone().filter(|rt| {
+        resolved
+            .get("runtimes")
+            .and_then(|r| r.as_mapping())
+            .is_some_and(|r| r.contains_key(rt.as_str()))
+    }) {
+        doc["default_runtime"] = rt.into();
     }
     if let Some(exts) = doc.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
         for (_, ext) in exts.iter_mut() {
@@ -738,6 +739,27 @@ fn norm_rel(p: &str) -> String {
         .filter(|c| !c.is_empty() && *c != ".")
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Refuse `rel` under `dir` when it, or any directory on the way to it, is a
+/// symlink: a write there could land outside `dir`.
+fn refuse_symlinks_under(dir: &Path, rel: &str) -> Result<()> {
+    let mut at = dir.to_path_buf();
+    for c in rel.split('/') {
+        at.push(c);
+        match std::fs::symlink_metadata(&at) {
+            Ok(md) if md.file_type().is_symlink() => {
+                bail!(
+                    "{} is a symlink; the bundle will not write through it",
+                    at.display()
+                )
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// A runtime's `stone_manifest` in the project, as the bundle carries it.
@@ -871,9 +893,10 @@ fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()>
         if !src_include_rel(rel) {
             bail!("bundle stone manifest {rel:?} is not valid");
         }
-        let path = cwd.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap_or(cwd))?;
-        std::fs::write(path, body)?;
+        refuse_symlinks_under(cwd, rel)?;
+        let dest = cwd.join(rel);
+        std::fs::create_dir_all(dest.parent().unwrap_or(cwd))?;
+        std::fs::write(dest, body)?;
     }
     Ok(())
 }
@@ -1301,7 +1324,6 @@ mod tests {
         pack_ext_sources(
             cfg,
             "t",
-            "r",
             &required_extensions(&composed, "t").unwrap(),
             blobs,
         )
@@ -1549,21 +1571,51 @@ mod tests {
         assert_eq!(doc["default_target_board"].as_str(), Some("b2"), "{yaml}");
     }
 
-    /// A runtime chosen by `AVOCADO_RUNTIME` on the packing host: the hub has
-    /// no such variable, so the bundled config names the packed runtime.
+    /// The bundle pins the runtime the pack resolved `{{ avocado.runtime }}`
+    /// with: `AVOCADO_RUNTIME` on the packing host (which the hub lacks), else
+    /// `default_runtime`, matched against the interpolated runtime names.
     #[test]
-    #[serial_test::serial] // interpolation reads AVOCADO_RUNTIME, which serial tests set
-    fn the_bundle_pins_the_runtime_it_was_packed_for() {
+    #[serial_test::serial] // sets AVOCADO_RUNTIME
+    fn the_bundle_pins_the_runtime_the_pack_resolved() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("avocado.yaml");
-        std::fs::write(
-            &cfg,
-            "default_target: t\ndefault_runtime: dev\nruntimes:\n  dev: {}\n  r: {}\n",
-        )
-        .unwrap();
-        let (_, yaml) = pack(&cfg, &tmp.path().join("blobs"));
-        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(doc["default_runtime"].as_str(), Some("r"), "{yaml}");
+        let pinned = |yaml: &str, env: Option<&str>| {
+            std::fs::write(&cfg, yaml).unwrap();
+            match env {
+                Some(rt) => std::env::set_var("AVOCADO_RUNTIME", rt),
+                None => std::env::remove_var("AVOCADO_RUNTIME"),
+            }
+            let (_, out) = pack(&cfg, &tmp.path().join("blobs"));
+            std::env::remove_var("AVOCADO_RUNTIME");
+            let doc: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+            doc["default_runtime"].as_str().map(String::from)
+        };
+        let plain = "default_target: t\ndefault_runtime: dev\nruntimes:\n  dev: {}\n  r: {}\n";
+        assert_eq!(pinned(plain, Some("r")).as_deref(), Some("r"));
+        // No AVOCADO_RUNTIME: the pack resolved `dev`, so the hub must too,
+        // whichever runtime is provisioned.
+        assert_eq!(pinned(plain, None).as_deref(), Some("dev"));
+        let templated = "default_target: t\nalt_name: alt\ndefault_runtime: dev\nruntimes:\n  dev: {}\n  '{{ config.alt_name }}': {}\n";
+        assert_eq!(pinned(templated, Some("alt")).as_deref(), Some("alt"));
+    }
+
+    /// The replay writes the stone manifest on the host before the SDK
+    /// container starts: never through a symlink in the replay directory.
+    #[test]
+    #[cfg(unix)]
+    fn a_stone_manifest_is_never_written_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, outside) = (tmp.path().join("hub"), tmp.path().join("outside"));
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, hub.join("boards")).unwrap();
+        std::os::unix::fs::symlink(outside.join("f"), hub.join("m.json")).unwrap();
+        for rel in ["boards/stone.json", "m.json"] {
+            let mut meta = meta("x86_64");
+            meta.stone_manifest = Some((rel.into(), "{}".into()));
+            assert!(unpack_ext_sources(&meta, &hub, &hub).is_err(), "{rel}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]
