@@ -115,6 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **`deploy -d` refuses a device string with shell syntax in it.** The user
+  and host were pasted into the deploy script that runs in the SDK container, so
+  `-d '$(cmd)'` ran `cmd` there. The user may now hold only letters, digits,
+  `.`, `_` and `-`, and the host only those plus the `:` and `%` of an IPv6
+  address, or a bracketed IPv6 address (`[::1]:2222`, `[fe80::1%eth0]`);
+  neither may start with `-`. The script also escapes both values.
 - **Whitespace at the edges of a quoted container value is kept.** A
   `container.environment` value such as `PASSWORD: 'secret '` reached the
   container as `PASSWORD=secret`. Only unquoted whitespace around an entry is

@@ -6,6 +6,7 @@ use crate::utils::{
     lockfile::LockFile,
     output::{print_info, print_success, print_warning, OutputLevel},
     output_format::{emit_json_event, is_json_output_active},
+    shell::shell_escape_double_quoted,
     stamps::{generate_batch_read_stamps_script, validate_stamps_batch, StampRequirement},
     target::resolve_target_required,
     update_repo::{self, HashCollectionOutput},
@@ -57,6 +58,32 @@ impl DeviceSpec {
         } else {
             (host_port.to_string(), None)
         };
+
+        // Both reach a shell script and the ssh command line: only the
+        // characters a user name, hostname, IPv4 or IPv6 address can hold.
+        let ok = |v: &str, extra: &[char]| {
+            !v.starts_with('-')
+                && v.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || extra.contains(&c)
+                })
+        };
+        anyhow::ensure!(ok(&user, &[]), "Invalid user in device string '{device}'");
+        anyhow::ensure!(
+            match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+                // A bracketed IPv6 address, the form that can carry a port.
+                Some(ip) => {
+                    let (addr, zone) = ip.split_once('%').unwrap_or((ip, ""));
+                    !addr.is_empty()
+                        && addr
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+                        && (zone.is_empty() != ip.contains('%'))
+                        && ok(zone, &[])
+                }
+                None => ok(&host, &[':', '%']),
+            },
+            "Invalid host in device string '{device}': use a hostname or an IP address"
+        );
 
         Ok(Self { user, host, port })
     }
@@ -998,9 +1025,9 @@ fi
 "#,
             runtime_name = self.runtime_name,
             runtime_uuid = runtime_uuid,
-            ssh_dest = spec.ssh_destination(),
+            ssh_dest = shell_escape_double_quoted(&spec.ssh_destination()),
             ssh_port_args = spec.ssh_port_args(),
-            device_host = spec.host,
+            device_host = shell_escape_double_quoted(&spec.host),
             port = port,
             staging_dir = DEPLOY_STAGING_DIR,
         );
@@ -1419,6 +1446,71 @@ mod tests {
     #[test]
     fn test_device_spec_empty_user_fails() {
         assert!(DeviceSpec::parse("@host").is_err());
+    }
+
+    /// The device string reaches a shell script: nothing a shell would
+    /// expand, split or read as an option gets through.
+    #[test]
+    fn test_device_spec_rejects_shell_syntax() {
+        for bad in [
+            "$(id>&2)",
+            "`id`",
+            "root@$(id)",
+            "a${IFS}b",
+            "host;id",
+            "host id",
+            "\"host\"",
+            "-oProxyCommand=id",
+            "$(id)@host",
+            "-x@host",
+            "host\nid",
+        ] {
+            assert!(DeviceSpec::parse(bad).is_err(), "{bad}");
+        }
+        for bad in ["[]", "[::1%]", "[::1]x", "[$(id)]", "[::1%$(id)]", "[::g]"] {
+            assert!(DeviceSpec::parse(bad).is_err(), "{bad}");
+        }
+        for good in ["fe80::1%eth0", "my_host.local", "deploy-user@10.0.0.1:2222"] {
+            assert!(DeviceSpec::parse(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn test_device_spec_bracketed_ipv6() {
+        let spec = DeviceSpec::parse("root@[::1]:2222").unwrap();
+        assert_eq!(spec.host, "[::1]");
+        assert_eq!(spec.port, Some(2222));
+        let spec = DeviceSpec::parse("[fe80::1%eth0]").unwrap();
+        assert_eq!(spec.host, "[fe80::1%eth0]");
+        assert_eq!(spec.port, None);
+
+        let cmd = RuntimeDeployCommand::new(
+            "test-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            "root@[::1]:2222".to_string(),
+            None,
+            None,
+        );
+        let script = cmd.create_deploy_script("x86_64", "uuid").unwrap();
+        assert!(script.contains("SSH_DEST=\"root@[::1]\""));
+        assert!(script.contains("DEVICE_HOST=\"[::1]\""));
+        assert!(script.contains("SSH_PORT_ARGS=\"-p 2222\""));
+    }
+
+    #[test]
+    fn test_create_deploy_script_refuses_an_injected_host() {
+        let cmd = RuntimeDeployCommand::new(
+            "test-runtime".to_string(),
+            "avocado.yaml".to_string(),
+            false,
+            Some("x86_64".to_string()),
+            "root@$(id>&2)".to_string(),
+            None,
+            None,
+        );
+        assert!(cmd.create_deploy_script("x86_64", "uuid").is_err());
     }
 
     // --- RuntimeDeployCommand tests ---
