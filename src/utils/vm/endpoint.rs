@@ -10,9 +10,13 @@
 //! The port file doubles as the "is the socket there?" marker, so callers
 //! that used to test `qmp.sock` for existence test the endpoint instead.
 //!
-//! Loopback TCP has no filesystem permissions: any local process can
-//! connect. That matches what a default-ACL named pipe would give and is
-//! the accepted trade-off for the Windows host.
+//! Loopback TCP has no filesystem permissions: any process of any local
+//! account can connect, unlike a Unix socket in the user's state dir (or a
+//! default-ACL named pipe, which other users can only read). Another local
+//! account can therefore drive QMP with the rights of the account running
+//! QEMU, and the VM's dockerd, which has the workspace mounted, through the
+//! supervisor's docker listener. That is accepted for a single-user dev
+//! box; a shared Windows host should not run the avocado-vm.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};

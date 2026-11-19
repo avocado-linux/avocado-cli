@@ -330,13 +330,34 @@ pub mod smb {
         })
     }
 
-    /// A new password for the share account: 244 random bits as hex, so it
-    /// needs no escaping in a mount option or a PowerShell string.
-    fn new_password() -> String {
+    /// A new password for the share account: 244 random bits as hex, plus a
+    /// fixed `Aa1!` so it meets Windows' complexity policy (three of upper,
+    /// lower, digit, symbol), which managed machines enforce. None of it
+    /// needs escaping in a mount option (`,` would), a guest shell line or
+    /// a PowerShell string (`'` would).
+    pub(super) fn new_password() -> String {
         format!(
-            "{}{}",
+            "{}{}Aa1!",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    /// The elevated child's argument list. The setup script travels inside
+    /// it as `-EncodedCommand` (base64 of UTF-16LE), so nothing the elevated
+    /// side executes is a file the unelevated user could swap before an
+    /// administrator approves the prompt. The other paths are only data.
+    pub(super) fn elevated_args(workspace: &Path, secret: &Path, result: &Path) -> String {
+        let command = format!(
+            "& {{\n{SETUP_SCRIPT}\n}} -Workspace {} -PasswordFile {} -ResultFile {}",
+            ps_quote(&workspace.to_string_lossy()),
+            ps_quote(&secret.to_string_lossy()),
+            ps_quote(&result.to_string_lossy()),
+        );
+        let utf16: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        format!(
+            "-NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, utf16)
         )
     }
 
@@ -401,9 +422,6 @@ pub mod smb {
              administrator approval)…",
             workspace.display()
         ));
-        let script = paths.root.join("smb_share_setup.ps1");
-        std::fs::write(&script, SETUP_SCRIPT)
-            .with_context(|| format!("writing {}", script.display()))?;
         let result = paths.root.join("share-setup.result");
         let _ = std::fs::remove_file(&result);
 
@@ -418,21 +436,7 @@ pub mod smb {
         std::fs::write(&secret, &password)
             .with_context(|| format!("writing {}", secret.display()))?;
 
-        // The elevated child's own argument list: every value double-quoted.
-        let child_args = [
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-File".to_string(),
-            format!("\"{}\"", script.display()),
-            "-Workspace".to_string(),
-            format!("\"{}\"", workspace.display()),
-            "-PasswordFile".to_string(),
-            format!("\"{}\"", secret.display()),
-            "-ResultFile".to_string(),
-            format!("\"{}\"", result.display()),
-        ]
-        .join(" ");
+        let child_args = elevated_args(workspace, &secret, &result);
         let command = format!(
             "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList {}",
             ps_quote(&child_args)
@@ -442,7 +446,6 @@ pub mod smb {
         let out = out?;
         let status = std::fs::read_to_string(&result).unwrap_or_default();
         let _ = std::fs::remove_file(&result);
-        let _ = std::fs::remove_file(&script);
         if status.trim() == "ok" {
             return Ok(());
         }
@@ -510,6 +513,47 @@ pub mod smb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows' complexity policy wants three of upper, lower, digit and
+    /// symbol; the password must also need no escaping where it goes.
+    #[test]
+    fn the_share_password_meets_windows_complexity() {
+        let p = smb::new_password();
+        let classes = [
+            p.chars().any(|c| c.is_ascii_uppercase()),
+            p.chars().any(|c| c.is_ascii_lowercase()),
+            p.chars().any(|c| c.is_ascii_digit()),
+            p.chars().any(|c| !c.is_ascii_alphanumeric()),
+        ];
+        assert!(classes.iter().filter(|&&c| c).count() >= 3, "{p}");
+        assert!(!p.contains([',', '\'', '"', ' ', '$', '`']), "{p}");
+    }
+
+    /// The elevated setup runs from the command line itself: nothing it
+    /// executes is a file, and its parameters arrive quoted.
+    #[test]
+    fn the_elevated_setup_carries_its_script_encoded() {
+        let args = smb::elevated_args(
+            Path::new(r"C:\Users\o'brien\ws"),
+            Path::new(r"C:\s\share-setup.secret"),
+            Path::new(r"C:\s\share-setup.result"),
+        );
+        let (head, b64) = args.rsplit_once(' ').unwrap();
+        assert_eq!(head, "-NoProfile -ExecutionPolicy Bypass -EncodedCommand");
+        assert!(!args.contains(".ps1"));
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let command = String::from_utf16(&units).unwrap();
+        assert!(command.contains("param("));
+        assert!(command.ends_with(
+            r"-Workspace 'C:\Users\o''brien\ws' -PasswordFile 'C:\s\share-setup.secret' -ResultFile 'C:\s\share-setup.result'"
+        ));
+        assert!(args.len() < 32_000, "fits a Windows command line");
+    }
 
     #[test]
     fn translates_paths_under_workspace() {
