@@ -7981,6 +7981,12 @@ pub fn find_active_extensions(
     let target_runtimes =
         find_target_relevant_runtimes(config, parsed, target, config_path, requested_runtime)?;
 
+    // A requested runtime that does not build for `target` selects nothing; the
+    // no-runtimes fallback below would turn that into every extension.
+    if let (Some(requested), true) = (requested_runtime, target_runtimes.is_empty()) {
+        anyhow::bail!("Runtime '{requested}' is not defined for target '{target}'.");
+    }
+
     if !target_runtimes.is_empty() {
         // Collect extensions referenced by active runtimes
         if let Some(runtime_section) = parsed.get("runtimes").and_then(|r| r.as_mapping()) {
@@ -8823,6 +8829,47 @@ extensions:
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         find_active_compile_sections(&config, &parsed, active_extensions, target, &path, None)
             .unwrap()
+    }
+
+    /// `install -r prod -t qemux86-64`, where only `dev` builds for that
+    /// target, is an error rather than every extension in the file.
+    #[test]
+    fn a_requested_runtime_off_the_target_is_an_error() {
+        let config_content = r#"
+runtimes:
+  dev:
+    target: qemux86-64
+    extensions: [dev-tools]
+  prod:
+    target: qemuarm64
+    extensions: [prod-app]
+
+extensions:
+  dev-tools:
+    version: "1.0.0"
+  prod-app:
+    version: "1.0.0"
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+
+        let err = find_active_extensions(&config, &parsed, "qemux86-64", &path, Some("prod"))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'prod' is not defined for target 'qemux86-64'"),
+            "{err}"
+        );
+        let dev =
+            find_active_extensions(&config, &parsed, "qemux86-64", &path, Some("dev")).unwrap();
+        assert_eq!(dev, ["dev-tools".to_string()].into_iter().collect());
     }
 
     /// `install -r dev` scans only `dev`: its extension and that extension's
