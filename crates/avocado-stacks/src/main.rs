@@ -161,16 +161,28 @@ fn kernel_ok(release: &str) -> bool {
 /// remembers only this one.
 const REFUSED: i32 = 3;
 
-/// Whether a failed view mount is this host's answer rather than a condition that passes.
+/// Whether a failed view mount is this host's answer rather than a condition that passes: only
+/// the kernel rejecting the filesystem or its options (EINVAL, ENODEV, ENOTBLK, or mount(8)
+/// saying so). Loop devices running out, EBUSY, ENOMEM, a full or read-only root may all pass
+/// on a retry. Only the innermost error counts: the loop fallback's context quotes the
+/// file-backed attempt's ENOTBLK, which is expected on kernels below 6.12.
 fn mount_refusal(e: &anyhow::Error) -> bool {
-    !e.chain().any(|c| {
-        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
-            )
-        }) || c.to_string().contains("No space left")
-    })
+    let root = e.root_cause();
+    if let Some(io) = root.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io.raw_os_error(),
+            Some(libc::EINVAL | libc::ENODEV | libc::ENOTBLK)
+        );
+    }
+    let msg = root.to_string();
+    [
+        "unknown filesystem type",
+        "wrong fs type",
+        "Invalid argument",
+        "Block device required",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
 }
 
 fn refuse(msg: String) -> ! {
@@ -373,16 +385,33 @@ mod tests {
         assert!(super::kernel_ok("7.1.7-200.fc44.x86_64"));
     }
 
-    /// A full stacks root is not this host refusing stacks; a mount the kernel rejects is.
+    /// Only the kernel rejecting the mount is a refusal; a full root, loop devices running out
+    /// or a busy mount may pass on a retry.
     #[test]
-    fn a_full_root_is_not_a_refusal() {
-        let full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
-            .context("write view record");
-        assert!(!super::mount_refusal(&full));
+    fn only_a_kernel_rejection_is_a_refusal() {
+        let os = |n| anyhow::Error::from(std::io::Error::from_raw_os_error(n)).context("mount");
+        assert!(super::mount_refusal(&os(libc::EINVAL)));
+        assert!(super::mount_refusal(&os(libc::ENODEV)));
+        for n in [
+            libc::ENOSPC,
+            libc::EBUSY,
+            libc::ENOMEM,
+            libc::EMFILE,
+            libc::EROFS,
+        ] {
+            assert!(!super::mount_refusal(&os(n)), "errno {n}");
+        }
         let text = anyhow::anyhow!("mkdir: No space left on device (os error 28)");
         assert!(!super::mount_refusal(&text));
         assert!(super::mount_refusal(&anyhow::anyhow!(
             "mount overlay: Invalid argument"
         )));
+        assert!(super::mount_refusal(&anyhow::anyhow!(
+            "mount: /v: unknown filesystem type 'erofs'."
+        )));
+        // The loop fallback quotes the file-backed ENOTBLK; its own failure decides.
+        let lost = anyhow::anyhow!("mount: /v: failed to setup loop device for /i.")
+            .context("mount erofs /i: file-backed: Block device required; through a loop device");
+        assert!(!super::mount_refusal(&lost));
     }
 }

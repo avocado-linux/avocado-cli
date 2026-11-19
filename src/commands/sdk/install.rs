@@ -3560,6 +3560,7 @@ runtimes:
 
     /// A repo CA lands in L0's CA bundle: projects with another CA, or none, get their own L0.
     #[test]
+    #[serial_test::serial]
     #[serial_test::serial(offline)]
     fn the_repo_ca_keys_l0() {
         let ca = tempfile::NamedTempFile::new().unwrap();
