@@ -525,8 +525,8 @@ mod tests {
             p.chars().any(|c| c.is_ascii_digit()),
             p.chars().any(|c| !c.is_ascii_alphanumeric()),
         ];
-        assert!(classes.iter().filter(|&&c| c).count() >= 3, "{p}");
-        assert!(!p.contains([',', '\'', '"', ' ', '$', '`']), "{p}");
+        assert!(classes.iter().filter(|&&c| c).count() >= 3);
+        assert!(!p.contains([',', '\'', '"', ' ', '$', '`']));
     }
 
     /// The elevated setup runs from the command line itself: nothing it
