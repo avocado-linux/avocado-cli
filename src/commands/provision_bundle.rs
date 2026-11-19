@@ -852,6 +852,15 @@ fn carried_feed(meta: &BundleMeta) -> Option<(&str, &str)> {
         .map(|u| ("AVOCADO_REPO_URL", u.as_str()))
 }
 
+/// The `sdk install` child's env: the caller's `--env` values, which it needs
+/// for `{{ env.K }}` in the avocado.yaml it reads in its own process, then the
+/// feed the bundle carries.
+fn sdk_install_env(meta: &BundleMeta) -> HashMap<String, String> {
+    let mut env = crate::utils::interpolation::env::flag_overrides();
+    env.extend(carried_feed(meta).map(|(k, v)| (k.to_string(), v.to_string())));
+    env
+}
+
 /// A replay writes the bundle's avocado.yaml and avocado.lock into the
 /// directory it runs in. Refuse one holding a project a replay didn't write
 /// (no `.avocado-bundle/files.tsv`, which every replay writes before them);
@@ -1100,7 +1109,7 @@ impl BundleProvision {
         let exe = std::env::current_exe()?;
         let st = std::process::Command::new(exe)
             .args(["sdk", "install", "--no-tui", "--target", &meta.target])
-            .envs(carried_feed(&meta))
+            .envs(sdk_install_env(&meta))
             .status()
             .context("run avocado sdk install")?;
         if !st.success() {
@@ -1305,6 +1314,29 @@ mod tests {
             .insert("AVOCADO_REPO_URL".into(), "http://10.10.0.10:8086".into());
         feed_for_local_vm(&mut meta);
         assert_eq!(meta.env["AVOCADO_REPO_URL"], "http://10.10.0.10:8086");
+    }
+
+    /// A hub replays `provision --bundle ... --env K=V`: the `sdk install` child
+    /// re-reads avocado.yaml in its own process, so it needs the `--env` values
+    /// in its env, next to the carried feed.
+    #[test]
+    #[serial_test::serial]
+    fn the_sdk_install_child_gets_the_callers_env() {
+        let meta: BundleMeta = serde_json::from_value(serde_json::json!({
+            "format": FORMAT, "target": "t", "runtime": "r", "sdk_host_arch": "x86_64",
+            "env": {"AVOCADO_REPO_URL": "http://feed:8086"}, "avocado_yaml": "",
+            "avocado_lock": "", "provision_script": "", "clear": [], "files": [],
+            "small_files": [], "created_at": "", "cli_version": ""
+        }))
+        .unwrap();
+        crate::utils::interpolation::env::set_flag_overrides(HashMap::from([(
+            "BOARD_REV".to_string(),
+            "b2".to_string(),
+        )]));
+        let env = sdk_install_env(&meta);
+        crate::utils::interpolation::env::set_flag_overrides(HashMap::new());
+        assert_eq!(env["BOARD_REV"], "b2");
+        assert_eq!(env["AVOCADO_REPO_URL"], "http://feed:8086");
     }
 
     #[test]

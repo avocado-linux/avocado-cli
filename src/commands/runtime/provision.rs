@@ -510,13 +510,7 @@ impl RuntimeProvisionCommand {
         };
         insert_provision_host_mounts_env(&mut env_vars, host_mounts.is_some());
 
-        // What the hook needs on another machine: the derived env, not the
-        // caller's own --env values (per-device or secret ones must not
-        // ride along into a bundle that Connect stores and replays).
-        let mut env_snapshot = env_vars.clone();
-        for k in self.config.env_vars.iter().flat_map(|m| m.keys()) {
-            env_snapshot.remove(k);
-        }
+        let mut env_snapshot = bundle_env_snapshot(&env_vars, self.config.env_vars.as_ref());
         crate::commands::provision_bundle::carry_feed(&mut env_snapshot, config.get_repo_url());
         let env_vars = if env_vars.is_empty() {
             None
@@ -1462,9 +1456,42 @@ fn insert_provision_host_mounts_env(env_vars: &mut HashMap<String, String>, boun
     }
 }
 
+/// What the hook needs on another machine: the derived env, not the caller's
+/// own --env values (per-device or secret ones must not ride along into a
+/// bundle that Connect stores and replays), nor the host-mounts file, which a
+/// replay never binds.
+fn bundle_env_snapshot(
+    env_vars: &HashMap<String, String>,
+    caller: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut snapshot = env_vars.clone();
+    for k in caller.into_iter().flat_map(|m| m.keys()) {
+        snapshot.remove(k);
+    }
+    snapshot.remove(crate::utils::host_mounts::ENV_VAR);
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle replays on a hub, which never binds this host's mounts file:
+    /// the snapshot drops its variable along with the caller's `--env` keys.
+    #[test]
+    fn a_bundle_snapshot_drops_the_host_mounts_and_caller_env() {
+        let env = HashMap::from([
+            (
+                crate::utils::host_mounts::ENV_VAR.to_string(),
+                "/x".to_string(),
+            ),
+            ("SECRET".to_string(), "s".to_string()),
+            ("AVOCADO_PROVISION_FORCE".to_string(), "1".to_string()),
+        ]);
+        let caller = HashMap::from([("SECRET".to_string(), "s".to_string())]);
+        let snap = bundle_env_snapshot(&env, Some(&caller));
+        assert_eq!(snap.keys().collect::<Vec<_>>(), ["AVOCADO_PROVISION_FORCE"]);
+    }
 
     #[test]
     fn dry_run_does_not_copy_state_back() {
