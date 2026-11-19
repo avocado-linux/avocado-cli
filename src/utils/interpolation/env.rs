@@ -41,6 +41,15 @@ pub fn set_flag_overrides(vars: HashMap<String, String>) {
     *FLAG_OVERRIDES.get_or_init(Default::default).lock().unwrap() = vars;
 }
 
+/// The `--env` values `set_flag_overrides` parked, for a child process that
+/// re-reads the config in its own process.
+pub fn flag_overrides() -> HashMap<String, String> {
+    FLAG_OVERRIDES
+        .get()
+        .map(|m| m.lock().unwrap().clone())
+        .unwrap_or_default()
+}
+
 /// Resolve an environment variable template.
 ///
 /// # Arguments

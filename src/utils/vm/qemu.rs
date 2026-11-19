@@ -38,6 +38,9 @@ pub struct QemuConfig {
     /// filesystem. `vm update` only sets this when the sha differs,
     /// which is exactly the case where the seeds were built separately.
     pub var_seed: Option<VarSeed>,
+    /// SMBIOS system UUID (`-uuid`): the guest's DMI `product_uuid`.
+    /// From [`super::state::instance_id`], so it is stable per install.
+    pub uuid: String,
 }
 
 /// A pending seed, plus the two identifiers the guest needs for it.
@@ -166,6 +169,9 @@ pub fn build_qemu_args(
 
     args.push("-machine".into());
     args.push(machine_for(&arch).into());
+
+    args.push("-uuid".into());
+    args.push(cfg.uuid.clone());
 
     args.push("-accel".into());
     args.push(accel_flag().into());
@@ -566,6 +572,7 @@ mod tests {
             artifact_dir: tmp.path().to_path_buf(),
             workspace: tmp.path().to_path_buf(),
             var_seed: None,
+            uuid: "0190c3a2-7b1e-7000-8000-000000000001".into(),
         };
         let args = build_qemu_args(&m, &paths, &cfg).unwrap();
         let rendered = args.join(" ");
@@ -580,6 +587,7 @@ mod tests {
         assert!(rendered.contains("org.qemu.guest_agent.0"));
         assert!(rendered.contains("readonly=on"));
         assert!(rendered.contains("mount_tag=workspace"));
+        assert!(rendered.contains("-uuid 0190c3a2-7b1e-7000-8000-000000000001"));
     }
 
     fn cfg_for(tmp: &Path, var_seed: Option<VarSeed>) -> QemuConfig {
@@ -591,6 +599,7 @@ mod tests {
             artifact_dir: tmp.to_path_buf(),
             workspace: tmp.to_path_buf(),
             var_seed,
+            uuid: "0190c3a2-7b1e-7000-8000-000000000001".into(),
         }
     }
 
