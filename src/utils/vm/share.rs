@@ -487,7 +487,7 @@ pub mod smb {
         }
         let password = read_password(&paths).await?;
         let first = target
-            .exec_script(&guest_mount_script(&computer, &password))
+            .exec_stdin("sh -s", guest_mount_script(&computer, &password).as_bytes())
             .await;
         match first {
             Ok(_) => Ok(()),
@@ -498,7 +498,7 @@ pub mod smb {
                 run_setup(&paths, &workspace).await?;
                 let password = read_password(&paths).await?;
                 target
-                    .exec_script(&guest_mount_script(&computer, &password))
+                    .exec_stdin("sh -s", guest_mount_script(&computer, &password).as_bytes())
                     .await
                     .map(|_| ())
                     .with_context(|| format!("mounting the workspace share at {VM_MOUNT_POINT}"))

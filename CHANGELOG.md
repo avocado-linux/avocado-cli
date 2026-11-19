@@ -110,6 +110,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **Whitespace at the edges of a quoted container value is kept.** A
+  `container.environment` value such as `PASSWORD: 'secret '` reached the
+  container as `PASSWORD=secret`. Only unquoted whitespace around an entry is
+  dropped now.
+- **A `--rm` container's exit code no longer depends on the daemon's event
+  history.** The engine client starts the container only once its events
+  subscription is live. If the events go quiet, it inspects the container,
+  so a lost `die` event ends the wait instead of leaving it open. A container
+  that is still running is still waited on.
 - **`avocado connect` commands honor `AVOCADO_CONNECT_TOKEN` and
   `AVOCADO_CONNECT_URL`.** They used to read only `credentials.json`, so they
   could send the saved profile's token to the saved profile's server while
