@@ -1,5 +1,6 @@
-//! Stacks client. Unless turned off (`avocado stack config`), a project's
-//! `/opt/_avocado/<target>` is a stack view (an EROFS layer + a private upper) mounted inside
+//! Stacks client. Once stacks are turned on (opt-in: `enabled: true` or a `root:` in
+//! `stacks.yaml`, or `AVOCADO_STACKS`; `avocado stack config` reports the settings and checks
+//! the host again), a project's `/opt/_avocado/<target>` is a stack view (an EROFS layer + a private upper) mounted inside
 //! its `avo-<uuid>` volume, and `sdk install` produces layers other projects with the same
 //! inputs share.
 //!
@@ -47,6 +48,13 @@ pub const PRIVATE: &[&str] = &[
     "runtimes",
     "output",
     "var-staging",
+    // `sdk compile` outputs and their stamps, kept together: a stamp without its build (or
+    // the reverse) would claim a compile a layer switch discarded. Per SDK arch, as `Private`
+    // has no wildcard for a middle segment and `sdk/*` would make the whole SDK private.
+    "sdk/x86_64/build",
+    ".stamps/sdk/x86_64/compile",
+    "sdk/aarch64/build",
+    ".stamps/sdk/aarch64/compile",
     ".stamps/ext",
     ".stamps/runtime",
     ".stamps/rootfs/*",
@@ -394,7 +402,10 @@ async fn preflight_within(
     // newer CLI never drives an engine pulled long ago. An image with no registry (a local
     // build) is used as it is.
     if image.contains('/') && !image.contains("@sha256:") {
-        let _ = bounded(crate::utils::engine::command(tool).args(["pull", "-q", &image])).await;
+        // Its own short bound: a hung registry must not spend the preflight's deadline when
+        // the image at hand would do.
+        let pull = bounded(crate::utils::engine::command(tool).args(["pull", "-q", &image]));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), pull).await;
     }
     let image_present = || async {
         crate::utils::engine::command(tool)
@@ -422,12 +433,14 @@ async fn preflight_within(
         Ok(o) if o.status.success() => (Ok(()), true),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            // This host's answer: the helper said no (exit 1), or docker refused to run it,
+            // This host's answer: the helper refused (exit 3: its kernel, or a view that will
+            // not mount; any other helper error exits 1 and may pass, a full root included),
+            // or docker refused to run it,
             // with the image at hand, for a reason of its setup (privileged containers or the
             // bind mounts not allowed). Anything else, a missing image or a container docker
             // could not create just now, may pass and is not remembered.
             let answer =
-                o.status.code() == Some(1) || (host_rejection(&err) && image_present().await);
+                o.status.code() == Some(3) || (host_rejection(&err) && image_present().await);
             (Err(err), answer)
         }
         Err(e) => (Err(format!("run the stacks helper: {e}")), false),
@@ -590,6 +603,27 @@ fn volumes_dir(tool: &str) -> Result<String> {
 
 /// Volumes whose views this process has already remounted.
 static REMOUNTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A clean is about to delete layer content from this project's view (`sdk clean`, `rootfs
+/// clean`, `initramfs clean`): mark the view dirty first, so the next install does not read it
+/// as still on its layer and skip work whose files are gone.
+pub async fn taint_before_clean(tool: &str, project_dir: &Path, target: &str) -> Result<()> {
+    let Some(state) = crate::utils::volume::VolumeState::load_from_dir(project_dir)? else {
+        return Ok(());
+    };
+    if !state.stacks {
+        return Ok(());
+    }
+    let Some(root) = active_root(tool).await else {
+        return Ok(());
+    };
+    let view = view_name(&state.volume_name, target)?;
+    Helper::new(tool, &root, &settings()?)
+        .json(&["taint", &view])
+        .await
+        .with_context(|| format!("mark stack view {view} dirty before the clean"))?;
+    Ok(())
+}
 
 /// Called whenever a project's volume is resolved: remount any of its views that are recorded
 /// but not mounted (a reboot drops mounts). Without this, a command would silently see the

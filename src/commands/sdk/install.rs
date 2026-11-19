@@ -131,6 +131,8 @@ struct PartKeyInputs<'a> {
     compile_deps: Option<String>,
     provision_dto: bool,
     provision_dto_compiler: bool,
+    /// `--no-stamps`: the Base install then writes no sysroot install stamps into its tree.
+    no_stamps: bool,
 }
 
 fn part_layer_inputs(p: &PartKeyInputs) -> serde_json::Value {
@@ -148,6 +150,8 @@ fn part_layer_inputs(p: &PartKeyInputs) -> serde_json::Value {
         Part::Base => {
             v["step"] = "L1 target base".into();
             v["sysroots"] = p.sysroots.clone().unwrap_or_default();
+            // A stamped and an unstamped install leave different trees: never one L1.
+            v["no_stamps"] = p.no_stamps.into();
             v["writes"] = serde_json::json!(["rootfs", "initramfs"]);
         }
         Part::Project | Part::All => {
@@ -184,6 +188,23 @@ struct L0KeyInputs<'a> {
     dnf_args: Option<&'a [String]>,
     no_weak_deps: bool,
     container_args: Option<&'a [String]>,
+    /// sha256 of the repo CA the container appends to the SDK's trust bundle, if any.
+    repo_ca: Option<String>,
+}
+
+/// The identity of the repo CA an install adds to the SDK's CA bundle: the same bytes
+/// `inject_repo_tls_env` hands the container (`AVOCADO_REPO_CA_B64`, set directly or read
+/// from the file `AVOCADO_REPO_CA` names).
+fn repo_ca_identity() -> Option<String> {
+    let mut env = std::collections::HashMap::new();
+    crate::utils::container::inject_repo_tls_env(&mut env);
+    env.remove("AVOCADO_REPO_CA_B64")
+        .or_else(|| std::env::var("AVOCADO_REPO_CA_B64").ok())
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            use sha2::Digest;
+            crate::utils::signing_keys::hex::encode(&sha2::Sha256::digest(b.as_bytes()))
+        })
 }
 
 /// L0's key inputs. Lock pins are in them, so a project pinned to other versions gets its own
@@ -204,6 +225,8 @@ fn l0_layer_inputs(p: &L0KeyInputs) -> serde_json::Value {
     v["dnf_args"] = p.dnf_args.into();
     v["no_weak_deps"] = p.no_weak_deps.into();
     v["container_args"] = p.container_args.into();
+    // L0's first container appends it to the SDK's CA bundle, so the tree carries it.
+    v["repo_ca"] = p.repo_ca.clone().into();
     v
 }
 
@@ -1291,6 +1314,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 compile_deps: compile_deps.clone(),
                 provision_dto,
                 provision_dto_compiler,
+                no_stamps: self.no_stamps,
             });
             s.scope(&mut v);
             (s, v)
@@ -1974,6 +1998,7 @@ echo "[INFO] Wrote compile-deps stamp for arch $HOST_ARCH"
                     dnf_args: self.dnf_args.as_deref(),
                     no_weak_deps: config.get_sdk_disable_weak_dependencies(),
                     container_args: merged_container_args.map(|a| a.as_slice()),
+                    repo_ca: repo_ca_identity(),
                 });
                 s.scope(&mut v);
                 Some((s, v))
@@ -3247,6 +3272,7 @@ runtimes:
             dnf_args: None,
             no_weak_deps,
             container_args: container_args.as_deref(),
+            repo_ca: None,
         });
 
         let active =
@@ -3295,6 +3321,7 @@ runtimes:
                     && !dto::active_extensions_declaring_overlays(&dto_parsed, &active).is_empty(),
                 provision_dto_compiler: part == Part::Project
                     && !dto::active_extensions_compiling_overlays(&dto_parsed, &active).is_empty(),
+                no_stamps: false,
             })
         };
         let l1 = part(
@@ -3527,6 +3554,40 @@ runtimes:
             compile_deps: Some("c1".into()),
             provision_dto: false,
             provision_dto_compiler: false,
+            no_stamps: false,
+        }
+    }
+
+    /// A repo CA lands in L0's CA bundle: projects with another CA, or none, get their own L0.
+    #[test]
+    #[serial_test::serial(offline)]
+    fn the_repo_ca_keys_l0() {
+        let ca = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca.path(), "-----BEGIN CERTIFICATE-----\nA\n").unwrap();
+        std::env::remove_var("AVOCADO_REPO_CA_B64");
+        std::env::set_var("AVOCADO_REPO_CA", ca.path());
+        let from_file = repo_ca_identity();
+        std::fs::write(ca.path(), "-----BEGIN CERTIFICATE-----\nB\n").unwrap();
+        let other = repo_ca_identity();
+        std::env::remove_var("AVOCADO_REPO_CA");
+        let none = repo_ca_identity();
+        assert!(from_file.is_some() && other.is_some());
+        assert_ne!(from_file, other);
+        assert_eq!(none, None);
+    }
+
+    /// `--no-stamps` leaves the sysroot install stamps out of the Base tree, so a stamped
+    /// project must not hit an unstamped L1 (its runtime build would find no stamps).
+    #[test]
+    fn no_stamps_splits_the_base_layer_only() {
+        let (lock, sdk, ext, feeds) = (a_lock(), None, HashMap::new(), serde_yaml::Value::Null);
+        for (part, splits) in [(Part::Base, true), (Part::Project, false)] {
+            let stamped = part_layer_inputs(&key_inputs(part, &lock, &sdk, &ext, &feeds));
+            let unstamped = part_layer_inputs(&PartKeyInputs {
+                no_stamps: true,
+                ..key_inputs(part, &lock, &sdk, &ext, &feeds)
+            });
+            assert_eq!(stamped != unstamped, splits, "{part:?}");
         }
     }
 
