@@ -123,17 +123,20 @@ pub(super) async fn run(docker: &Docker, args: &[String], start: bool) -> Result
 
     // A `--rm` container is gone the moment it exits, so a wait sent after
     // that finds nothing, and nothing says when the daemon has taken one in.
-    // Its event log does not race: read from the container's creation, it
-    // has the exit code whenever it is read. The daemon still does the
-    // removing, so a killed shim leaves nothing behind.
+    // Its events do: read from the container's creation, the replayed
+    // `create` says the subscription is live before the container starts, so
+    // its `die` arrives live rather than from the daemon's short replay
+    // buffer. The daemon still does the removing, so a killed shim leaves
+    // nothing behind.
     let removed = match a.has("--rm") {
         true => {
             let since = created_at(docker, &id).await?;
-            Some(tokio::spawn(exit_from_events(
-                docker.clone(),
-                id.clone(),
-                since,
-            )))
+            let (ready, subscribed) = tokio::sync::oneshot::channel();
+            let removed = tokio::spawn(exit_from_events(docker.clone(), id.clone(), since, ready));
+            // ponytail: a replay that lost the `create` is not waited on past
+            // this; `exit_from_events` then falls back to inspecting.
+            let _ = tokio::time::timeout(SUBSCRIBE, subscribed).await;
+            Some(removed)
         }
         false => None,
     };
@@ -259,8 +262,16 @@ async fn created_at(docker: &Docker, id: &str) -> Result<String> {
 }
 
 /// The exit code of a `--rm` container, from its `die` event, once its
-/// `destroy` event says it is gone, as `docker run --rm` waits for.
-async fn exit_from_events(docker: Docker, id: String, since: String) -> Result<i32> {
+/// `destroy` event says it is gone, as `docker run --rm` waits for. `ready`
+/// fires on the replayed `create`, once the subscription is live. Without
+/// events for a while it inspects the container instead, so a lost `die`
+/// cannot leave it waiting forever; a running container just keeps it waiting.
+async fn exit_from_events(
+    docker: Docker,
+    id: String,
+    since: String,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<i32> {
     let filters = HashMap::from([
         ("type", vec!["container"]),
         ("container", vec![id.as_str()]),
@@ -270,20 +281,42 @@ async fn exit_from_events(docker: Docker, id: String, since: String) -> Result<i
         .filters(&filters)
         .build();
     let mut events = Box::pin(docker.events(Some(options)));
+    let mut ready = Some(ready);
     let mut code = None;
+    // Inspect found it removed: what the stream already holds may still
+    // carry its `die`, so read on until it goes quiet.
+    let mut gone = false;
     loop {
         // ponytail: once it has died, give the removal a minute rather than
         // hanging on a daemon that failed to remove it.
-        let next = match code {
-            None => events.next().await,
-            Some(_) => tokio::time::timeout(Duration::from_secs(60), events.next())
-                .await
-                .unwrap_or(None),
+        let quiet = match code {
+            None => QUIET,
+            Some(_) => REMOVAL,
         };
-        let Some(event) = next.transpose()? else {
-            break;
+        let event = match tokio::time::timeout(quiet, events.next()).await {
+            Ok(next) => match next.transpose()? {
+                Some(event) => event,
+                None => break,
+            },
+            Err(_) if code.is_some() || gone => break,
+            Err(_) => match exited(&docker, &id).await? {
+                Exited::Running => continue,
+                Exited::With(c) => {
+                    code = Some(c);
+                    continue;
+                }
+                Exited::Gone => {
+                    gone = true;
+                    continue;
+                }
+            },
         };
         match event.action.as_deref() {
+            Some("create") => {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+            }
             Some("die") => {
                 code = event
                     .actor
@@ -295,6 +328,39 @@ async fn exit_from_events(docker: Docker, id: String, since: String) -> Result<i
         }
     }
     code.with_context(|| format!("container {id} went away without an exit status"))
+}
+
+/// How long a `--rm` start waits for its events subscription to show live.
+const SUBSCRIBE: Duration = Duration::from_millis(if cfg!(test) { 1_000 } else { 10_000 });
+/// How long events may be quiet before the container is inspected.
+const QUIET: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 5_000 });
+/// How long a container that has died gets to be removed.
+const REMOVAL: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 60_000 });
+
+enum Exited {
+    Running,
+    With(i32),
+    Gone,
+}
+
+/// Where a container is, for when its events have gone quiet.
+async fn exited(docker: &Docker, id: &str) -> Result<Exited> {
+    use bollard::models::ContainerStateStatusEnum as S;
+    match docker.inspect_container(id, None).await {
+        Err(ApiError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(Exited::Gone),
+        Err(e) => Err(e.into()),
+        Ok(found) => {
+            let state = found.state.unwrap_or_default();
+            Ok(match state.status {
+                Some(S::EXITED | S::DEAD | S::REMOVING) => {
+                    Exited::With(state.exit_code.unwrap_or(0) as i32)
+                }
+                _ => Exited::Running,
+            })
+        }
+    }
 }
 
 /// Send the terminating signals on to the container instead of dying of them,
@@ -737,6 +803,257 @@ fn container(a: &Parsed, image: &str, cmd: &[String]) -> Result<ContainerCreateB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon on a unix socket: `/events` streams `events` and then stays
+    /// open, and an inspect answers `inspect` (`None` is a 404).
+    #[cfg(unix)]
+    async fn fake_daemon(
+        events: &'static [&'static str],
+        inspect: Option<&'static str>,
+        delay: Delay,
+    ) -> (Docker, tempfile::TempDir) {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if conn.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    if head.contains("/events") {
+                        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(delay.events)).await;
+                        let mut out = String::new();
+                        for e in events {
+                            let line = format!("{e}\n");
+                            out.push_str(&format!("{:x}\r\n{line}\r\n", line.len()));
+                        }
+                        conn.write_all(out.as_bytes()).await.unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay.inspect)).await;
+                    let reply = match inspect {
+                        Some(body) => format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}".to_string(),
+                    };
+                    conn.write_all(reply.as_bytes()).await.ok();
+                });
+            }
+        });
+        let docker =
+            Docker::connect_with_unix(path.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        (docker, dir)
+    }
+
+    /// Milliseconds before the fake daemon sends its events, and answers an
+    /// inspect.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Default)]
+    struct Delay {
+        events: u64,
+        inspect: u64,
+    }
+
+    #[cfg(unix)]
+    async fn rm_exit(
+        events: &'static [&'static str],
+        inspect: Option<&'static str>,
+        delay: Delay,
+    ) -> (Result<i32>, bool) {
+        let (docker, _dir) = fake_daemon(events, inspect, delay).await;
+        let (ready, subscribed) = tokio::sync::oneshot::channel();
+        let code = exit_from_events(docker, "c1".into(), "0".into(), ready).await;
+        (code, subscribed.await.is_ok())
+    }
+
+    /// The replayed `create` says the subscription is live; `die` has the code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_comes_from_the_die_event() {
+        let (code, subscribed) = rm_exit(
+            &[
+                r#"{"Type":"container","Action":"create","Actor":{"ID":"c1"}}"#,
+                r#"{"Type":"container","Action":"die","Actor":{"ID":"c1","Attributes":{"exitCode":"7"}}}"#,
+                r#"{"Type":"container","Action":"destroy","Actor":{"ID":"c1"}}"#,
+            ],
+            None,
+            Delay::default(),
+        )
+        .await;
+        assert_eq!(code.unwrap(), 7);
+        assert!(subscribed);
+    }
+
+    /// With its events lost, an exited container's code comes from inspecting it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_without_events_inspects_the_container() {
+        let (code, _) = rm_exit(
+            &[],
+            Some(r#"{"State":{"Status":"exited","ExitCode":3}}"#),
+            Delay::default(),
+        )
+        .await;
+        assert_eq!(code.unwrap(), 3);
+    }
+
+    /// With its events lost and the container already removed, the wait ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_without_events_or_container_ends() {
+        let (code, _) = rm_exit(&[], None, Delay::default()).await;
+        assert!(code
+            .unwrap_err()
+            .to_string()
+            .contains("without an exit status"));
+    }
+
+    /// Its exit arrives while a slow inspect is out, and the inspect then
+    /// finds it removed: the code still comes from the queued `die`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_reads_events_that_arrive_during_an_inspect() {
+        let events = &[
+            r#"{"Type":"container","Action":"die","Actor":{"ID":"c1","Attributes":{"exitCode":"5"}}}"#,
+            r#"{"Type":"container","Action":"destroy","Actor":{"ID":"c1"}}"#,
+        ];
+        let delay = Delay {
+            events: 80,
+            inspect: 150,
+        };
+        let (code, _) = rm_exit(events, None, delay).await;
+        assert_eq!(code.unwrap(), 5);
+    }
+
+    /// A daemon for `run --rm`: it records each request line, and holds the
+    /// replayed `create` back until `release` is notified (`None`: never).
+    /// Attach and start fail, which ends the run.
+    #[cfg(unix)]
+    async fn fake_engine(
+        release: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) -> (
+        Docker,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let (log, release) = (log.clone(), release.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if conn.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    log.lock().unwrap().push(line.clone());
+                    let reply = |status: &str, body: &str| {
+                        format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    };
+                    let out = if line.contains("/events") {
+                        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                        match release {
+                            Some(release) => release.notified().await,
+                            None => std::future::pending().await,
+                        }
+                        let e = "{\"Type\":\"container\",\"Action\":\"create\",\"Actor\":{\"ID\":\"c1\"}}\n";
+                        conn.write_all(format!("{:x}\r\n{e}\r\n", e.len()).as_bytes())
+                            .await
+                            .unwrap();
+                        std::future::pending::<String>().await
+                    } else if line.contains("/containers/create") {
+                        reply("201 Created", r#"{"Id":"c1","Warnings":[]}"#)
+                    } else if line.contains("/containers/c1/json") {
+                        reply("200 OK", r#"{"Id":"c1","Created":"2026-01-01T00:00:00Z"}"#)
+                    } else {
+                        reply(
+                            "500 Internal Server Error",
+                            r#"{"message":"not in this fake"}"#,
+                        )
+                    };
+                    conn.write_all(out.as_bytes()).await.ok();
+                });
+            }
+        });
+        let docker =
+            Docker::connect_with_unix(path.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        (docker, dir, seen)
+    }
+
+    #[cfg(unix)]
+    fn started(seen: &std::sync::Mutex<Vec<String>>) -> bool {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("/attach") || l.contains("/start"))
+    }
+
+    #[cfg(unix)]
+    fn rm_args() -> Vec<String> {
+        ["--rm", "img", "true"].map(String::from).to_vec()
+    }
+
+    /// `run --rm` attaches and starts only once its subscription shows live.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_run_starts_only_once_its_events_are_live() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (docker, _dir, seen) = fake_engine(Some(release.clone())).await;
+        let running = tokio::spawn(async move { run(&docker, &rm_args(), true).await });
+        tokio::time::sleep(SUBSCRIBE / 3).await;
+        assert!(!started(&seen), "started before the subscription: {seen:?}");
+        release.notify_one();
+        let _ = tokio::time::timeout(SUBSCRIBE / 2, running)
+            .await
+            .expect("run went on");
+        assert!(started(&seen), "never started: {seen:?}");
+    }
+
+    /// With the `create` never replayed, the start still goes ahead after
+    /// the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_run_starts_after_the_bound_without_a_create() {
+        let (docker, _dir, seen) = fake_engine(None).await;
+        let begun = std::time::Instant::now();
+        let running = tokio::spawn(async move { run(&docker, &rm_args(), true).await });
+        let _ = tokio::time::timeout(SUBSCRIBE * 3, running)
+            .await
+            .expect("run went on");
+        assert!(started(&seen), "never started: {seen:?}");
+        assert!(begun.elapsed() >= SUBSCRIBE);
+    }
+
+    /// A container stuck in removal, its `die` lost, still ends the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rm_exit_takes_a_removing_containers_code() {
+        let inspect = Some(r#"{"State":{"Status":"removing","ExitCode":4}}"#);
+        let (code, _) = rm_exit(&[], inspect, Delay::default()).await;
+        assert_eq!(code.unwrap(), 4);
+    }
 
     fn body(args: &[&str]) -> serde_json::Value {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
