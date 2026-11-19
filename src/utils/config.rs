@@ -8825,6 +8825,68 @@ extensions:
             .unwrap()
     }
 
+    /// `install -r dev` scans only `dev`: its extension and that extension's
+    /// compile section, not `prod`'s. Without a runtime, both.
+    #[test]
+    fn a_requested_runtime_scopes_extensions_and_compile_sections() {
+        let config_content = r#"
+runtimes:
+  dev:
+    extensions: [dev-tools]
+  prod:
+    extensions: [prod-app]
+
+extensions:
+  dev-tools:
+    version: "1.0.0"
+    packages:
+      dev-lib:
+        compile: dev-lib
+  prod-app:
+    version: "1.0.0"
+    packages:
+      prod-lib:
+        compile: prod-lib
+
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    dev-lib:
+      compile: dev-lib.sh
+    prod-lib:
+      compile: prod-lib.sh
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let scan = |runtime: Option<&str>| {
+            let exts =
+                find_active_extensions(&config, &parsed, "qemux86-64", &path, runtime).unwrap();
+            let mut sections =
+                find_active_compile_sections(&config, &parsed, &exts, "qemux86-64", &path, runtime)
+                    .unwrap();
+            sections.sort();
+            let mut exts: Vec<_> = exts.into_iter().collect();
+            exts.sort();
+            (exts, sections)
+        };
+
+        assert_eq!(
+            scan(Some("dev")),
+            (vec!["dev-tools".to_string()], vec!["dev-lib".to_string()])
+        );
+        assert_eq!(
+            scan(None),
+            (
+                vec!["dev-tools".to_string(), "prod-app".to_string()],
+                vec!["dev-lib".to_string(), "prod-lib".to_string()]
+            )
+        );
+    }
+
     #[test]
     fn test_find_active_compile_sections_via_runtime_kernel() {
         let config_content = r#"

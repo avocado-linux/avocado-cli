@@ -68,6 +68,10 @@ pub struct SdkInstallCommand {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Runtime `avocado install -r` scoped this install to: only its
+    /// extensions and compile sections are scanned (all target-relevant
+    /// runtimes when unset)
+    pub runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     pub tui_context: Option<TuiContext>,
@@ -468,6 +472,7 @@ impl SdkInstallCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
             tui_context: None,
         }
@@ -495,6 +500,12 @@ impl SdkInstallCommand {
     /// Set SDK container architecture for cross-arch emulation
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
+        self
+    }
+
+    /// Scope the extension and compile-section scans to one runtime
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
         self
     }
 
@@ -561,7 +572,7 @@ impl SdkInstallCommand {
             &composed.merged_value,
             &target,
             &composed.config_path,
-            None,
+            self.runtime.as_deref(),
         )?;
 
         // Before the first download. `active_extensions` ignores `enabled`, so an
@@ -783,7 +794,7 @@ impl SdkInstallCommand {
             active_extensions,
             target,
             &composed.config_path,
-            None,
+            self.runtime.as_deref(),
         )?;
         // An extension declaring device-tree overlays needs the delivery
         // hook in the target-sysroot, so provision the target-sysroot even when
@@ -2097,7 +2108,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
             &composed.merged_value,
             target,
             &self.config_path,
-            None,
+            self.runtime.as_deref(),
         )?;
 
         // Re-compute extension SDK dependencies, filtered to only active extensions
