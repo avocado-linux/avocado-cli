@@ -156,6 +156,28 @@ fn kernel_ok(release: &str) -> bool {
     (maj, min) >= (6, 5)
 }
 
+/// `preflight`'s exit code when this host cannot run stacks (its kernel, or a view that will not
+/// mount). Any other failure exits 1 and may pass (a full root, a daemon hiccup), so the CLI
+/// remembers only this one.
+const REFUSED: i32 = 3;
+
+/// Whether a failed view mount is this host's answer rather than a condition that passes.
+fn mount_refusal(e: &anyhow::Error) -> bool {
+    !e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            )
+        }) || c.to_string().contains("No space left")
+    })
+}
+
+fn refuse(msg: String) -> ! {
+    eprintln!("Error: {msg}");
+    std::process::exit(REFUSED)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let stacks = Stacks::open(&cli.root)?;
@@ -165,13 +187,19 @@ fn main() -> Result<()> {
                 .trim()
                 .to_string();
             if !kernel_ok(&rel) {
-                bail!("kernel {rel} is older than 6.5 (overlay data-only lowers)");
+                refuse(format!(
+                    "kernel {rel} is older than 6.5 (overlay data-only lowers)"
+                ));
             }
             let name = format!("preflight-{}", avocado_stacks::uniq());
             let r = stacks.mount_view(&name, Some(EMPTY_KEY), &[]);
             let _ = stacks.drop_view(&name);
-            if let Err(e) = r {
-                bail!("cannot mount an EROFS + overlay view here: {e:#}");
+            match r {
+                Err(e) if mount_refusal(&e) => {
+                    refuse(format!("cannot mount an EROFS + overlay view here: {e:#}"))
+                }
+                Err(e) => bail!("cannot mount an EROFS + overlay view here: {e:#}"),
+                Ok(_) => {}
             }
             write_out(&json!({"ok": true, "kernel": rel, "erofs": stacks.last_mode()}));
         }
@@ -239,7 +267,13 @@ fn main() -> Result<()> {
             let (mounted, blocked) = stacks.remount(&prefix)?;
             write_out(&json!({"mounted": mounted, "needs_adopt": blocked}))
         }
-        Cmd::Alias { alias, key } => stacks.alias(&alias, &key)?,
+        Cmd::Alias { alias, key } => {
+            // As a commit writes a layer: gc must not evict `key` between the check and the
+            // links, and two aliases of one name must not interleave.
+            let _gc = stacks.gc_lock(false)?;
+            let _l = stacks.key_lock(&alias)?;
+            stacks.alias(&alias, &key)?
+        }
         Cmd::Umount { view } => {
             let _l = stacks.view_lock(&view)?;
             stacks.umount_view(&view)?
@@ -337,5 +371,18 @@ mod tests {
         assert!(super::kernel_ok("6.11.9"));
         assert!(super::kernel_ok("6.12.1"));
         assert!(super::kernel_ok("7.1.7-200.fc44.x86_64"));
+    }
+
+    /// A full stacks root is not this host refusing stacks; a mount the kernel rejects is.
+    #[test]
+    fn a_full_root_is_not_a_refusal() {
+        let full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("write view record");
+        assert!(!super::mount_refusal(&full));
+        let text = anyhow::anyhow!("mkdir: No space left on device (os error 28)");
+        assert!(!super::mount_refusal(&text));
+        assert!(super::mount_refusal(&anyhow::anyhow!(
+            "mount overlay: Invalid argument"
+        )));
     }
 }
