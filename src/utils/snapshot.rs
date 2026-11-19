@@ -1197,7 +1197,7 @@ mod tests {
 
     impl ActiveRenderer {
         fn new() -> Self {
-            let lock = crate::utils::tui::tests::GLOBAL_LOCK
+            let lock = crate::utils::tui::TEST_RENDERER_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let renderer = std::sync::Arc::new(crate::utils::tui::TaskRenderer::new_test());

@@ -1213,9 +1213,9 @@ impl Stacks {
         // projects still on the old digest would reuse them.
         if self.shareable {
             if let Some(name) = crate::utils::feeds::first_moved_feed(&self.content_pins) {
+                // The view stays dirty: it was tainted before the step and no commit clears it.
                 self.uncommitted
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.helper.json(&["taint", &self.view]).await?;
                 crate::utils::output::print_info_stderr(&format!(
                     "Stacks: {label} built in the view, not committed: the feed '{name}' \
                      changed after this install computed its layer keys. Run the install \
@@ -1486,8 +1486,12 @@ esac
             .unwrap();
         assert_eq!(r.outcome, Outcome::Built);
         let calls = helper_calls(dir.path());
+        assert_eq!(
+            calls.iter().filter(|c| *c == "taint").count(),
+            1,
+            "{calls:?}"
+        );
         assert!(!calls.contains(&"commit".to_string()), "{calls:?}");
-        assert!(calls.contains(&"taint".to_string()), "{calls:?}");
 
         // The control: an unchanged feed commits.
         let dir = tempfile::tempdir().unwrap();
@@ -1499,8 +1503,11 @@ esac
         .await
         .unwrap();
         let calls = helper_calls(dir.path());
-        assert!(calls.contains(&"commit".to_string()), "{calls:?}");
-        assert!(!calls.contains(&"taint".to_string()), "{calls:?}");
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("commit"),
+            "{calls:?}"
+        );
     }
 
     /// `avocado install` runs `sdk install` under its task renderer, which swallows
