@@ -226,6 +226,7 @@ mod tests {
             provision_profiles: None,
             signing_keys: None,
             connect: None,
+            rubicon: None,
             rootfs: None,
             initramfs: None,
             kernel: None,
