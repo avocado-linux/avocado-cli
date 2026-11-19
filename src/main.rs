@@ -6151,13 +6151,31 @@ mod tests {
             let refused = on_big_stack(move || Cli::try_parse_from(args).is_err());
             assert!(refused, "--bundle with {extra:?} must not parse");
         }
-        assert!(matches!(
-            parse_cli(&["avocado", "provision", "--bundle", "b", "--env", "K=V"]),
-            Commands::Provision {
-                bundle: Some(_),
-                ..
-            }
-        ));
+        // What the hub agent replays (avocado-vm `provision_args`), plain and
+        // in its exec form: these must keep parsing.
+        let hub = [
+            "avocado",
+            "provision",
+            "--no-tui",
+            "--bundle",
+            "b",
+            "--profile",
+            "p",
+            "--env",
+            "K=V",
+            "--env",
+            "AVOCADO_PROVISION_DEVICE=/dev/sda",
+        ];
+        for tail in [&[][..], &["--", "flash.sh", "--usb"]] {
+            let args: Vec<&str> = hub.iter().chain(tail).copied().collect();
+            assert!(matches!(
+                parse_cli(&args),
+                Commands::Provision {
+                    bundle: Some(_),
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
