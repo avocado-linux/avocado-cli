@@ -99,11 +99,15 @@ impl ConnectAuthLoginCommand {
         // Wait for the browser to redirect to our local server. Over ssh the
         // browser runs on another machine and can't reach it: the user pastes
         // the URL it was sent to instead.
-        let paste = !self.output.is_json() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let paste = offer_paste(
+            self.output.is_json(),
+            std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+        );
         if paste {
             println!(
-                "  If the browser can't reach this machine (ssh, a headless host), it shows\n  \
-                 a connection error after you log in: paste the URL from its address bar here."
+                "  Over ssh the browser can't reach this machine: after you log in it shows a\n  \
+                 connection error. Paste the URL from its address bar here."
             );
             println!();
         }
@@ -351,14 +355,28 @@ async fn wait_for_callback(
     Ok((code, state, stream))
 }
 
+/// Offer to read a pasted callback URL only where the browser can't reach the
+/// local listener (an ssh session) and a person is at the terminal. On a
+/// desktop no reader starts, so nothing competes with the org prompt.
+fn offer_paste(json: bool, stdin_is_terminal: bool, over_ssh: bool) -> bool {
+    !json && stdin_is_terminal && over_ssh
+}
+
 /// Read the callback URL the user pasted from the browser's address bar.
+///
+/// On a detached thread rather than `spawn_blocking`: the runtime waits for
+/// blocking tasks when it shuts down, so a reader left behind when the redirect
+/// wins would hold the exit until Enter.
 async fn read_pasted_callback() -> Result<(String, String)> {
-    let line = tokio::task::spawn_blocking(|| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map(|_| line)
-    })
-    .await?
-    .context("failed to read the pasted callback URL")?;
+        let _ = tx.send(std::io::stdin().read_line(&mut line).map(|_| line));
+    });
+    let line = rx
+        .await
+        .context("the paste reader stopped")?
+        .context("failed to read the pasted callback URL")?;
     callback_params(line.trim())
 }
 
@@ -880,6 +898,16 @@ mod tests {
         assert_eq!((code.as_str(), state.as_str()), ("abc+d", "s1"));
         assert!(callback_params("http://127.0.0.1:41234/callback?state=s1").is_err());
         assert!(callback_params("not a url").is_err());
+    }
+
+    /// The paste reader starts only over ssh with a person at the terminal:
+    /// never on a desktop, in JSON mode, or with piped stdin.
+    #[test]
+    fn the_paste_prompt_is_offered_only_over_ssh_at_a_terminal() {
+        assert!(offer_paste(false, true, true));
+        assert!(!offer_paste(false, true, false), "desktop");
+        assert!(!offer_paste(true, true, true), "json");
+        assert!(!offer_paste(false, false, true), "piped stdin");
     }
 
     fn org(id: &str, name: &str) -> OrgInfo {
