@@ -2104,9 +2104,9 @@ mod tests {
     use super::generate_var_key_attestation_script;
     use super::kernel_pin_moved;
     use super::{
-    build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
-    incomplete_install_reason, parse_probe_output, render_overlay_snippet,
-};
+        build_overlay_script, detect_sysroot_package_removals, incomplete_install_error,
+        incomplete_install_reason, parse_probe_output, render_overlay_snippet,
+    };
     use super::{contract_outputs, scriptlet_contract_stale};
     use crate::utils::lockfile::{LockFile, SysrootType};
     use crate::utils::stamps::{Stamp, StampOutputs};
