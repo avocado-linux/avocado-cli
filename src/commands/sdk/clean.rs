@@ -198,6 +198,27 @@ impl SdkCleanCommand {
         // Get clean scripts for the requested sections
         let clean_scripts = self.get_clean_scripts_for_sections(config)?;
 
+        // Every requested section loses its stamp, with or without a clean
+        // script, so the next `ext build` compiles it again. This runs first:
+        // a clean script that fails part way has still changed the output.
+        let run_config = RunConfig {
+            container_image: ctx.container_image.to_string(),
+            target: ctx.target.to_string(),
+            command: remove_section_stamps_command(&self.sections),
+            verbose: self.verbose,
+            source_environment: false,
+            interactive: false,
+            repo_url: ctx.repo_url.clone(),
+            repo_release: ctx.repo_release.clone(),
+            container_args: ctx.merged_container_args.clone(),
+            dnf_args: self.dnf_args.clone(),
+            sdk_arch: self.sdk_arch.clone(),
+            ..Default::default()
+        };
+        if !ctx.container_helper.run_in_container(run_config).await? {
+            return Err(anyhow::anyhow!("Failed to remove compile section stamps"));
+        }
+
         if clean_scripts.is_empty() {
             print_info(
                 "No clean scripts defined for the specified sections.",
@@ -338,8 +359,28 @@ impl SdkCleanCommand {
     }
 }
 
+/// Shell that removes the stamps of `sections`.
+fn remove_section_stamps_command(sections: &[String]) -> String {
+    sections
+        .iter()
+        .map(|s| crate::utils::stamps::remove_own_stamp_line(&StampRequirement::sdk_compile(s)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `sdk clean lib-a lib-c` removes both stamps, also when only one of the
+    /// sections has a clean script.
+    #[test]
+    fn every_requested_section_loses_its_stamp() {
+        let sections = vec!["lib-a".to_string(), "lib-c".to_string()];
+        let command = remove_section_stamps_command(&sections);
+        for section in &sections {
+            let stamp = StampRequirement::sdk_compile(section).relative_path();
+            assert!(command.contains(&stamp), "{stamp} missing from:\n{command}");
+        }
+    }
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

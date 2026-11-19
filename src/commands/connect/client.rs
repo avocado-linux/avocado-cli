@@ -84,6 +84,32 @@ impl ConnectConfig {
         }
     }
 
+    /// Only the profiles for `url`, defaulting to the stored default when it
+    /// is one of them. None matching is an error: falling back to another
+    /// server's profile would send its token there.
+    pub fn for_url(mut self, url: &str) -> Result<Self> {
+        let norm = |u: &str| u.trim_end_matches('/').to_string();
+        let want = norm(url);
+        let default_url = self
+            .profiles
+            .get(&self.default_profile)
+            .map(|p| p.api_url.clone());
+        self.profiles.retain(|_, p| norm(&p.api_url) == want);
+        if !self.profiles.contains_key(&self.default_profile) {
+            let Some(name) = self.profiles.keys().min().cloned() else {
+                anyhow::bail!(
+                    "AVOCADO_CONNECT_URL is {url}, but no saved profile is for that server{}. \
+                     Set AVOCADO_CONNECT_TOKEN too, or run 'avocado connect auth login' to log in there.",
+                    default_url
+                        .map(|u| format!(" (the default profile is for {u})"))
+                        .unwrap_or_default()
+                );
+            };
+            self.default_profile = name;
+        }
+        Ok(self)
+    }
+
     /// Resolve a profile: explicit name > org-based lookup > default profile.
     pub fn resolve_profile<'a>(
         &'a self,
@@ -605,8 +631,44 @@ fn get_config_path() -> Result<PathBuf> {
     Ok(get_config_dir()?.join(CONFIG_FILE))
 }
 
-/// Load the config from disk.
+/// The profile name `AVOCADO_CONNECT_TOKEN` stands in as.
+pub const ENV_PROFILE: &str = "AVOCADO_CONNECT_TOKEN";
+
+/// The config a command authenticates with. `AVOCADO_CONNECT_TOKEN`, when
+/// set, replaces the stored profiles (at `AVOCADO_CONNECT_URL`, else
+/// https://connect.peridio.com), as it does for feeds, so CI needs no
+/// `credentials.json`. Commands that write profiles back read
+/// [`load_stored_config`] instead, so the env token is never saved.
+///
+/// `AVOCADO_CONNECT_URL` alone never mixes servers: only the stored profiles
+/// for that URL are used (see [`ConnectConfig::for_url`]).
 pub fn load_config() -> Result<Option<ConnectConfig>> {
+    match std::env::var("AVOCADO_CONNECT_TOKEN") {
+        Ok(token) if !token.is_empty() => Ok(Some(ConnectConfig::new_with_profile(
+            ENV_PROFILE,
+            Profile {
+                api_url: std::env::var("AVOCADO_CONNECT_URL")
+                    .unwrap_or_else(|_| "https://connect.peridio.com".to_string()),
+                token,
+                user: ProfileUser {
+                    email: String::new(),
+                    name: ENV_PROFILE.to_string(),
+                },
+                created_at: String::new(),
+                organization_id: None,
+            },
+        ))),
+        _ => match std::env::var("AVOCADO_CONNECT_URL") {
+            Ok(url) if !url.is_empty() => {
+                load_stored_config()?.map(|c| c.for_url(&url)).transpose()
+            }
+            _ => load_stored_config(),
+        },
+    }
+}
+
+/// Load the stored profiles from disk.
+pub fn load_stored_config() -> Result<Option<ConnectConfig>> {
     let path = get_config_path()?;
     if !path.exists() {
         return Ok(None);
@@ -618,13 +680,35 @@ pub fn load_config() -> Result<Option<ConnectConfig>> {
     Ok(Some(config))
 }
 
-/// Save the full config to disk.
+/// Save the full config to disk, readable by its owner only: it holds API
+/// tokens. A file or directory left looser by an older CLI is tightened.
 pub fn save_config(config: &ConnectConfig) -> Result<()> {
     let dir = get_config_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
     let path = dir.join(CONFIG_FILE);
     let json = serde_json::to_string_pretty(config)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Failed to restrict directory: {}", dir.display()))?;
+        // Tighten before writing, so the new tokens never sit in a 0644 file.
+        if path.exists() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict config: {}", path.display()))?;
+        }
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(json.as_bytes()))
+            .with_context(|| format!("Failed to write config: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
     fs::write(&path, json)
         .with_context(|| format!("Failed to write config: {}", path.display()))?;
     Ok(())
@@ -2061,6 +2145,142 @@ fn list_runtimes_url(api_url: &str, org: &str, project: &str, status: Option<&st
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `AVOCADO_CONNECT_TOKEN` authenticates every `connect` command with no
+    /// `credentials.json`, at `AVOCADO_CONNECT_URL` when that is set.
+    #[test]
+    #[serial_test::serial(offline)]
+    fn the_env_token_stands_in_for_the_stored_profiles() {
+        std::env::set_var("AVOCADO_CONNECT_TOKEN", "ci-token");
+        std::env::set_var("AVOCADO_CONNECT_URL", "https://connect.example");
+        let cfg = load_config();
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+        std::env::remove_var("AVOCADO_CONNECT_URL");
+        let cfg = cfg.unwrap().expect("a config from the env token");
+        let (name, profile) = cfg.resolve_profile(None, Some("some-org")).unwrap();
+        assert_eq!(name, ENV_PROFILE);
+        assert_eq!(profile.token, "ci-token");
+        assert_eq!(profile.api_url, "https://connect.example");
+    }
+
+    fn profile_at(url: &str, token: &str) -> Profile {
+        Profile {
+            api_url: url.to_string(),
+            token: token.to_string(),
+            user: ProfileUser {
+                email: String::new(),
+                name: String::new(),
+            },
+            created_at: String::new(),
+            organization_id: None,
+        }
+    }
+
+    /// The saved credentials are owner-only, including a file an older CLI
+    /// left at 0644.
+    // Linux only: XDG_CONFIG_HOME does not move ProjectDirs on macOS or
+    // Windows, so elsewhere this would rewrite the real credentials.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial(offline)]
+    fn saved_credentials_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", home.path());
+        let cfg =
+            ConnectConfig::new_with_profile("default", profile_at("https://connect.example", "t"));
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let saved = save_config(&cfg).and_then(|_| {
+            let path = get_config_path()?;
+            let fresh = (mode(&path), mode(path.parent().unwrap()));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755))?;
+            save_config(&cfg)?;
+            Ok((fresh, (mode(&path), mode(path.parent().unwrap()))))
+        });
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let (fresh, tightened) = saved.unwrap();
+        assert_eq!(fresh, (0o600, 0o700));
+        assert_eq!(tightened, (0o600, 0o700));
+    }
+
+    /// A token alone talks to the production server, as feeds do, never to
+    /// the stored profile's server.
+    #[test]
+    #[serial_test::serial(offline)]
+    fn a_token_alone_uses_the_production_server() {
+        std::env::set_var("AVOCADO_CONNECT_TOKEN", "ci-token");
+        std::env::remove_var("AVOCADO_CONNECT_URL");
+        let cfg = load_config();
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+        let cfg = cfg.unwrap().unwrap();
+        let (_, profile) = cfg.resolve_profile(None, None).unwrap();
+        assert_eq!(profile.api_url, "https://connect.peridio.com");
+    }
+
+    /// With neither env var set, commands use the stored default profile.
+    // Linux only, as for saved_credentials_are_owner_only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial(offline)]
+    fn the_stored_profile_is_used_without_the_env() {
+        let home = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", home.path());
+        std::env::remove_var("AVOCADO_CONNECT_TOKEN");
+        std::env::remove_var("AVOCADO_CONNECT_URL");
+        save_config(&ConnectConfig::new_with_profile(
+            "default",
+            profile_at("https://connect.example", "stored-token"),
+        ))
+        .unwrap();
+        let cfg = load_config();
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let cfg = cfg.unwrap().expect("the stored config");
+        let (name, profile) = cfg.resolve_profile(None, None).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(profile.token, "stored-token");
+    }
+
+    /// `AVOCADO_CONNECT_URL` alone picks the stored profile for that server,
+    /// even when the default is for another.
+    #[test]
+    fn a_url_alone_picks_the_profile_for_that_server() {
+        let mut cfg =
+            ConnectConfig::new_with_profile("prod", profile_at("https://prod.example", "p"));
+        cfg.profiles.insert(
+            "staging".into(),
+            profile_at("https://staging.example/", "s"),
+        );
+        let cfg = cfg.for_url("https://staging.example").unwrap();
+        let (name, profile) = cfg.resolve_profile(None, None).unwrap();
+        assert_eq!((name, profile.token.as_str()), ("staging", "s"));
+        assert!(!cfg.profiles.contains_key("prod"));
+    }
+
+    /// With no stored profile for `AVOCADO_CONNECT_URL`, the command fails
+    /// instead of sending another server's token.
+    #[test]
+    fn a_url_alone_with_no_profile_for_it_is_an_error() {
+        let cfg = ConnectConfig::new_with_profile("prod", profile_at("https://prod.example", "p"));
+        let err = cfg
+            .for_url("https://staging.example")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https://staging.example"), "{err}");
+        assert!(
+            err.contains("default profile is for https://prod.example"),
+            "{err}"
+        );
+        assert!(err.contains("AVOCADO_CONNECT_TOKEN"), "{err}");
+    }
 
     #[test]
     fn list_runtimes_url_without_filter_includes_drafts() {

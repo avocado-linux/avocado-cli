@@ -154,11 +154,17 @@ pub fn user_agent_for(key_id: Option<&str>, tier: Option<u32>) -> String {
     }
 }
 
+/// Whether feed requests carry a Connect key id: logged in, or
+/// `AVOCADO_CONNECT_TOKEN` set. Decides which bucket the edge counts them in.
+pub fn is_identified() -> bool {
+    feed_key_id().is_some()
+}
+
 fn feed_key_id() -> Option<String> {
     let token = match std::env::var("AVOCADO_CONNECT_TOKEN") {
         Ok(t) if !t.is_empty() => t,
         _ => {
-            let cfg = crate::commands::connect::client::load_config().ok()??;
+            let cfg = crate::commands::connect::client::load_stored_config().ok()??;
             let (_, profile) = cfg.resolve_profile(None, None).ok()?;
             profile.token.clone()
         }
@@ -281,6 +287,28 @@ struct MintedFeedToken {
     expires_at: Option<i64>,
 }
 
+/// A feed's URL as the host reaches it, with the TLS settings and credential
+/// dnf uses for it, so a probe from the host is answered as dnf was.
+#[derive(Debug, Clone, Default)]
+pub struct FeedEndpoint {
+    pub url: String,
+    pub ca: Option<PathBuf>,
+    pub tls_verify: bool,
+    pub credential: Option<(String, String)>,
+}
+
+impl FeedEndpoint {
+    /// A feed known only by its URL: the SDK repository, verified with the
+    /// global repo TLS settings alone.
+    pub fn plain(url: String) -> Self {
+        Self {
+            url,
+            tls_verify: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// A feed after resolution: everything dnf will see, plus what the cache needs.
 /// `#[serde(skip)]` marks the fields that must never reach the canonical document.
 #[derive(Debug, Clone, Serialize)]
@@ -374,9 +402,29 @@ impl Placement {
 }
 
 impl ResolvedFeed {
+    /// The feed's URL as this host reaches it, or `None` when it has none:
+    /// a path or built-in feed, a Connect feed not minted yet, or one whose
+    /// loopback host was rewritten for the container.
+    fn host_url(&self) -> Option<&str> {
+        match self.kind {
+            FeedKind::Url => Some(&self.configured_locator),
+            FeedKind::Connect
+                if !self.baseurl.starts_with("connect://") && !self.loopback_rewritten =>
+            {
+                Some(&self.baseurl)
+            }
+            _ => None,
+        }
+    }
+
     fn applies_to(&self, stage: FeedStage) -> bool {
         (self.stages.is_empty() || self.stages.contains(&stage.scope()))
             && self.placement.admits(stage)
+    }
+
+    /// A Connect feed `stage` uses that has no token yet, so one must be minted.
+    fn needs_minted_token(&self, stage: FeedStage) -> bool {
+        self.kind == FeedKind::Connect && self.applies_to(stage) && self.credential.is_none()
     }
 
     fn repo_file(&self, ca_in_container: Option<&str>) -> String {
@@ -461,6 +509,9 @@ pub struct FeedMaterialization {
     /// Key id of the credential the mint used, when it differs from the default
     /// profile's.
     pub key_id: Option<String>,
+    /// Each written feed as the host reaches it (see `ResolvedFeed::host_url`),
+    /// by repo id, for probing the feed a `--repo=` restricted run used.
+    pub host_feeds: HashMap<String, FeedEndpoint>,
     /// `--add-host` entries the container needs.
     pub add_hosts: Vec<String>,
     /// SHA-256 of the stage projection this was materialized from. Lets
@@ -1250,11 +1301,7 @@ impl ResolvedFeedSet {
         // feed still needed a login and a network round trip. Later stages reuse
         // what earlier ones minted, so a feed is minted at most once per
         // invocation, and never at all if no stage needs it.
-        if !self
-            .feeds
-            .iter()
-            .any(|f| f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none())
-        {
+        if !self.feeds.iter().any(|f| f.needs_minted_token(stage)) {
             return Ok(self.minted_tier);
         }
         // A token is short-lived and minted over HTTPS, so nothing recorded can
@@ -1263,9 +1310,7 @@ impl ResolvedFeedSet {
             let names: Vec<&str> = self
                 .feeds
                 .iter()
-                .filter(|f| {
-                    f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
-                })
+                .filter(|f| f.needs_minted_token(stage))
                 .map(|f| f.name.as_str())
                 .collect();
             anyhow::bail!(
@@ -1277,7 +1322,7 @@ impl ResolvedFeedSet {
                     .join(", ")
             );
         }
-        let profiles = crate::commands::connect::client::load_config()
+        let profiles = crate::commands::connect::client::load_stored_config()
             .ok()
             .flatten();
         // No fixed User-Agent on the client: the header is set per request, from
@@ -1297,9 +1342,11 @@ impl ResolvedFeedSet {
         let mut lowest: Option<u32> = self.minted_tier;
         let mut self_key_id: Option<String> = self.minted_key_id.clone();
         let mut key_seen = self.minted_key_id.is_some();
-        for feed in self.feeds.iter_mut().filter(|f| {
-            f.kind == FeedKind::Connect && f.applies_to(stage) && f.credential.is_none()
-        }) {
+        for feed in self
+            .feeds
+            .iter_mut()
+            .filter(|f| f.needs_minted_token(stage))
+        {
             let org = feed.org.clone().ok_or_else(|| {
                 anyhow::anyhow!("repos.{}: a Connect feed without an org", feed.name)
             })?;
@@ -1538,6 +1585,7 @@ impl ResolvedFeedSet {
         let mut env = vec![("AVOCADO_FEEDS_DIR".to_string(), container_stage_dir.clone())];
         let mut dnf_args = Vec::new();
         let mut add_hosts = Vec::new();
+        let mut host_feeds = HashMap::new();
 
         if let Some(base) = self.distro_priority_base {
             env.push(("AVOCADO_DISTRO_PRIORITY_BASE".to_string(), base.to_string()));
@@ -1586,6 +1634,17 @@ impl ResolvedFeedSet {
             };
             let repo_path = dir.join(format!("{GENERATED_PREFIX}{}.repo", feed.name));
             fs::write(&repo_path, feed.repo_file(ca_in_container.as_deref()))?;
+            if let Some(url) = feed.host_url() {
+                host_feeds.insert(
+                    feed.name.clone(),
+                    FeedEndpoint {
+                        url: url.to_string(),
+                        ca: feed.ca.clone(),
+                        tls_verify: feed.tls_verify,
+                        credential: feed.credential.clone(),
+                    },
+                );
+            }
             #[cfg(unix)]
             if feed.credential.is_some() {
                 use std::os::unix::fs::PermissionsExt;
@@ -1646,6 +1705,7 @@ impl ResolvedFeedSet {
             env,
             dnf_args,
             add_hosts,
+            host_feeds,
             fingerprint,
         })
     }
@@ -1661,6 +1721,31 @@ struct Probe<'a> {
     ca: Option<PathBuf>,
     tls_verify: bool,
     credential: Option<&'a (String, String)>,
+}
+
+/// A feed's own CA added to a probe's client, as dnf trusts it for the feed.
+pub(crate) fn trust_feed_ca(
+    mut builder: reqwest::ClientBuilder,
+    ca: Option<&Path>,
+    subject: &str,
+) -> Result<reqwest::ClientBuilder> {
+    if let Some(ca) = ca {
+        for cert in load_ca_certificates(ca, subject)? {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    Ok(builder)
+}
+
+/// A probe request sent with the feed's credential, as dnf sends it.
+pub(crate) fn authorize_feed(
+    req: reqwest::RequestBuilder,
+    credential: Option<&(String, String)>,
+) -> reqwest::RequestBuilder {
+    match credential {
+        Some((user, pass)) => req.basic_auth(user, Some(pass)),
+        None => req,
+    }
 }
 
 /// Every certificate in the CA file. A bundle may carry several, and dnf
@@ -1690,22 +1775,14 @@ impl Probe<'_> {
             ));
             return Ok(());
         }
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(20))
             .user_agent(user_agent());
-        if let Some(ca) = &self.ca {
-            for cert in load_ca_certificates(ca, &self.subject)? {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-        let client = builder
+        let client = trust_feed_ca(builder, self.ca.as_deref(), &self.subject)?
             .build()
             .with_context(|| format!("{}: building the HTTP client", self.subject))?;
-        let mut req = client.get(&self.url);
-        if let Some((user, pass)) = self.credential {
-            req = req.basic_auth(user, Some(pass));
-        }
+        let req = authorize_feed(client.get(&self.url), self.credential);
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => bail!("{}: cannot connect to {} ({e})", self.subject, self.url),
@@ -1796,15 +1873,10 @@ pub async fn preflight_feeds(
                 }
                 continue;
             }
-            FeedKind::Url => feed.configured_locator.as_str(),
-            // The mint's host is only known once minted, and a loopback one has
-            // been rewritten for the container, which the host cannot reach.
-            FeedKind::Connect
-                if !feed.baseurl.starts_with("connect://") && !feed.loopback_rewritten =>
-            {
-                feed.baseurl.as_str()
-            }
-            FeedKind::Connect | FeedKind::Distro | FeedKind::Builtin => continue,
+            _ => match feed.host_url() {
+                Some(url) => url,
+                None => continue,
+            },
         };
         if !host_can_probe(locator) {
             continue;
@@ -3630,6 +3702,18 @@ distro:
                 .unwrap()
                 .unwrap();
         (c, set)
+    }
+
+    /// A materialized feed carries the URL the host reaches it at, so a
+    /// probe after a `--repo=` restricted run can ask that feed.
+    #[test]
+    fn materialization_records_each_feeds_host_url() {
+        let (_, set) = url_feed_set("https://named.example", "");
+        let m = set.materialize(FeedStage::Ext).unwrap();
+        assert_eq!(
+            m.host_feeds.get("local").map(|f| f.url.as_str()),
+            Some("https://named.example/feed")
+        );
     }
 
     #[tokio::test]

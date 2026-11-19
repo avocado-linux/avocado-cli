@@ -7,7 +7,7 @@
 //! it carries the in-VM Docker volumes.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::endpoint::Endpoint;
 
@@ -57,35 +57,45 @@ impl VmPaths {
         self.install_dir().join("manifest.json")
     }
 
+    /// Record `dir` as the source a bare `vm start` boots next (every
+    /// start, rebuild and update does). Absolute, so a start from another
+    /// directory finds the same dir, not one that happens to share its name.
+    pub fn record_source(&self, dir: &Path) {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let _ = std::fs::write(self.artifact_dir_file(), dir.display().to_string());
+    }
+
+    /// Select the managed install, if there is one, as the source: a
+    /// `vm update` that had nothing to download still means "boot the
+    /// managed install", as one that downloads does.
+    pub fn select_install(&self) {
+        if self.install_manifest().is_file() {
+            self.record_source(&self.install_dir());
+        }
+    }
+
     /// Default artifact directory to boot from when the user didn't
     /// pass `--vm-source` and `AVOCADO_VM_DIR` is unset. Layered:
     ///
-    ///   1. [`install_dir`] if it has a manifest (i.e. the user ran
-    ///      `avocado vm update` — the common path for end-users).
-    ///   2. The `artifact-dir` pointer file written by previous
-    ///      `vm start` / `vm rebuild` runs, if it still points at
-    ///      an extant directory with a manifest (dev workflow).
+    ///   1. The `artifact-dir` pointer file, if it still points at an
+    ///      extant directory with a manifest. Every `vm start`,
+    ///      `vm rebuild` and `vm update` rewrites it, so it is whatever
+    ///      the user last chose: a bare restart after
+    ///      `vm start --vm-source <dir>` boots that dir again, not an
+    ///      older managed install.
+    ///   2. [`install_dir`] if it has a manifest (`avocado vm update`
+    ///      ran, and the pointer is gone or stale).
     ///   3. `None` — the caller surfaces an error pointing the user
     ///      at `avocado vm update`.
     pub fn default_vm_source(&self) -> Option<PathBuf> {
-        // Managed install first — that's what the user gets after
-        // `avocado vm update`.
-        let install = self.install_dir();
-        if install.join("manifest.json").is_file() {
-            return Some(install);
-        }
-        // Fallback: artifact-dir pointer file from the last explicit
-        // `vm start --vm-source <dir>` / `vm rebuild`.
         if let Ok(raw) = std::fs::read_to_string(self.artifact_dir_file()) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                let p = PathBuf::from(trimmed);
-                if p.join("manifest.json").is_file() {
-                    return Some(p);
-                }
+            let p = PathBuf::from(raw.trim());
+            if !raw.trim().is_empty() && p.join("manifest.json").is_file() {
+                return Some(p);
             }
         }
-        None
+        let install = self.install_dir();
+        install.join("manifest.json").is_file().then_some(install)
     }
     /// Reserved for future artifact caching under ~/.avocado/vm/.
     #[allow(dead_code)]
@@ -426,6 +436,43 @@ mod tests {
         assert_eq!(p.rootfs(), Path::new("/tmp/test-vm/rootfs.img"));
         assert_eq!(p.qmp_socket(), Path::new("/tmp/test-vm/qmp.sock"));
         assert_eq!(p.ssh_port_file(), Path::new("/tmp/test-vm/ssh-port"));
+    }
+
+    #[test]
+    fn default_vm_source_prefers_the_last_chosen_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path().join("vm"));
+        let dev = tmp.path().join("dev");
+        std::fs::create_dir_all(paths.install_dir()).unwrap();
+        std::fs::create_dir_all(&dev).unwrap();
+        assert_eq!(paths.default_vm_source(), None);
+        std::fs::write(paths.install_manifest(), "{}").unwrap();
+        assert_eq!(paths.default_vm_source(), Some(paths.install_dir()));
+        // A later `vm start --vm-source dev` wins over the older install.
+        std::fs::write(dev.join("manifest.json"), "{}").unwrap();
+        std::fs::write(paths.artifact_dir_file(), dev.display().to_string()).unwrap();
+        assert_eq!(paths.default_vm_source(), Some(dev.clone()));
+        // An update that had nothing to download selects the install again.
+        paths.select_install();
+        assert_eq!(paths.default_vm_source(), Some(paths.install_dir()));
+        paths.record_source(&dev);
+        // A pointer to a dir that's gone falls back to the install.
+        std::fs::remove_dir_all(&dev).unwrap();
+        assert_eq!(paths.default_vm_source(), Some(paths.install_dir()));
+    }
+
+    #[test]
+    fn a_relative_source_is_recorded_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = VmPaths::at(tmp.path().join("vm"));
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // `--vm-source build` in project A; a later bare start runs elsewhere.
+        paths.record_source(Path::new("build"));
+        let saved = std::fs::read_to_string(paths.artifact_dir_file()).unwrap();
+        assert_eq!(
+            PathBuf::from(saved),
+            std::env::current_dir().unwrap().join("build")
+        );
     }
 
     #[test]

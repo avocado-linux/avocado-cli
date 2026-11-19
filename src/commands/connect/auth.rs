@@ -243,7 +243,7 @@ impl ConnectAuthLoginCommand {
             organization_id,
         };
 
-        let mut config = client::load_config()?;
+        let mut config = client::load_stored_config()?;
         let is_new_config = config.is_none();
         let existed = config
             .as_ref()
@@ -626,7 +626,7 @@ pub struct ConnectAuthLogoutCommand {
 
 impl ConnectAuthLogoutCommand {
     pub async fn execute(&self) -> Result<()> {
-        let config = client::load_config()?;
+        let config = client::load_stored_config()?;
         match config {
             Some(mut cfg) => {
                 let profile_name = self.profile.as_deref().unwrap_or(&cfg.default_profile);
@@ -703,7 +703,7 @@ impl ConnectAuthStatusCommand {
             return self.execute_json().await;
         }
 
-        match client::load_config()? {
+        match client::load_stored_config()? {
             Some(cfg) => {
                 let (profile_name, profile) =
                     match cfg.resolve_profile(self.profile.as_deref(), None) {
@@ -775,7 +775,7 @@ impl ConnectAuthStatusCommand {
     /// so callers can distinguish "creds on disk but server rejected
     /// them" from "no creds at all".
     async fn execute_json(&self) -> Result<()> {
-        let Some(cfg) = client::load_config()? else {
+        let Some(cfg) = client::load_stored_config()? else {
             emit_json_object(&serde_json::json!({ "logged_in": false }));
             return Ok(());
         };

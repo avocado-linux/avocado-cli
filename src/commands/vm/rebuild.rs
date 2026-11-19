@@ -49,7 +49,7 @@ impl RebuildCommand {
         );
 
         // Record artifact dir so Avocado.app can adopt it.
-        let _ = std::fs::write(paths.artifact_dir_file(), vm_source.display().to_string());
+        paths.record_source(&vm_source);
 
         if self.reset_data {
             let mut removed_any = false;

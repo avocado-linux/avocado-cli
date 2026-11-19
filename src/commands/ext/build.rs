@@ -322,6 +322,83 @@ impl ExtBuildCommand {
         // writes, so both describe the same tree.
         let mut sysroot_tree: Option<String> = None;
 
+        // Find extension using comprehensive lookup
+        let extension_location = config
+            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+            })?;
+
+        // Get the config path where this extension is actually defined
+        // Note: For SDK compile operations, we need a path that's accessible from the host.
+        // For remote extensions, the sdk.compile sections are already merged into the main
+        // config via load_composed(), so we use the main config path for SDK compile.
+        // The ext_src_path (for overlay/scripts) is computed separately below.
+        let ext_config_path = match &extension_location {
+            ExtensionLocation::Local { config_path, .. } => config_path.clone(),
+            ExtensionLocation::Remote { .. } => {
+                // For remote extensions, use the main config path because:
+                // 1. Remote extension sdk.compile sections are merged into main config via load_composed
+                // 2. The Docker volume path is not accessible from the host for SDK compile operations
+                self.config_path.clone()
+            }
+        };
+
+        if self.verbose {
+            match &extension_location {
+                ExtensionLocation::Local { name, config_path } => {
+                    print_info(
+                        &format!("Found local extension '{name}' in config '{config_path}'"),
+                        OutputLevel::Normal,
+                    );
+                }
+                ExtensionLocation::Remote { name, source } => {
+                    print_info(
+                        &format!("Found remote extension '{name}' with source: {source:?}"),
+                        OutputLevel::Normal,
+                    );
+                }
+            }
+        }
+
+        // Get extension configuration from the composed/merged config
+        // For remote extensions, this comes from the merged remote extension config (already read via container)
+        // For local extensions, this uses get_merged_ext_config which reads from the file
+        let ext_config = match &extension_location {
+            ExtensionLocation::Remote { .. } => {
+                // Resolve the remote/path-sourced ext's config from the composed
+                // value, honoring its `target-<name>:` overrides (overlay + `--tag`)
+                // — the same result the Local path gets via get_merged_ext_config.
+                // Shared with `ext image`.
+                super::resolve_remote_ext_config(config, parsed, &self.extension, &target)
+            }
+            ExtensionLocation::Local { config_path, .. } => {
+                // For local extensions, read from the file with proper target merging
+                config.get_merged_ext_config_with_board(
+                    &self.extension,
+                    &target,
+                    config_path,
+                    self.target_board.as_deref(),
+                )?
+            }
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
+        })?;
+
+        // Get extension version from the composed config (source of truth).
+        // For remote extensions, the version comes from the merged remote extension avocado.yaml.
+        // Checked before the up-to-date skip below: the stamp does not cover
+        // every way the version can render empty.
+        let config_version = super::ext_config_version(&ext_config).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Extension '{}' has a missing or empty 'version' field. \
+                 Remote extensions must define 'version' in their avocado.yaml; \
+                 a templated one like '{{{{ env.X }}}}' is empty when X is unset.",
+                self.extension
+            )
+        })?;
+
         // Validate stamps before proceeding (unless --no-stamps)
         if !self.no_stamps {
             let container_helper = SdkContainer::from_config(&self.config_path, config)?
@@ -451,25 +528,32 @@ impl ExtBuildCommand {
             }
 
             // Skip: this step's own stamp is current for every input computed
-            // above (config, compile and install script content, the
-            // `package_files` source tree, the overlay, the sysroot tree it
-            // builds per runtime or per target), and that sysroot is still
-            // there. Nothing it would do could change the tree.
+            // above (config, script content, the `package_files` source tree,
+            // the overlay, the sysroot tree it builds per runtime or per
+            // target), and that sysroot is still there. Nothing it would do
+            // could change the tree.
             // The stamp is left as it is; `ext image` reads the same
             // content_hash from it and reaches the same verdict.
             //
             // The skip is only sound while those inputs describe the whole
-            // build. A `post_build` hook or a compile/install package installs
-            // content that no config key lists, so such an extension is
-            // rebuilt unless it declares `package_files`. See
+            // build. A `post_build` hook installs content that no config key
+            // lists, so such an extension is rebuilt unless it declares
+            // `package_files`. A compile/install package is always rebuilt
+            // here, and its compile step decides whether to skip. See
             // `ext_build_inputs_are_complete`.
             let sysroot_present = crate::utils::stamps::output_listing_from_batch(batch)
                 .iter()
                 .any(|d| d == &self.extension);
+            // The hash reads files under `project_root`; the build reads the
+            // tree the container mounts. They differ when there is no
+            // `src_dir` and the CLI runs from another directory.
             let inputs_are_complete = crate::utils::stamps::ext_build_inputs_are_complete(
                 parsed,
                 &self.extension,
                 &project_root,
+            ) && crate::utils::stamps::hash_root_is_mounted(
+                &project_root,
+                container_helper.mounted_src_dir(),
             );
             if let Some(ref i) = build_inputs {
                 if inputs_are_complete
@@ -485,70 +569,6 @@ impl ExtBuildCommand {
             }
         }
 
-        // Find extension using comprehensive lookup
-        let extension_location = config
-            .find_extension_in_dependency_tree(&self.config_path, &self.extension, &target)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-            })?;
-
-        // Get the config path where this extension is actually defined
-        // Note: For SDK compile operations, we need a path that's accessible from the host.
-        // For remote extensions, the sdk.compile sections are already merged into the main
-        // config via load_composed(), so we use the main config path for SDK compile.
-        // The ext_src_path (for overlay/scripts) is computed separately below.
-        let ext_config_path = match &extension_location {
-            ExtensionLocation::Local { config_path, .. } => config_path.clone(),
-            ExtensionLocation::Remote { .. } => {
-                // For remote extensions, use the main config path because:
-                // 1. Remote extension sdk.compile sections are merged into main config via load_composed
-                // 2. The Docker volume path is not accessible from the host for SDK compile operations
-                self.config_path.clone()
-            }
-        };
-
-        if self.verbose {
-            match &extension_location {
-                ExtensionLocation::Local { name, config_path } => {
-                    print_info(
-                        &format!("Found local extension '{name}' in config '{config_path}'"),
-                        OutputLevel::Normal,
-                    );
-                }
-                ExtensionLocation::Remote { name, source } => {
-                    print_info(
-                        &format!("Found remote extension '{name}' with source: {source:?}"),
-                        OutputLevel::Normal,
-                    );
-                }
-            }
-        }
-
-        // Get extension configuration from the composed/merged config
-        // For remote extensions, this comes from the merged remote extension config (already read via container)
-        // For local extensions, this uses get_merged_ext_config which reads from the file
-        let ext_config = match &extension_location {
-            ExtensionLocation::Remote { .. } => {
-                // Resolve the remote/path-sourced ext's config from the composed
-                // value, honoring its `target-<name>:` overrides (overlay + `--tag`)
-                // — the same result the Local path gets via get_merged_ext_config.
-                // Shared with `ext image`.
-                super::resolve_remote_ext_config(config, parsed, &self.extension, &target)
-            }
-            ExtensionLocation::Local { config_path, .. } => {
-                // For local extensions, read from the file with proper target merging
-                config.get_merged_ext_config_with_board(
-                    &self.extension,
-                    &target,
-                    config_path,
-                    self.target_board.as_deref(),
-                )?
-            }
-        }
-        .ok_or_else(|| {
-            anyhow::anyhow!("Extension '{}' not found in configuration.", self.extension)
-        })?;
-
         // Determine the extension source path for compile/install scripts
         // For remote extensions, scripts are in $AVOCADO_PREFIX/includes/<ext-name>/
         // For local extensions, scripts are in /opt/src (the mounted src_dir)
@@ -562,7 +582,7 @@ impl ExtBuildCommand {
         // Handle compile dependencies with install scripts before building the extension
         // Pass the ext_config_path so SDK compile sections are loaded from the correct config
         self.handle_compile_dependencies(
-            config,
+            &composed,
             &ext_config,
             &target,
             &ext_config_path,
@@ -707,29 +727,6 @@ impl ExtBuildCommand {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| ext_scopes.clone());
-
-        // Get extension version from the composed config (source of truth).
-        // For remote extensions, the version comes from the merged remote extension avocado.yaml.
-        let config_version = ext_config
-            .get("version")
-            .map(|v| {
-                v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                    format!(
-                        "{}",
-                        v.as_i64()
-                            .or_else(|| v.as_f64().map(|f| f as i64))
-                            .unwrap_or(0)
-                    )
-                })
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Extension '{}' is missing a 'version' field. \
-                 Remote extensions must define 'version' in their avocado.yaml. \
-                 Check that the extension config was parsed and merged correctly.",
-                    self.extension
-                )
-            })?;
 
         // Get overlay configuration
         let mut overlay_config = ext_config.get("overlay").map(|v| {
@@ -1847,13 +1844,14 @@ fi
     /// (container path). For remote extensions, this is `$AVOCADO_PREFIX/includes/<ext>/`.
     async fn handle_compile_dependencies(
         &self,
-        config: &Config,
+        composed: &ComposedConfig,
         ext_config: &serde_yaml::Value,
         target: &str,
         sdk_config_path: &str,
         ext_script_workdir: Option<&str>,
         effective_tui_context: &Option<TuiContext>,
     ) -> Result<()> {
+        let config = &composed.config;
         // Get dependencies from extension configuration
         let dependencies = ext_config.get("packages").and_then(|v| v.as_mapping());
 
@@ -1938,7 +1936,21 @@ fi
                 self.container_args.clone(),
                 self.dnf_args.clone(),
             )
-            .with_workdir(ext_script_workdir.map(|s| s.to_string()));
+            .with_workdir(ext_script_workdir.map(|s| s.to_string()))
+            .with_no_stamps(self.no_stamps);
+            // Every extension that builds this section, so its stamp hashes
+            // all of their sources. Without them the section always runs.
+            if let Some(extensions) = super::extensions_naming_compile_section(
+                config,
+                &composed.merged_value,
+                &self.config_path,
+                (&self.extension, ext_config),
+                &compile_section,
+                target,
+                self.target_board.as_deref(),
+            ) {
+                compile_command = compile_command.with_extensions(extensions);
+            }
             if let Some(ref ctx) = effective_tui_context {
                 compile_command = compile_command.with_tui_context(ctx.clone());
             }
