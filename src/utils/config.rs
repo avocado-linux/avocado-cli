@@ -9303,6 +9303,29 @@ sdk:
     }
 
     #[test]
+    fn edge_whitespace_in_a_block_value_reaches_the_container() {
+        let config = Config::load_from_str(
+            r#"
+sdk:
+  container:
+    environment:
+      PASSWORD: 'secret '
+      GREETING: "\thi\n"
+"#,
+        )
+        .unwrap();
+        // The entries as `build_container_command` splits them for docker.
+        let mut argv: Vec<String> = config
+            .get_sdk_container_args()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| crate::utils::container::SdkContainer::parse_container_arg(entry))
+            .collect();
+        argv.sort();
+        assert_eq!(argv, ["-e", "-e", "GREETING=\thi\n", "PASSWORD=secret "]);
+    }
+
+    #[test]
     fn a_profile_can_turn_privileged_off() {
         let config = Config::load_from_str(
             r#"
