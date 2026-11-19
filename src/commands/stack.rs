@@ -283,6 +283,14 @@ impl StackCommand {
                 },
                 None => None,
             };
+            // A state file naming another volume proves this view stale only when that volume
+            // is on this daemon: otherwise it may be another daemon's (the avocado-vm and
+            // native docker, another DOCKER_HOST), as the volume reaper judges it.
+            let present = match &state_volume {
+                Some(sv) if *sv != volume => self.volume_present(sv).await,
+                _ => None,
+            };
+            let state_volume = state_volume_here(state_volume, &volume, present);
             let reason = orphan_reason(
                 &name,
                 meta,
@@ -458,6 +466,12 @@ impl StackCommand {
     }
 }
 
+/// The project's state volume as evidence about view volume `volume`: one that names another
+/// volume counts only when docker says that volume is on this daemon (`present`).
+fn state_volume_here(state: Option<String>, volume: &str, present: Option<bool>) -> Option<String> {
+    state.filter(|sv| sv == volume || present == Some(true))
+}
+
 /// Whether `stack drop` selects view `name`: the given target's view exactly, else every
 /// view of the project (`prefix` is `<volume>-`). A prefix match on a target's view would
 /// also take a sibling whose target extends it (`raspberrypi4` and `raspberrypi4-64`).
@@ -472,6 +486,17 @@ fn drop_selects(name: &str, prefix: &str, exact: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Another daemon's volume in the state file says nothing about this daemon's view.
+    #[test]
+    fn a_state_volume_on_another_daemon_keeps_the_view() {
+        let other = || Some("avo-b".to_string());
+        assert_eq!(state_volume_here(other(), "avo-a", Some(true)), other());
+        assert_eq!(state_volume_here(other(), "avo-a", Some(false)), None);
+        assert_eq!(state_volume_here(other(), "avo-a", None), None);
+        let same = Some("avo-a".to_string());
+        assert_eq!(state_volume_here(same.clone(), "avo-a", None), same);
+    }
 
     #[test]
     fn dropping_a_target_leaves_a_target_it_prefixes() {

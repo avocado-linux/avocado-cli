@@ -411,10 +411,16 @@ impl Private {
             .exact
             .iter()
             .map(|e| PathBuf::from(std::ffi::OsStr::from_bytes(e)))
-            .filter(|r| fs::symlink_metadata(root.join(r)).is_ok())
+            .filter(|r| {
+                r.parent().is_none_or(|p| real_dirs(root, p))
+                    && fs::symlink_metadata(root.join(r)).is_ok()
+            })
             .collect();
         for pre in &self.dirs_under {
             let base = PathBuf::from(std::ffi::OsStr::from_bytes(pre));
+            if !real_dirs(root, &base) {
+                continue;
+            }
             if let Ok(rd) = fs::read_dir(root.join(&base)) {
                 for d in rd.flatten() {
                     if d.file_type().is_ok_and(|t| t.is_dir()) {
@@ -426,6 +432,17 @@ impl Private {
         out.sort();
         out
     }
+}
+
+/// Whether every component of `rel` under `root` is a real directory, not a symlink. The
+/// helper moves private paths as root: a build step that turns `.stamps/rootfs` into a link to
+/// the stacks root must not get store directories moved along with its own.
+fn real_dirs(root: &Path, rel: &Path) -> bool {
+    let mut p = root.to_path_buf();
+    rel.components().all(|c| {
+        p.push(c);
+        fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir())
+    })
 }
 
 struct Walk {
@@ -1152,8 +1169,11 @@ impl Stacks {
     }
 
     /// Mark a view's upper as holding uncommitted work (see `ViewRecord::dirty`).
+    /// No view yet (a clean before the first install) has nothing to mark.
     pub fn taint(&self, name: &str) -> Result<()> {
-        let mut v = self.view(name)?.ok_or_else(|| anyhow!("no view {name}"))?;
+        let Some(mut v) = self.view(name)? else {
+            return Ok(());
+        };
         v.dirty = true;
         self.save_view(&v)
     }
@@ -1527,7 +1547,17 @@ impl Stacks {
     pub fn remount(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>)> {
         let (mut out, mut blocked) = (Vec::new(), Vec::new());
         for v in self.views()? {
-            if v.name.starts_with(prefix) && !is_mounted(&self.merged(&v)) {
+            if !v.name.starts_with(prefix) {
+                continue;
+            }
+            // Under the view's lock, re-read: a commit unmounts its view while it moves the
+            // upper, and mounting it in that window would put a stale overlay on a record
+            // that then names the new layer.
+            let _l = self.view_lock(&v.name)?;
+            let Some(v) = self.view(&v.name)? else {
+                continue;
+            };
+            if !is_mounted(&self.merged(&v)) {
                 match self.mount_view(&v.name, None, &[]) {
                     Ok(_) => out.push(v.name),
                     Err(e) if format!("{e:#}").contains("NEEDS_ADOPT") => blocked.push(v.name),
@@ -1998,6 +2028,49 @@ pub fn write_out(v: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clean marks its view dirty, so the next install does not trust the view's layer; a
+    /// clean before any install has no view to mark.
+    #[test]
+    fn taint_marks_a_view_and_ignores_a_missing_one() {
+        let st = bare_store();
+        fs::create_dir_all(st.root.join("views")).unwrap();
+        st.taint("avo-1-qemux86-64").unwrap();
+        let v: ViewRecord = serde_json::from_value(serde_json::json!({
+            "name": "avo-1-qemux86-64", "layer": EMPTY_KEY, "private": [], "updated": 0,
+        }))
+        .unwrap();
+        st.save_view(&v).unwrap();
+        st.taint(&v.name).unwrap();
+        assert!(st.view(&v.name).unwrap().unwrap().dirty);
+        let _ = fs::remove_dir_all(&st.root);
+    }
+
+    /// A private path behind a symlinked directory is not moved: it would be the link's target.
+    #[test]
+    fn private_paths_do_not_follow_symlinked_parents() {
+        let root = std::env::temp_dir().join(format!("avo-stacks-priv-{}", uniq()));
+        let elsewhere = root.join("store");
+        fs::create_dir_all(elsewhere.join("img")).unwrap();
+        fs::create_dir_all(elsewhere.join("x")).unwrap();
+        let upper = root.join("upper");
+        fs::create_dir_all(upper.join(".stamps")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, upper.join(".stamps/rootfs")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, upper.join("runtimes")).unwrap();
+        let p = Private::new(&[".stamps/rootfs/*".to_string(), "runtimes/x".to_string()]);
+        assert!(
+            p.present_under(&upper).is_empty(),
+            "{:?}",
+            p.present_under(&upper)
+        );
+        fs::remove_file(upper.join(".stamps/rootfs")).unwrap();
+        fs::create_dir_all(upper.join(".stamps/rootfs/img")).unwrap();
+        assert_eq!(
+            p.present_under(&upper),
+            [PathBuf::from(".stamps/rootfs/img")]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// A store without the empty layer, for tests that need no `mkcomposefs`.
     fn bare_store() -> Stacks {

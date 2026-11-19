@@ -70,6 +70,12 @@ impl RootfsCleanCommand {
             SdkContainer::from_config(&self.config_path, config)?.verbose(self.verbose);
 
         print_info("Cleaning rootfs sysroot.", OutputLevel::Normal);
+        crate::utils::stacks::taint_before_clean(
+            &container_helper.container_tool,
+            &container_helper.cwd,
+            &target,
+        )
+        .await?;
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
