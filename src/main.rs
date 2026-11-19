@@ -2660,6 +2660,9 @@ async fn main() -> Result<()> {
                 );
             }
             check_provision_output(output, bundle.is_some(), rubicon.is_some())?;
+            // Before `--bundle` returns: a hub replays every job as `provision --bundle
+            // ... --env K=V`, and the bundled avocado.yaml may read `{{ env.K }}`.
+            let env = park_env_flags(env);
             if let Some(source) = bundle {
                 return crate::commands::provision_bundle::BundleProvision {
                     source,
@@ -2693,7 +2696,6 @@ async fn main() -> Result<()> {
             );
             // No JSON-implies-force coercion here either (see the `Install`
             // arm above for why both of its reasons are gone).
-            let env = park_env_flags(env);
             let src_dir = std::path::Path::new(&config)
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
