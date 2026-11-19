@@ -96,8 +96,27 @@ impl ConnectAuthLoginCommand {
             );
         }
 
-        // Wait for the browser to redirect to our local server
-        let (code, received_state, mut stream) = wait_for_callback(&listener).await?;
+        // Wait for the browser to redirect to our local server. Over ssh the
+        // browser runs on another machine and can't reach it: the user pastes
+        // the URL it was sent to instead.
+        let paste = !self.output.is_json() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if paste {
+            println!(
+                "  If the browser can't reach this machine (ssh, a headless host), it shows\n  \
+                 a connection error after you log in: paste the URL from its address bar here."
+            );
+            println!();
+        }
+        let (code, received_state, mut stream) = tokio::select! {
+            r = wait_for_callback(&listener) => {
+                let (code, state, stream) = r?;
+                (code, state, Some(stream))
+            }
+            r = read_pasted_callback(), if paste => {
+                let (code, state) = r?;
+                (code, state, None)
+            }
+        };
 
         // Validate state to prevent CSRF — respond to browser BEFORE bailing
         if received_state != state {
@@ -328,22 +347,39 @@ async fn wait_for_callback(
         .and_then(|line| line.split_whitespace().nth(1))
         .ok_or_else(|| anyhow::anyhow!("malformed HTTP request from browser callback"))?;
 
-    // Parse query params from the path
-    let params = parse_query_params(path);
-    let code = params
-        .get("code")
-        .ok_or_else(|| anyhow::anyhow!("no 'code' parameter in callback"))?
-        .clone();
-    let state = params
-        .get("state")
-        .ok_or_else(|| anyhow::anyhow!("no 'state' parameter in callback"))?
-        .clone();
-
+    let (code, state) = callback_params(path)?;
     Ok((code, state, stream))
 }
 
+/// Read the callback URL the user pasted from the browser's address bar.
+async fn read_pasted_callback() -> Result<(String, String)> {
+    let line = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await?
+    .context("failed to read the pasted callback URL")?;
+    callback_params(line.trim())
+}
+
+/// `code` and `state` from a callback URL or path.
+fn callback_params(url: &str) -> Result<(String, String)> {
+    let params = parse_query_params(url);
+    let get = |k: &str| {
+        params
+            .get(k)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no '{k}' parameter in the callback URL"))
+    };
+    Ok((get("code")?, get("state")?))
+}
+
 /// Send an HTTP 302 redirect response on the given stream and shut it down cleanly.
-async fn respond_redirect(stream: &mut tokio::net::TcpStream, url: &str) {
+/// Nothing to answer when the callback URL was pasted.
+async fn respond_redirect(stream: &mut Option<tokio::net::TcpStream>, url: &str) {
+    let Some(stream) = stream else {
+        return;
+    };
     let response = format!(
         "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         url,
@@ -834,6 +870,17 @@ impl ConnectAuthStatusCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pasted callback URL (ssh, headless host) gives the same code and state
+    /// as the redirect the local listener would have read.
+    #[test]
+    fn a_pasted_callback_url_gives_code_and_state() {
+        let (code, state) =
+            callback_params("http://127.0.0.1:41234/callback?code=abc%2Bd&state=s1").unwrap();
+        assert_eq!((code.as_str(), state.as_str()), ("abc+d", "s1"));
+        assert!(callback_params("http://127.0.0.1:41234/callback?state=s1").is_err());
+        assert!(callback_params("not a url").is_err());
+    }
 
     fn org(id: &str, name: &str) -> OrgInfo {
         OrgInfo {
