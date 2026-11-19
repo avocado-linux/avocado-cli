@@ -110,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **`avocado clean` removes `.avocado/overlay-staging/`.** Preprocessed
+  overlays, which can hold rendered templated secrets, stayed on disk after a
+  clean until that overlay was next built. They are removed on every clean,
+  including with `--skip-volumes`.
 - **`deploy -d` refuses a device string with shell syntax in it.** The user
   and host were pasted into the deploy script that runs in the SDK container, so
   `-d '$(cmd)'` ran `cmd` there. The user may now hold only letters, digits,
