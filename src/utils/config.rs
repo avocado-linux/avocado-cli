@@ -6430,13 +6430,24 @@ impl Config {
         // src_dir into a /opt/src/<...> container path. Mirrors the legacy
         // resolution behavior so existing runtime-level paths stay byte-
         // identical to the previous CLI output.
+        //
+        // The result is a path inside the container, so it is judged and
+        // written by POSIX rules whatever the host: a leading `/` means
+        // absolute (the host's own test says otherwise on Windows), and the
+        // relative part is joined with `/`, never the host's separator.
+        let is_container_absolute = |path: &str| path.starts_with('/');
         let to_consumer_opt_src = |path: &str| -> String {
-            if Path::new(path).is_absolute() {
+            if is_container_absolute(path) {
                 return path.to_string();
             }
             let resolved = self.resolve_path_relative_to_src_dir(&config_path, path);
             if let Ok(relative) = resolved.strip_prefix(&consumer_src_dir) {
-                format!("/opt/src/{}", relative.display())
+                let relative = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                format!("/opt/src/{relative}")
             } else {
                 format!("/opt/src/{path}")
             }
@@ -6461,7 +6472,7 @@ impl Config {
         // any relative path the extension declares resolves there, not to
         // /opt/src (the consumer's project).
         let to_remote_extension_path = |ext_name: &str, path: &str| -> String {
-            if Path::new(path).is_absolute() {
+            if is_container_absolute(path) {
                 return path.to_string();
             }
             format!("/opt/_avocado/{target}/includes/{ext_name}/{path}")

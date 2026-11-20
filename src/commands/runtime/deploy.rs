@@ -1102,21 +1102,15 @@ fn strip_host_network_args(args_out: &mut Vec<String>) {
 /// A qemu slirp host-forward opened for the duration of one deploy. Teardown
 /// is async, so it's closed explicitly by the caller rather than via `Drop`.
 struct OpenForward {
-    qmp_socket: std::path::PathBuf,
+    qmp: crate::utils::vm::endpoint::Endpoint,
     host_port: u16,
 }
 
 impl OpenForward {
     async fn close(self) {
-        // The qmp module is unix-only (unix-socket transport), so this teardown
-        // only exists on unix. On other platforms OpenForward is never built
-        // (the qmp block below is cfg'd out), so this is unreachable there.
-        #[cfg(unix)]
-        if let Ok(mut c) = crate::utils::vm::qmp::QmpClient::connect(&self.qmp_socket).await {
+        if let Ok(mut c) = crate::utils::vm::qmp::QmpClient::connect_endpoint(&self.qmp).await {
             let _ = c.hostfwd_remove("net0", "0.0.0.0", self.host_port).await;
         }
-        #[cfg(not(unix))]
-        let _ = (&self.qmp_socket, self.host_port);
     }
 }
 
@@ -1197,8 +1191,8 @@ async fn prepare_mac_deploy_net(
     // published port through qemu. Docker Desktop forwards `-p` to the host
     // itself (vpnkit), so it needs no qemu step.
     if vm_routing {
-        let sock = match crate::utils::vm::state::VmPaths::resolve() {
-            Ok(p) => p.qmp_socket(),
+        let qmp = match crate::utils::vm::state::VmPaths::resolve() {
+            Ok(p) => p.qmp_endpoint(),
             Err(e) => {
                 print_warning(
                     &format!("deploy: can't locate the avocado-vm for port forwarding ({e})."),
@@ -1207,11 +1201,7 @@ async fn prepare_mac_deploy_net(
                 return net;
             }
         };
-        // QMP rides a unix-socket transport (the qmp module is unix-only), and
-        // avocado-vm routing only happens on unix hosts — so the port-forward
-        // setup is compiled in on unix only. Elsewhere it's a no-op.
-        #[cfg(unix)]
-        match crate::utils::vm::qmp::QmpClient::connect(&sock).await {
+        match crate::utils::vm::qmp::QmpClient::connect_endpoint(&qmp).await {
             Ok(mut c) => {
                 // Clear any stale forward from a prior interrupted deploy, then add.
                 let _ = c.hostfwd_remove("net0", "0.0.0.0", port).await;
@@ -1226,7 +1216,7 @@ async fn prepare_mac_deploy_net(
                             );
                         }
                         net.forward = Some(OpenForward {
-                            qmp_socket: sock,
+                            qmp,
                             host_port: port,
                         });
                     }
@@ -1246,8 +1236,6 @@ async fn prepare_mac_deploy_net(
                 OutputLevel::Normal,
             ),
         }
-        #[cfg(not(unix))]
-        let _ = &sock;
     }
 
     net
