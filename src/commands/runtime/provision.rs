@@ -553,13 +553,21 @@ impl RuntimeProvisionCommand {
         // provisioning tail, and it is provisioning's to run.
         // Bound above, before the kernel cmdline export.
         let merged_runtime = merged_runtime.clone().unwrap_or_default();
+        // Configuration names, not the versioned `resolved_extensions`. The
+        // privilege check below reads the same list, so it can't disagree
+        // with what gets primed.
+        let ext_names = crate::commands::runtime::var_image::runtime_extension_names(
+            &composed,
+            &merged_runtime,
+            &target_arch,
+        )?;
         let var_ctx = crate::commands::runtime::var_image::VarImageContext {
             runtime_name: &self.config.runtime_name,
             target_arch: &target_arch,
             config,
             parsed,
             merged_runtime: &merged_runtime,
-            ext_list: &resolved_extensions,
+            ext_list: &ext_names,
         };
         let var_section = crate::commands::runtime::var_image::render_var_image(&var_ctx)?;
         // --pack: what a bundle replays after restoring its files. Built by
@@ -606,11 +614,18 @@ impl RuntimeProvisionCommand {
             interactive: !self.config.force,
             env_vars,
             container_args: {
-                let mut args =
-                    strip_cli_owned_provision_env(config.merge_provision_container_args(
-                        self.config.provision_profile.as_deref(),
-                        self.config.container_args.as_ref(),
-                    ));
+                let mut args = provision_container_args(
+                    config,
+                    self.config.provision_profile.as_deref(),
+                    self.config.container_args.as_ref(),
+                    !crate::commands::runtime::var_image::docker_images(
+                        config,
+                        parsed,
+                        &ext_names,
+                        &target_arch,
+                    )
+                    .is_empty(),
+                );
                 if let Some(copy) = &host_mounts {
                     args.get_or_insert_with(Vec::new)
                         .extend(["-v".to_string(), copy.bind_arg()]);
@@ -1412,6 +1427,30 @@ fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String
     args.map(|a| crate::utils::container::strip_env_args(&a, &KEYS))
 }
 
+/// The provision container's args. Priming Docker images runs dockerd in the
+/// container, which needs `--privileged`; an explicit `--privileged=<bool>`
+/// (e.g. a profile's `container.privileged: false`) is left as set.
+fn provision_container_args(
+    config: &crate::utils::config::Config,
+    profile: Option<&str>,
+    cli_args: Option<&Vec<String>>,
+    primes_docker: bool,
+) -> Option<Vec<String>> {
+    let mut args =
+        strip_cli_owned_provision_env(config.merge_provision_container_args(profile, cli_args));
+    let privilege_set = || {
+        args.iter()
+            .flatten()
+            .flat_map(|a| SdkContainer::parse_container_arg(a))
+            .any(|t| t == "--privileged" || t.starts_with("--privileged="))
+    };
+    if primes_docker && !privilege_set() {
+        args.get_or_insert_with(Vec::new)
+            .push("--privileged".to_string());
+    }
+    args
+}
+
 /// Whether the container's provision state file is copied over the host's.
 /// A dry run writes nothing, so the host state stays as it was.
 fn state_copy_applies(dry_run: bool) -> bool {
@@ -1493,6 +1532,64 @@ mod tests {
         let caller = HashMap::from([("SECRET".to_string(), "s".to_string())]);
         let snap = bundle_env_snapshot(&env, Some(&caller));
         assert_eq!(snap.keys().collect::<Vec<_>>(), ["AVOCADO_PROVISION_FORCE"]);
+    }
+
+    fn privileged_count(sdk_args: &str, primes_docker: bool) -> usize {
+        let config = crate::utils::config::Config::load_from_str(&format!(
+            "sdk:\n  container_args: {sdk_args}\n"
+        ))
+        .unwrap();
+        provision_container_args(&config, None, None, primes_docker)
+            .unwrap_or_default()
+            .iter()
+            .filter(|a| a.as_str() == "--privileged")
+            .count()
+    }
+
+    /// Priming runs dockerd in the provision container, which needs
+    /// `--privileged` whether or not `sdk.container_args` has it.
+    #[test]
+    fn docker_priming_makes_the_provision_container_privileged_once() {
+        assert_eq!(privileged_count(r#"["--network=host"]"#, true), 1);
+        assert_eq!(privileged_count("[]", true), 1);
+        assert_eq!(privileged_count(r#"["--privileged"]"#, true), 1);
+        assert_eq!(
+            privileged_count(r#"["--network=host --privileged"]"#, true),
+            0,
+            "already in a combined entry, not added beside it"
+        );
+        assert_eq!(privileged_count(r#"["--network=host"]"#, false), 0);
+    }
+
+    #[test]
+    fn without_docker_images_the_provision_args_are_unchanged() {
+        let config = crate::utils::config::Config::load_from_str(
+            "sdk:\n  container_args: [\"--network=host\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provision_container_args(&config, None, None, false),
+            config.merge_provision_container_args(None, None)
+        );
+    }
+
+    #[test]
+    fn docker_priming_keeps_a_profile_that_turns_privileged_off() {
+        let config = crate::utils::config::Config::load_from_str(
+            r#"
+sdk:
+  container_args: ["--privileged"]
+provision_profiles:
+  safe:
+    container:
+      privileged: false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provision_container_args(&config, Some("safe"), None, true).unwrap(),
+            ["--privileged=false"]
+        );
     }
 
     #[test]
