@@ -110,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **`avocado connect auth login` works over ssh.** The browser redirects to
+  a local port on the machine running the CLI, which a laptop's browser can't
+  reach when the CLI runs on a headless host. The CLI now also takes the URL
+  from the browser's address bar pasted at its prompt, whichever comes first.
 - **`avocado clean` removes `.avocado/overlay-staging/`.** Preprocessed
   overlays, which can hold rendered templated secrets, stayed on disk after a
   clean until that overlay was next built. They are removed on every clean,
