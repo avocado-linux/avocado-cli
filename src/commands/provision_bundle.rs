@@ -1548,6 +1548,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_bundle_pins_the_board_it_was_built_for() {
         // The host resolved board b2 (here from the sole runtime's
         // target_board; on a bench, usually AVOCADO_TARGET_BOARD), not the
