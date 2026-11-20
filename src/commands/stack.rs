@@ -161,7 +161,7 @@ impl StackCommand {
         match Helper::configured(&self.container_tool)? {
             Some(h) => Ok(h),
             None => bail!(
-                "stacks are not configured. Set `root:` in {} (see `avocado stack config`)",
+                "stacks are not configured. Set `stacks.root` in {} (see `avocado stack config`)",
                 config_path()?.display()
             ),
         }
@@ -393,7 +393,7 @@ impl StackCommand {
         h.json(&["destroy"]).await?;
         print_success(
             &format!(
-                "Deleted all stacks ({}). Remove `root:` from {} to stop using stacks.",
+                "Deleted all stacks ({}). Remove `stacks.root` from {} to stop using stacks.",
                 bytes(&r["total_bytes"]),
                 config_path()?.display()
             ),
@@ -431,7 +431,7 @@ impl StackCommand {
         );
         match &s.root {
             None => println!(
-                "Stacks are off (`enabled: false` or AVOCADO_STACKS=off): installs use plain \
+                "Stacks are off (`stacks.enabled: false` or AVOCADO_STACKS=off): installs use plain \
                  volumes. Remove that to turn them back on."
             ),
             Some(root) => {

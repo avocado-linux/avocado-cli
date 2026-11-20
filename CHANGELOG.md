@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default `ext clean` still runs the clean script of each section.
 
 - **Stacks (opt-in): SDK installs shared across projects.** With
-  `enabled: true` in `<config dir>/avocado/stacks.yaml` (or
+  `enabled: true` under `stacks:` in `~/.avocado/config.yaml` (or
   `AVOCADO_STACKS=on`), `sdk install` builds a project's
   `/opt/_avocado/<target>` as content-addressed layers: the SDK bootstrap,
   the target base (rootfs, initramfs and the platform SDK packages) and the
@@ -122,8 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared layers. Needs rootful docker that can run `--privileged` and Linux
   6.5+ (layers mount file-backed on 6.12+, through loop devices below); a
   host that cannot run stacks uses plain volumes, with a warning. Stacks live
-  in `/var/lib/avocado/stacks` on the docker host unless `root:` in
-  `<config dir>/avocado/stacks.yaml` (or `AVOCADO_STACKS`) says otherwise,
+  in `/var/lib/avocado/stacks` on the docker host unless `stacks.root` in
+  `~/.avocado/config.yaml` (or `AVOCADO_STACKS`) says otherwise,
   and keep 20 GiB free there unless `gc:` sets a limit. A `root:` also turns
   them on; `enabled: false` or `AVOCADO_STACKS=off` keeps them off. `commit: false` (or
   `AVOCADO_STACKS_COMMIT=0`) reuses layers but stops the CLI from committing

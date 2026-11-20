@@ -1,5 +1,5 @@
-//! Stacks client. Once stacks are turned on (opt-in: `enabled: true` or a `root:` in
-//! `stacks.yaml`, or `AVOCADO_STACKS`; `avocado stack config` reports the settings and checks
+//! Stacks client. Once stacks are turned on (opt-in: `enabled: true` or a `root:` under
+//! `stacks:` in `~/.avocado/config.yaml`, or `AVOCADO_STACKS`; `avocado stack config` reports the settings and checks
 //! the host again), a project's `/opt/_avocado/<target>` is a stack view (an EROFS layer + a private upper) mounted inside
 //! its `avo-<uuid>` volume, and `sdk install` produces layers other projects with the same
 //! inputs share.
@@ -61,7 +61,7 @@ pub const PRIVATE: &[&str] = &[
     ".stamps/initramfs/*",
 ];
 
-/// Per-machine stacks settings: `<avocado config dir>/stacks.yaml`, then the
+/// Per-machine stacks settings: the `stacks:` section of `~/.avocado/config.yaml`, then the
 /// environment (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`, `AVOCADO_STACKS_COMMIT`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,7 +138,21 @@ impl Settings {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    Ok(crate::utils::signing_keys::get_avocado_config_dir()?.join("stacks.yaml"))
+    crate::utils::user_config::UserConfig::default_path()
+        .ok_or_else(|| anyhow::anyhow!("could not determine the home directory"))
+}
+
+/// The `stacks:` section of the user config file's text, as YAML text. A file that does not
+/// parse is passed on whole, so `resolve_settings` reports it (and `AVOCADO_STACKS=off` still
+/// gets past it).
+fn stacks_section(file: &str) -> String {
+    match serde_yaml::from_str::<serde_yaml::Value>(file) {
+        Ok(v) => v
+            .get("stacks")
+            .map(|s| serde_yaml::to_string(s).unwrap_or_default())
+            .unwrap_or_default(),
+        Err(_) => file.to_string(),
+    }
 }
 
 /// The environment's overrides (`AVOCADO_STACKS`, `AVOCADO_STACKS_HELPER`,
@@ -218,7 +232,8 @@ pub fn settings() -> Result<Settings> {
     S.get_or_init(|| {
         let file = config_path()
             .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok());
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| stacks_section(&t));
         let (root, helper, commit) = (
             std::env::var("AVOCADO_STACKS").ok(),
             std::env::var("AVOCADO_STACKS_HELPER").ok(),
@@ -1676,6 +1691,21 @@ esac
             helper,
             commit,
         }
+    }
+
+    /// The settings are the `stacks:` section of the user config, beside its other sections;
+    /// a file without one leaves stacks off, and a file that does not parse is still reported.
+    #[test]
+    fn settings_are_the_stacks_section_of_the_user_config() {
+        let file = "vm:\n  channel: beta\nstacks:\n  root: /srv/stacks\n";
+        let s = resolve_settings(Some(&stacks_section(file)), &EnvSettings::default()).unwrap();
+        assert_eq!(s.root.as_deref(), Some("/srv/stacks"));
+        let none = stacks_section("vm:\n  channel: beta\n");
+        assert!(resolve_settings(Some(&none), &EnvSettings::default())
+            .unwrap()
+            .root
+            .is_none());
+        assert!(resolve_settings(Some(&stacks_section("[")), &EnvSettings::default()).is_err());
     }
 
     #[test]
