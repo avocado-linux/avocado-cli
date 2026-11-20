@@ -93,6 +93,21 @@ fn part_lock_sections(part: Part) -> &'static [&'static str] {
     }
 }
 
+/// A target's lock section as the layer keys read it, without the target-sysroot's kernel pin:
+/// the resolver pins it before the key is computed, but the lock only keeps it once a
+/// target-sysroot installs, so a project without one would key differently on every re-run.
+/// It is the rootfs kernel, which the Base key already carries.
+fn key_lock(lock: &LockFile, target: &str) -> serde_json::Value {
+    let mut v = serde_json::to_value(lock.targets.get(target)).unwrap_or_default();
+    if let Some(kv) = v.get_mut("kernel-versions").and_then(|k| k.as_object_mut()) {
+        kv.remove(&SysrootType::TargetSysroot.lock_key());
+        if kv.is_empty() {
+            v.as_object_mut().map(|o| o.remove("kernel-versions"));
+        }
+    }
+    v
+}
+
 /// Just `sections` of a target's lock section, every one present (null when the lock has
 /// none yet): the re-run aliases refresh exactly the sections a key names, so a section left
 /// out on a first install would never reach the next run's key.
@@ -1446,7 +1461,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
             ),
             _ => None,
         };
-        let lock_json = serde_json::to_value(lock_file.targets.get(target)).unwrap_or_default();
+        let lock_json = key_lock(lock_file, target);
         let releasever = std::env::var("AVOCADO_RELEASEVER").ok();
         let l1_inputs = stacks.filter(|_| !adds_nothing).map(|s| {
             let mut v = part_layer_inputs(&PartKeyInputs {
@@ -1850,10 +1865,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 let key = r.key;
                 if part == Part::Project {
                     let saved = LockFile::load(src_dir)?;
-                    s.alias_for_lock(
-                        &serde_json::to_value(saved.targets.get(target)).unwrap_or_default(),
-                    )
-                    .await?;
+                    s.alias_for_lock(&key_lock(&saved, target)).await?;
                 }
                 Some(key)
             }
@@ -1865,10 +1877,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                 }
                 if let Some(s) = stacks {
                     let saved = LockFile::load(src_dir)?;
-                    s.alias_for_lock(
-                        &serde_json::to_value(saved.targets.get(target)).unwrap_or_default(),
-                    )
-                    .await?;
+                    s.alias_for_lock(&key_lock(&saved, target)).await?;
                 }
                 parent.map(String::from)
             }
@@ -3935,6 +3944,23 @@ runtimes:
             "target-sysroot": {"libfoo": "1.0"},
             "extensions": {"app": {"version": "0.1.0-r0.only-in-project-a"}},
         })
+    }
+
+    /// A project without a target-sysroot: the resolver pins its kernel before the key, the
+    /// saved lock drops it. Both must give the same Base key, or every warm install misses.
+    #[test]
+    fn the_target_sysroot_kernel_pin_does_not_move_the_base_key() {
+        let mut pinned = LockFile::new();
+        pinned.set_kernel_version("qemux86-64", &SysrootType::Rootfs, "6.6.1");
+        let saved = pinned.clone();
+        pinned.set_kernel_version("qemux86-64", &SysrootType::TargetSysroot, "6.6.1");
+        let (sdk, ext, feeds) = (None, HashMap::new(), serde_yaml::Value::Null);
+        let base = |lock: &LockFile| {
+            let lock = key_lock(lock, "qemux86-64");
+            part_layer_inputs(&key_inputs(Part::Base, &lock, &sdk, &ext, &feeds))
+        };
+        assert_eq!(base(&pinned), base(&saved));
+        assert_eq!(base(&saved)["lock"]["kernel-versions"]["rootfs"], "6.6.1");
     }
 
     /// Each part's key carries the lock sections its installs pin, under the lock file's own
