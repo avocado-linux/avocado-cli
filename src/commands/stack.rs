@@ -439,8 +439,8 @@ impl StackCommand {
                     unreachable!("a root means a helper")
                 };
                 // Always a fresh answer, and no cached failure outliving a fix.
-                if let Ok(d) = crate::utils::signing_keys::get_avocado_config_dir() {
-                    let _ = std::fs::remove_file(d.join("stacks-preflight.json"));
+                if let Some(p) = crate::utils::stacks::preflight_cache_path() {
+                    let _ = std::fs::remove_file(p);
                 }
                 match h.json(&["preflight"]).await {
                     Ok(p) => print_success(

@@ -142,6 +142,11 @@ pub fn config_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("could not determine the home directory"))
 }
 
+/// The host check's cache, beside the user config in `~/.avocado/`.
+pub fn preflight_cache_path() -> Option<PathBuf> {
+    Some(config_path().ok()?.with_file_name("stacks-preflight.json"))
+}
+
 /// The `stacks:` section of the user config file's text, as YAML text. A file that does not
 /// parse is passed on whole, so `resolve_settings` reports it (and `AVOCADO_STACKS=off` still
 /// gets past it).
@@ -329,7 +334,7 @@ pub async fn active_root(tool: &str) -> Option<String> {
 }
 
 /// The helper's preflight (a real view mounted and dropped), remembered per docker host,
-/// kernel, image and root in `<config dir>/stacks-preflight.json`: a day when it worked, an hour
+/// kernel, image and root in `~/.avocado/stacks-preflight.json`: a day when it worked, an hour
 /// when the host answered no, so hosts that cannot run stacks do not pay for it on every
 /// command. Transient failures (a pull, a daemon hiccup, no answer) are not remembered. The
 /// second value says whether the check ran now (false: from the cache). The whole check,
@@ -385,9 +390,7 @@ async fn preflight_within(
         "{info}|{image}|{root}|{}",
         std::env::var("AVOCADO_STACKS_FORCE_LOOP").unwrap_or_default()
     );
-    let path = crate::utils::signing_keys::get_avocado_config_dir()
-        .ok()
-        .map(|d| d.join("stacks-preflight.json"));
+    let path = preflight_cache_path();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
