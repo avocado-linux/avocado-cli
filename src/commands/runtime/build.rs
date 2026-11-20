@@ -1006,46 +1006,11 @@ impl RuntimeBuildCommand {
             Some(env_vars)
         };
 
-        // If any extension in this runtime declares docker_images, add --privileged
-        // to container args so dockerd can run inside the SDK container (Docker-in-Docker)
-        let build_container_args = {
-            let ext_list: Vec<&str> = merged_runtime
-                .as_ref()
-                .and_then(|rt| rt.get("extensions"))
-                .and_then(|e| e.as_sequence())
-                .map(|seq| seq.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-
-            let has_docker_images = ext_list.iter().any(|ext_name| {
-                parsed
-                    .get("extensions")
-                    .and_then(|e| e.get(*ext_name))
-                    .map(|ext| !crate::utils::config::get_docker_images(ext).is_empty())
-                    .unwrap_or(false)
-            });
-
-            let mut args = merged_container_args.clone().unwrap_or_default();
-            let mut modified = false;
-            if has_docker_images && !args.iter().any(|a| a == "--privileged") {
-                args.push("--privileged".to_string());
-                modified = true;
-            }
-            if let Some(ref keyset_path) = kab_keyset_host_path {
-                args.push("-v".to_string());
-                args.push(format!("{keyset_path}:/tmp/kab.keyset:ro"));
-                modified = true;
-            }
-            if let Some(ref keydir) = fit_keydir_host_path {
-                args.push("-v".to_string());
-                args.push(format!("{keydir}:/tmp/fit-keys:ro"));
-                modified = true;
-            }
-            if modified {
-                Some(args)
-            } else {
-                merged_container_args.clone()
-            }
-        };
+        let build_container_args = build_container_args(
+            merged_container_args,
+            kab_keyset_host_path.as_deref(),
+            fit_keydir_host_path.as_deref(),
+        );
 
         let run_config = RunConfig {
             container_image: container_image.to_string(),
@@ -2395,7 +2360,7 @@ echo "Provisioned update authority: metadata/root.json""#
             (None, false) => unreachable!("dev signing key should have been auto-generated above"),
         };
 
-        // Extension list from runtime config (used by var_files, docker priming, and subvolumes)
+        // Extension list from runtime config (used by var_files and subvolumes)
         let ext_list: Vec<&str> = merged_runtime
             .get("extensions")
             .and_then(|e| e.as_sequence())
@@ -2481,9 +2446,6 @@ fi"#
             &crate::utils::config::get_runtime_var_files(&merged_runtime),
             "/opt/src",
         );
-
-        // Build Docker image priming section
-        // Collect docker_images from all extensions in the runtime
 
         // Helper closure: given the rootfs/initramfs ImageConfig the runtime
         // resolves to, render the users/groups script that will edit the
@@ -3589,8 +3551,41 @@ avocado_staged_kernel"#
     }
 }
 
+/// The build container's args: the merged SDK args plus the signing key
+/// mounts. No `--privileged` for `docker_images`: provision primes them.
+fn build_container_args(
+    merged: &Option<Vec<String>>,
+    kab_keyset: Option<&str>,
+    fit_keydir: Option<&str>,
+) -> Option<Vec<String>> {
+    if kab_keyset.is_none() && fit_keydir.is_none() {
+        return merged.clone();
+    }
+    let mut args = merged.clone().unwrap_or_default();
+    if let Some(keyset_path) = kab_keyset {
+        args.push("-v".to_string());
+        args.push(format!("{keyset_path}:/tmp/kab.keyset:ro"));
+    }
+    if let Some(keydir) = fit_keydir {
+        args.push("-v".to_string());
+        args.push(format!("{keydir}:/tmp/fit-keys:ro"));
+    }
+    Some(args)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_args_are_the_merged_args_plus_key_mounts() {
+        let merged = Some(vec!["--network=host".to_string()]);
+        assert_eq!(super::build_container_args(&merged, None, None), merged);
+        assert_eq!(super::build_container_args(&None, None, None), None);
+        assert_eq!(
+            super::build_container_args(&merged, Some("/k"), None).unwrap(),
+            ["--network=host", "-v", "/k:/tmp/kab.keyset:ro"]
+        );
+    }
+
     /// Runs `render_kernel_image_section` in sh against a fake
     /// `$AVOCADO_PREFIX/kernel` and returns (exit status, exported image).
     fn run_kernel_image_section(pinned: Option<&str>, staged: &[&str]) -> (i32, String) {

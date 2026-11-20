@@ -38,14 +38,16 @@ pub struct VarImageContext<'a> {
     pub config: &'a Config,
     pub parsed: &'a serde_yaml::Value,
     pub merged_runtime: &'a serde_yaml::Value,
-    /// Extensions in this runtime: the Docker priming section and the subvolume
-    /// resolution both read per-extension config.
+    /// Extensions in this runtime, by configuration name
+    /// ([`runtime_extension_names`]): the Docker priming section and the
+    /// subvolume resolution both look up per-extension config with them.
     pub ext_list: &'a [String],
 }
 
 /// Shared context unpacking and config-derived sections for both halves.
 struct Rendered {
     docker_section: String,
+    subvol_mkdir_section: String,
     mkfs_flags: String,
     global_compress_flag: String,
     post_creation_section: String,
@@ -68,6 +70,71 @@ fn keep_initial_os_rollback(merged_runtime: &serde_yaml::Value) -> Result<bool> 
             anyhow::bail!("var.initial_os_rollback must be true or false, got {other:?}")
         }
     }
+}
+
+/// The images [`render_var_image`] primes: every `docker_images` entry of the
+/// runtime's extensions, each resolved for `target` (its `target-<name>:`
+/// block applied) the way `ext build` resolves it.
+pub fn docker_images(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    ext_list: &[impl AsRef<str>],
+    target: &str,
+) -> Vec<crate::utils::config::DockerImageRef> {
+    ext_list
+        .iter()
+        .flat_map(|ext_name| {
+            crate::commands::ext::resolve_remote_ext_config(
+                config,
+                parsed,
+                ext_name.as_ref(),
+                target,
+            )
+            .map(|ext| crate::utils::config::get_docker_images(&ext))
+            .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The runtime's extensions by configuration name (their key under
+/// `extensions:`): the `extensions` list with `depends_on` expanded, as
+/// `runtime build` resolves it, then any deprecated
+/// `packages.<p>.extensions` entries. `AVOCADO_EXT_LIST` carries versioned
+/// identifiers (`app-1.0.0`), which match no configuration key.
+pub fn runtime_extension_names(
+    composed: &crate::utils::config::ComposedConfig,
+    merged_runtime: &serde_yaml::Value,
+    target_arch: &str,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    if let Some(seq) = merged_runtime
+        .get("extensions")
+        .and_then(|e| e.as_sequence())
+    {
+        let authored: Vec<String> = seq
+            .iter()
+            .filter_map(crate::utils::runtime_extension::RuntimeExtensionSpec::parse_entry)
+            .map(|spec| crate::utils::interpolation::interpolate_name(&spec.name, target_arch))
+            .collect();
+        let graph = crate::utils::ext_deps::DependencyGraph::from_composed(composed, target_arch)?;
+        names.extend(
+            graph
+                .resolve_runtime_list(&authored)?
+                .into_iter()
+                .map(|entry| entry.name),
+        );
+    }
+    if let Some(packages) = merged_runtime.get("packages").and_then(|p| p.as_mapping()) {
+        names.extend(
+            packages
+                .values()
+                .filter_map(|spec| spec.get("extensions")?.as_str())
+                .map(str::to_string),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
+    Ok(names)
 }
 
 fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
@@ -103,6 +170,13 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
         .map(|s| format!("    --subvol rw:{}", s.path))
         .collect();
     let mkfs_flags = subvol_flags.join(" \\\n");
+    // mkfs.btrfs rejects a --subvol with no source directory, and build stages
+    // only the subvolumes of the extensions the runtime lists by plain name.
+    let subvol_mkdir_section = resolved_subvolumes
+        .iter()
+        .map(|s| format!("mkdir -p \"$VAR_DIR/{}\"", s.path))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let global_compress_flag = {
         // Use the runtime-level var.compression as a global --compress flag
@@ -192,16 +266,7 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
     };
 
     let docker_section = {
-        let docker_images: Vec<crate::utils::config::DockerImageRef> = ext_list
-            .iter()
-            .flat_map(|ext_name| {
-                parsed
-                    .get("extensions")
-                    .and_then(|e| e.get(*ext_name))
-                    .map(crate::utils::config::get_docker_images)
-                    .unwrap_or_default()
-            })
-            .collect();
+        let docker_images = docker_images(config, parsed, &ext_list, target_arch);
         if docker_images.is_empty() {
             "# No Docker images to prime".to_string()
         } else {
@@ -326,6 +391,7 @@ echo "Docker image priming complete.""#,
 
     Ok(Rendered {
         docker_section,
+        subvol_mkdir_section,
         mkfs_flags,
         global_compress_flag: if global_compress_flag.is_empty() {
             String::new()
@@ -684,6 +750,8 @@ if [ "{keep_initial_os_rollback}" = "0" ] && [ -n "$OS_BUNDLE_ID" ] && [ -f "$AV
     mv "$AVOCADO_IMAGES_DIR/$OS_BUNDLE_ID.raw" "$OS_BUNDLE_ASIDE" || exit 1
 fi
 
+{subvol_mkdir_section}
+
 VAR_IMAGE="$OUTPUT_DIR/avocado-image-var-$TARGET_ARCH.btrfs"
 # mkfs.btrfs writes into an existing file without shrinking it, so a var
 # image left by an earlier, larger provision would keep that size. Truncate
@@ -745,6 +813,7 @@ echo "Built var image: ${{FINAL_MB}}MB"
         target_arch = target_arch,
         namespace_uuid = crate::commands::rootfs::image::NAMESPACE_UUID,
         docker_section = r.docker_section,
+        subvol_mkdir_section = r.subvol_mkdir_section,
         mkfs_flags = r.mkfs_flags,
         global_compress_flag = r.global_compress_flag,
         post_creation_section = r.post_creation_section,
@@ -1192,9 +1261,9 @@ stone() {
     #[cfg(unix)]
     #[test]
     fn the_os_bundle_is_never_left_aside() {
-        assert_eq!(run_var_half(&opted_out(), true, false), None);
+        assert_eq!(run_var_half(&var_half(&opted_out()), true, false), None);
         assert_eq!(
-            run_var_half(BASE, false, true).as_deref(),
+            run_var_half(&var_half(BASE), false, true).as_deref(),
             Some("aos1.raw\next1.raw")
         );
     }
@@ -1213,14 +1282,14 @@ stone() {
 
     #[cfg(unix)]
     fn packed_images(config: &str) -> String {
-        run_var_half(config, false, false).expect("mkfs ran")
+        run_var_half(&var_half(config), false, false).expect("mkfs ran")
     }
 
-    /// Runs the var half under `set -e` (as provision does) against a stand-in
-    /// mkfs.btrfs, which fails when `mkfs_fails`; returns the images it packed.
-    /// `left_aside`: a killed provision left the bundle beside the image.
+    /// Runs the var half `script` under `set -e` (as provision does) against a
+    /// stand-in mkfs.btrfs, which fails when `mkfs_fails`; returns the images it
+    /// packed. `left_aside`: a killed provision left the bundle beside the image.
     #[cfg(unix)]
-    fn run_var_half(config: &str, mkfs_fails: bool, left_aside: bool) -> Option<String> {
+    fn run_var_half(script: &str, mkfs_fails: bool, left_aside: bool) -> Option<String> {
         let dir = TempDir::new().unwrap();
         let prefix = dir.path();
         let lib = prefix.join("runtimes/test-runtime/var-staging/lib/avocado");
@@ -1241,13 +1310,22 @@ stone() {
         }
         std::fs::write(lib.join("images/ext1.raw"), "ext").unwrap();
         // mkfs.btrfs stand-in: record what it would pack, write the image.
+        // Like mkfs.btrfs, it rejects a --subvol whose source directory is
+        // missing under -r.
         let bin = prefix.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let mkfs = bin.join("mkfs.btrfs");
         std::fs::write(
             &mkfs,
             "#!/bin/sh\nls \"$AVOCADO_IMAGES_DIR\" > \"$OUTPUT_DIR/packed\"\n\
-             while [ $# -gt 1 ]; do shift; done\n\
+             root=\n\
+             while [ $# -gt 1 ]; do\n\
+             case \"$1\" in\n\
+             -r) root=$2 ;;\n\
+             --subvol) [ -d \"$root/${2#*:}\" ] || { echo \"ERROR: subvolume path does not exist: ${2#*:}\" >&2; exit 1; } ;;\n\
+             esac\n\
+             shift\n\
+             done\n\
              [ -e \"$1\" ] || { echo 'ERROR: zoned: unable to stat' >&2; exit 1; }\n\
              echo img >> \"$1\"\n",
         )
@@ -1260,11 +1338,11 @@ stone() {
         // A larger image from an earlier provision must not keep its size.
         let image = prefix.join("runtimes/test-runtime/avocado-image-var-x86_64.btrfs");
         std::fs::write(&image, vec![0u8; 4096]).unwrap();
-        let script = prefix.join("var.sh");
-        std::fs::write(&script, var_half(config)).unwrap();
+        let script_path = prefix.join("var.sh");
+        std::fs::write(&script_path, script).unwrap();
         let out = std::process::Command::new("bash")
             .arg("-e")
-            .arg(&script)
+            .arg(&script_path)
             .env("AVOCADO_PREFIX", prefix)
             .env(
                 "PATH",
@@ -1326,5 +1404,157 @@ stone() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    /// The var image from a real runtime declaration, with the extension list
+    /// provision passes. It used to pass the versioned `AVOCADO_EXT_LIST` ids,
+    /// which match no configuration key, so nothing was primed.
+    fn var_from_declaration(content: &str) -> (Vec<String>, String) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, content).unwrap();
+        let path = path.to_str().unwrap();
+        let composed = Config::load_composed(path, Some("x86_64")).unwrap();
+        let merged = composed
+            .config
+            .get_merged_runtime_config("test-runtime", "x86_64", path)
+            .unwrap()
+            .unwrap_or_default();
+        let names = runtime_extension_names(&composed, &merged, "x86_64").unwrap();
+        let ctx = ctx_for(&composed.config, &composed.merged_value, &merged, &names);
+        let var = render_var_image(&ctx).unwrap();
+        (names, var)
+    }
+
+    #[test]
+    fn a_runtime_extensions_list_primes_and_lays_out_its_extensions() {
+        let (names, var) = var_from_declaration(&format!(
+            r#"{BASE}    extensions:
+      - app
+      - tools: {{ enabled: false }}
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    depends_on:
+      - base
+    docker_images:
+      - {{ image: redis, tag: "7" }}
+    subvolumes:
+      lib/app: true
+  tools:
+    version: "1.0.0"
+  base:
+    version: "1.0.0"
+    docker_images:
+      - {{ image: nginx, tag: "1" }}
+"#
+        ));
+        // The order `runtime build` ships: a dependency follows its dependent.
+        assert_eq!(names, ["app", "base", "tools"]);
+        assert!(var.contains("Primed: redis:7"));
+        assert!(
+            var.contains("Primed: nginx:1"),
+            "a depends_on extension ships too"
+        );
+        assert!(var.contains("--subvol rw:lib/app"));
+    }
+
+    #[test]
+    fn a_deprecated_packages_extension_primes_its_docker_images() {
+        let (names, var) = var_from_declaration(&format!(
+            r#"{BASE}    packages:
+      avocado-runtime: "*"
+      app:
+        extensions: app
+        vsn: "1.0.0"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - {{ image: redis, tag: "7" }}
+"#
+        ));
+        assert_eq!(names, ["app"]);
+        assert!(var.contains("Primed: redis:7"));
+    }
+
+    /// `runtime build` stages directories only for the plain-string entries it
+    /// lists, so a dependency's or a map-form entry's subvolume has no source
+    /// directory until the var half makes it; mkfs.btrfs rejects a `--subvol`
+    /// whose directory is missing.
+    #[cfg(unix)]
+    #[test]
+    fn the_var_half_makes_the_directories_of_every_resolved_subvolume() {
+        let (names, var) = var_from_declaration(&format!(
+            r#"{BASE}    extensions:
+      - app
+      - tools: {{ enabled: false }}
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    depends_on:
+      - base
+  base:
+    version: "1.0.0"
+    subvolumes:
+      lib/base: true
+  tools:
+    version: "1.0.0"
+    subvolumes:
+      lib/tools: true
+"#
+        ));
+        assert_eq!(names, ["app", "base", "tools"]);
+        assert!(var.contains("--subvol rw:lib/base"));
+        assert!(var.contains("--subvol rw:lib/tools"));
+        assert_eq!(
+            run_var_half(&var, false, false).as_deref(),
+            Some("aos1.raw\next1.raw")
+        );
+    }
+
+    /// An extension's `target-<name>:` block applies before images are
+    /// collected: priming and the provision container's `--privileged` both
+    /// read [`docker_images`], so a target-only declaration reaches both and a
+    /// sibling target's reaches neither.
+    #[test]
+    fn target_specific_docker_images_are_primed() {
+        let content = format!(
+            r#"{BASE}    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    target-x86_64:
+      docker_images:
+        - {{ image: redis, tag: "7" }}
+    target-aarch64:
+      docker_images:
+        - {{ image: arm-only, tag: "1" }}
+"#
+        );
+        let (names, var) = var_from_declaration(&content);
+        assert!(var.contains("Primed: redis:7"));
+        assert!(!var.contains("arm-only"));
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, &content).unwrap();
+        let composed = Config::load_composed(path.to_str().unwrap(), Some("x86_64")).unwrap();
+        let images = docker_images(&composed.config, &composed.merged_value, &names, "x86_64");
+        assert_eq!(
+            images.iter().map(|i| i.image.as_str()).collect::<Vec<_>>(),
+            ["redis"]
+        );
     }
 }
