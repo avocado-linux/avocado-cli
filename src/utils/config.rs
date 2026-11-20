@@ -1666,7 +1666,7 @@ pub struct RepoDef {
     pub rewrite_loopback: Option<bool>,
 }
 
-/// Reference to a Docker image for priming on the var partition at build time.
+/// Reference to a Docker image for priming on the var partition at provision time.
 #[derive(Debug, Clone)]
 pub struct DockerImageRef {
     pub image: String,

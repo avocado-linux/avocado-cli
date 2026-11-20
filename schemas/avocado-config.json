@@ -1100,7 +1100,7 @@
           "items": {
             "$ref": "#/definitions/varFileMapping"
           },
-          "description": "Static files to copy from the source directory onto the var partition at build time. Each entry maps a source path (relative to src_dir) to a destination path on the var partition. Directories are copied recursively. The dest for a directory should end with /.",
+          "description": "Static files to copy from the source directory onto the var partition. 'avocado build' stages them and 'avocado provision' writes them into the var partition image. Each entry maps a source path (relative to src_dir) to a destination path on the var partition. Directories are copied recursively. The dest for a directory should end with /.",
           "examples": [
             [
               {
@@ -1249,7 +1249,7 @@
     "varFileMapping": {
       "title": "Var file mapping",
       "type": "object",
-      "description": "A source-to-destination mapping for seeding static files onto the var partition at build time.",
+      "description": "A source-to-destination mapping for seeding static files onto the var partition at provision time.",
       "properties": {
         "source": {
           "type": "string",
@@ -2286,7 +2286,7 @@
           "items": {
             "$ref": "#/definitions/dockerImageRef"
           },
-          "description": "Docker images to pull and pre-cache onto the var partition at build time. When declared, the CLI automatically adds --privileged to the SDK container args and runs a temporary dockerd to pull images for the target architecture. Requires var_files to exclude var/lib/docker/** from the .raw image.",
+          "description": "Docker images to pull and pre-cache onto the var partition at provision time. Provisioning runs a temporary dockerd in the SDK container to pull images for the target architecture. The provision container needs --privileged, which the default sdk.container_args includes. Requires var_files to exclude var/lib/docker/** from the .raw image.",
           "examples": [
             [
               {
