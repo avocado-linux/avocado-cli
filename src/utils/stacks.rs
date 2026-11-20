@@ -1419,9 +1419,10 @@ mod tests {
         );
     }
 
-    /// A `Stacks` whose helper is a script standing in for docker: it logs each helper
+    /// A `Stacks` whose helper is a `/bin/sh` script standing in for docker: it logs each helper
     /// subcommand to `<dir>/calls` and answers `check` with a miss, or with the asked key
     /// in the view when `in_view` is set.
+    #[cfg(unix)]
     fn fake_stacks(
         dir: &Path,
         in_view: bool,
@@ -1486,6 +1487,7 @@ esac
         }
     }
 
+    #[cfg(unix)]
     fn helper_calls(dir: &Path) -> Vec<String> {
         std::fs::read_to_string(dir.join("calls"))
             .unwrap_or_default()
@@ -1497,6 +1499,7 @@ esac
     /// A path feed re-indexed after the layer key was derived (here: while the step runs)
     /// would commit the new RPMs under the old digest's key, which projects still on the old
     /// digest would then reuse. The step must stay uncommitted instead.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_feed_that_moved_since_the_key_was_derived_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1547,6 +1550,7 @@ esac
     /// `avocado install` runs `sdk install` under its task renderer, which swallows
     /// `print_info`. A re-run whose layers are all in the view must still say so, like the
     /// hit and committed lines do.
+    #[cfg(unix)]
     #[test]
     fn the_in_view_line_shows_under_the_install_renderer() {
         use crate::utils::tui::{self, TaskRenderer};
