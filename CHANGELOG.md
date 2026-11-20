@@ -146,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image is `ghcr.io/avocado-linux/avocado-stacks:<CLI version>` (`:edge` for
   development builds).
 ### Changed
+- **`avocado install -r <runtime>` scopes its SDK step to that runtime.** The
+  SDK step installed SDK dependencies and target-dev compile packages for the
+  extensions and compile sections of every runtime for the target. It now
+  scans only the named runtime and the extensions they `depends_on`, as the
+  extension and runtime steps already did. The shared target-sysroot only gains
+  packages under `-r`: another runtime's packages are never treated as removed,
+  and a sysroot that must be wiped is reinstalled for every runtime. A runtime
+  that is not defined for the target is an error. Without `-r`, and for
+  `avocado sdk install`, nothing changes.
 - **New projects require CLI 1.0.0 or later.** The `avocado init` template's
   `cli_requirement` is now `>=1.0.0` (was `>=0.41.0`). Pre-release builds such
   as `1.1.0-dev` still satisfy it.
@@ -156,6 +165,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already does.
 
 ### Fixed
+- **`avocado connect auth login` works over ssh.** The browser redirects to
+  a local port on the machine running the CLI, which a laptop's browser can't
+  reach when the CLI runs on a headless host. The CLI now also takes the URL
+  from the browser's address bar pasted at its prompt, whichever comes first.
+- **`avocado clean` removes `.avocado/overlay-staging/`.** Preprocessed
+  overlays, which can hold rendered templated secrets, stayed on disk after a
+  clean until that overlay was next built. They are removed on every clean,
+  including with `--skip-volumes`.
 - **`deploy -d` refuses a device string with shell syntax in it.** The user
   and host were pasted into the deploy script that runs in the SDK container, so
   `-d '$(cmd)'` ran `cmd` there. The user may now hold only letters, digits,

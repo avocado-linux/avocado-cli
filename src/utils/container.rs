@@ -85,7 +85,7 @@ pub fn is_vm_routing_active() -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    host == format!("unix://{}", paths.docker_socket().display())
+    paths.docker_host().as_deref() == Some(host.as_str())
 }
 
 /// Host UID/GID passed to the container entrypoint, which bindfs-maps them to
@@ -253,6 +253,17 @@ fn translate_bind_for_vm(src_path: &Path) -> PathBuf {
     vm_workspace()
         .and_then(|ws| crate::utils::vm::share::translate_to_vm(src_path, &ws).ok())
         .unwrap_or_else(|| src_path.to_path_buf())
+}
+
+/// Whether the engine can bind-mount `src_path`. Only Windows can say no: a
+/// path outside the avocado-vm workspace stays a drive-letter path there,
+/// which the Linux engine in the VM rejects outright. Elsewhere a host path
+/// is at least a well-formed path for the engine, as it always was.
+fn bind_source_reaches_engine(src_path: &Path) -> bool {
+    if !cfg!(windows) || !is_vm_routing_active() {
+        return true;
+    }
+    vm_workspace().is_some_and(|ws| crate::utils::vm::share::translate_to_vm(src_path, &ws).is_ok())
 }
 
 /// Container paths where a git common dir may be mounted, besides the
@@ -2886,7 +2897,21 @@ impl SdkContainer {
         // Mount signing keys directory if it exists (read-only for security)
         let signing_keys_env =
             if let Ok(signing_keys_dir) = crate::utils::signing_keys::get_signing_keys_dir() {
-                if signing_keys_dir.exists() {
+                if signing_keys_dir.exists() && !bind_source_reaches_engine(&signing_keys_dir) {
+                    // A Windows path the avocado-vm cannot see is not a
+                    // bind source the engine accepts; the run would die on
+                    // "invalid volume specification" before it starts.
+                    crate::utils::output::print_warning(
+                        &format!(
+                            "Signing keys in {} are outside the folder shared with the \
+                             avocado-vm, so this run cannot use them. Set \
+                             AVOCADO_SIGNING_KEYS_DIR to a folder inside the shared workspace.",
+                            signing_keys_dir.display()
+                        ),
+                        OutputLevel::Normal,
+                    );
+                    None
+                } else if signing_keys_dir.exists() {
                     container_cmd.push("-v".to_string());
                     container_cmd.push(format!(
                         "{}:/opt/signing-keys:ro",
@@ -3245,8 +3270,7 @@ impl SdkContainer {
         }
 
         // Execute command and capture output
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(&container_cmd)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd
@@ -3620,8 +3644,7 @@ impl SdkContainer {
         }
 
         if detach {
-            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-            cmd.args(&container_cmd[1..]);
+            let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = cmd
                 .output()
@@ -3648,8 +3671,7 @@ impl SdkContainer {
             }
         } else {
             // In non-detached mode, wait for completion with Ctrl-C handling.
-            let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-            cmd.args(&container_cmd[1..]);
+            let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
 
             // When a TUI renderer is globally active, pipe output instead of
             // inheriting stdio.  This prevents container output from leaking
@@ -3847,8 +3869,7 @@ impl SdkContainer {
             .renderer
             .set_status(&tui_ctx.task_id, TaskStatus::Running);
 
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(container_cmd)?;
         // Pipe stdout/stderr so we can capture output line by line.
         // The container still gets a PTY (-t flag) so programs like dnf
         // produce live progress output.
@@ -4043,8 +4064,7 @@ mkdir -p /opt/src && bindfs --map=$AVOCADO_HOST_UID/0:@$AVOCADO_HOST_GID/@0 /mnt
             );
         }
 
-        let mut cmd = crate::utils::engine::command(&container_cmd[0]);
-        cmd.args(&container_cmd[1..]);
+        let (mut cmd, _argv_file) = crate::utils::engine::command_for_argv(&container_cmd)?;
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let status = cmd
@@ -5619,13 +5639,13 @@ extensions:
         for k in ["DOCKER_HOST", "AVOCADO_HOST_UID", "AVOCADO_HOST_GID"] {
             std::env::remove_var(k);
         }
-        let vm_sock = format!(
-            "unix://{}",
-            crate::utils::vm::state::VmPaths::resolve()
-                .unwrap()
-                .docker_socket()
-                .display()
-        );
+        // The forward's address, as `vm::route` exports it. On Windows that
+        // is a TCP port recorded only while a VM runs, so without one this
+        // is empty and the routing-on half of a test is skipped.
+        let vm_sock = crate::utils::vm::state::VmPaths::resolve()
+            .unwrap()
+            .docker_host()
+            .unwrap_or_default();
         (restore, vm_sock)
     }
 
@@ -5670,6 +5690,9 @@ extensions:
             assert!(!cmd.contains(&git), "{name}: git trust without VM routing");
         }
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         for (name, cmd) in [("build", build(&container)), ("simple", simple(&container))] {
             assert!(
@@ -5707,6 +5730,9 @@ extensions:
             .iter()
             .any(|e| e.starts_with("GIT_CONFIG")));
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         assert_eq!(src_mount_uid_gid(), (0, 0));
         assert_eq!(
@@ -6719,6 +6745,9 @@ extensions:
         // Per-step variables stay on the exec.
         assert!(!args.iter().any(|a| a.starts_with("AVOCADO_RUNTIME")));
 
+        if vm_sock.is_empty() {
+            return; // Windows with no VM running: see `vm_routing_env`.
+        }
         std::env::set_var("DOCKER_HOST", &vm_sock);
         let args = session_create_env(&env);
         has(

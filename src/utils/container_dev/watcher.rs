@@ -1542,7 +1542,8 @@ mod tests {
         let marker = dir.path().join("child-survived");
         let argv = vec![
             "-c".to_string(),
-            format!("sleep 3; touch {}", marker.display()),
+            // Quoted: a Windows path's backslashes are escapes to an unquoted sh word.
+            format!("sleep 3; touch '{}'", marker.display()),
         ];
 
         {

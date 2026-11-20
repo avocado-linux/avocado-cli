@@ -7,12 +7,11 @@
 //! not installed in the VM image).
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
-#[cfg(unix)]
+use super::endpoint::Endpoint;
 use super::qga::QgaClient;
 
 // 120s covers cold-boot pessimism on first run (kernel ramdisk extract +
@@ -29,52 +28,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// progress and we'll keep polling SSH; if SSH responds first, qga gets
 /// dropped. Errors only if both are still failing when `timeout` elapses.
 pub async fn wait_for_guest_ready(
-    qga_socket: &Path,
+    qga: &Endpoint,
     ssh_port: u16,
     timeout: Option<Duration>,
 ) -> Result<&'static str> {
     let timeout = timeout.unwrap_or(DEFAULT_BOOT_TIMEOUT);
 
-    #[cfg(unix)]
-    {
-        let qga = wait_qga(qga_socket.to_path_buf(), timeout);
-        let ssh = wait_ssh(ssh_port, timeout);
+    let qga = wait_qga(qga.clone(), timeout);
+    let ssh = wait_ssh(ssh_port, timeout);
 
-        // Race for the first sign of life. qga winning is fine — it just means
-        // we'll lean on the SSH wait that follows. SSH winning is enough by
-        // itself (it's the same thing the caller's about to use).
-        let winner = tokio::select! {
-            r = qga => r.map(|_| "qga"),
-            r = ssh => r.map(|_| "ssh"),
-        }?;
+    // Race for the first sign of life. qga winning is fine — it just means
+    // we'll lean on the SSH wait that follows. SSH winning is enough by
+    // itself (it's the same thing the caller's about to use).
+    let winner = tokio::select! {
+        r = qga => r.map(|_| "qga"),
+        r = ssh => r.map(|_| "ssh"),
+    }?;
 
-        // If qga won, sshd may still be in its accept-but-reset window. Do a
-        // final SSH-banner check before returning so the next operation
-        // doesn't immediately hit "kex_exchange_identification: Connection
-        // reset by peer".
-        if winner == "qga" {
-            wait_ssh(ssh_port, timeout)
-                .await
-                .context("qga came up but sshd never advanced past kex-init")?;
-        }
-        Ok(winner)
+    // If qga won, sshd may still be in its accept-but-reset window. Do a
+    // final SSH-banner check before returning so the next operation
+    // doesn't immediately hit "kex_exchange_identification: Connection
+    // reset by peer".
+    if winner == "qga" {
+        wait_ssh(ssh_port, timeout)
+            .await
+            .context("qga came up but sshd never advanced past kex-init")?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = qga_socket;
-        wait_ssh(ssh_port, timeout).await?;
-        Ok("ssh")
-    }
+    Ok(winner)
 }
 
-#[cfg(unix)]
-async fn wait_qga(socket: std::path::PathBuf, timeout: Duration) -> Result<()> {
+async fn wait_qga(endpoint: Endpoint, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    while !socket.exists() {
+    while !endpoint.exists() {
         if Instant::now() >= deadline {
             bail!(
-                "qga socket {} never appeared (waited {}s)",
-                socket.display(),
+                "qga socket {endpoint} never appeared (waited {}s)",
                 timeout.as_secs()
             );
         }
@@ -83,12 +71,11 @@ async fn wait_qga(socket: std::path::PathBuf, timeout: Duration) -> Result<()> {
     loop {
         if Instant::now() >= deadline {
             bail!(
-                "guest-sync never responded on {} (waited {}s); is qemu-guest-agent installed and enabled in the VM?",
-                socket.display(),
+                "guest-sync never responded on {endpoint} (waited {}s); is qemu-guest-agent installed and enabled in the VM?",
                 timeout.as_secs(),
             );
         }
-        if let Ok(mut client) = QgaClient::connect(&socket).await {
+        if let Ok(mut client) = QgaClient::connect(&endpoint).await {
             if client.ping().await.is_ok() {
                 return Ok(());
             }
@@ -129,9 +116,8 @@ async fn wait_ssh(port: u16, deadline_window: Duration) -> Result<()> {
 
 /// Same as [`wait_for_guest_ready`] but tries to surface a final error from
 /// the last attempt, useful for `avocado vm status` style introspection.
-#[cfg(unix)]
 #[allow(dead_code)]
-pub async fn last_boot_error(socket: &Path) -> Result<()> {
-    let mut client = QgaClient::connect(socket).await.context("qga connect")?;
+pub async fn last_boot_error(endpoint: &Endpoint) -> Result<()> {
+    let mut client = QgaClient::connect(endpoint).await.context("qga connect")?;
     client.ping().await.context("qga ping")
 }

@@ -25,21 +25,19 @@ pub mod channel;
 #[cfg(target_os = "macos")]
 pub mod client;
 pub mod config;
+pub mod endpoint;
 pub mod fdt;
 pub mod forward;
 pub mod hub;
 pub mod lifecycle;
 pub mod manifest;
 pub mod qemu;
-#[cfg(unix)]
 pub mod qga;
-#[cfg(unix)]
 pub mod qmp;
 pub mod route;
 pub mod share;
 pub mod ssh;
 pub mod staging;
 pub mod state;
-#[cfg(unix)]
 pub mod supervisor;
 pub mod tpm;

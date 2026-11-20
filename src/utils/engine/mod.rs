@@ -60,9 +60,6 @@ fn use_builtin(tool: &str) -> bool {
     tool == "docker"
         // A unit-test binary has no `__docker` entry point to re-invoke.
         && !cfg!(test)
-        // ponytail: Windows keeps the docker CLI until this has been run
-        // there: console input and half-closing a named pipe are unproven.
-        && !cfg!(windows)
         && std::env::var_os(USE_CLI_ENV).is_none()
         // bollard is built without its TLS and ssh transports.
         && std::env::var_os("DOCKER_TLS_VERIFY").is_none()
@@ -113,6 +110,82 @@ pub fn command(tool: impl AsRef<str>) -> tokio::process::Command {
     cmd
 }
 
+/// Leads the one argument of `avocado __docker @<file>`: the docker argv is
+/// in `<file>`, a JSON array of strings, instead of on the command line.
+const ARGV_FILE_PREFIX: char = '@';
+
+/// Longest command line this lets a child be started with before the argv
+/// moves to a file. Windows refuses to start a process past 32,767
+/// characters ("The filename or extension is too long"); the margin covers
+/// the program path and the quoting, which is only estimated.
+const COMMAND_LINE_BUDGET: usize = 30_000;
+
+/// An upper bound, in UTF-16 units (what the Windows limit counts), on how
+/// long `argv` is once quoted into a command line: each argument, a
+/// separator and a pair of quotes, one escaping backslash per embedded
+/// quote, and every backslash counted twice, since the quoting doubles the
+/// ones that precede a quote or end the argument. Over-counting only moves
+/// the argv to a file a little early; under-counting fails the spawn.
+fn command_line_len<S: AsRef<str>>(argv: &[S]) -> usize {
+    argv.iter()
+        .map(|a| {
+            let a = a.as_ref();
+            let escapes = a.chars().filter(|c| matches!(c, '"' | '\\')).count();
+            a.encode_utf16().count() + escapes + 3
+        })
+        .sum()
+}
+
+/// `tokio::process::Command` for a whole docker argv (`argv[0]` is the
+/// tool), for the commands that carry a container's shell script inline.
+///
+/// That script rides as `bash -c <script>` and runs to tens of kilobytes,
+/// more than a Windows command line can hold. With the built-in client the
+/// argv never has to be one: past [`COMMAND_LINE_BUDGET`] on Windows it is
+/// written to a temporary file and the child is started as
+/// `avocado __docker @<file>`; the script then travels in the Engine API
+/// request body, which has no such limit. Keep the returned file alive
+/// until the child has started.
+///
+/// A real docker CLI or another tool gets the argv as given, so there an
+/// over-long command still fails at spawn.
+pub fn command_for_argv<S: AsRef<str>>(
+    argv: &[S],
+) -> Result<(tokio::process::Command, Option<tempfile::NamedTempFile>)> {
+    let (tool, args) = argv.split_first().context("empty container command")?;
+    let (program, lead) = program(tool.as_ref());
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(lead);
+    let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
+    if lead.is_some() && cfg!(windows) && command_line_len(&args) > COMMAND_LINE_BUDGET {
+        let file = write_argv_file(&args)?;
+        cmd.arg(format!("{ARGV_FILE_PREFIX}{}", file.path().display()));
+        return Ok((cmd, Some(file)));
+    }
+    cmd.args(&args);
+    Ok((cmd, None))
+}
+
+fn write_argv_file(args: &[&str]) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new().context("creating the docker argv file")?;
+    serde_json::to_writer(&mut file, args).context("writing the docker argv file")?;
+    file.flush().context("writing the docker argv file")?;
+    Ok(file)
+}
+
+/// Undo [`command_for_argv`]'s file form: `["@<file>"]` becomes the argv the
+/// file holds. Anything else is returned as it came.
+fn expand_argv_file(args: Vec<String>) -> Result<Vec<String>> {
+    let [only] = args.as_slice() else {
+        return Ok(args);
+    };
+    let Some(path) = only.strip_prefix(ARGV_FILE_PREFIX) else {
+        return Ok(args);
+    };
+    let raw = std::fs::read(path).with_context(|| format!("reading docker argv file {path}"))?;
+    serde_json::from_slice(&raw).with_context(|| format!("parsing docker argv file {path}"))
+}
+
 /// Blocking counterpart of [`command`].
 pub fn std_command(tool: impl AsRef<str>) -> std::process::Command {
     let (program, lead) = program(tool.as_ref());
@@ -123,6 +196,13 @@ pub fn std_command(tool: impl AsRef<str>) -> std::process::Command {
 
 /// Entry point for `avocado __docker <args>`. Returns the process exit code.
 pub async fn main(args: Vec<String>) -> i32 {
+    let args = match expand_argv_file(args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 125;
+        }
+    };
     // `docker container <verb>` is the long spelling of `docker <verb>`.
     let args = match args.split_first() {
         Some((first, rest)) if first == "container" => rest,
@@ -937,6 +1017,56 @@ mod tests {
         for tool in ["docker", "podman", "/usr/bin/docker", "/tmp/x/fake-tool"] {
             assert_eq!(program(tool), (tool.into(), None));
         }
+    }
+
+    #[test]
+    fn an_argv_file_round_trips_any_argument() {
+        // What a container script is made of: quotes, newlines, `$`, and far
+        // more of it than a Windows command line holds.
+        let script = "if [ \"$A\" = 'b' ]; then\n  echo \"$0 $@\"\nfi\n".repeat(2_000);
+        let args = ["run", "--rm", "image", "bash", "-c", script.as_str()];
+        assert!(command_line_len(&args) > COMMAND_LINE_BUDGET);
+
+        // The bound covers what quoting adds: a doubled backslash, an
+        // escaped quote, and characters that take two UTF-16 units.
+        assert_eq!(command_line_len(&["ab"]), 2 + 3);
+        assert_eq!(command_line_len(&[r"a\"]), 2 + 1 + 3);
+        assert_eq!(command_line_len(&[r#"say \"hi\""#]), 10 + 4 + 3);
+        assert_eq!(command_line_len(&["\u{1F600}"]), 2 + 3);
+        // 15,000 escaped quotes are 30,000 bytes but up to 60,000 on the
+        // command line: that must count as over the budget.
+        let quotes = r#"\""#.repeat(15_000);
+        assert!(quotes.len() <= COMMAND_LINE_BUDGET);
+        assert!(command_line_len(&[quotes.as_str()]) > COMMAND_LINE_BUDGET);
+
+        let file = write_argv_file(&args).unwrap();
+        let at = format!("{ARGV_FILE_PREFIX}{}", file.path().display());
+        assert_eq!(expand_argv_file(vec![at]).unwrap(), argv(&args));
+    }
+
+    #[test]
+    fn only_a_lone_at_argument_names_an_argv_file() {
+        // An ordinary argv passes through, including one that merely
+        // contains an `@` argument among others (`docker pull img@sha256:…`).
+        let plain = argv(&["pull", "repo/img@sha256:abc"]);
+        assert_eq!(expand_argv_file(plain.clone()).unwrap(), plain);
+        let two = argv(&["@not-a-file", "ps"]);
+        assert_eq!(expand_argv_file(two.clone()).unwrap(), two);
+        // A lone `@<missing>` is a broken hand-off, and says so.
+        let err = expand_argv_file(argv(&["@/no/such/argv-file"])).unwrap_err();
+        assert!(format!("{err:#}").contains("docker argv file"), "{err:#}");
+    }
+
+    #[test]
+    fn a_tool_spawned_as_given_keeps_its_argv_on_the_command_line() {
+        // Under `cfg(test)` nothing is rerouted (as for podman or a real
+        // docker CLI), so even an over-long argv is passed through.
+        let long = "x".repeat(COMMAND_LINE_BUDGET + 1);
+        let (cmd, file) = command_for_argv(&["docker", "run", long.as_str()]).unwrap();
+        assert!(file.is_none());
+        let passed: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(passed.len(), 2);
+        assert!(command_for_argv::<&str>(&[]).is_err());
     }
 
     #[test]

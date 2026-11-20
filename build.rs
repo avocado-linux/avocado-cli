@@ -35,6 +35,25 @@ fn main() {
     println!("cargo:rustc-env=AVOCADO_CLI_VERSION={version}");
 
     println!("cargo:rustc-env=TARGET={}", env::var("TARGET").unwrap());
+
+    emit_windows_stack_size();
+}
+
+/// Give the Windows binary the 8 MiB main-thread stack every Unix host has.
+///
+/// Windows reserves 1 MiB by default, and `main`'s command-dispatch future
+/// alone outgrows that: without this even `avocado --version` dies with
+/// "thread 'main' has overflowed its stack".
+fn emit_windows_stack_size() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    const STACK_BYTES: u32 = 8 * 1024 * 1024;
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:{STACK_BYTES}");
+    } else {
+        println!("cargo:rustc-link-arg-bins=-Wl,--stack,{STACK_BYTES}");
+    }
 }
 
 /// Whether the repository git just answered from is this crate's own.

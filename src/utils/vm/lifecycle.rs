@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use super::manifest::Manifest;
 use super::qemu::{self, QemuConfig};
-#[cfg(unix)]
 use super::qmp::QmpClient;
 use super::ssh::SshTarget;
 use super::state::{self, VmPaths};
@@ -179,18 +178,13 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // Loopback-only port QEMU's hostfwd binds to. The supervisor
     // listens on the user-facing `ssh_port` and proxies through to
     // this one; downstream callers (vm shell, forward.rs, Avocado.app)
-    // only ever see `ssh_port`. On non-unix the supervisor is
-    // unavailable (uses tokio's UnixListener), so QEMU binds the
-    // user-facing port directly — pre-supervisor behavior.
-    #[cfg(unix)]
+    // only ever see `ssh_port`.
     let qemu_hostfwd_port = {
         let internal = qemu::pick_free_port()?;
         std::fs::write(paths.internal_ssh_port_file(), internal.to_string())
             .with_context(|| format!("writing {}", paths.internal_ssh_port_file().display()))?;
         internal
     };
-    #[cfg(not(unix))]
-    let qemu_hostfwd_port = ssh_port;
 
     // Infrastructure SSH port — second user-facing port that the
     // supervisor proxies identically to `ssh_port`, but connections to
@@ -198,15 +192,12 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // telemetry channels (Avocado.app's agent SSH tunnel, docker
     // /events subscriptions) connect here so they wake the VM on
     // attach but don't pin it awake forever.
-    #[cfg(unix)]
     let infra_ssh_port = {
         let port = qemu::pick_free_port()?;
         std::fs::write(paths.infra_ssh_port_file(), port.to_string())
             .with_context(|| format!("writing {}", paths.infra_ssh_port_file().display()))?;
         port
     };
-    #[cfg(not(unix))]
-    let infra_ssh_port = ssh_port;
 
     // Now that the port is known, write the ssh-config + wire it into
     // ~/.ssh/config. This is required for `DOCKER_HOST=ssh://avocado-vm`
@@ -248,6 +239,17 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
             }
         });
     let pending_seed_sha = var_seed.as_ref().map(|vs| vs.sha256.clone());
+
+    // Reserve the QMP / qga / control-plane addresses. A no-op where they
+    // are Unix sockets; on Windows this picks the loopback TCP ports and
+    // records them for every later client (this CLI, Avocado Desktop).
+    for endpoint in [
+        paths.qmp_endpoint(),
+        paths.qga_endpoint(),
+        paths.control_endpoint(),
+    ] {
+        endpoint.allocate()?;
+    }
 
     let cfg = QemuConfig {
         memory_mib,
@@ -291,15 +293,9 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     // `idle_after_secs` of no proxied activity, sends QMP `stop` to
     // halt the vCPUs; wakes on the next incoming TCP. boot_sync below
     // goes through the proxy, which is why we spawn before waiting.
-    // Unix-only because the supervisor uses tokio's UnixListener for
-    // the docker-socket path; on Windows the supervisor is absent
-    // (idle_after_secs forced to 0) and we fall through to the legacy
-    // long-lived docker forwarder below.
-    #[cfg(unix)]
+    // On Windows its docker endpoints are loopback TCP ports rather than
+    // Unix sockets (see supervisor.rs).
     let idle_after_secs = resolve_idle_after_secs(&paths);
-    #[cfg(not(unix))]
-    let idle_after_secs: u64 = 0;
-    #[cfg(unix)]
     spawn_supervisor(
         &paths,
         ssh_port,
@@ -310,7 +306,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     .await?;
 
     // Wait for the guest to become ready — first signal wins (qga vs SSH).
-    let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_socket(), ssh_port, None)
+    let signal = super::boot_sync::wait_for_guest_ready(&paths.qga_endpoint(), ssh_port, None)
         .await
         .context("guest never became ready (check `avocado vm logs`)")?;
     let _ = signal; // currently informational; callers may want to log which path won
@@ -321,7 +317,7 @@ pub async fn start(opts: StartOptions) -> Result<VmStatus> {
     let target = super::ssh::SshTarget::local(&paths, ssh_port);
     if let Err(e) = super::share::ensure_mounted_in_guest(&target).await {
         // Don't tear down the VM — user can `avocado vm shell` and inspect.
-        return Err(e).context("workspace 9p mount in guest");
+        return Err(e).context("workspace mount in guest");
     }
 
     // Grow /var inside the VM to fill the resized block device. Idempotent
@@ -424,7 +420,6 @@ async fn stop_inner(force: bool) -> Result<()> {
     // exited, the next `vm start` would race against a still-bound port.
     // The docker socket forwarder is an SSH child that can outlive QEMU
     // if we shut down by signal, leaving a stale `docker.sock`.
-    #[cfg(unix)]
     stop_supervisor(&paths);
     let _ = super::forward::stop(&paths).await;
     super::tpm::stop_swtpm(&paths);
@@ -447,10 +442,10 @@ async fn stop_inner(force: bool) -> Result<()> {
     // 30 s, so without this the last writes (a fresh claim, a config edit)
     // come back as empty files. Best-effort and bounded: a hibernated or
     // wedged guest can't answer, and stopping must still work then.
-    #[cfg(unix)]
-    if !force && paths.qga_socket().exists() {
+    let qga = paths.qga_endpoint();
+    if !force && qga.exists() {
         let _ = tokio::time::timeout(Duration::from_secs(15), async {
-            let mut g = super::qga::QgaClient::connect(&paths.qga_socket()).await?;
+            let mut g = super::qga::QgaClient::connect(&qga).await?;
             g.ping().await?;
             g.execute_with_timeout("guest-fsfreeze-freeze", None, Duration::from_secs(10))
                 .await
@@ -459,9 +454,9 @@ async fn stop_inner(force: bool) -> Result<()> {
     }
 
     // Try QMP quit first if the socket is around.
-    #[cfg(unix)]
-    if paths.qmp_socket().exists() {
-        if let Ok(mut q) = QmpClient::connect(&paths.qmp_socket()).await {
+    let qmp = paths.qmp_endpoint();
+    if qmp.exists() {
+        if let Ok(mut q) = QmpClient::connect_endpoint(&qmp).await {
             let _ = q.quit().await;
         }
     }
@@ -719,8 +714,41 @@ fn grow_var_file(paths: &VmPaths, target_bytes: u64) -> Result<()> {
         .write(true)
         .open(&var)
         .with_context(|| format!("open {} to grow", var.display()))?;
+    // The "sparse" this relies on is implicit on macOS and Linux. NTFS
+    // allocates every byte `set_len` adds unless the file is first marked
+    // sparse, so a 50 GiB var disk would cost 50 GiB of real disk.
+    #[cfg(windows)]
+    mark_sparse(&f).with_context(|| format!("marking {} sparse", var.display()))?;
     f.set_len(target_bytes)
         .with_context(|| format!("set_len {} -> {target_bytes}", var.display()))?;
+    Ok(())
+}
+
+/// Mark an open file as sparse on NTFS, so space is only allocated where
+/// data is written. Idempotent.
+#[cfg(windows)]
+fn mark_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let mut returned = 0u32;
+    // SAFETY: a plain ioctl on a handle this function borrows for the call;
+    // FSCTL_SET_SPARSE with no input buffer sets the flag.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -851,7 +879,14 @@ fn send_signal(pid: u32, sig: libc::c_int) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
-    #[cfg(not(unix))]
+    // No signals on Windows: both TERM and KILL end the process outright.
+    // QEMU has already been asked to quit over QMP by the time we get here.
+    #[cfg(windows)]
+    {
+        let _ = sig;
+        state::terminate_pid(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (pid, sig);
     }
@@ -1006,28 +1041,21 @@ fn write_ssh_config(paths: &VmPaths, ssh_port: u16) -> Result<()> {
 /// state, and `None` if the QMP socket is unreachable. Short timeout
 /// (~500ms) so a wedged QEMU doesn't make `vm status` hang.
 async fn probe_paused(paths: &VmPaths) -> Option<bool> {
-    #[cfg(unix)]
-    {
-        if !paths.qmp_socket().exists() {
-            return None;
-        }
-        let probe = async {
-            let mut client = QmpClient::connect(&paths.qmp_socket()).await.ok()?;
-            let v = client.execute("query-status", None).await.ok()?;
-            v.get("status")
-                .and_then(|s| s.as_str())
-                .map(|s| s == "paused")
-        };
-        tokio::time::timeout(Duration::from_millis(500), probe)
-            .await
-            .ok()
-            .flatten()
+    let qmp = paths.qmp_endpoint();
+    if !qmp.exists() {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = paths;
-        None
-    }
+    let probe = async {
+        let mut client = QmpClient::connect_endpoint(&qmp).await.ok()?;
+        let v = client.execute("query-status", None).await.ok()?;
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "paused")
+    };
+    tokio::time::timeout(Duration::from_millis(500), probe)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Default idle timeout in seconds when neither config nor env var sets
@@ -1035,14 +1063,12 @@ async fn probe_paused(paths: &VmPaths) -> Option<bool> {
 /// when the user steps away from active work and not pausing mid-pause
 /// during normal SSH/docker bursts. Users with snappier wake budgets
 /// can lower via `avocado vm config set idle.hibernate_after_secs N`.
-#[cfg(unix)]
 const DEFAULT_IDLE_AFTER_SECS: u64 = 60;
 
 /// Resolve the hibernate timeout. Env var wins (one-shot override for
 /// experimentation), else the persisted `idle.hibernate_after_secs`,
 /// else the default. `0` disables hibernation while keeping the proxy
 /// up — useful for isolating proxy issues from QMP issues.
-#[cfg(unix)]
 fn resolve_idle_after_secs(paths: &VmPaths) -> u64 {
     if let Ok(raw) = std::env::var("AVOCADO_VM_IDLE_HIBERNATE_SECS") {
         if let Ok(parsed) = raw.parse::<u64>() {
@@ -1068,12 +1094,29 @@ fn resolve_idle_after_secs(paths: &VmPaths) -> u64 {
 /// Best-effort SIGTERM → SIGKILL on the supervisor pid, then remove
 /// its pidfile + internal-ssh-port marker. Idempotent — missing
 /// pidfile / dead pid is a no-op.
-#[cfg(unix)]
+///
+/// On Windows there is no SIGTERM for the supervisor to catch, so it cannot
+/// resume a paused VM or stop its ssh tunnel on the way out. The tunnel is
+/// its child, so the supervisor is ended as a process tree; a paused VM is
+/// fine because the caller then stops QEMU over QMP, which answers while
+/// the vCPUs are halted.
 fn stop_supervisor(paths: &VmPaths) {
     let pidfile = paths.supervisor_pid();
     if let Ok(raw) = std::fs::read_to_string(&pidfile) {
         if let Ok(pid) = raw.trim().parse::<u32>() {
             if state::pid_alive(pid) {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                }
                 send_signal(pid, SIGTERM);
                 for _ in 0..20 {
                     if !state::pid_alive(pid) {
@@ -1092,7 +1135,6 @@ fn stop_supervisor(paths: &VmPaths) {
     let _ = std::fs::remove_file(paths.infra_ssh_port_file());
 }
 
-#[cfg(unix)]
 async fn spawn_supervisor(
     paths: &VmPaths,
     user_port: u16,
@@ -1146,6 +1188,14 @@ async fn spawn_supervisor(
             let _ = libc::setsid();
             Ok(())
         });
+    }
+    // Detached on Windows the same way QEMU is (see qemu::spawn_detached).
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        state::stop_std_handle_inheritance();
     }
     let child = cmd
         .spawn()
