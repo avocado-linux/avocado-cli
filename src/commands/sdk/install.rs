@@ -68,6 +68,10 @@ pub struct SdkInstallCommand {
     pub nfs_port: Option<u16>,
     /// SDK container architecture for cross-arch emulation
     pub sdk_arch: Option<String>,
+    /// Runtime `avocado install -r` scoped this install to: only its
+    /// extensions and compile sections are scanned (all target-relevant
+    /// runtimes when unset)
+    pub runtime: Option<String>,
     /// Pre-composed configuration to avoid reloading
     composed_config: Option<Arc<ComposedConfig>>,
     pub tui_context: Option<TuiContext>,
@@ -468,6 +472,7 @@ impl SdkInstallCommand {
             runs_on: None,
             nfs_port: None,
             sdk_arch: None,
+            runtime: None,
             composed_config: None,
             tui_context: None,
         }
@@ -496,6 +501,36 @@ impl SdkInstallCommand {
     pub fn with_sdk_arch(mut self, sdk_arch: Option<String>) -> Self {
         self.sdk_arch = sdk_arch;
         self
+    }
+
+    /// Scope the extension and compile-section scans to one runtime
+    pub fn with_runtime(mut self, runtime: Option<String>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Under `-r`, the runtime's extensions plus everything they `depends_on`,
+    /// as the extension step installs them: a base that only another runtime
+    /// lists still needs its SDK dependencies and compile sections. Unscoped,
+    /// the set is unchanged. An unfetched remote extension's edges are unknown
+    /// until the fetch, so a closure that does not resolve yet keeps the set as
+    /// it is; the scan after the fetch expands it.
+    fn scoped_with_depends_on(
+        &self,
+        composed: &ComposedConfig,
+        target: &str,
+        mut extensions: HashSet<String>,
+    ) -> HashSet<String> {
+        if self.runtime.is_some() {
+            let roots: Vec<String> = extensions.iter().cloned().collect();
+            if let Ok(closure) =
+                crate::utils::ext_deps::DependencyGraph::from_composed(composed, target)
+                    .and_then(|g| g.resolve(&roots))
+            {
+                extensions.extend(closure.order);
+            }
+        }
+        extensions
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -556,13 +591,17 @@ impl SdkInstallCommand {
         })?;
 
         // Determine which extensions are active for this target based on runtime configuration
-        let active_extensions = find_active_extensions(
-            config,
-            &composed.merged_value,
+        let active_extensions = self.scoped_with_depends_on(
+            &composed,
             &target,
-            &composed.config_path,
-            None,
-        )?;
+            find_active_extensions(
+                config,
+                &composed.merged_value,
+                &target,
+                &composed.config_path,
+                self.runtime.as_deref(),
+            )?,
+        );
 
         // Before the first download. `active_extensions` ignores `enabled`, so an
         // `enabled: false` extension with a package `source` still needs the
@@ -783,7 +822,7 @@ impl SdkInstallCommand {
             active_extensions,
             target,
             &composed.config_path,
-            None,
+            self.runtime.as_deref(),
         )?;
         // An extension declaring device-tree overlays needs the delivery
         // hook in the target-sysroot, so provision the target-sysroot even when
@@ -846,26 +885,36 @@ impl SdkInstallCommand {
 
         // Prepare target-dev install command if needed (CPU-only prep, no container calls)
         let target_dev_command = if need_target_dev {
+            // The target-sysroot is shared by every runtime. Under `-r` it only
+            // gains: removals are judged against every runtime's sections, and
+            // a wipe reinstalls them all, so another runtime's packages are
+            // never dropped by a scoped install.
+            let every_section = if self.runtime.is_some() {
+                let all_extensions = find_active_extensions(
+                    config,
+                    &composed.merged_value,
+                    target,
+                    &composed.config_path,
+                    None,
+                )?;
+                find_active_compile_sections(
+                    config,
+                    &composed.merged_value,
+                    &all_extensions,
+                    target,
+                    &composed.config_path,
+                    None,
+                )?
+            } else {
+                active_compile_sections.clone()
+            };
             let compile_dependencies = config.get_compile_dependencies();
-            let mut all_compile_package_names: Vec<String> = Vec::new();
-            for section_name in &active_compile_sections {
-                if let Some(dependencies) = compile_dependencies.get(section_name) {
-                    all_compile_package_names.extend(self.extract_package_names(dependencies));
-                }
-            }
-            all_compile_package_names.sort();
-            all_compile_package_names.dedup();
 
             if !target_kver_changed {
-                // The lock records the compile dependencies and the base package.
-                let effective: HashSet<String> = all_compile_package_names
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(target_sysroot_base_pkg.to_string()))
-                    .collect();
-                let removed = detect_sysroot_package_removals(
-                    &effective,
-                    &SysrootType::TargetSysroot,
+                let removed = target_sysroot_removals(
+                    &compile_dependencies,
+                    &every_section,
+                    target_sysroot_base_pkg,
                     target,
                     lock_file,
                 );
@@ -888,8 +937,20 @@ impl SdkInstallCommand {
 
             // Pins come from the cleaned lock, so a wipe does not reinstall the
             // old kernel's versions.
+            let install_sections = if clean_target_sysroot {
+                &every_section
+            } else {
+                &active_compile_sections
+            };
+            let mut all_compile_package_names: Vec<String> = install_sections
+                .iter()
+                .filter_map(|s| compile_dependencies.get(s))
+                .flat_map(|deps| self.extract_package_names(deps))
+                .collect();
+            all_compile_package_names.sort();
+            all_compile_package_names.dedup();
             let mut all_compile_packages: Vec<String> = Vec::new();
-            for section_name in &active_compile_sections {
+            for section_name in install_sections {
                 if let Some(dependencies) = compile_dependencies.get(section_name) {
                     all_compile_packages.extend(self.build_package_list_with_lock(
                         dependencies,
@@ -2092,13 +2153,17 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
         let config = &composed.config;
 
         // Re-compute active extensions after config reload (remote extension configs may be merged)
-        let active_extensions = find_active_extensions(
-            config,
-            &composed.merged_value,
+        let active_extensions = self.scoped_with_depends_on(
+            &composed,
             target,
-            &self.config_path,
-            None,
-        )?;
+            find_active_extensions(
+                config,
+                &composed.merged_value,
+                target,
+                &self.config_path,
+                self.runtime.as_deref(),
+            )?,
+        );
 
         // Re-compute extension SDK dependencies, filtered to only active extensions
         let config_content = serde_yaml::to_string(&composed.merged_value)
@@ -2505,11 +2570,110 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS \
 "#
 }
 
+/// Target-sysroot packages the config no longer asks for. `sections` must be
+/// every runtime's compile sections, not only a `-r` scope's: another
+/// runtime's packages would otherwise count as removed and wipe the shared
+/// sysroot. The lock also records the base package.
+fn target_sysroot_removals(
+    compile_dependencies: &HashMap<String, &HashMap<String, serde_yaml::Value>>,
+    sections: &[String],
+    base_pkg: &str,
+    target: &str,
+    lock_file: &LockFile,
+) -> Vec<String> {
+    let effective: HashSet<String> = sections
+        .iter()
+        .filter_map(|s| compile_dependencies.get(s))
+        .flat_map(|deps| deps.keys().cloned())
+        .chain(std::iter::once(base_pkg.to_string()))
+        .collect();
+    detect_sysroot_package_removals(&effective, &SysrootType::TargetSysroot, target, lock_file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_yaml::Value;
     use std::collections::HashMap;
+
+    fn sdk_install(runtime: Option<&str>) -> SdkInstallCommand {
+        SdkInstallCommand::new("avocado.yaml".into(), false, None, None, None)
+            .with_runtime(runtime.map(String::from))
+    }
+
+    /// `install -r dev`: `dev` lists `app`, `app` depends on `base`, and only
+    /// `prod` lists `base`. The SDK step still covers `base`, as the extension
+    /// step installs it. Unscoped, the set is what the runtimes list.
+    #[test]
+    fn a_scoped_install_follows_depends_on() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  dev:
+    extensions: [app]
+  prod:
+    extensions: [base]
+extensions:
+  app:
+    version: "1.0.0"
+    depends_on:
+      - base
+    packages: { a: '*' }
+  base:
+    version: "1.0.0"
+    packages: { b: '*' }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).unwrap();
+        let scan = |runtime: Option<&str>| {
+            let found = find_active_extensions(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                config_path,
+                runtime,
+            )
+            .unwrap();
+            let mut exts: Vec<String> = sdk_install(runtime)
+                .scoped_with_depends_on(&composed, "qemux86-64", found)
+                .into_iter()
+                .collect();
+            exts.sort();
+            exts
+        };
+        assert_eq!(scan(Some("dev")), ["app", "base"]);
+        assert_eq!(scan(Some("prod")), ["base"]);
+        assert_eq!(scan(None), ["app", "base"]);
+    }
+
+    /// After an unscoped install put `dev`'s and `prod`'s compile packages in
+    /// the shared target-sysroot, `install -r dev` finds nothing removed, so
+    /// it neither wipes the sysroot nor drops its compile-deps stamp. Judged
+    /// against `dev`'s sections alone, `prod`'s package would read as removed.
+    #[test]
+    fn a_scoped_install_keeps_other_runtimes_target_sysroot_packages() {
+        let mut lock = LockFile::new();
+        for pkg in ["dev-pkg", "prod-pkg", "avocado-sdk-target-sysroot"] {
+            lock.set_locked_version("t", &SysrootType::TargetSysroot, pkg, "1.0");
+        }
+        let dev: HashMap<String, Value> = HashMap::from([("dev-pkg".into(), "*".into())]);
+        let prod: HashMap<String, Value> = HashMap::from([("prod-pkg".into(), "*".into())]);
+        let deps = HashMap::from([
+            ("dev-lib".to_string(), &dev),
+            ("prod-lib".to_string(), &prod),
+        ]);
+        let removals = |sections: &[&str]| {
+            let sections: Vec<String> = sections.iter().map(|s| s.to_string()).collect();
+            target_sysroot_removals(&deps, &sections, "avocado-sdk-target-sysroot", "t", &lock)
+        };
+        assert!(removals(&["dev-lib", "prod-lib"]).is_empty());
+        assert_eq!(removals(&["dev-lib"]), ["prod-pkg"]);
+    }
 
     /// A failed install keeps the disk section and the old kernel pin, so both
     /// clean triggers fire again on the next run: the wipe may never have run.
