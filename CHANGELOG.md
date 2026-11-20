@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Layer sharing rule documented.** SDK layers are reused across projects
+  when the distro feed is pinned to a snapshot and every enabled custom feed
+  in `repos:` is a `path:` feed, which has a content identity (the sha256 of
+  its `repodata/repomd.xml`). A project that enables a `url:` or `org:` feed
+  keeps its layers private, and `sdk install` prints a notice naming the first
+  such feed. Run `avocado feed index` after changing a feed directory: the key
+  sees only `repomd.xml`, so an RPM replaced in place without re-indexing
+  reuses the old layer. A feed re-indexed while `sdk install` runs makes that
+  install commit nothing shared. See docs/layer-sharing.md.
 - **Release override notice.** When `AVOCADO_RELEASEVER` is exported in a
   project that has a locked pin, avocado prints
   `pin ignored: AVOCADO_RELEASEVER is set to <value>; the locked pin <pin> is not used`
@@ -99,6 +108,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its stamps, and leaves the `sdk.compile` sections it uses as they are. By
   default `ext clean` still runs the clean script of each section.
 
+- **Stacks (opt-in): SDK installs shared across projects.** With
+  `enabled: true` under `stacks:` in `~/.avocado/config.yaml` (or
+  `AVOCADO_STACKS=on`), `sdk install` builds a project's
+  `/opt/_avocado/<target>` as content-addressed layers: the SDK bootstrap,
+  the target base (rootfs, initramfs and the platform SDK packages) and the
+  project's own additions. Another project whose inputs match reuses them
+  instead of installing, and gets the lock pins of what it reused. Layers are
+  shared when the feed is pinned to a snapshot and every enabled `repos:`
+  feed is a `path:` feed (see docs/layer-sharing.md). Files are stored once
+  by content; each project keeps
+  its private paths (extension and runtime outputs, build stamps) out of
+  shared layers. Needs rootful docker that can run `--privileged` and Linux
+  6.5+ (layers mount file-backed on 6.12+, through loop devices below); a
+  host that cannot run stacks uses plain volumes, with a warning. Stacks live
+  in `/var/lib/avocado/stacks` on the docker host unless `stacks.root` in
+  `~/.avocado/config.yaml` (or `AVOCADO_STACKS`) says otherwise,
+  and keep 20 GiB free there unless `gc:` sets a limit. A `root:` also turns
+  them on; `enabled: false` or `AVOCADO_STACKS=off` keeps them off. `commit: false` (or
+  `AVOCADO_STACKS_COMMIT=0`) reuses layers but stops the CLI from committing
+  any. It is not a trust boundary: a job that runs the CLI also runs the
+  privileged helper against the shared root and can change its own
+  environment, so a job whose inputs are untrusted (CI building pull
+  requests) needs a stacks root of its own, not this setting. A project installed on a plain volume moves
+  over on its next install: its outputs move into its view, and the old
+  SDK tree is deleted rather than left hidden under it.
+- **`avocado stack`: see and reclaim the space stacks use.** `status`
+  shows totals, what is reclaimable now, every project's view and every
+  layer with what evicting it alone would free and what holds it. `gc`
+  evicts layers no project uses (all of them, or down to `--max-size` /
+  `--min-free`; leaves first, so shared base layers go last), `prune` drops
+  views whose project or volume is gone, `drop` releases one project's
+  views, `destroy --yes` deletes all stacks (their files are root-owned),
+  and `config` shows the effective settings and whether stacks work on
+  this host. The ones that change something take `--dry-run`. `gc:` limits in
+  the config file run the same cleanup after each `sdk install`. The helper
+  image is `ghcr.io/avocado-linux/avocado-stacks:<CLI version>` (`:edge` for
+  development builds).
 ### Changed
 - **`avocado install -r <runtime>` scopes its SDK step to that runtime.** The
   SDK step installed SDK dependencies and target-dev compile packages for the

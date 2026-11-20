@@ -240,6 +240,26 @@ async fn dispatch(docker: &Docker, args: &[String]) -> Result<i32> {
         "kill" => kill(docker, rest).await,
         "rm" => rm(docker, rest).await,
         "volume" => volume(docker, rest).await,
+        "info" => {
+            let a = parse(rest, &["-f|--format"], &[], true)?;
+            print_inspected(
+                vec![serde_json::to_value(docker.info().await?)?],
+                a.get("--format"),
+            )?;
+            Ok(0)
+        }
+        "image" => match rest.split_first() {
+            Some((verb, names)) if verb == "inspect" => {
+                let a = parse(names, &["-f|--format"], &[], true)?;
+                let mut objects = Vec::new();
+                for name in &a.rest {
+                    objects.push(serde_json::to_value(docker.inspect_image(name).await?)?);
+                }
+                print_inspected(objects, a.get("--format"))?;
+                Ok(0)
+            }
+            _ => bail!("docker image: only `inspect` is supported here"),
+        },
         "pull" => {
             let a = parse(rest, &["--platform"], &["-q|--quiet"], true)?;
             let image = a.rest.first().context("docker pull: no image given")?;
@@ -1133,5 +1153,31 @@ mod tests {
         }
         assert!(render("{{range .Mounts}}x{{end}}", &container).is_err());
         assert!(render("{{.ID", &container).is_err());
+    }
+
+    /// The `info` and `image inspect` templates stacks uses read the daemon's own field names.
+    #[test]
+    fn info_and_image_templates_render_daemon_fields() {
+        let info = serde_json::to_value(bollard::models::SystemInfo {
+            id: Some("ABCD".into()),
+            kernel_version: Some("6.12.0".into()),
+            docker_root_dir: Some("/var/lib/docker".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            render("{{.ID}} {{.KernelVersion}}", &info).unwrap(),
+            "ABCD 6.12.0"
+        );
+        assert_eq!(
+            render("{{.DockerRootDir}}", &info).unwrap(),
+            "/var/lib/docker"
+        );
+        let image = serde_json::to_value(bollard::models::ImageInspect {
+            id: Some("sha256:1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(render("{{.Id}}", &image).unwrap(), "sha256:1");
     }
 }

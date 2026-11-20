@@ -4,7 +4,8 @@
 //! that parses `avocado.yaml`. The project config describes a build; this
 //! one describes the user's preferences for the CLI itself (which channel
 //! they want VM updates from, whether to opt out of auto-updates, where to
-//! point at a custom dev VM).
+//! point at a custom dev VM). Its `stacks:` section is read by
+//! [`crate::utils::stacks::settings`].
 //!
 //! The file is optional. A missing file means "all defaults".
 

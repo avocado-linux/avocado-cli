@@ -377,6 +377,43 @@ pub struct ResolvedFeed {
     pub placement: Placement,
 }
 
+/// The first enabled custom feed (`url:`, `path:`, `org:`) with no recorded content identity.
+/// Today only a `path:` feed has one (the digest of its `repodata/repomd.xml`); a `url:` or
+/// `org:` feed can change under the same name. The distro feed, built-in re-scopes and distro
+/// add-ons are not custom feeds: all sit under the snapshot pin, and an add-on is the only feed
+/// whose placement is not `Any`.
+pub fn first_unpinned_feed(feeds: &[ResolvedFeed]) -> Option<String> {
+    feeds
+        .iter()
+        .filter(|f| matches!(f.kind, FeedKind::Url | FeedKind::Path | FeedKind::Connect))
+        .filter(|f| f.placement == Placement::Any)
+        .find(|f| f.content_digest.is_none())
+        .map(|f| f.name.clone())
+}
+
+/// A `path:` feed's content identity as the layer key saw it: the digest of
+/// `<dir>/repodata/repomd.xml` when the feed set was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentPin {
+    pub name: String,
+    pub dir: PathBuf,
+    pub digest: String,
+}
+
+/// The first feed whose `repodata/repomd.xml` no longer has its pinned digest (changed or
+/// gone), re-read now.
+pub fn first_moved_feed(pins: &[ContentPin]) -> Option<&str> {
+    pins.iter()
+        .find(|p| {
+            fs::read(p.dir.join("repodata").join("repomd.xml"))
+                .map(|b| full_sha256(&b))
+                .ok()
+                .as_ref()
+                != Some(&p.digest)
+        })
+        .map(|p| p.name.as_str())
+}
+
 /// Which side of a stage's dnf a feed is written for. See `ResolvedFeed::placement`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -518,6 +555,12 @@ pub struct FeedMaterialization {
     /// process-level caches keyed on the feed identity (kernel_resolver) tell
     /// two feed sets apart without re-deriving anything.
     pub fingerprint: String,
+    /// [`first_unpinned_feed`] over the whole set this was materialized from (every stage,
+    /// not only this one): the layer-sharing decision, from the same set as `fingerprint`.
+    pub first_unpinned_feed: Option<String>,
+    /// Every content-addressed feed in the set, with the digest the fingerprint hashed, so a
+    /// layer can be checked against its feeds before it is committed.
+    pub content_pins: Vec<ContentPin>,
 }
 
 impl ResolvedFeedSet {
@@ -1163,6 +1206,27 @@ impl ResolvedFeedSet {
     /// the drop-`stages` rule lives here, next to the struct whose field order
     /// defines it (fast-rebuilds/plan.md §4.0).
     pub fn stage_projection_json(&self, stage: FeedStage) -> Result<String> {
+        self.projection_json(stage, false)
+    }
+
+    /// The stage projection with each content-addressed feed (a `path:` feed that has a
+    /// `content_digest`) identified by that digest alone: its `baseurl` (a mount path
+    /// that does not move when the RPMs do) and `source` are dropped. This is what the
+    /// layer key hashes, so a changed directory changes the key and the same content
+    /// at another path shares it. The stamp hash keeps the full projection.
+    fn layer_key_projection_json(&self, stage: FeedStage) -> Result<String> {
+        self.projection_json(stage, true)
+    }
+
+    /// SHA-256 of [`Self::layer_key_projection_json`]: `FeedMaterialization::fingerprint`.
+    /// Needs no minted token, so a test can key an `org:` feed without the network.
+    pub(crate) fn layer_key_fingerprint(&self, stage: FeedStage) -> Result<String> {
+        Ok(full_sha256(
+            self.layer_key_projection_json(stage)?.as_bytes(),
+        ))
+    }
+
+    fn projection_json(&self, stage: FeedStage, content_addressed: bool) -> Result<String> {
         let mut v = serde_json::to_value(self).context("serializing feed set")?;
         let stage_name = stage.to_string();
         if let Some(feeds) = v.get_mut("feeds").and_then(|f| f.as_array_mut()) {
@@ -1200,6 +1264,10 @@ impl ResolvedFeedSet {
             for f in feeds.iter_mut() {
                 if let Some(o) = f.as_object_mut() {
                     o.remove("stages");
+                    if content_addressed && o.contains_key("content_digest") {
+                        o.remove("baseurl");
+                        o.remove("source");
+                    }
                 }
             }
         }
@@ -1692,11 +1760,7 @@ impl ResolvedFeedSet {
             }
         }
 
-        let fingerprint = {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(self.stage_projection_json(stage)?.as_bytes());
-            digest.iter().map(|b| format!("{b:02x}")).collect()
-        };
+        let fingerprint = self.layer_key_fingerprint(stage)?;
         Ok(FeedMaterialization {
             tier: self.minted_tier,
             key_id: self.minted_key_id.clone(),
@@ -1707,6 +1771,18 @@ impl ResolvedFeedSet {
             add_hosts,
             host_feeds,
             fingerprint,
+            first_unpinned_feed: first_unpinned_feed(&self.feeds),
+            content_pins: self
+                .feeds
+                .iter()
+                .filter_map(|f| {
+                    Some(ContentPin {
+                        name: f.name.clone(),
+                        dir: f.mount.clone()?,
+                        digest: f.content_digest.clone()?,
+                    })
+                })
+                .collect(),
         })
     }
 }
@@ -3145,6 +3221,137 @@ distro:
         assert!(a1.contains("\"source\": \"./a\"") && a1.contains("\"content_digest\""));
     }
 
+    /// The layer key hashes the materialization fingerprint. A path feed's
+    /// identity there is its repodata, not where it lives: changed RPMs must
+    /// change the key, and the same content at another path must not.
+    #[test]
+    fn changed_path_feed_changes_layer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (d, body) in [("a", "one"), ("b", "two"), ("c", "one")] {
+            fs::create_dir_all(dir.path().join(d).join("repodata")).unwrap();
+            fs::write(
+                dir.path().join(d).join("repodata/repomd.xml"),
+                format!("<repomd>{body}</repomd>"),
+            )
+            .unwrap();
+        }
+        let key = |p: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [local]\nrepos:\n  local:\n    path: ./{p}\n"
+            ));
+            ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+                .unwrap()
+                .unwrap()
+                .materialize(FeedStage::Rootfs)
+                .unwrap()
+                .fingerprint
+        };
+        assert_ne!(
+            key("a"),
+            key("b"),
+            "different repomd.xml digests must change the key"
+        );
+        assert_eq!(
+            key("a"),
+            key("c"),
+            "the same repodata at another path must give the same key"
+        );
+    }
+
+    /// Only a feed with a content digest is keyed by it. Any other feed keeps its URL in the
+    /// layer key, and its projection is byte for byte the stamp hash's.
+    #[test]
+    fn a_feed_without_a_digest_keeps_its_url_in_the_layer_key() {
+        let set = |url: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [mirror]\nrepos:\n  mirror:\n    url: {url}\n"
+            ));
+            ResolvedFeedSet::resolve(&c, "t", Path::new("."), None)
+                .unwrap()
+                .unwrap()
+        };
+        let (a, b) = (
+            set("http://example.invalid/a"),
+            set("http://example.invalid/b"),
+        );
+        assert_ne!(
+            a.materialize(FeedStage::Rootfs).unwrap().fingerprint,
+            b.materialize(FeedStage::Rootfs).unwrap().fingerprint,
+            "another URL is other packages"
+        );
+        assert_eq!(
+            a.layer_key_projection_json(FeedStage::Rootfs).unwrap(),
+            a.stage_projection_json(FeedStage::Rootfs).unwrap()
+        );
+    }
+
+    /// The share decision rides on the materialization, so it comes from the set this
+    /// invocation pinned, the one the layer key hashes. A feed indexed after that set was
+    /// resolved must not make a key with no content identity in it look shareable.
+    #[test]
+    fn share_decision_follows_the_pinned_feed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("feed")).unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [local]\nrepos:\n  local:\n    path: ./feed\n"
+        ));
+        let pinned = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
+        fs::write(dir.path().join("feed/repodata/repomd.xml"), "<repomd/>").unwrap();
+        let fresh = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_unpinned_feed(&fresh.feeds), None);
+        assert_eq!(
+            pinned
+                .materialize(FeedStage::Sdk)
+                .unwrap()
+                .first_unpinned_feed
+                .as_deref(),
+            Some("local")
+        );
+    }
+
+    /// The digest the pre-commit check compares against is the one the fingerprint hashed,
+    /// and only a feed with one is checked.
+    #[test]
+    fn materialization_pins_each_content_addressed_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("feed/repodata")).unwrap();
+        fs::write(dir.path().join("feed/repodata/repomd.xml"), "<repomd/>").unwrap();
+        let c = load(&format!(
+            "{BASE}  feeds: [local, mirror]\nrepos:\n  local:\n    path: ./feed\n  mirror:\n    url: http://example.invalid/r\n"
+        ));
+        let set = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+            .unwrap()
+            .unwrap();
+        let pins = set.materialize(FeedStage::Sdk).unwrap().content_pins;
+        assert_eq!(
+            pins,
+            vec![ContentPin {
+                name: "local".into(),
+                dir: set
+                    .feeds
+                    .iter()
+                    .find(|f| f.name == "local")
+                    .unwrap()
+                    .mount
+                    .clone()
+                    .unwrap(),
+                digest: full_sha256(b"<repomd/>"),
+            }]
+        );
+        assert_eq!(first_moved_feed(&pins), None);
+        fs::write(
+            dir.path().join("feed/repodata/repomd.xml"),
+            "<repomd>2</repomd>",
+        )
+        .unwrap();
+        assert_eq!(first_moved_feed(&pins), Some("local"));
+    }
+
     #[test]
     fn distro_feed_rejects_shapes_the_baked_repos_cannot_serve() {
         let err = |yaml: &str| {
@@ -3605,6 +3812,28 @@ distro:
                 feed.baseurl
             );
         }
+    }
+
+    /// A `path:` feed is pinned by its repodata digest and only while it has one; an `org:`
+    /// (Connect) feed resolves to whatever the organization publishes, so it never is.
+    #[test]
+    fn only_a_path_feed_with_a_digest_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("indexed/repodata")).unwrap();
+        fs::write(dir.path().join("indexed/repodata/repomd.xml"), "<repomd/>").unwrap();
+        fs::create_dir_all(dir.path().join("bare")).unwrap();
+        let unpinned = |repo: &str| {
+            let c = load(&format!(
+                "{BASE}  feeds: [mine]\nrepos:\n  mine:\n    {repo}\n"
+            ));
+            let set = ResolvedFeedSet::resolve(&c, "t", dir.path(), None)
+                .unwrap()
+                .unwrap();
+            first_unpinned_feed(&set.feeds)
+        };
+        assert_eq!(unpinned("path: ./indexed"), None);
+        assert_eq!(unpinned("path: ./bare").as_deref(), Some("mine"));
+        assert_eq!(unpinned("org: acme").as_deref(), Some("mine"));
     }
 
     #[tokio::test]
