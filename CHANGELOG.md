@@ -119,9 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`provision --dry-run`.** Runs every guard of a profile and writes
   nothing, by exporting `AVOCADO_PROVISION_DRY_RUN=1`. It is refused for a
   profile whose stone manifest does not declare `config.dry_run: true`.
-  Provision scripts also get a read-only copy of the host's mount table at
-  `AVOCADO_PROVISION_HOST_MOUNTS`, so a profile can refuse to write a mounted
-  disk.
+  On a Linux host running Docker directly, provision scripts also get a
+  read-only copy of the host's mount table at `AVOCADO_PROVISION_HOST_MOUNTS`,
+  so a profile can refuse to write a mounted disk. It is unset on Docker
+  Desktop, with `--runs-on` and under the avocado-vm, so a profile cannot rely
+  on it.
 - **`AVOCADO_PROVISION_FORCE`.** Provision scripts see `1` under `--force`
   and `0` without it, so a script can require a terminal confirmation before
   an erasing flash unless the operator already confirmed.
@@ -345,8 +347,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no `package_files` rebuilds on every build.
 - **`enable_services` on an extension without `confext`** is reported as a
   warning, not under an `[ERROR]` label: it was never fatal.
+- **`ext build` and `config validate` reject a `"` in `on_merge`,
+  `on_unmerge` and `modprobe` entries, and a `modprobe` word starting with
+  `-`.** avocadoctl runs these lines on the device with no shell, so an inner
+  quote would reach the command, and `nvidia -r` would unload the module. A
+  config that built on 1.0.0 can fail here: remove the quotes. A `modprobe`
+  entry takes a wider set of parameters than before, such as
+  `force_probe=*`.
 
 ### Fixed
+- **`ext build` escapes hook and `modprobe` entries.** They were written raw
+  into the generated build script, so `$(...)` or a backtick ran in the build
+  container and a `"` broke the release file. Entries that worked before are
+  written byte for byte the same.
+- **A `modprobe` change rebuilds the extension.** A change to only the
+  `modprobe` list, or to any build key only in a `target-<name>:` override,
+  reported "up to date" and kept the old release file.
+- **`ext build` warns about `modprobe` on an extension without `sysext`.**
+  Only the sysext release file carries it, so the modules never loaded.
 - **`enable_services` accepts a template instance** such as
   `wpa_supplicant@wlan0.service`. `ext build` failed with "no such unit" even
   when the extension shipped `wpa_supplicant@.service`; it now links the
