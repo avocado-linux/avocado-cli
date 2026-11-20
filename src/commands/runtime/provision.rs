@@ -318,11 +318,13 @@ impl RuntimeProvisionCommand {
 
         // Signal USB passthrough availability to provisioning scripts.
         // Docker Desktop (macOS/Windows) runs containers in a VM without host device access.
+        // An explicit `--env AVOCADO_USB_PASSTHROUGH=...` wins: under the
+        // avocado-vm a device imported over USB/IP does reach the container,
+        // and only the caller knows whether one is attached.
         let usb_passthrough = if is_docker_desktop() { "0" } else { "1" };
-        env_vars.insert(
-            "AVOCADO_USB_PASSTHROUGH".to_string(),
-            usb_passthrough.to_string(),
-        );
+        env_vars
+            .entry("AVOCADO_USB_PASSTHROUGH".to_string())
+            .or_insert_with(|| usb_passthrough.to_string());
 
         // When the container is running inside the avocado-vm (driven by
         // Avocado.app on macOS), expose the in-VM agent's Unix socket so

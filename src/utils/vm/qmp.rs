@@ -14,25 +14,31 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
+
+use super::endpoint::{BoxedRead, BoxedWrite, Endpoint};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct QmpClient {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<BoxedRead>,
+    writer: BoxedWrite,
 }
 
 impl QmpClient {
-    /// Connect to the QMP socket and complete capability negotiation.
+    /// Connect to the QMP Unix socket and complete capability negotiation.
     pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = timeout(HANDSHAKE_TIMEOUT, UnixStream::connect(socket))
+        Self::connect_endpoint(&Endpoint::Unix(socket.to_path_buf())).await
+    }
+
+    /// Connect to QMP at `endpoint` (Unix socket, or loopback TCP on
+    /// Windows) and complete capability negotiation.
+    pub async fn connect_endpoint(endpoint: &Endpoint) -> Result<Self> {
+        let (rh, wh) = timeout(HANDSHAKE_TIMEOUT, endpoint.connect())
             .await
-            .with_context(|| format!("timeout connecting to QMP {}", socket.display()))?
-            .with_context(|| format!("connect to QMP {}", socket.display()))?;
-        let (rh, wh) = stream.into_split();
+            .with_context(|| format!("timeout connecting to QMP {endpoint}"))?
+            .with_context(|| format!("connect to QMP {endpoint}"))?;
         let mut client = Self {
             reader: BufReader::new(rh),
             writer: wh,
@@ -167,7 +173,9 @@ impl QmpClient {
     }
 }
 
-#[cfg(test)]
+// These drive the client against a mock on a Unix socket. The TCP path is
+// covered by `endpoint::tests::qmp_client_negotiates_over_tcp`.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;

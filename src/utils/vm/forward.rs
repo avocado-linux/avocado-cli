@@ -38,6 +38,19 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
     // socket file even if it's dead.
     let local = paths.docker_socket();
     let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(paths.docker_port_file());
+
+    // Local end of the forward: the Unix socket, or on Windows a loopback
+    // TCP port (see `VmPaths::docker_port_file`).
+    let tcp_port: Option<u16> = if cfg!(windows) {
+        Some(super::qemu::pick_free_port()?)
+    } else {
+        None
+    };
+    let local_spec = match tcp_port {
+        Some(port) => format!("127.0.0.1:{port}"),
+        None => local.display().to_string(),
+    };
 
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.args([
@@ -67,7 +80,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
         "-p",
         &ssh_port.to_string(),
         "-L",
-        &format!("{}:{}", local.display(), REMOTE_DOCKER_SOCK),
+        &format!("{local_spec}:{REMOTE_DOCKER_SOCK}"),
         "root@127.0.0.1",
     ]);
     cmd.stdin(Stdio::null());
@@ -79,6 +92,13 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
             let _ = libc::setsid();
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        state::stop_std_handle_inheritance();
     }
 
     let child = cmd.spawn().context("failed to spawn ssh -L forwarder")?;
@@ -95,8 +115,25 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
     // ssh dies fast if /run/docker.sock isn't there yet on the remote side.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if local.exists() {
-            return Ok(pid);
+        match tcp_port {
+            Some(port) => {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
+                    // Recorded only once it accepts, so the file's presence
+                    // means the same thing the socket's does on Unix.
+                    std::fs::write(paths.docker_port_file(), port.to_string()).with_context(
+                        || format!("writing {}", paths.docker_port_file().display()),
+                    )?;
+                    return Ok(pid);
+                }
+            }
+            None => {
+                if local.exists() {
+                    return Ok(pid);
+                }
+            }
         }
         if !state::pid_alive(pid) {
             let _ = std::fs::remove_file(paths.forwarder_pid());
@@ -109,10 +146,7 @@ pub async fn start(paths: &VmPaths, ssh_port: u16) -> Result<u32> {
             // Best-effort kill so we don't leak the process.
             send_signal(pid, SIGTERM);
             let _ = std::fs::remove_file(paths.forwarder_pid());
-            bail!(
-                "timed out waiting for {} to appear (ssh forward not established)",
-                local.display()
-            );
+            bail!("timed out waiting for {local_spec} to appear (ssh forward not established)");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -136,6 +170,7 @@ pub async fn stop(paths: &VmPaths) -> Result<()> {
     }
     let _ = std::fs::remove_file(paths.forwarder_pid());
     let _ = std::fs::remove_file(paths.docker_socket());
+    let _ = std::fs::remove_file(paths.docker_port_file());
     Ok(())
 }
 
@@ -158,7 +193,12 @@ fn send_signal(pid: u32, sig: libc::c_int) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = sig;
+        state::terminate_pid(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (pid, sig);
     }

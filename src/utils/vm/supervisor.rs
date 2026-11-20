@@ -34,12 +34,84 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use super::endpoint::Endpoint;
 use super::qmp::QmpClient;
 use super::state;
+
+// ─── Local docker endpoints ──────────────────────────────────────────
+//
+// The docker-facing sockets are Unix sockets on Unix hosts. Windows has no
+// usable equivalent here (`docker.exe` does not speak `unix://`, `ssh -L`
+// cannot bind one), so there each becomes a loopback TCP port recorded in
+// the file of the same stem: `docker.sock` -> `docker.port`,
+// `docker-stream.sock` -> `docker-stream.port`. The tunnel's own local end
+// is a port held in memory.
+
+/// A connected byte stream, whichever transport it came from.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+type BoxDuplex = Box<dyn Duplex>;
+
+/// The port file that stands for `socket` on Windows.
+#[cfg(not(unix))]
+fn port_file_for(socket: &Path) -> PathBuf {
+    socket.with_extension("port")
+}
+
+/// Listener for a user-facing docker endpoint named by its socket path.
+struct LocalListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(not(unix))]
+    inner: TcpListener,
+}
+
+impl LocalListener {
+    async fn bind(socket: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            // Stale Unix socket would refuse bind; ours is owned by us
+            // across restarts.
+            let _ = std::fs::remove_file(socket);
+            let inner = tokio::net::UnixListener::bind(socket)
+                .with_context(|| format!("binding {}", socket.display()))?;
+            Ok(Self { inner })
+        }
+        #[cfg(not(unix))]
+        {
+            let inner = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .context("binding a loopback port for docker")?;
+            let port = inner.local_addr()?.port();
+            let file = port_file_for(socket);
+            std::fs::write(&file, port.to_string())
+                .with_context(|| format!("writing {}", file.display()))?;
+            Ok(Self { inner })
+        }
+    }
+
+    async fn accept(&self) -> std::io::Result<BoxDuplex> {
+        let (stream, _) = self.inner.accept().await?;
+        Ok(Box::new(stream))
+    }
+
+    /// Where this listener is reachable, for the log.
+    fn describe(&self, socket: &Path) -> String {
+        #[cfg(unix)]
+        {
+            socket.display().to_string()
+        }
+        #[cfg(not(unix))]
+        {
+            let port = self.inner.local_addr().map(|a| a.port()).unwrap_or(0);
+            format!("127.0.0.1:{port} ({})", port_file_for(socket).display())
+        }
+    }
+}
 
 /// Log a supervisor event with a UTC timestamp prefix. Timestamps make
 /// pause/wake cycles in `~/.avocado/vm/supervisor.log` legible without
@@ -99,6 +171,10 @@ struct State {
     /// SSH `-L` tunnel child pid, if running. Mutex serializes
     /// spawn/kill so a pause/wake race doesn't leak a child.
     tunnel: Mutex<Option<u32>>,
+    /// Windows: loopback port the tunnel's local end listens on, 0 while
+    /// the tunnel is down. (On Unix that end is `docker_socket_internal`.)
+    #[cfg(not(unix))]
+    tunnel_port: std::sync::atomic::AtomicU16,
     /// Serializes QMP stop/cont so racing wake-and-pause attempts
     /// can't leave the supervisor's `paused` flag out of sync with
     /// QEMU's actual state.
@@ -191,25 +267,93 @@ impl State {
     /// Spawn the SSH `-L` tunnel if it's not already running. Polls
     /// briefly for the local socket to appear so callers can proceed
     /// to `connect()` immediately on return.
+    /// Whether the tunnel's local end is there to connect to.
+    fn tunnel_is_up(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.args.docker_socket_internal.exists()
+        }
+        #[cfg(not(unix))]
+        {
+            self.tunnel_port.load(Ordering::Relaxed) != 0
+        }
+    }
+
+    /// Forget the tunnel's local end (after the ssh child is gone).
+    fn clear_tunnel_end(&self) {
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&self.args.docker_socket_internal);
+        }
+        #[cfg(not(unix))]
+        {
+            self.tunnel_port.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Connect to the tunnel's local end.
+    async fn connect_tunnel(&self) -> Result<BoxDuplex> {
+        #[cfg(unix)]
+        {
+            let s = tokio::net::UnixStream::connect(&self.args.docker_socket_internal)
+                .await
+                .with_context(|| {
+                    format!(
+                        "connecting to docker tunnel sock {}",
+                        self.args.docker_socket_internal.display()
+                    )
+                })?;
+            Ok(Box::new(s))
+        }
+        #[cfg(not(unix))]
+        {
+            let port = self.tunnel_port.load(Ordering::Relaxed);
+            let s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .with_context(|| format!("connecting to docker tunnel port {port}"))?;
+            Ok(Box::new(s))
+        }
+    }
+
     async fn ensure_tunnel(self: &Arc<Self>) -> Result<()> {
         let mut lock = self.tunnel.lock().await;
         if self.paused.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!("VM is paused"));
         }
         if let Some(pid) = *lock {
-            if state::pid_alive(pid) && self.args.docker_socket_internal.exists() {
+            if state::pid_alive(pid) && self.tunnel_is_up() {
                 return Ok(());
             }
             // stale handle; clean up before respawning
             send_signal(pid, SIGTERM);
-            let _ = std::fs::remove_file(&self.args.docker_socket_internal);
+            self.clear_tunnel_end();
         }
-        let pid = spawn_ssh_tunnel(&self.args)?;
-        // Wait for the local sock to materialize — ssh -L creates it
+        // The tunnel's local end: the internal Unix socket, or on Windows a
+        // free loopback port.
+        #[cfg(unix)]
+        let local_spec = {
+            let _ = std::fs::remove_file(&self.args.docker_socket_internal);
+            self.args.docker_socket_internal.display().to_string()
+        };
+        #[cfg(not(unix))]
+        let candidate_port = super::qemu::pick_free_port()?;
+        #[cfg(not(unix))]
+        let local_spec = format!("127.0.0.1:{candidate_port}");
+
+        let pid = spawn_ssh_tunnel(&self.args, &local_spec)?;
+        // Wait for the local end to materialize — ssh -L creates it
         // only after authentication completes.
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         loop {
-            if self.args.docker_socket_internal.exists() {
+            #[cfg(unix)]
+            let ready = self.args.docker_socket_internal.exists();
+            #[cfg(not(unix))]
+            let ready = TcpStream::connect(("127.0.0.1", candidate_port))
+                .await
+                .is_ok();
+            if ready {
+                #[cfg(not(unix))]
+                self.tunnel_port.store(candidate_port, Ordering::Relaxed);
                 *lock = Some(pid);
                 slog!("docker tunnel up (pid {pid})");
                 return Ok(());
@@ -244,7 +388,7 @@ impl State {
                 send_signal(pid, SIGKILL);
             }
         }
-        let _ = std::fs::remove_file(&self.args.docker_socket_internal);
+        self.clear_tunnel_end();
     }
 }
 
@@ -264,7 +408,13 @@ fn send_signal(pid: u32, sig: libc::c_int) {
     unsafe {
         libc::kill(pid as libc::pid_t, sig);
     }
-    #[cfg(not(unix))]
+    // No signals on Windows: either request ends the process.
+    #[cfg(windows)]
+    {
+        let _ = sig;
+        state::terminate_pid(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (pid, sig);
     }
@@ -282,6 +432,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         qmp_socket: args.qmp_socket.clone(),
         idle_threshold_ms: (args.idle_after_secs.saturating_mul(1000)) as i64,
         tunnel: Mutex::new(None),
+        #[cfg(not(unix))]
+        tunnel_port: std::sync::atomic::AtomicU16::new(0),
         qmp_lock: Mutex::new(()),
         args: args.clone(),
     });
@@ -301,13 +453,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
         args.user_port, args.internal_port, args.idle_after_secs
     );
 
-    // Stale Unix socket would refuse bind; ours is owned by us across restarts.
-    let _ = std::fs::remove_file(&args.docker_socket);
-    let unix_listener = UnixListener::bind(&args.docker_socket)
-        .with_context(|| format!("binding {}", args.docker_socket.display()))?;
+    let unix_listener = LocalListener::bind(&args.docker_socket).await?;
     eprintln!(
-        "supervisor: Unix listening on {} → SSH→/run/docker.sock",
-        args.docker_socket.display()
+        "supervisor: docker listening on {} → SSH→/run/docker.sock",
+        unix_listener.describe(&args.docker_socket)
     );
 
     // Infrastructure TCP lane — wakes the VM on connect, proxies to the
@@ -324,12 +473,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     // Infrastructure docker socket — same SSH tunnel, doesn't count toward
     // idle. Meant for `GET /events` streaming subscriptions.
-    let _ = std::fs::remove_file(&args.docker_socket_stream);
-    let infra_unix_listener = UnixListener::bind(&args.docker_socket_stream)
-        .with_context(|| format!("binding {}", args.docker_socket_stream.display()))?;
+    let infra_unix_listener = LocalListener::bind(&args.docker_socket_stream).await?;
     eprintln!(
-        "supervisor: infra Unix listening on {} → SSH→/run/docker.sock (idle-exempt)",
-        args.docker_socket_stream.display()
+        "supervisor: infra docker listening on {} → SSH→/run/docker.sock (idle-exempt)",
+        infra_unix_listener.describe(&args.docker_socket_stream)
     );
 
     if args.idle_after_secs > 0 {
@@ -385,7 +532,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 });
             }
             res = unix_listener.accept() => {
-                let (sock, _peer) = match res {
+                let sock = match res {
                     Ok(v) => v,
                     Err(e) => { slog!("Unix accept error: {e:#}"); continue; }
                 };
@@ -397,7 +544,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                 });
             }
             res = infra_unix_listener.accept() => {
-                let (sock, _peer) = match res {
+                let sock = match res {
                     Ok(v) => v,
                     Err(e) => { slog!("infra Unix accept error: {e:#}"); continue; }
                 };
@@ -467,7 +614,7 @@ async fn handle_tcp(
 /// retry. A paused VM stays paused: this is what lets hibernation actually
 /// stick when the desktop is open, since the watcher's reconnect attempts
 /// can't pin the VM awake by themselves, only user activity can.
-async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -> Result<()> {
+async fn handle_docker(mut client: BoxDuplex, state: Arc<State>, count: bool) -> Result<()> {
     if count {
         state.active_conns.fetch_add(1, Ordering::Relaxed);
         state.touch();
@@ -476,7 +623,7 @@ async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -
             .ensure_tunnel()
             .await
             .context("bringing docker tunnel up")?;
-    } else if !state.args.docker_socket_internal.exists() {
+    } else if !state.tunnel_is_up() {
         // Infra: tunnel not currently up. Fail fast — caller (likely
         // ContainersWatcher) backs off and retries. The VM can be awake
         // without a tunnel (resumed by the TCP lane or by the desktop, or
@@ -496,14 +643,7 @@ async fn handle_docker(mut client: UnixStream, state: Arc<State>, count: bool) -
         ));
     }
 
-    let mut backend = UnixStream::connect(&state.args.docker_socket_internal)
-        .await
-        .with_context(|| {
-            format!(
-                "connecting to docker tunnel sock {}",
-                state.args.docker_socket_internal.display()
-            )
-        })?;
+    let mut backend = state.connect_tunnel().await?;
     let res = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
     let _ = client.shutdown().await;
     let _ = backend.shutdown().await;
@@ -555,8 +695,10 @@ async fn idle_watcher(state: Arc<State>) {
 /// Spawn an `ssh -N -L <local-sock>:/run/docker.sock` to the guest.
 /// Same flag set as the original `forward.rs`; managed by the
 /// supervisor instead of `lifecycle::start`.
-fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
-    let _ = std::fs::remove_file(&args.docker_socket_internal);
+///
+/// `local_spec` is the forward's local end: the internal Unix socket path,
+/// or on Windows `127.0.0.1:<port>`.
+fn spawn_ssh_tunnel(args: &RunArgs, local_spec: &str) -> Result<u32> {
     let mut cmd = std::process::Command::new("ssh");
     cmd.args([
         "-N",
@@ -585,7 +727,7 @@ fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
         "-p",
         &args.internal_port.to_string(),
         "-L",
-        &format!("{}:/run/docker.sock", args.docker_socket_internal.display()),
+        &format!("{local_spec}:/run/docker.sock"),
         "root@127.0.0.1",
     ]);
     cmd.stdin(Stdio::null());
@@ -599,6 +741,14 @@ fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
             Ok(())
         });
     }
+    // No console window for the tunnel on Windows. It stays a child of the
+    // supervisor so a process-tree kill of the supervisor takes it down too.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let child = cmd.spawn().context("spawning ssh -L tunnel")?;
     Ok(child.id())
 }
@@ -607,7 +757,9 @@ fn spawn_ssh_tunnel(args: &RunArgs) -> Result<u32> {
 /// stop/cont happen at most a few times per minute and the QmpClient
 /// holds its own connection state.
 async fn qmp_send(socket: &Path, cmd: &str, args: Option<serde_json::Value>) -> Result<()> {
-    let mut client = QmpClient::connect(socket).await?;
+    // `socket` names the endpoint; on Windows it resolves to the loopback
+    // port recorded beside it.
+    let mut client = QmpClient::connect_endpoint(&Endpoint::for_socket(socket)).await?;
     let _ = client.execute(cmd, args).await?;
     Ok(())
 }
@@ -648,10 +800,12 @@ async fn wait_for_term() -> Result<()> {
         .context("install ctrl-c handler")
 }
 
-#[cfg(test)]
+// The fake QMP server below is a Unix socket.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tokio::io::AsyncBufReadExt;
+    use tokio::net::UnixListener;
 
     /// A QMP socket that answers `query-status` with `running`.
     fn fake_qmp(dir: &Path, running: bool) -> PathBuf {

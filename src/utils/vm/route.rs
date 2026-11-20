@@ -127,8 +127,15 @@ pub async fn ensure_routed_for_process(
     // DOCKER_HOST at that socket means every spawned `docker` subprocess
     // just talks to a Unix socket — no ssh transport in the docker client,
     // no ssh-config modifications, no host-key verification edge cases.
-    let socket = paths.docker_socket();
-    if !socket.exists() {
+    // On Windows the forward is a loopback TCP port recorded in
+    // `docker.port` instead; `docker_host()` covers both.
+    let socket = if cfg!(windows) {
+        paths.docker_port_file()
+    } else {
+        paths.docker_socket()
+    };
+    let docker_host = paths.docker_host().filter(|_| socket.exists());
+    let Some(docker_host) = docker_host else {
         // Be loud — auto-routing without a working socket leaves the user
         // hitting "Cannot connect to the Docker daemon" mysteriously.
         print_warning_stderr(
@@ -139,8 +146,8 @@ pub async fn ensure_routed_for_process(
             ),
         );
         return Ok(RoutingMode::OptedOut);
-    }
-    std::env::set_var("DOCKER_HOST", format!("unix://{}", socket.display()));
+    };
+    std::env::set_var("DOCKER_HOST", docker_host);
     Ok(RoutingMode::Apply)
 }
 

@@ -106,6 +106,18 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 # plain HTTP; no TLS or ssh transport.
 bollard = "0.21"
 
+# Process liveness and termination for the `avocado vm` lifecycle on Windows,
+# where there is no kill(2). Already in the dependency graph via tokio.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # `oneshot` drives the write router directly, so a body stream that ERRORS can be
 # injected deterministically - a truncated real HTTP body just makes the server

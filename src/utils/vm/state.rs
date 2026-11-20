@@ -9,6 +9,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use super::endpoint::Endpoint;
+
 /// Paths under `~/.avocado/vm/`.
 #[derive(Debug, Clone)]
 pub struct VmPaths {
@@ -147,6 +149,20 @@ impl VmPaths {
     pub fn control_socket(&self) -> PathBuf {
         self.root.join("control.sock")
     }
+    /// Where QEMU serves a chardev on this host: the Unix socket, or on
+    /// Windows a loopback TCP port recorded in `<name>.port`.
+    fn chardev_endpoint(&self, socket: PathBuf) -> Endpoint {
+        Endpoint::for_socket(&socket)
+    }
+    pub fn qmp_endpoint(&self) -> Endpoint {
+        self.chardev_endpoint(self.qmp_socket())
+    }
+    pub fn qga_endpoint(&self) -> Endpoint {
+        self.chardev_endpoint(self.qga_socket())
+    }
+    pub fn control_endpoint(&self) -> Endpoint {
+        self.chardev_endpoint(self.control_socket())
+    }
     pub fn serial_log(&self) -> PathBuf {
         self.root.join("serial.log")
     }
@@ -169,6 +185,24 @@ impl VmPaths {
     /// (over an SSH `-L` tunnel managed by [`super::forward`]).
     pub fn docker_socket(&self) -> PathBuf {
         self.root.join("docker.sock")
+    }
+    /// Windows only: loopback TCP port the docker forward listens on, as
+    /// decimal text. `ssh -L` cannot bind a Unix socket there and
+    /// `docker.exe` does not speak `unix://`, so the forward lands on TCP.
+    pub fn docker_port_file(&self) -> PathBuf {
+        self.root.join("docker.port")
+    }
+    /// The `DOCKER_HOST` value that reaches the VM's dockerd through the
+    /// forward: `unix://<docker.sock>`, or on Windows `tcp://127.0.0.1:<port>`
+    /// (`None` there until the forward has recorded its port).
+    pub fn docker_host(&self) -> Option<String> {
+        if cfg!(windows) {
+            let raw = std::fs::read_to_string(self.docker_port_file()).ok()?;
+            let port: u16 = raw.trim().parse().ok()?;
+            Some(format!("tcp://127.0.0.1:{port}"))
+        } else {
+            Some(format!("unix://{}", self.docker_socket().display()))
+        }
     }
     /// Internal-only landing point for the supervisor-managed SSH `-L`
     /// tunnel to `/run/docker.sock`. Lives next to `docker.sock` but
@@ -332,10 +366,73 @@ pub fn pid_alive(pid: u32) -> bool {
         // signal 0 is "check liveness without sending"; returns Ok if process exists.
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        // A process handle is signaled once the process has exited, so a
+        // zero-length wait that times out means it is still running.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+            CloseHandle(handle);
+            alive
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
+    }
+}
+
+/// Stop children spawned from now on inheriting this process's own
+/// stdin/stdout/stderr. Call before spawning a process meant to outlive the
+/// CLI (QEMU, the ssh forwarder).
+///
+/// Windows hands every inheritable handle to a child, not just the three
+/// it is given as stdio. Our own stdout is inheritable (that is how we got
+/// it), so without this a detached QEMU keeps the write end of whatever
+/// pipe the CLI was started with, and anything reading `avocado vm start`
+/// to EOF — a shell pipeline, Avocado Desktop — waits for as long as the VM
+/// runs. Later children that are given `Stdio::inherit()` are unaffected:
+/// std duplicates the handle for them.
+#[cfg(windows)]
+pub fn stop_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// Forcibly end a process on Windows, where there are no signals. The
+/// graceful path is QMP `quit` (QEMU) — this is the fallback, and the only
+/// way to stop helper processes such as the ssh forwarder.
+#[cfg(windows)]
+pub fn terminate_pid(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
     }
 }
 
@@ -346,10 +443,15 @@ pub fn cleanup_transient(paths: &VmPaths) {
         paths.qmp_socket(),
         paths.qga_socket(),
         paths.control_socket(),
+        paths.qmp_endpoint().file().to_path_buf(),
+        paths.qga_endpoint().file().to_path_buf(),
+        paths.control_endpoint().file().to_path_buf(),
         paths.pid_file(),
         paths.ssh_port_file(),
         paths.lock_file(),
         paths.docker_socket(),
+        paths.docker_port_file(),
+        paths.docker_socket_stream().with_extension("port"),
         paths.docker_socket_internal(),
         paths.docker_socket_stream(),
         paths.forwarder_pid(),
