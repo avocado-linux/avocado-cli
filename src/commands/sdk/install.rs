@@ -452,19 +452,23 @@ const POSTINST_INTERCEPT: &str = r#"#!/bin/sh
 exit 0
 "#;
 
-/// `extensions` plus everything they reach through `depends_on`. An unfetched
-/// remote extension's edges are unknown until the fetch, so a closure that
-/// does not resolve yet keeps the set as it is.
+/// `extensions` plus everything they reach through `depends_on`. Each root
+/// resolves on its own: an unfetched remote extension's edges are unknown
+/// until the fetch, so a root whose closure meets one adds nothing yet, and
+/// the other roots still expand.
 fn with_depends_on(
     composed: &ComposedConfig,
     target: &str,
     mut extensions: HashSet<String>,
 ) -> HashSet<String> {
+    let Ok(graph) = crate::utils::ext_deps::DependencyGraph::from_composed(composed, target) else {
+        return extensions;
+    };
     let roots: Vec<String> = extensions.iter().cloned().collect();
-    if let Ok(closure) = crate::utils::ext_deps::DependencyGraph::from_composed(composed, target)
-        .and_then(|g| g.resolve(&roots))
-    {
-        extensions.extend(closure.order);
+    for root in roots {
+        if let Ok(closure) = graph.resolve(std::slice::from_ref(&root)) {
+            extensions.extend(closure.order);
+        }
     }
     extensions
 }
@@ -2679,7 +2683,8 @@ extensions:
     }
 
     /// `dev` lists `app`, and `app` depends on `lib`, which no runtime lists
-    /// and which has a compile section. `install -r dev` installs `lib-dev`,
+    /// and which has a compile section. `prod` lists a remote that a scoped
+    /// install never fetches, so its closure stays unresolved. `install -r dev` installs `lib-dev`,
     /// so the set it judges removals and reinstalls against must hold it too,
     /// or the next `install -r dev` reads its packages as removed and drops
     /// them on the wipe.
@@ -2692,7 +2697,11 @@ supported_targets:
 runtimes:
   dev:
     extensions: [app]
+  prod:
+    extensions: [remote]
 extensions:
+  remote:
+    source: { type: package, version: "1.0.0" }
   app:
     version: "1.0.0"
     depends_on:
