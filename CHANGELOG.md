@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-19
+
 ### Added
 - **Release override notice.** When `AVOCADO_RELEASEVER` is exported in a
   project that has a locked pin, avocado prints
@@ -99,6 +101,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its stamps, and leaves the `sdk.compile` sections it uses as they are. By
   default `ext clean` still runs the clean script of each section.
 
+- **`avocado rubicon` and provisionable bundles.** `avocado rubicon` lists
+  the Rubicon boards reachable from here (this machine's VM and the org's
+  VMs), runs a project's run profiles (`rubicon.run.<name>`) on a board,
+  opens or watches a DUT's serial console, claims boards for the Connect org,
+  updates their firmware, and shows hub queues, waits in them and cancels
+  jobs. `avocado provision --pack` writes a provisionable bundle, `--bundle`
+  provisions from one, and `--rubicon` provisions through a hub's Rubicon;
+  `connect upload --provisionable`, `connect bundle` and `connect provision`
+  do the same through Connect. A hub job's SDK container sees only its own
+  board's USB buses, and `provision --interactive` is for a person at the
+  board's console.
+- **`avocado vm` on Windows.** The avocado-vm boots under QEMU with WHPX, the
+  built-in Docker Engine client talks to it, and `provision` runs through it.
+  The workspace share uses SMB and needs a one-time elevated setup, so treat
+  it as a preview.
+- **`provision --dry-run`.** Runs every guard of a profile and writes
+  nothing, by exporting `AVOCADO_PROVISION_DRY_RUN=1`. It is refused for a
+  profile whose stone manifest does not declare `config.dry_run: true`.
+  Provision scripts also get a read-only copy of the host's mount table at
+  `AVOCADO_PROVISION_HOST_MOUNTS`, so a profile can refuse to write a mounted
+  disk.
+- **`AVOCADO_PROVISION_FORCE`.** Provision scripts see `1` under `--force`
+  and `0` without it, so a script can require a terminal confirmation before
+  an erasing flash unless the operator already confirmed.
+
 ### Changed
 - **`avocado install -r <runtime>` scopes its SDK step to that runtime.** The
   SDK step installed SDK dependencies and target-dev compile packages for the
@@ -117,6 +144,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split them again and expanded them. An argument containing `$VAR`, a glob or
   `&&` now reaches dnf literally instead of being interpreted, as `sdk run`
   already does.
+
+- **`provision --env KEY=VAL` also fills `{{ env.KEY }}` in avocado.yaml**,
+  ahead of the caller's environment. It used to reach only the provision
+  container, so a run whose shell did not also export the variable (a Rubicon
+  hub replaying a provision) rendered it empty. A hub replay of
+  `provision --bundle` gets the same values.
+- **An empty extension `version` fails like a missing one.** `ext build`,
+  `runtime build`, `ext image` and `ext package` carried on with an empty
+  version (for example `'{{ env.APP_VERSION }}'` with the variable unset), and
+  deploy then skipped the extension. The error says when a templated version
+  is empty because its variable is unset.
+- **`sdk install` cleans the target-sysroot when the kernel pin changes.** The
+  old kernel's packages stayed beside the new kernel's, so out-of-tree modules
+  could compile against the wrong headers, and two per-kernel
+  `kernel-devsrc` packages conflict outright.
+- **A failed `ext fetch` of a short commit hash says so.** It suggests the
+  full 40-character hash, or a branch or tag, instead of only "couldn't find
+  remote ref".
 
 ### Fixed
 - **A runtime's `stone_manifest` in the project can be bundled.** `provision
@@ -255,6 +300,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `rootfs:` are flagged as ignored. The config schema and
   `avocado config validate` accept these rootfs shapes. A flat `rootfs:`
   section without matching target overrides hashes exactly as before.
+
+- **A bare `vm start` boots the source last chosen.** After any
+  `vm update`, a `vm start` following `vm start --vm-source <dir>` booted the
+  older managed install instead.
+- **The VM's docker tunnel comes back whenever the VM is awake.** Resumed by
+  anything but a Docker connection (`vm shell`, or the desktop waking it), the
+  idle-exempt docker lane failed until the next build, and the supervisor
+  never idle-paused that VM again.
+- **The rootfs keeps package-owned directories under `/boot`.** Emptying
+  `/boot` also removed mount points such as Jetson's `/boot/efi`, so its
+  mount failed on every boot and the system came up degraded.
+- **Runtime builds no longer print `ERROR: zoned: unable to stat`.** The var
+  image is truncated before `mkfs.btrfs` instead of removed; the build had
+  succeeded anyway.
+- **A rate-limited package-extension fetch reports the HTTP 429**, like the
+  other dnf runs, instead of only "No more mirrors to try".
+
+### Security
+- **Dependency updates for RustSec advisories:** `quinn-udp` 0.5.16
+  (RUSTSEC-2026-0538), `anyhow` 1.0.104 (RUSTSEC-2026-0190), `rustix` 1.1.6
+  (RUSTSEC-2026-0486) and `tokio` 1.54.1 (RUSTSEC-2026-0386).
 
 ## [1.1.0] - 2026-11-11
 
@@ -1800,6 +1866,7 @@ are made now, in the RC, precisely so 1.0.0 can commit to the contract above.
 - **`ext-paths.json`.** Extension path mounts are now derived from config; the
   sidecar file is no longer written or read.
 
+[1.2.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.2.0
 [1.1.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.1.0
 [1.0.0]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0
 [1.0.0-rc.5]: https://github.com/avocado-linux/avocado-cli/releases/tag/1.0.0-rc.5
