@@ -172,7 +172,7 @@ impl CleanCommand {
             return roots;
         }
         match staged_src_dir(&config_path, self.target.as_deref()) {
-            Ok(Some(root)) if !roots.contains(&root) => roots.push(root),
+            Ok(root) if !roots.contains(&root) => roots.push(root),
             Ok(_) => {}
             // A broken config must not block a clean, but say what was skipped.
             Err(e) => print_warning(
@@ -357,23 +357,22 @@ fi
     }
 }
 
-/// The `src_dir` a build for `target` stages under, read from the config
-/// with the build's interpolation but nothing else: composing the config
-/// would discover remote extensions through the volume, which can start a
-/// session that holds it, or recreate one a clean is removing.
-fn staged_src_dir(config_path: &Path, target: Option<&str>) -> Result<Option<PathBuf>> {
+/// The root a build for `target` stages under: its `src_dir`, else the
+/// config file's directory (as `project_root`). Read from the config with the
+/// build's interpolation but nothing else: composing the config would discover
+/// remote extensions through the volume, which can start a session that holds
+/// it, or recreate one a clean is removing.
+fn staged_src_dir(config_path: &Path, target: Option<&str>) -> Result<PathBuf> {
     let mut value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(config_path)?)?;
     crate::utils::interpolation::interpolate_config(&mut value, target, None)?;
-    let Some(src_dir) = value.get("src_dir").and_then(|v| v.as_str()) else {
-        return Ok(None);
+    let config_dir = crate::utils::config::config_file_dir(config_path);
+    let root = match value.get("src_dir").and_then(|v| v.as_str()) {
+        Some(src_dir) if Path::new(src_dir).is_absolute() => return Ok(PathBuf::from(src_dir)),
+        // Resolved as Config::get_resolved_src_dir resolves it.
+        Some(src_dir) => config_dir.join(src_dir),
+        None => config_dir.to_path_buf(),
     };
-    let path = Path::new(src_dir);
-    if path.is_absolute() {
-        return Ok(Some(path.to_path_buf()));
-    }
-    // Resolved as Config::get_resolved_src_dir resolves it.
-    let joined = crate::utils::config::config_file_dir(config_path).join(path);
-    Ok(Some(joined.canonicalize().unwrap_or(joined)))
+    Ok(root.canonicalize().unwrap_or(root))
 }
 
 #[cfg(test)]
@@ -430,6 +429,34 @@ mod tests {
         .unwrap();
 
         assert!(!temp_dir.path().join("b/.avocado/overlay-staging").exists());
+    }
+
+    /// `clean -C sub/avocado.yaml` from the parent, with no `src_dir`: the
+    /// overlays a build staged under `sub/` are removed too.
+    #[tokio::test]
+    async fn clean_removes_staged_overlays_beside_the_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let project = temp_dir.path().join("sub");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("avocado.yaml"), "default_target: a\n").unwrap();
+        let staged = project.join(".avocado/overlay-staging/rootfs");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("secret"), "s3cr3t").unwrap();
+
+        CleanCommand::new(
+            Some(temp_dir.path().to_string_lossy().to_string()),
+            false,
+            None,
+            false,
+        )
+        .with_config_path(Some(
+            project.join("avocado.yaml").to_string_lossy().to_string(),
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+        assert!(!project.join(".avocado/overlay-staging").exists());
     }
 
     /// With `src_dir` moving the project root away from the directory, the

@@ -96,8 +96,31 @@ impl ConnectAuthLoginCommand {
             );
         }
 
-        // Wait for the browser to redirect to our local server
-        let (code, received_state, mut stream) = wait_for_callback(&listener).await?;
+        // Wait for the browser to redirect to our local server. Over ssh the
+        // browser runs on another machine and can't reach it: the user pastes
+        // the URL it was sent to instead.
+        let paste = offer_paste(
+            self.output.is_json(),
+            std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+        );
+        if paste {
+            println!(
+                "  Over ssh the browser can't reach this machine: after you log in it shows a\n  \
+                 connection error. Paste the URL from its address bar here."
+            );
+            println!();
+        }
+        let (code, received_state, mut stream) = tokio::select! {
+            r = wait_for_callback(&listener) => {
+                let (code, state, stream) = r?;
+                (code, state, Some(stream))
+            }
+            r = read_pasted_callback(), if paste => {
+                let (code, state) = r?;
+                (code, state, None)
+            }
+        };
 
         // Validate state to prevent CSRF — respond to browser BEFORE bailing
         if received_state != state {
@@ -328,22 +351,53 @@ async fn wait_for_callback(
         .and_then(|line| line.split_whitespace().nth(1))
         .ok_or_else(|| anyhow::anyhow!("malformed HTTP request from browser callback"))?;
 
-    // Parse query params from the path
-    let params = parse_query_params(path);
-    let code = params
-        .get("code")
-        .ok_or_else(|| anyhow::anyhow!("no 'code' parameter in callback"))?
-        .clone();
-    let state = params
-        .get("state")
-        .ok_or_else(|| anyhow::anyhow!("no 'state' parameter in callback"))?
-        .clone();
-
+    let (code, state) = callback_params(path)?;
     Ok((code, state, stream))
 }
 
+/// Offer to read a pasted callback URL only where the browser can't reach the
+/// local listener (an ssh session) and a person is at the terminal. On a
+/// desktop no reader starts, so nothing competes with the org prompt.
+fn offer_paste(json: bool, stdin_is_terminal: bool, over_ssh: bool) -> bool {
+    !json && stdin_is_terminal && over_ssh
+}
+
+/// Read the callback URL the user pasted from the browser's address bar.
+///
+/// On a detached thread rather than `spawn_blocking`: the runtime waits for
+/// blocking tasks when it shuts down, so a reader left behind when the redirect
+/// wins would hold the exit until Enter.
+async fn read_pasted_callback() -> Result<(String, String)> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = tx.send(std::io::stdin().read_line(&mut line).map(|_| line));
+    });
+    let line = rx
+        .await
+        .context("the paste reader stopped")?
+        .context("failed to read the pasted callback URL")?;
+    callback_params(line.trim())
+}
+
+/// `code` and `state` from a callback URL or path.
+fn callback_params(url: &str) -> Result<(String, String)> {
+    let params = parse_query_params(url);
+    let get = |k: &str| {
+        params
+            .get(k)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no '{k}' parameter in the callback URL"))
+    };
+    Ok((get("code")?, get("state")?))
+}
+
 /// Send an HTTP 302 redirect response on the given stream and shut it down cleanly.
-async fn respond_redirect(stream: &mut tokio::net::TcpStream, url: &str) {
+/// Nothing to answer when the callback URL was pasted.
+async fn respond_redirect(stream: &mut Option<tokio::net::TcpStream>, url: &str) {
+    let Some(stream) = stream else {
+        return;
+    };
     let response = format!(
         "HTTP/1.1 302 Found\r\nLocation: {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         url,
@@ -834,6 +888,27 @@ impl ConnectAuthStatusCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pasted callback URL (ssh, headless host) gives the same code and state
+    /// as the redirect the local listener would have read.
+    #[test]
+    fn a_pasted_callback_url_gives_code_and_state() {
+        let (code, state) =
+            callback_params("http://127.0.0.1:41234/callback?code=abc%2Bd&state=s1").unwrap();
+        assert_eq!((code.as_str(), state.as_str()), ("abc+d", "s1"));
+        assert!(callback_params("http://127.0.0.1:41234/callback?state=s1").is_err());
+        assert!(callback_params("not a url").is_err());
+    }
+
+    /// The paste reader starts only over ssh with a person at the terminal:
+    /// never on a desktop, in JSON mode, or with piped stdin.
+    #[test]
+    fn the_paste_prompt_is_offered_only_over_ssh_at_a_terminal() {
+        assert!(offer_paste(false, true, true));
+        assert!(!offer_paste(false, true, false), "desktop");
+        assert!(!offer_paste(true, true, true), "json");
+        assert!(!offer_paste(false, false, true), "piped stdin");
+    }
 
     fn org(id: &str, name: &str) -> OrgInfo {
         OrgInfo {

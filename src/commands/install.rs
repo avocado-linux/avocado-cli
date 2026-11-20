@@ -169,6 +169,23 @@ impl InstallCommand {
         self
     }
 
+    /// The SDK step: `-r` scopes its extension and compile-section scans to
+    /// that runtime, as it scopes the extension and runtime steps.
+    fn sdk_install_command(&self) -> SdkInstallCommand {
+        SdkInstallCommand::new(
+            self.config_path.clone(),
+            self.verbose,
+            self.target.clone(),
+            self.container_args.clone(),
+            self.dnf_args.clone(),
+        )
+        .with_no_stamps(self.no_stamps)
+        .with_runs_on(self.runs_on.clone(), self.nfs_port)
+        .with_sdk_arch(self.sdk_arch.clone())
+        .with_target_board(self.target_board.clone())
+        .with_runtime(self.runtime.clone())
+    }
+
     /// Set pre-composed configuration to avoid reloading
     #[allow(dead_code)]
     pub fn with_composed_config(mut self, config: Arc<ComposedConfig>) -> Self {
@@ -293,18 +310,9 @@ impl InstallCommand {
             renderer: Arc::clone(r),
         });
 
-        let mut sdk_install_cmd = SdkInstallCommand::new(
-            self.config_path.clone(),
-            self.verbose,
-            self.target.clone(),
-            self.container_args.clone(),
-            self.dnf_args.clone(),
-        )
-        .with_no_stamps(self.no_stamps)
-        .with_runs_on(self.runs_on.clone(), self.nfs_port)
-        .with_sdk_arch(self.sdk_arch.clone())
-        .with_target_board(self.target_board.clone())
-        .with_composed_config(Arc::clone(&composed));
+        let mut sdk_install_cmd = self
+            .sdk_install_command()
+            .with_composed_config(Arc::clone(&composed));
 
         if let Some(ctx) = sdk_tui_ctx {
             sdk_install_cmd = sdk_install_cmd.with_tui_context(ctx);
@@ -932,6 +940,27 @@ fn scope_label(scope: &PackageScope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `install -r dev` hands `dev` to the SDK step; without `-r` it scans
+    /// every target-relevant runtime, as before.
+    #[test]
+    fn the_sdk_step_gets_the_install_runtime() {
+        let cmd = |runtime: Option<&str>| {
+            InstallCommand::new(
+                "avocado.yaml".into(),
+                false,
+                false,
+                runtime.map(String::from),
+                None,
+                None,
+                None,
+            )
+            .sdk_install_command()
+            .runtime
+        };
+        assert_eq!(cmd(Some("dev")).as_deref(), Some("dev"));
+        assert_eq!(cmd(None), None);
+    }
 
     fn runtime_for(yaml: &str) -> Option<String> {
         let dir = tempfile::TempDir::new().unwrap();

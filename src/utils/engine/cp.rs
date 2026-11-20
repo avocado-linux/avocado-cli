@@ -30,8 +30,12 @@ pub(super) async fn cp(docker: &Docker, args: &[String]) -> Result<i32> {
 
 /// Split `CONTAINER:PATH`. Anything absolute or starting with `.` is a local
 /// path, colon or not, as the docker CLI has it.
+///
+/// "Absolute" covers a leading `/` on every host, not only what the host
+/// itself calls absolute: on Windows `/tmp/a:b` is not, and would otherwise
+/// be read as a container named `/tmp/a`.
 fn container_path(arg: &str) -> Option<(&str, &str)> {
-    if Path::new(arg).is_absolute() {
+    if Path::new(arg).is_absolute() || arg.starts_with('/') || arg.starts_with('\\') {
         return None;
     }
     arg.split_once(':')
@@ -155,6 +159,9 @@ mod tests {
         assert_eq!(container_path("/tmp/a:b"), None);
         assert_eq!(container_path("./a:b"), None);
         assert_eq!(container_path("plain"), None);
+        // A Windows drive path is local, its colon notwithstanding.
+        #[cfg(windows)]
+        assert_eq!(container_path(r"C:\Users\me\out.tar"), None);
     }
 
     #[cfg(unix)]
