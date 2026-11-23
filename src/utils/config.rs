@@ -15800,6 +15800,7 @@ runtimes:
     // --- Implicit default-runtime synthesis tests (Phase 1d) ---
 
     #[test]
+    #[serial_test::serial] // resolve_runtime reads AVOCADO_RUNTIME, which other tests set
     fn test_synthesize_implicit_default_runtime_when_zero_runtimes_and_singletons_present() {
         let yaml = r#"
 default_target: qemux86-64
