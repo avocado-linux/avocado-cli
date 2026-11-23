@@ -150,6 +150,11 @@ pub struct BundleMeta {
     /// there unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub src_includes: Vec<SrcInclude>,
+    /// The runtime's `stone_manifest` when it is a project file: (path
+    /// relative to the project, content), written back at that path in the
+    /// replay's directory so `AVOCADO_STONE_MANIFEST` resolves unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stone_manifest: Option<(String, String)>,
 }
 
 /// The Rubicon side of a bundle, resolved from the composed config at pack
@@ -313,6 +318,8 @@ if [ -n "$AVOCADO_STONE_MANIFEST" ]; then
     case "$AVOCADO_STONE_MANIFEST" in
         "$P"/sdk/*) ;;
         "$P"/*) paths="$paths ${{AVOCADO_STONE_MANIFEST#"$P"/}}" ;;
+        # In the project: carried from the copy staged below (`stone_manifest`).
+        /opt/src/*) ;;
         *) echo "[ERROR] stone manifest $AVOCADO_STONE_MANIFEST is outside \$AVOCADO_PREFIX; it cannot be bundled" >&2; exit 1 ;;
     esac
 fi
@@ -490,6 +497,18 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         &std::fs::read_to_string(stage.join("src_includes"))?,
         &stage.join("blobs"),
     )?;
+    let stone_manifest = match p
+        .env
+        .get("AVOCADO_STONE_MANIFEST")
+        .and_then(|m| m.strip_prefix("/opt/src/"))
+    {
+        Some(rel) => Some(project_manifest(
+            rel,
+            std::fs::read_to_string(stage.join("stone-manifest.json"))
+                .with_context(|| format!("stone manifest /opt/src/{rel} not found"))?,
+        )?),
+        None => None,
+    };
     let meta = BundleMeta {
         format: FORMAT,
         target: p.target.into(),
@@ -515,6 +534,7 @@ pub fn assemble(out: &Path, p: PackInputs) -> Result<PathBuf> {
         )?,
         ext_sources,
         src_includes,
+        stone_manifest,
     };
     let dir = if out.is_dir() {
         out.join(format!("{}-{}.bundle", p.runtime, p.target))
@@ -636,6 +656,18 @@ pub fn pack_ext_sources(
     if let Some(board) = &ctx.target_board {
         pin_board(&mut doc, board);
     }
+    // Pin the runtime this pack resolved `{{ avocado.runtime }}` with (often
+    // from `AVOCADO_RUNTIME`, which the hub does not have), so the hub
+    // resolves the same extensions the bundle carries. Checked against the
+    // interpolated runtime names: a key may itself be templated.
+    if let Some(rt) = ctx.runtime.clone().filter(|rt| {
+        resolved
+            .get("runtimes")
+            .and_then(|r| r.as_mapping())
+            .is_some_and(|r| r.contains_key(rt.as_str()))
+    }) {
+        doc["default_runtime"] = rt.into();
+    }
     if let Some(exts) = doc.get_mut("extensions").and_then(|e| e.as_mapping_mut()) {
         for (_, ext) in exts.iter_mut() {
             let Some(src) = ext.get_mut("source").and_then(|s| s.as_mapping_mut()) else {
@@ -682,12 +714,7 @@ pub fn pack_ext_sources(
 fn pack_src_includes(src_dir: &Path, list: &str, blobs: &Path) -> Result<Vec<SrcInclude>> {
     let mut out = Vec::new();
     for rel in list.split_whitespace() {
-        // `./carrier` (a config-relative entry) is `carrier`.
-        let rel = rel
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .collect::<Vec<_>>()
-            .join("/");
+        let rel = norm_rel(rel);
         let rel = rel.as_str();
         if !src_include_rel(rel) {
             bail!("stone include path /opt/src/{rel} is not a plain path in the project; it cannot be bundled");
@@ -704,6 +731,44 @@ fn pack_src_includes(src_dir: &Path, list: &str, blobs: &Path) -> Result<Vec<Src
         });
     }
     Ok(out)
+}
+
+/// `./carrier//stone/` (a config-relative entry) is `carrier/stone`.
+fn norm_rel(p: &str) -> String {
+    p.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Refuse `rel` under `dir` when it, or any directory on the way to it, is a
+/// symlink: a write there could land outside `dir`.
+fn refuse_symlinks_under(dir: &Path, rel: &str) -> Result<()> {
+    let mut at = dir.to_path_buf();
+    for c in rel.split('/') {
+        at.push(c);
+        match std::fs::symlink_metadata(&at) {
+            Ok(md) if md.file_type().is_symlink() => {
+                bail!(
+                    "{} is a symlink; the bundle will not write through it",
+                    at.display()
+                )
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// A runtime's `stone_manifest` in the project, as the bundle carries it.
+fn project_manifest(rel: &str, body: String) -> Result<(String, String)> {
+    let rel = norm_rel(rel);
+    if !src_include_rel(&rel) {
+        bail!("stone manifest /opt/src/{rel} is not a plain path in the project; it cannot be bundled");
+    }
+    Ok((rel, body))
 }
 
 /// A project-relative include dir a replay may replace: no `.`/`..`, not
@@ -823,6 +888,15 @@ fn unpack_ext_sources(meta: &BundleMeta, cwd: &Path, cache: &Path) -> Result<()>
         tar::Archive::new(flate2::read::GzDecoder::new(f))
             .unpack(&dir)
             .with_context(|| format!("unpack stone include '{}'", a.path))?;
+    }
+    if let Some((rel, body)) = &meta.stone_manifest {
+        if !src_include_rel(rel) {
+            bail!("bundle stone manifest {rel:?} is not valid");
+        }
+        refuse_symlinks_under(cwd, rel)?;
+        let dest = cwd.join(rel);
+        std::fs::create_dir_all(dest.parent().unwrap_or(cwd))?;
+        std::fs::write(dest, body)?;
     }
     Ok(())
 }
@@ -1474,6 +1548,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_bundle_pins_the_board_it_was_built_for() {
         // The host resolved board b2 (here from the sole runtime's
         // target_board; on a bench, usually AVOCADO_TARGET_BOARD), not the
@@ -1495,6 +1570,53 @@ mod tests {
         assert_eq!(a[0].name, "bsp-b2");
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(doc["default_target_board"].as_str(), Some("b2"), "{yaml}");
+    }
+
+    /// The bundle pins the runtime the pack resolved `{{ avocado.runtime }}`
+    /// with: `AVOCADO_RUNTIME` on the packing host (which the hub lacks), else
+    /// `default_runtime`, matched against the interpolated runtime names.
+    #[test]
+    #[serial_test::serial] // sets AVOCADO_RUNTIME
+    fn the_bundle_pins_the_runtime_the_pack_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("avocado.yaml");
+        let pinned = |yaml: &str, env: Option<&str>| {
+            std::fs::write(&cfg, yaml).unwrap();
+            match env {
+                Some(rt) => std::env::set_var("AVOCADO_RUNTIME", rt),
+                None => std::env::remove_var("AVOCADO_RUNTIME"),
+            }
+            let (_, out) = pack(&cfg, &tmp.path().join("blobs"));
+            std::env::remove_var("AVOCADO_RUNTIME");
+            let doc: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+            doc["default_runtime"].as_str().map(String::from)
+        };
+        let plain = "default_target: t\ndefault_runtime: dev\nruntimes:\n  dev: {}\n  r: {}\n";
+        assert_eq!(pinned(plain, Some("r")).as_deref(), Some("r"));
+        // No AVOCADO_RUNTIME: the pack resolved `dev`, so the hub must too,
+        // whichever runtime is provisioned.
+        assert_eq!(pinned(plain, None).as_deref(), Some("dev"));
+        let templated = "default_target: t\nalt_name: alt\ndefault_runtime: dev\nruntimes:\n  dev: {}\n  '{{ config.alt_name }}': {}\n";
+        assert_eq!(pinned(templated, Some("alt")).as_deref(), Some("alt"));
+    }
+
+    /// The replay writes the stone manifest on the host before the SDK
+    /// container starts: never through a symlink in the replay directory.
+    #[test]
+    #[cfg(unix)]
+    fn a_stone_manifest_is_never_written_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hub, outside) = (tmp.path().join("hub"), tmp.path().join("outside"));
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, hub.join("boards")).unwrap();
+        std::os::unix::fs::symlink(outside.join("f"), hub.join("m.json")).unwrap();
+        for rel in ["boards/stone.json", "m.json"] {
+            let mut meta = meta("x86_64");
+            meta.stone_manifest = Some((rel.into(), "{}".into()));
+            assert!(unpack_ext_sources(&meta, &hub, &hub).is_err(), "{rel}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]
@@ -1561,6 +1683,7 @@ mod tests {
             rubicon: None,
             ext_sources: a,
             src_includes: vec![],
+            stone_manifest: None,
         };
         assert!(meta
             .blobs()
@@ -1607,6 +1730,25 @@ mod tests {
         assert!(
             !hub.join("carrier/stone/stale").exists(),
             "replaced, not merged"
+        );
+    }
+
+    /// A runtime's `stone_manifest` is a project file: it travels with the
+    /// bundle and lands at the same path in the replay's directory.
+    #[test]
+    fn a_project_stone_manifest_travels_and_lands_at_the_same_path() {
+        let m = project_manifest("./boards//stone.json", "{}".into()).unwrap();
+        assert_eq!(m, ("boards/stone.json".to_string(), "{}".to_string()));
+        for bad in ["../x.json", "a/../b.json", ".avocado-bundle/m.json"] {
+            assert!(project_manifest(bad, String::new()).is_err(), "{bad}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = meta("x86_64");
+        meta.stone_manifest = Some(m);
+        unpack_ext_sources(&meta, tmp.path(), tmp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("boards/stone.json")).unwrap(),
+            "{}"
         );
     }
 
@@ -1753,6 +1895,7 @@ provision:
             rubicon: None,
             ext_sources: vec![],
             src_includes: vec![],
+            stone_manifest: None,
         }
     }
 

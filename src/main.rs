@@ -452,8 +452,9 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
         /// Skip warnings and confirmation prompts. A raw SD card write from the
-        /// host still asks for confirmation.
-        #[arg(short, long)]
+        /// host still asks for confirmation. Not with `--bundle`, which
+        /// carries the packing run's choice.
+        #[arg(short, long, conflicts_with = "bundle")]
         force: bool,
         /// Run the provision script without writing the target. The script
         /// receives AVOCADO_PROVISION_DRY_RUN=1, and the host-side SD card
@@ -463,8 +464,8 @@ enum Commands {
         /// Runtime name to provision (deprecated, use positional argument)
         #[arg(short = 'r', long = "runtime", hide = true)]
         runtime: Option<String>,
-        /// Target architecture
-        #[arg(short, long)]
+        /// Target architecture. Not with `--bundle`, which carries its own.
+        #[arg(short, long, conflicts_with = "bundle")]
         target: Option<String>,
         /// Target board override for `{{ avocado.target.board }}`
         #[arg(long)]
@@ -476,14 +477,17 @@ enum Commands {
         /// `{{ env.KEY }}` in avocado.yaml, ahead of the caller's environment
         #[arg(long = "env", num_args = 1, action = clap::ArgAction::Append)]
         env: Option<Vec<String>>,
-        /// Output path relative to src_dir for provisioning artifacts
-        #[arg(long = "out")]
+        /// Output path relative to src_dir for provisioning artifacts. Not with
+        /// `--bundle`.
+        #[arg(long = "out", conflicts_with = "bundle")]
         out: Option<String>,
-        /// Additional arguments to pass to the container runtime
-        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        /// Additional arguments to pass to the container runtime. Not with
+        /// `--bundle`: a replay runs with the bundled config's container args.
+        #[arg(long = "container-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append, conflicts_with = "bundle")]
         container_args: Option<Vec<String>>,
-        /// Additional arguments to pass to DNF commands
-        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append)]
+        /// Additional arguments to pass to DNF commands. Not with `--bundle`,
+        /// whose SDK install follows the bundled lock.
+        #[arg(long = "dnf-arg", num_args = 1, allow_hyphen_values = true, action = clap::ArgAction::Append, conflicts_with = "bundle")]
         dnf_args: Option<Vec<String>>,
         /// List the provisioning profiles available for the resolved
         /// target instead of provisioning. Reads the stone manifest
@@ -6209,6 +6213,48 @@ mod tests {
             parse_cli(&["avocado", "provision", "--dry-run"]),
             Commands::Provision { dry_run: true, .. }
         ));
+    }
+
+    /// A replay would drop these flags: refuse them rather than ignore them.
+    #[test]
+    fn provision_bundle_refuses_flags_it_would_drop() {
+        for extra in [
+            &["--container-arg", "--privileged"][..],
+            &["--dnf-arg", "--refresh"],
+            &["--out", "o"],
+            &["--force"],
+            &["--target", "t"],
+        ] {
+            let mut args = vec!["avocado", "provision", "--bundle", "b"];
+            args.extend_from_slice(extra);
+            let refused = on_big_stack(move || Cli::try_parse_from(args).is_err());
+            assert!(refused, "--bundle with {extra:?} must not parse");
+        }
+        // What the hub agent replays (avocado-vm `provision_args`), plain and
+        // in its exec form: these must keep parsing.
+        let hub = [
+            "avocado",
+            "provision",
+            "--no-tui",
+            "--bundle",
+            "b",
+            "--profile",
+            "p",
+            "--env",
+            "K=V",
+            "--env",
+            "AVOCADO_PROVISION_DEVICE=/dev/sda",
+        ];
+        for tail in [&[][..], &["--", "flash.sh", "--usb"]] {
+            let args: Vec<&str> = hub.iter().chain(tail).copied().collect();
+            assert!(matches!(
+                parse_cli(&args),
+                Commands::Provision {
+                    bundle: Some(_),
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

@@ -674,6 +674,27 @@ const POSTINST_INTERCEPT: &str = r#"#!/bin/sh
 exit 0
 "#;
 
+/// `extensions` plus everything they reach through `depends_on`. Each root
+/// resolves on its own: an unfetched remote extension's edges are unknown
+/// until the fetch, so a root whose closure meets one adds nothing yet, and
+/// the other roots still expand.
+fn with_depends_on(
+    composed: &ComposedConfig,
+    target: &str,
+    mut extensions: HashSet<String>,
+) -> HashSet<String> {
+    let Ok(graph) = crate::utils::ext_deps::DependencyGraph::from_composed(composed, target) else {
+        return extensions;
+    };
+    let roots: Vec<String> = extensions.iter().cloned().collect();
+    for root in roots {
+        if let Ok(closure) = graph.resolve(std::slice::from_ref(&root)) {
+            extensions.extend(closure.order);
+        }
+    }
+    extensions
+}
+
 impl SdkInstallCommand {
     /// Create a new SdkInstallCommand instance
     pub fn new(
@@ -744,15 +765,39 @@ impl SdkInstallCommand {
         mut extensions: HashSet<String>,
     ) -> HashSet<String> {
         if self.runtime.is_some() {
-            let roots: Vec<String> = extensions.iter().cloned().collect();
-            if let Ok(closure) =
-                crate::utils::ext_deps::DependencyGraph::from_composed(composed, target)
-                    .and_then(|g| g.resolve(&roots))
-            {
-                extensions.extend(closure.order);
-            }
+            extensions = with_depends_on(composed, target, extensions);
         }
         extensions
+    }
+
+    /// Every runtime's compile sections, with the extensions they reach through
+    /// `depends_on`, so the sections of a scoped install are always among them.
+    /// A scoped install judges removals and reinstalls the shared
+    /// target-sysroot against this set.
+    fn every_compile_section(
+        config: &Config,
+        composed: &ComposedConfig,
+        target: &str,
+    ) -> Result<Vec<String>> {
+        let all_extensions = with_depends_on(
+            composed,
+            target,
+            find_active_extensions(
+                config,
+                &composed.merged_value,
+                target,
+                &composed.config_path,
+                None,
+            )?,
+        );
+        find_active_compile_sections(
+            config,
+            &composed.merged_value,
+            &all_extensions,
+            target,
+            &composed.config_path,
+            None,
+        )
     }
 
     /// Set pre-composed configuration to avoid reloading
@@ -1243,21 +1288,7 @@ impl SdkInstallCommand {
             // a wipe reinstalls them all, so another runtime's packages are
             // never dropped by a scoped install.
             let every_section = if self.runtime.is_some() {
-                let all_extensions = find_active_extensions(
-                    config,
-                    &composed.merged_value,
-                    target,
-                    &composed.config_path,
-                    None,
-                )?;
-                find_active_compile_sections(
-                    config,
-                    &composed.merged_value,
-                    &all_extensions,
-                    target,
-                    &composed.config_path,
-                    None,
-                )?
+                Self::every_compile_section(config, composed, target)?
             } else {
                 active_compile_sections.clone()
             };
@@ -4148,6 +4179,74 @@ extensions:
         assert_eq!(scan(Some("dev")), ["app", "base"]);
         assert_eq!(scan(Some("prod")), ["base"]);
         assert_eq!(scan(None), ["app", "base"]);
+    }
+
+    /// `dev` lists `app`, and `app` depends on `lib`, which no runtime lists
+    /// and which has a compile section. `prod` lists a remote that a scoped
+    /// install never fetches, so its closure stays unresolved. `install -r dev` installs `lib-dev`,
+    /// so the set it judges removals and reinstalls against must hold it too,
+    /// or the next `install -r dev` reads its packages as removed and drops
+    /// them on the wipe.
+    #[test]
+    fn every_compile_section_holds_the_scoped_ones() {
+        let yaml = r#"
+default_target: qemux86-64
+supported_targets:
+  - qemux86-64
+runtimes:
+  dev:
+    extensions: [app]
+  prod:
+    extensions: [remote]
+extensions:
+  remote:
+    source: { type: package, version: "1.0.0" }
+  app:
+    version: "1.0.0"
+    depends_on:
+      - lib
+    packages: { a: '*' }
+  lib:
+    version: "1.0.0"
+    packages:
+      l:
+        compile: lib-dev
+sdk:
+  compile:
+    lib-dev:
+      packages: { libfoo-dev: '*' }
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let config_path = path.to_str().unwrap();
+        let composed = Config::load_composed(config_path, Some("qemux86-64")).unwrap();
+        let scoped = sdk_install(Some("dev")).scoped_with_depends_on(
+            &composed,
+            "qemux86-64",
+            find_active_extensions(
+                &composed.config,
+                &composed.merged_value,
+                "qemux86-64",
+                config_path,
+                Some("dev"),
+            )
+            .unwrap(),
+        );
+        let scoped_sections = find_active_compile_sections(
+            &composed.config,
+            &composed.merged_value,
+            &scoped,
+            "qemux86-64",
+            config_path,
+            Some("dev"),
+        )
+        .unwrap();
+        assert_eq!(scoped_sections, ["lib-dev"]);
+        let every =
+            SdkInstallCommand::every_compile_section(&composed.config, &composed, "qemux86-64")
+                .unwrap();
+        assert_eq!(every, ["lib-dev"]);
     }
 
     /// After an unscoped install put `dev`'s and `prod`'s compile packages in
