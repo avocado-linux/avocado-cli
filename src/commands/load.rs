@@ -93,6 +93,7 @@ impl LoadCommand {
             volume_name: volume_name.clone(),
             source_path: config_dir_abs.to_string_lossy().to_string(),
             container_tool: self.container_tool.clone(),
+            stacks: false,
         };
         volume_state.save_to_dir(config_dir)?;
 
@@ -610,6 +611,7 @@ mod tests {
             volume_name: "avo-previous".to_string(),
             source_path: project.display().to_string(),
             container_tool: "docker".to_string(),
+            stacks: false,
         }
         .save_to_dir(&project)
         .unwrap();

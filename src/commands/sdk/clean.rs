@@ -164,6 +164,12 @@ impl SdkCleanCommand {
         // them behind makes `sdk clean && sdk install` a silent no-op: both
         // stamps still match, both installs report "up to date", and the build
         // that follows consumes two empty sysroots.
+        crate::utils::stacks::taint_before_clean(
+            &container_helper.container_tool,
+            &container_helper.cwd,
+            &target,
+        )
+        .await?;
         let remove_command = "rm -rf $AVOCADO_SDK_PREFIX \
              $AVOCADO_PREFIX/rootfs $AVOCADO_PREFIX/initramfs \
              $AVOCADO_PREFIX/.stamps/rootfs $AVOCADO_PREFIX/.stamps/initramfs";

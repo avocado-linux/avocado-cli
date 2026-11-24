@@ -1,0 +1,84 @@
+name: Stacks end to end
+
+# scripts/stacks-e2e.sh against the real feeds: cold, warm and shared installs, stacks vs plain
+# volumes (identical trees, including one built only from another project's stored layers),
+# parallel installs, commit: false, migrating a plain project, busy-view refusal, status, prune,
+# clean, gc, and the fallback to plain volumes. Layers are forced through loop devices (the
+# 6.5-6.11 path): hosted kernels mount file-backed, as do the 6.12+ machines stacks run on day to
+# day, so this is where the fallback gets its full run (`stack config` prints the mode).
+#
+# Nightly (a stored layer against a fresh rebuild catches inputs that drift outside the config,
+# such as feed contents), on demand, and on pull requests that touch stacks.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/avocado-stacks/**'
+      - 'src/utils/stacks.rs'
+      - 'src/commands/stack.rs'
+      - 'src/commands/sdk/install.rs'
+      - 'src/commands/rootfs/install.rs'
+      - 'scripts/stacks-e2e.sh'
+      - '.github/workflows/stacks-e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stacks-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Stacks end to end
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        # Several SDK trees (stacks and plain volumes side by side) need more than the image
+        # leaves free.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: avocado-linux/references
+          path: references
+      - name: Kernel modules
+        # Hosted runner kernels may ship erofs in the extra modules package.
+        run: |
+          uname -r
+          sudo modprobe erofs || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe erofs; }
+          sudo modprobe loop
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI
+        run: cargo build --release --locked
+      - name: Build the helper image
+        run: docker build -f crates/avocado-stacks/Dockerfile.helper -t avocado-stacks:ci crates/avocado-stacks
+      - name: Stacks on this host
+        env:
+          AVOCADO_STACKS_FORCE_LOOP: '1'
+          AVOCADO_STACKS: /mnt/avocado-stacks-e2e/stacks
+          AVOCADO_STACKS_HELPER: avocado-stacks:ci
+        run: |
+          sudo mkdir -p /mnt/avocado-stacks-e2e && sudo chown "$USER" /mnt/avocado-stacks-e2e
+          target/release/avocado stack config
+      - name: End to end
+        env:
+          AVOCADO_STACKS_FORCE_LOOP: '1'
+          AVOCADO: target/release/avocado
+          REFS: references
+          WORK: /mnt/avocado-stacks-e2e
+          HELPER: avocado-stacks:ci
+        run: scripts/stacks-e2e.sh
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stacks-e2e-logs
+          path: /mnt/avocado-stacks-e2e/logs
+          if-no-files-found: ignore

@@ -258,6 +258,15 @@ impl CleanCommand {
         let container_helper =
             SdkContainer::from_config(config_path, &config)?.verbose(self.verbose);
 
+        // The install stamps live in the stack view's layers: dirty the view first, or the
+        // next `sdk install` reads it as still on its layer and never rewrites them.
+        crate::utils::stacks::taint_before_clean(
+            &container_helper.container_tool,
+            &container_helper.cwd,
+            &target,
+        )
+        .await?;
+
         // Remove the stamps directory
         let clean_script = r#"
 if [ -d "$AVOCADO_PREFIX/.stamps" ]; then

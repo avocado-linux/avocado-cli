@@ -364,6 +364,10 @@ impl PruneCommand {
             }
         }
 
+        // Drop the project's stack views first: `volume rm` would empty a mounted view
+        // before failing on its busy mount point.
+        crate::utils::stacks::drop_volume_views(&self.container_tool, volume_name).await?;
+
         // Remove the volume
         let output = crate::utils::engine::command(&self.container_tool)
             .args(["volume", "rm", volume_name])

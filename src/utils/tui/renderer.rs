@@ -305,7 +305,7 @@ impl TaskRenderer {
     /// full captured output in red.
     pub fn shutdown(&self) {
         // Unregister from global so print_info etc. stop routing here.
-        super::clear_active_renderer();
+        super::clear_active_renderer_if(self);
 
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
