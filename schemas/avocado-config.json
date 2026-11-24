@@ -133,7 +133,8 @@
                 "then": {
                   "properties": {
                     "recovery": {
-                      "pattern": "\\S"
+                      "pattern": "\\S",
+                      "x-avocado-pattern-message": "must not be blank when 'hardware' is 'none'"
                     }
                   },
                   "required": [
@@ -1318,7 +1319,8 @@
       "if": {
         "properties": {
           "fit_key": {
-            "pattern": "\\S"
+            "pattern": "\\S",
+            "x-avocado-pattern-message": "must not be blank"
           }
         },
         "required": [
@@ -2188,7 +2190,8 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^ *[A-Za-z0-9_][A-Za-z0-9_-]*( +[^\\s\"-][^\\s\"]*)* *$"
+            "pattern": "^ *[A-Za-z0-9_][A-Za-z0-9_-]*( +[^\\s\"-][^\\s\"]*)* *$",
+            "x-avocado-pattern-message": "must be a module name of letters, digits, '_' and '-' that does not start with '-', optionally followed by space-separated parameters such as param=value; a parameter may not start with '-' or hold double quotes"
           },
           "description": "Kernel modules to load when the extension is active, each a module name optionally followed by parameters such as 'param=value'. Parameters may not start with '-' or hold double quotes. Modules must be available in the kernel or provided by the extension. The extension must build a sysext.",
           "examples": [
@@ -2202,7 +2205,8 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^[^\\r\\n\"]*$"
+            "pattern": "^[^\\r\\n\"]*$",
+            "x-avocado-pattern-message": "must be one command on one line, without double quotes"
           },
           "description": "Commands run when the extension is merged. Each item is one command on one line, run without a shell, so it may not hold double quotes."
         },
@@ -2210,7 +2214,8 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^[^\\r\\n\"]*$"
+            "pattern": "^[^\\r\\n\"]*$",
+            "x-avocado-pattern-message": "must be one command on one line, without double quotes"
           },
           "description": "Commands run when the extension is unmerged. Each item is one command on one line, run without a shell, so it may not hold double quotes."
         },
@@ -2327,7 +2332,8 @@
           "items": {
             "type": "string",
             "minLength": 3,
-            "pattern": "^[A-Za-z_][A-Za-z0-9_]*=.*$"
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*=.*$",
+            "x-avocado-pattern-message": "must be one key=value line, such as dtparam=i2c_arm=on, whose key is letters, digits and '_' and does not start with a digit"
           }
         },
         "stone_include_paths": {
@@ -2666,7 +2672,8 @@
           "type": "object",
           "description": "What each of the Rubicon's pins is wired to on this target (ssr1: \"REC button\"), shown beside the pin by `avocado rubicon show` and in a hub's job log. Extensions contribute it with their run profiles; the project wins per pin.",
           "propertyNames": {
-            "pattern": "^[a-z][a-z0-9]*$"
+            "pattern": "^[a-z][a-z0-9]*$",
+            "x-avocado-pattern-message": "must be a Rubicon pin name: lowercase letters and digits, starting with a letter, such as ssr1"
           },
           "additionalProperties": {
             "type": "string"
@@ -2687,6 +2694,7 @@
             "additionalProperties": {
               "type": "string",
               "pattern": "^la([0-9]|1[0-5])$",
+              "x-avocado-pattern-message": "must be a logic-analyzer channel, la0 to la15",
               "description": "The channel carrying this signal."
             }
           }
@@ -2704,7 +2712,8 @@
           "description": "Switch Rubicon outputs (power, ssr1…, od1…) on or off. What each is wired to is the target's business.",
           "propertyNames": {
             "type": "string",
-            "pattern": "^[a-z]+[0-9]*$"
+            "pattern": "^[a-z]+[0-9]*$",
+            "x-avocado-pattern-message": "must be a Rubicon output name: lowercase letters, optionally followed by digits, such as power or ssr1"
           },
           "additionalProperties": {
             "enum": [
@@ -2718,7 +2727,8 @@
           "description": "Turn outputs on for this many milliseconds, then off (a button press).",
           "propertyNames": {
             "type": "string",
-            "pattern": "^[a-z]+[0-9]*$"
+            "pattern": "^[a-z]+[0-9]*$",
+            "x-avocado-pattern-message": "must be a Rubicon output name: lowercase letters, optionally followed by digits, such as power or ssr1"
           },
           "additionalProperties": {
             "type": "integer",
@@ -2754,7 +2764,8 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^([0-9a-fA-F]{4}:([0-9a-fA-F]{4}|\\*)|\\*)$"
+            "pattern": "^([0-9a-fA-F]{4}:([0-9a-fA-F]{4}|\\*)|\\*)$",
+            "x-avocado-pattern-message": "must be a USB id: vvvv:pppp of four hex digits each, vvvv:* for any product, or * for every device"
           },
           "description": "Keep the board's USB devices with these ids (vvvv:pppp, vvvv:* for any product, or * for every device on the board's USB port) attached to the hub for the rest of the job."
         },
@@ -2763,7 +2774,8 @@
           "properties": {
             "id": {
               "type": "string",
-              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$"
+              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$",
+              "x-avocado-pattern-message": "must be a USB id: vvvv:pppp, four hex digits each, such as 0483:df11"
             },
             "timeout_s": {
               "type": "integer",
@@ -2823,7 +2835,8 @@
           "properties": {
             "id": {
               "type": "string",
-              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$"
+              "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$",
+              "x-avocado-pattern-message": "must be a USB id: vvvv:pppp, four hex digits each, such as 0483:df11"
             },
             "run": {
               "type": "array",

@@ -591,12 +591,27 @@ fn leaf_error(e: &jsonschema::ValidationError) -> ConfigError {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Kind::Pattern { .. } => pattern_message(e).unwrap_or_else(|| e.to_string()),
+        Kind::PropertyNames { error } => {
+            pattern_message(error).map_or_else(|| e.to_string(), |m| format!("key {m}"))
+        }
         _ => e.to_string(),
     };
     ConfigError {
         path: e.instance_path().to_string(),
         message,
     }
+}
+
+/// A failed `pattern` in the schema's words (`x-avocado-pattern-message`),
+/// not as the regex.
+fn pattern_message(e: &jsonschema::ValidationError) -> Option<String> {
+    let pattern = e.schema_path().as_str().strip_suffix("/pattern")?;
+    let rule = config_lint::schema()
+        .pointer(pattern)?
+        .get("x-avocado-pattern-message")?
+        .as_str()?;
+    Some(format!("{} {rule}", e.instance()))
 }
 
 /// The schema validator. `additionalProperties: false` is removed, because
@@ -1324,6 +1339,68 @@ mod tests {
                 "unknown key 'permissions.dev.colour' is ignored",
                 "unknown key 'kernel.lts.colour' is ignored",
             ]
+        );
+    }
+
+    #[test]
+    fn a_pattern_error_says_what_the_value_must_look_like() {
+        let errs = errors(
+            "default_target: qemux86-64\nextensions:\n  app:\n    modprobe: [uvcvideo, \"nvidia -r\"]\n",
+        );
+        assert_eq!(
+            errs,
+            ["/extensions/app/modprobe/1 \"nvidia -r\" must be a module name of letters, digits, '_' and '-' that does not start with '-', optionally followed by space-separated parameters such as param=value; a parameter may not start with '-' or hold double quotes"]
+        );
+    }
+
+    #[test]
+    fn a_key_pattern_error_says_what_the_key_must_look_like() {
+        let errs = errors("rubicon:\n  wiring:\n    SSR1: REC button\n");
+        assert_eq!(
+            errs,
+            ["/rubicon/wiring key \"SSR1\" must be a Rubicon pin name: lowercase letters and digits, starting with a letter, such as ssr1"]
+        );
+    }
+
+    #[test]
+    fn a_pattern_without_a_message_shows_the_regex() {
+        let validator =
+            jsonschema::validator_for(&json!({ "properties": { "zz": { "pattern": "^a$" } } }))
+                .unwrap();
+        let instance = json!({ "zz": "b" });
+        let e = validator.iter_errors(&instance).next().unwrap();
+        assert_eq!(leaf_error(&e).message, "\"b\" does not match \"^a$\"");
+    }
+
+    #[test]
+    fn every_schema_pattern_has_a_message() {
+        fn walk(node: &Json, path: &str, missing: &mut Vec<String>) {
+            match node {
+                Json::Object(map) => {
+                    if map.get("pattern").is_some_and(Json::is_string)
+                        && !map
+                            .get("x-avocado-pattern-message")
+                            .is_some_and(Json::is_string)
+                    {
+                        missing.push(path.to_string());
+                    }
+                    for (k, v) in map {
+                        walk(v, &format!("{path}/{k}"), missing);
+                    }
+                }
+                Json::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        walk(v, &format!("{path}/{i}"), missing);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut missing = Vec::new();
+        walk(config_lint::schema(), "", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "pattern without x-avocado-pattern-message at {missing:?}"
         );
     }
 }
