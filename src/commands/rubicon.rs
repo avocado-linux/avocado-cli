@@ -203,12 +203,9 @@ impl RubiconCommand {
             }
             RubiconAction::Logs { board, follow } => {
                 let b = self.board(board).await?;
-                let token = if *follow {
+                let token =
                     remote::local_token(&b, "rubicon_console", self.connect_profile.as_deref())
-                        .await?
-                } else {
-                    None
-                };
+                        .await?;
                 self.console(&b, false, true, *follow, token, None).await
             }
         }
