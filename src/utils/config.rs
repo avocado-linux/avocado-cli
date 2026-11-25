@@ -4479,6 +4479,26 @@ impl Config {
         })
     }
 
+    /// The top-level `kernel.package` that `merged_runtime` leaves uninstalled.
+    ///
+    /// A runtime installs a kernel image only through its own `kernel:` entry;
+    /// the top-level block is reached by reference, never inherited. A runtime
+    /// with no entry silently skips the package while the top-level version
+    /// still pins kernel-versioned packages, so callers warn with this name.
+    /// `merged_runtime` is the target-merged value, so a `kernel:` inside a
+    /// `target-<t>:` block counts as set.
+    pub fn ignored_top_level_kernel_package(
+        &self,
+        merged_runtime: &serde_yaml::Value,
+    ) -> Option<String> {
+        let package = self.kernel_default()?.package.as_ref()?;
+        match merged_runtime.get("kernel") {
+            None => Some(package.clone()),
+            Some(v) if v.is_null() => Some(package.clone()),
+            Some(_) => None,
+        }
+    }
+
     /// Get all runtime names defined in the configuration
     ///
     /// Returns a sorted list of runtime names from the `runtimes` section.
@@ -14095,6 +14115,98 @@ kernel:
 
     fn runtime_with_kernel(kernel_yaml: &str) -> serde_yaml::Value {
         serde_yaml::from_str(&format!("kernel:\n{kernel_yaml}")).unwrap()
+    }
+
+    fn config_with_top_level_kernel(extra: &str) -> Config {
+        Config::load_from_yaml_str(&format!(
+            "kernel:\n  package: kernel-image\n  version: '6.8.*'\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_runtime_without_kernel_returns_the_package() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        assert_eq!(
+            config.ignored_top_level_kernel_package(&merged).as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_null_kernel_returns_the_package() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("kernel: null").unwrap();
+        assert_eq!(
+            config.ignored_top_level_kernel_package(&merged).as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_named_reference_returns_none() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev:\n    kernel: default\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("kernel: default").unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_inline_block_returns_none() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged = runtime_with_kernel("  package: other-kernel\n");
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_kernel_in_a_target_block_returns_none() {
+        let yaml = "kernel:\n  package: kernel-image\nruntimes:\n  dev:\n    packages:\n      avocado-runtime: '*'\n    target-qemux86-64:\n      kernel:\n        package: other-kernel\n";
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(file.path(), yaml).unwrap();
+        let path = file.path().to_str().unwrap();
+
+        let on_target = config
+            .get_merged_runtime_config("dev", "qemux86-64", path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&on_target), None);
+
+        // Another target has no kernel entry, so the package is ignored there.
+        let off_target = config
+            .get_merged_runtime_config("dev", "qemuarm64", path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config
+                .ignored_top_level_kernel_package(&off_target)
+                .as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_no_top_level_package_returns_none() {
+        let config =
+            Config::load_from_yaml_str("kernel:\n  version: '6.8.*'\nruntimes:\n  dev: {}\n")
+                .unwrap();
+        let merged: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+
+        let no_kernel = Config::load_from_yaml_str("runtimes:\n  dev: {}\n").unwrap();
+        assert_eq!(no_kernel.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_implicit_default_runtime_returns_none() {
+        let config = config_with_top_level_kernel("default_target: qemux86-64\n");
+        let synthesized = config
+            .runtimes
+            .as_ref()
+            .and_then(|m| m.get("default"))
+            .expect("implicit default runtime");
+        let merged = serde_yaml::to_value(synthesized).unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
     }
 
     #[test]
