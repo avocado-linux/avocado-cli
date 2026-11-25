@@ -1620,7 +1620,7 @@ if [ -n "$unit_file" ]; then
     # An [Install] section with neither key enables nothing, so the declaration
     # is unmet just as surely as a missing unit - fail rather than warn.
     if [ -z "$wanted_by" ] && [ -z "$required_by" ]; then
-        echo "Error: enable_services lists $service, but its [Install] section has no WantedBy= or RequiredBy=, so there is no target to enable it into. Add one, or drop it from enable_services."
+        echo "Error: enable_services lists $service, but it has no [Install] section with WantedBy= or RequiredBy=, so there is no target to enable it into. Add one to the unit, or drop it from enable_services and ship the link in the overlay instead: overlay/etc/systemd/system/<target>.wants/$service -> /usr/lib/systemd/system/$service."
         exit 1
     fi
     echo "Successfully enabled $service"
@@ -1631,7 +1631,7 @@ elif [ -n "$template" ]; then
     echo "Error: enable_services lists $service, but its template $template is not in the extension sysroot ($sysroot). If the template comes from the rootfs, drop $service from enable_services and ship the link in the overlay instead: overlay/etc/systemd/system/<target>.wants/$service -> /usr/lib/systemd/system/$template."
     exit 1
 else
-    echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/."
+    echo "Error: enable_services lists $service, but no such unit exists in the extension sysroot ($sysroot) under /etc/systemd/system or /usr/lib/systemd/system. Units shipped via overlay belong in overlay/usr/lib/systemd/system/. If $service ships in the rootfs, drop it from enable_services and ship the link in the overlay instead: overlay/etc/systemd/system/<target>.wants/$service -> /usr/lib/systemd/system/$service."
     exit 1
 fi"#,
                     service, self.extension, self.extension, service
@@ -2795,7 +2795,7 @@ extensions:
         // Unit absent from both search directories.
         assert!(script.contains("no such unit exists in the extension sysroot"));
         // An [Install] section carrying neither key enables nothing either.
-        assert!(script.contains("has no WantedBy= or RequiredBy="));
+        assert!(script.contains("has no [Install] section with WantedBy= or RequiredBy="));
 
         // Each failure path exits non-zero rather than falling through: the
         // missing unit, the missing template, no install target, a specifier
@@ -3387,6 +3387,63 @@ extensions:
                 .contains("overlay/etc/systemd/system/<target>.wants/serial-getty@ttyGS0.service"),
             "{stdout}"
         );
+    }
+
+    /// A unit that ships in the rootfs is out of this build's sight, so the
+    /// error names the overlay link that enables it instead.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn enable_services_error_names_overlay_wants_for_a_unit_missing_from_the_sysroot() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        std::fs::create_dir_all(root.join("sysroots/app")).unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["systemd-networkd.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("ship the link in the overlay"), "{stdout}");
+        assert!(
+            stdout.contains(".wants/systemd-networkd.service"),
+            "{stdout}"
+        );
+    }
+
+    /// A unit with no [Install] section has no target to enable into; the
+    /// error offers the overlay link as the way out.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn enable_services_error_names_overlay_wants_for_a_unit_without_install_section() {
+        if crate::utils::gnu_test_tools::missing() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        overlay_fixture(root, &[], &["usr/local/bin/hello.sh"], None);
+        let unit_dir = root.join("sysroots/app/usr/lib/systemd/system");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(
+            unit_dir.join("bare.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let out = run_overlay_script_raw(
+            &confext_script_for(root, OverlayMode::Merge, &["bare.service"]),
+            root,
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("has no [Install] section"), "{stdout}");
+        assert!(stdout.contains(".wants/"), "{stdout}");
     }
 
     /// A specifier the build cannot expand fails rather than linking a target
