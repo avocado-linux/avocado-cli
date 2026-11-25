@@ -13,12 +13,16 @@ use crate::commands::provision_remote::{self as remote, Board, Hub, Scope, Via};
 use crate::commands::vm::rubicon::{RubiconAction as VmAction, RubiconCommand as VmRubicon};
 use crate::utils::config::Config;
 use crate::utils::output::{print_success, OutputLevel};
+use crate::utils::output_format::{emit_json_object, OutputFormat};
 use crate::utils::vm::lifecycle;
 
 pub enum RubiconAction {
-    List,
+    List {
+        output: OutputFormat,
+    },
     Show {
         board: Option<String>,
+        output: OutputFormat,
     },
     Add {
         address: String,
@@ -103,9 +107,13 @@ impl RubiconCommand {
 
     pub async fn execute(self) -> Result<()> {
         match &self.action {
-            RubiconAction::List => self.list().await,
-            RubiconAction::Show { board } => {
+            RubiconAction::List { output } => self.list(*output).await,
+            RubiconAction::Show { board, output } => {
                 let b = self.board(board).await?;
+                if output.is_json() {
+                    emit_json_object(&board_json(&b));
+                    return Ok(());
+                }
                 let wiring = self.project()?.and_then(|c| Some(c.rubicon?.wiring));
                 show(&b, &wiring.unwrap_or_default());
                 Ok(())
@@ -340,8 +348,12 @@ impl RubiconCommand {
         })
     }
 
-    async fn list(&self) -> Result<()> {
+    async fn list(&self, output: OutputFormat) -> Result<()> {
         let boards = self.all_boards().await?;
+        if output.is_json() {
+            emit_json_object(&Value::Array(boards.iter().map(board_json).collect()));
+            return Ok(());
+        }
         if boards.is_empty() {
             println!(
                 "No Rubicons. Add one to this machine's VM with `avocado rubicon add <address>`."
@@ -797,6 +809,24 @@ fn print_queue(b: &Board, indent: &str) {
     }
 }
 
+/// A board for `--output json`: what `list` prints, field by field, with the
+/// hub's record (`info`) as it came.
+fn board_json(b: &Board) -> Value {
+    let hub = match &b.hub {
+        Hub::Local => json!({"kind": "local"}),
+        Hub::Connect { vm, vm_name } => json!({"kind": "connect", "vm": vm, "vm_name": vm_name}),
+    };
+    json!({
+        "name": b.name,
+        "label": b.label,
+        "address": b.address,
+        "hub": hub,
+        "vm_instance": b.vm_instance,
+        "state": state(b),
+        "info": b.info,
+    })
+}
+
 fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
     println!("{}", b.describe());
     println!("  state:    {}", state(b));
@@ -909,7 +939,9 @@ mod tests {
 
     fn command(config_path: &str, target: Option<&str>) -> RubiconCommand {
         RubiconCommand {
-            action: RubiconAction::List,
+            action: RubiconAction::List {
+                output: OutputFormat::Human,
+            },
             config_path: config_path.into(),
             target: target.map(String::from),
             via: Via::Auto,
@@ -1011,6 +1043,42 @@ mod tests {
             ..local
         };
         assert_eq!(state(&off), "offline (no route)");
+    }
+
+    /// The desktop parses this: keep the shape stable.
+    #[test]
+    fn board_json_shape_is_stable() {
+        let info = json!({"online": true, "fw": "0.1", "dut": {"power": true, "recovery": false}});
+        let local = Board {
+            address: "10.0.0.5".into(),
+            name: Some("rubicon-a".into()),
+            label: None,
+            hub: Hub::Local,
+            info: info.clone(),
+            vm_instance: None,
+        };
+        assert_eq!(
+            board_json(&local),
+            json!({"name": "rubicon-a", "label": null, "address": "10.0.0.5",
+                   "hub": {"kind": "local"}, "vm_instance": null,
+                   "state": "online  fw 0.1  power on  recovery off", "info": info})
+        );
+        let connect = Board {
+            label: Some("thor".into()),
+            hub: Hub::Connect {
+                vm: "vm-1".into(),
+                vm_name: "molcajete".into(),
+            },
+            vm_instance: Some("i-1".into()),
+            ..local
+        };
+        assert_eq!(
+            board_json(&connect),
+            json!({"name": "rubicon-a", "label": "thor", "address": "10.0.0.5",
+                   "hub": {"kind": "connect", "vm": "vm-1", "vm_name": "molcajete"},
+                   "vm_instance": "i-1",
+                   "state": "online  fw 0.1  power on  recovery off", "info": info})
+        );
     }
 
     #[test]

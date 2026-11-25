@@ -3650,8 +3650,8 @@ async fn main() -> Result<()> {
                 connect_profile,
             } = *args;
             let action = match command {
-                RubiconCommands::List => A::List,
-                RubiconCommands::Show { board } => A::Show { board },
+                RubiconCommands::List { output } => A::List { output },
+                RubiconCommands::Show { board, output } => A::Show { board, output },
                 RubiconCommands::Add { address, label } => A::Add { address, label },
                 RubiconCommands::Remove { board } => A::Remove { board },
                 RubiconCommands::Label { board, label } => A::Label { board, label },
@@ -5555,9 +5555,18 @@ struct RubiconArgs {
 #[derive(Subcommand)]
 enum RubiconCommands {
     /// Boards reachable from here, with their state.
-    List,
+    List {
+        /// `json`: one array of boards on stdout.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
     /// One board in detail.
-    Show { board: Option<String> },
+    Show {
+        board: Option<String>,
+        /// `json`: the board as one object on stdout.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
     /// Add a board to this machine's VM by address.
     Add {
         address: String,

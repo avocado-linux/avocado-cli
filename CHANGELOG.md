@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`avocado rubicon list` and `show` take `--output json`.** `list` prints one
+  array of boards, `show` one board: `name`, `label`, `address`, `hub`
+  (`{"kind": "local"}` or `{"kind": "connect", "vm", "vm_name"}`),
+  `vm_instance`, `state` (the same text as the table) and the hub's `info`
+  record. Errors and the "Connect not consulted" note stay on stderr.
+
 ## [1.2.0] - 2026-11-19
 
 ### Added
