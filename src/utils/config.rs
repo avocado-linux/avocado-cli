@@ -14037,6 +14037,52 @@ packages:
     }
 
     #[test]
+    fn characterize_kernel_version_only_block_fails_validation() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kernel:
+  version: '6.8.*'
+"#,
+        )
+        .unwrap();
+
+        let err = Config::get_kernel_config_from_runtime(&yaml, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("either 'package' or 'compile' must be set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn characterize_kernel_version_only_block_still_pins() {
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      version: '6.8.*'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("6.8.12"));
+        assert!(!spec.matches("6.18.35"));
+    }
+
+    #[test]
+    fn characterize_kernel_top_level_package_ignored_by_explicit_runtime() {
+        let yaml = r#"
+kernel:
+  package: kernel-image
+  version: '6.8.*'
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.resolve_runtime_kernel("dev").is_none());
+        assert!(config.effective_kernel_spec(Some("dev")).unwrap().is_some());
+    }
+
+    #[test]
     fn test_kernel_config_deserialization_in_runtime() {
         let config_content = r#"
 runtimes:
