@@ -360,24 +360,30 @@ impl RubiconCommand {
             );
             return Ok(());
         }
-        println!(
-            "{:<18} {:<16} {:<16} {:<20} STATE",
-            "NAME", "LABEL", "ADDRESS", "HUB"
+        let rows: Vec<[String; 6]> = boards
+            .iter()
+            .map(|b| {
+                [
+                    b.name.clone().unwrap_or_else(|| "-".into()),
+                    b.label.clone().unwrap_or_else(|| "-".into()),
+                    b.address.clone(),
+                    match &b.hub {
+                        Hub::Local => "this machine".to_string(),
+                        Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+                    },
+                    status(b),
+                    b.info["fw"]
+                        .as_str()
+                        .filter(|f| !f.is_empty())
+                        .unwrap_or("-")
+                        .to_string(),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            table(["NAME", "LABEL", "ADDRESS", "HUB", "STATUS", "FW"], &rows)
         );
-        for b in &boards {
-            println!(
-                "{:<18} {:<16} {:<16} {:<20} {}",
-                b.name.as_deref().unwrap_or("-"),
-                b.label.as_deref().unwrap_or("-"),
-                b.address,
-                match &b.hub {
-                    Hub::Local => "this machine".to_string(),
-                    Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
-                },
-                state(b)
-            );
-            print_queue(b, "  ");
-        }
         Ok(())
     }
 
@@ -774,20 +780,11 @@ fn state(b: &Board) -> String {
         );
     }
     let dut = |k: &str| {
-        let v = if i["dut"].is_object() {
+        level(if i["dut"].is_object() {
             &i["dut"][k]
         } else {
             &i["state"]["dut"][k]
-        };
-        match v {
-            Value::Bool(true) => "on".to_string(),
-            Value::Bool(false) => "off".to_string(),
-            Value::Null => "?".to_string(),
-            v => v
-                .as_str()
-                .map(String::from)
-                .unwrap_or_else(|| v.to_string()),
-        }
+        })
     };
     format!(
         "online  fw {}  power {}  recovery {}",
@@ -795,6 +792,43 @@ fn state(b: &Board) -> String {
         dut("power"),
         dut("recovery")
     )
+}
+
+/// One word for `list`: `unknown`, `offline`, `online`, or `busy` while a
+/// job holds the board. `show` has the rest.
+fn status(b: &Board) -> String {
+    let i = &b.info;
+    if i.is_null() || i["unknown"].is_string() {
+        "unknown".into()
+    } else if i["online"] != true {
+        "offline".into()
+    } else if !remote::queue_of(b).is_empty() {
+        "busy".into()
+    } else {
+        "online".into()
+    }
+}
+
+/// Left-aligned columns, each as wide as its widest cell.
+fn table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
+    let mut width = header.map(str::len);
+    for r in rows {
+        for (w, c) in width.iter_mut().zip(r) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| {
+        let mut l = String::new();
+        for (c, w) in cells.iter().zip(width) {
+            l.push_str(&format!("{c:<w$}  "));
+        }
+        format!("{}\n", l.trim_end())
+    };
+    let mut out = line(header.to_vec());
+    for r in rows {
+        out.push_str(&line(r.iter().map(String::as_str).collect()));
+    }
+    out
 }
 
 /// The board's holder, then whoever waits for it.
@@ -806,6 +840,45 @@ fn print_queue(b: &Board, indent: &str) {
     }
     if let Some(w) = remote::console_writer(b, now) {
         println!("{indent}{w}");
+    }
+}
+
+/// Output levels by pin: a protocol 2 board's generic outputs, else the
+/// DUT's power and recovery. Empty while the board is offline.
+fn outputs(b: &Board) -> std::collections::BTreeMap<String, String> {
+    let i = &b.info;
+    if i["online"] != true {
+        return Default::default();
+    }
+    let io = if i["io"].is_object() {
+        &i["io"]
+    } else {
+        &i["state"]["io"]
+    };
+    if let Some(io) = io.as_object().filter(|o| !o.is_empty()) {
+        return io.iter().map(|(k, v)| (k.clone(), level(v))).collect();
+    }
+    let dut = if i["dut"].is_object() {
+        &i["dut"]
+    } else {
+        &i["state"]["dut"]
+    };
+    ["power", "recovery"]
+        .into_iter()
+        .map(|k| (k.to_string(), level(&dut[k])))
+        .collect()
+}
+
+/// An output's level as a hub reports it: a bool, or already a word.
+fn level(v: &Value) -> String {
+    match v {
+        Value::Bool(true) => "on".to_string(),
+        Value::Bool(false) => "off".to_string(),
+        Value::Null => "?".to_string(),
+        v => v
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string()),
     }
 }
 
@@ -823,17 +896,38 @@ fn board_json(b: &Board) -> Value {
         "hub": hub,
         "vm_instance": b.vm_instance,
         "state": state(b),
+        "status": status(b),
         "info": b.info,
     })
 }
 
 fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
+    let i = &b.info;
     println!("{}", b.describe());
-    println!("  state:    {}", state(b));
+    let mut status = status(b);
+    if let Some(why) = i["unknown"].as_str().or(i["error"].as_str()) {
+        status.push_str(&format!(" ({why})"));
+    } else if i["online"] == true {
+        status.push_str(if i["claimed"] == true {
+            " (claimed)"
+        } else {
+            " (dev mode)"
+        });
+    }
+    println!("  status:   {status}");
+    if let Some(fw) = i["fw"].as_str().filter(|f| !f.is_empty()) {
+        println!("  firmware: {fw}");
+    }
     print_queue(b, "  ");
-    // The project's wiring, by pin: what this board drives on its DUT.
-    for (pin, what) in wiring {
-        println!("  {:<9} {what}", format!("{pin}:"));
+    // Each output, its level, and what the project wires it to.
+    let outputs = outputs(b);
+    for (pin, level) in &outputs {
+        let what = wiring.get(pin).map(String::as_str).unwrap_or("");
+        let line = format!("  {:<9} {level:<4}{what}", format!("{pin}:"));
+        println!("{}", line.trim_end());
+    }
+    for (pin, what) in wiring.iter().filter(|(p, _)| !outputs.contains_key(*p)) {
+        println!("  {:<9} ?   {what}", format!("{pin}:"));
     }
     if let Some(m) = b.info["model"].as_str().filter(|m| !m.is_empty()) {
         println!("  model:    {m}");
@@ -1061,7 +1155,8 @@ mod tests {
             board_json(&local),
             json!({"name": "rubicon-a", "label": null, "address": "10.0.0.5",
                    "hub": {"kind": "local"}, "vm_instance": null,
-                   "state": "online  fw 0.1  power on  recovery off", "info": info})
+                   "state": "online  fw 0.1  power on  recovery off", "status": "online",
+                   "info": info})
         );
         let connect = Board {
             label: Some("thor".into()),
@@ -1077,8 +1172,43 @@ mod tests {
             json!({"name": "rubicon-a", "label": "thor", "address": "10.0.0.5",
                    "hub": {"kind": "connect", "vm": "vm-1", "vm_name": "molcajete"},
                    "vm_instance": "i-1",
-                   "state": "online  fw 0.1  power on  recovery off", "info": info})
+                   "state": "online  fw 0.1  power on  recovery off", "status": "online",
+                   "info": info})
         );
+    }
+
+    /// `list` stays one short line per board: the status word, with the
+    /// outputs and queue left to `show`; columns fit the widest cell.
+    #[test]
+    fn list_is_one_short_line_per_board() {
+        let b = Board {
+            address: "10.0.0.5".into(),
+            name: None,
+            label: Some("iot-gate-imx8plus".into()),
+            hub: Hub::Local,
+            info: json!({"online": true, "fw": "0.2", "io": {"power": true, "ssr1": false},
+                         "queue": [{"id": "j1"}]}),
+            vm_instance: None,
+        };
+        assert_eq!(status(&b), "busy");
+        let off = Board {
+            info: json!({"online": false, "error": "no route"}),
+            ..b.clone()
+        };
+        assert_eq!(status(&off), "offline");
+        let t = table(
+            ["NAME", "LABEL"],
+            &[
+                ["-".into(), "iot-gate-imx8plus".into()],
+                ["rubicon-a".into(), "x".into()],
+            ],
+        );
+        assert_eq!(
+            t,
+            "NAME       LABEL\n-          iot-gate-imx8plus\nrubicon-a  x\n"
+        );
+        assert_eq!(outputs(&b)["ssr1"], "off");
+        assert!(outputs(&off).is_empty());
     }
 
     #[test]

@@ -12,7 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array of boards, `show` one board: `name`, `label`, `address`, `hub`
   (`{"kind": "local"}` or `{"kind": "connect", "vm", "vm_name"}`),
   `vm_instance`, `state` (the same text as the table) and the hub's `info`
-  record. Errors and the "Connect not consulted" note stay on stderr.
+  record, plus a one-word `status`. Errors and the "Connect not consulted"
+  note stay on stderr.
+
+### Changed
+- **`avocado rubicon list` is one short line per board.** Columns are NAME,
+  LABEL, ADDRESS, HUB, STATUS (`online`, `busy`, `offline` or `unknown`) and FW,
+  sized to fit. Each output's level and the job queue moved to `rubicon show`,
+  which lists the outputs one per line beside the project's wiring.
 
 ## [1.2.0] - 2026-11-19
 
