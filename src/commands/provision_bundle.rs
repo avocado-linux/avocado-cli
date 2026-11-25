@@ -376,6 +376,60 @@ set +f
     )
 }
 
+/// The provisioning-script container's args for a bundle replay.
+///
+/// Derived the same way the live `runtime provision` call site derives
+/// `primes_docker`: resolve the bundled runtime's own merged entry, collect
+/// its extension names, then check whether any of them declare a
+/// `docker_images` to prime. A missing runtime entry is an inconsistent
+/// bundle (this is the bundle's own avocado.yaml, naming the runtime it was
+/// packed for), so it is an error naming the runtime, not a silent "primes
+/// no Docker" default - unlike the live path's `unwrap_or_default()`, which
+/// is fine there because the live path already has a valid, loaded project.
+///
+/// `provision_container_args` also runs `strip_cli_owned_provision_env`,
+/// which strips three specific CLI-generated `-e AVOCADO_PROVISION_*`
+/// container-arg forms the live CLI's own flag handling produces. A bundle's
+/// merged `container_args` comes from its carried avocado.yaml profile, and
+/// the same `HOST_ONLY_ENV` stripping that keeps those keys out of
+/// `meta.env` at pack time means they never legitimately land in a profile's
+/// `container.args` either, so this call is a no-op for replay.
+fn replay_container_args(
+    composed: &ComposedConfig,
+    meta: &BundleMeta,
+    profile: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let merged_runtime = composed
+        .config
+        .get_merged_runtime_config(&meta.runtime, &meta.target, &composed.config_path)?
+        .with_context(|| {
+            format!(
+                "bundle's own avocado.yaml has no runtime '{}' - the bundle is inconsistent",
+                meta.runtime
+            )
+        })?;
+    let ext_names = crate::commands::runtime::var_image::runtime_extension_names(
+        composed,
+        &merged_runtime,
+        &meta.target,
+    )?;
+    let primes_docker = !crate::commands::runtime::var_image::docker_images(
+        &composed.config,
+        &composed.merged_value,
+        &ext_names,
+        &meta.target,
+    )
+    .is_empty();
+    Ok(
+        crate::commands::runtime::provision::provision_container_args(
+            &composed.config,
+            profile,
+            None,
+            primes_docker,
+        ),
+    )
+}
+
 /// A replay runs no signing service (the key stays on the packing host), so
 /// a hook calling `avocado-sign-request` would fail mid-provision: refuse a
 /// runtime that signs, at pack time and again at replay.
@@ -935,6 +989,93 @@ fn sdk_install_env(meta: &BundleMeta) -> HashMap<String, String> {
     env
 }
 
+/// `path:` feed directories a bundle replay's machine does not have: every
+/// resolved feed whose `kind` is [`crate::utils::feeds::FeedKind::Path`] and
+/// whose `mount` is not currently a directory on disk. `mount` is already an
+/// absolute host path by construction (`resolve_relative()` in `feeds.rs`),
+/// so no further path resolution happens here.
+///
+/// A path occupied by something other than a directory (a plain file, a
+/// broken symlink) matches `!dir.is_dir()` too and is included here - it is
+/// not a true "missing feed", and [`stub_missing_path_feeds`] fails loudly on
+/// it rather than papering over the obstruction.
+fn missing_path_feed_dirs(
+    feeds: &[crate::utils::feeds::ResolvedFeed],
+) -> Vec<&crate::utils::feeds::ResolvedFeed> {
+    feeds
+        .iter()
+        .filter(|f| {
+            f.kind == crate::utils::feeds::FeedKind::Path
+                && f.mount.as_deref().is_some_and(|d| !d.is_dir())
+        })
+        .collect()
+}
+
+/// Stub an empty, indexed feed at each of `missing`'s directories, so
+/// `sdk install`'s dnf run sees a valid (if empty) repo instead of hard-
+/// failing on a `path:` feed directory this replaying machine never had. A
+/// package genuinely needed from it still fails loudly later, through dnf's
+/// own resolution - `feeds.rs`'s own materialization check is untouched for
+/// every other caller.
+///
+/// A directory that already exists is left completely untouched: no
+/// re-index, no warning. That is also the correct behavior on a hub reusing
+/// one work directory across repeated replays of the same project - only
+/// the first replay stubs and warns, later ones stay silent.
+///
+/// A directory this call creates is removed again if indexing fails (a
+/// missing or broken `createrepo_c`): leaving an unindexed directory behind
+/// would make a retry see it as "already there" via `missing_path_feed_dirs`'s
+/// `is_dir()` check, skip stubbing it a second time, and hard-fail later with
+/// `feeds.rs`'s generic no-repodata message instead of a retry ever getting
+/// another chance to stub it. Cleanup is best-effort: a failure to remove it
+/// is folded into the original indexing error rather than replacing it.
+fn stub_missing_path_feeds(missing: &[&crate::utils::feeds::ResolvedFeed]) -> Result<()> {
+    stub_missing_path_feeds_with(missing, std::env::var_os("PATH").as_deref())
+}
+
+fn stub_missing_path_feeds_with(
+    missing: &[&crate::utils::feeds::ResolvedFeed],
+    path: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    for f in missing {
+        let Some(dir) = &f.mount else { continue };
+        std::fs::create_dir_all(dir).with_context(|| {
+            format!(
+                "repos.{}: could not create stub feed directory {}",
+                f.name,
+                dir.display()
+            )
+        })?;
+        if let Err(e) = crate::commands::feed::index::run_with(dir, path, |tool, argv| {
+            std::process::Command::new(tool)
+                .args(argv)
+                .status()
+                .map(|s| s.success())
+        }) {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(dir) {
+                return Err(e.context(format!(
+                    "repos.{}: also failed to remove the stub directory {} after the indexing \
+                     failure above ({cleanup_err}); remove it by hand before retrying",
+                    f.name,
+                    dir.display()
+                )));
+            }
+            return Err(e);
+        }
+        crate::utils::output::print_warning(
+            &format!(
+                "repos.{}: {} not found on this machine - stubbing an empty feed; \
+                 replay fails separately if a package was actually needed from it",
+                f.name,
+                dir.display()
+            ),
+            OutputLevel::Normal,
+        );
+    }
+    Ok(())
+}
+
 /// A replay writes the bundle's avocado.yaml and avocado.lock into the
 /// directory it runs in. Refuse one holding a project a replay didn't write
 /// (no `.avocado-bundle/files.tsv`, which every replay writes before them);
@@ -1178,6 +1319,21 @@ impl BundleProvision {
         std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
         std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
 
+        let composed =
+            crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
+        let config = &composed.config;
+        // A `path:` feed directory the replaying machine never had (built on
+        // the packing host, not carried in the bundle) would otherwise hard-
+        // fail `sdk install`'s dnf run through `feeds.rs`'s own materialization
+        // check; stub an empty, indexed feed there instead, same as a hub
+        // reusing one work directory across repeated replays leaves an
+        // already-present directory untouched.
+        if let Some(feed_set) =
+            crate::utils::feeds::ResolvedFeedSet::resolve(config, &meta.target, &cwd, None)?
+        {
+            stub_missing_path_feeds(&missing_path_feed_dirs(&feed_set.feeds))?;
+        }
+
         // The SDK matching the bundled lock. Reuses this directory's volume,
         // so later bundles for the same target skip the download.
         let exe = std::env::current_exe()?;
@@ -1190,6 +1346,13 @@ impl BundleProvision {
             bail!("avocado sdk install failed ({st})");
         }
 
+        // Re-load composed config: `sdk install` just fetched and merged in
+        // any remote (non-`path:`) extensions under `includes/`, which the
+        // earlier load above (taken before `sdk install` ran, for the feed-
+        // stub check) cannot see. `replay_container_args` below needs this
+        // fresh view - a Docker-priming extension sourced remotely, like this
+        // project's own `docker`/`nvidia-container-toolkit`, would otherwise
+        // never be found and `--privileged` would silently never be injected.
         let composed =
             crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
         let config = &composed.config;
@@ -1275,8 +1438,7 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
                 source_environment: true,
                 interactive: false,
                 env_vars: Some(env),
-                container_args: config
-                    .merge_provision_container_args(self.profile.as_deref(), None),
+                container_args: replay_container_args(&composed, &meta, self.profile.as_deref())?,
                 // The restored includes are what the hook runs on: no live
                 // extension sources mounted over them, read-write.
                 ext_path_mounts: Some(HashMap::new()),
@@ -1434,6 +1596,140 @@ mod tests {
         assert_eq!(a[0].name, "bsp-b1");
         assert!(yaml.contains(".avocado-bundle/ext/bsp-b1"), "{yaml}");
         assert!(!yaml.contains("../extensions"), "{yaml}");
+    }
+
+    /// A bundle replay's own fixture: an avocado.yaml with one runtime and a
+    /// `BundleMeta` naming it, so `replay_container_args` resolves the
+    /// runtime's merged entry the same way a real replay would.
+    fn composed_and_meta(
+        content: &str,
+        runtime: &str,
+        target: &str,
+    ) -> (tempfile::TempDir, ComposedConfig, BundleMeta) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("avocado.yaml");
+        std::fs::write(&cfg, content).unwrap();
+        let composed = Config::load_composed(&cfg, Some(target)).unwrap();
+        let meta = BundleMeta {
+            format: FORMAT,
+            target: target.to_string(),
+            runtime: runtime.to_string(),
+            sdk_host_arch: "x86_64".to_string(),
+            env: HashMap::new(),
+            avocado_yaml: String::new(),
+            avocado_lock: String::new(),
+            provision_script: String::new(),
+            clear: vec![],
+            files: vec![],
+            small_files: vec![],
+            created_at: String::new(),
+            cli_version: String::new(),
+            rubicon: None,
+            ext_sources: vec![],
+            src_includes: vec![],
+            stone_manifest: None,
+        };
+        (tmp, composed, meta)
+    }
+
+    #[test]
+    fn replay_container_args_gets_privileged_when_runtime_primes_docker() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - { image: redis, tag: "7" }
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, None)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(args.contains(&"--privileged".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn replay_container_args_unaffected_when_runtime_does_not_prime_docker() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, None)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !args.contains(&"--privileged".to_string()),
+            "today's behavior: no priming, no injected flag - {args:?}"
+        );
+    }
+
+    #[test]
+    fn replay_container_args_respects_explicit_privileged_false() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - { image: redis, tag: "7" }
+
+provision_profiles:
+  safe:
+    container:
+      privileged: false
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, Some("safe"))
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            args,
+            ["--privileged=false"],
+            "the profile's explicit setting must survive the automatic injection: {args:?}"
+        );
     }
 
     #[test]
@@ -2043,5 +2339,135 @@ provision:
             "t\nt/sub\nt/sub/small\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `createrepo_c` for tests that must not assume the real tool is
+    /// on `$PATH`: writes `repodata/repomd.xml` under its last argument (the
+    /// directory `index_argv` passes), which is all a caller here checks for.
+    #[cfg(unix)]
+    fn write_fake_createrepo_c(bin_dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = bin_dir.join("createrepo_c");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nfor a; do d=\"$a\"; done\nmkdir -p \"$d/repodata\" && printf '<repomd/>' > \"$d/repodata/repomd.xml\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A minimal composed config resolving to one `path:` feed named `local`,
+    /// pointed at `dir` (relative to `config_dir`, as `path:` is written).
+    fn resolve_one_path_feed(
+        config_dir: &Path,
+        dir_name: &str,
+    ) -> crate::utils::feeds::ResolvedFeedSet {
+        let cfg: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\nrepos:\n  local:\n    path: ./{dir_name}\n"
+        ))
+        .unwrap();
+        crate::utils::feeds::ResolvedFeedSet::resolve(&cfg, "t", config_dir, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // Not the PATH-mutation hazard the earlier version of this test carried -
+    // stub_missing_path_feeds_with now takes its search path as an argument,
+    // so no process-global env var is touched. Serialized instead against a
+    // reproduced flake in this environment: two tests concurrently writing,
+    // chmod'ing and exec'ing a freshly created script (write_fake_createrepo_c)
+    // can hit a transient ETXTBSY ("Text file busy") on the exec, even though
+    // each writes to its own unique tempdir.
+    #[serial_test::serial]
+    fn missing_path_feed_directories_are_stubbed_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "missing-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert_eq!(missing.len(), 1, "{feed_set:?}");
+        let dir = missing[0].mount.clone().unwrap();
+        assert!(!dir.is_dir());
+
+        let bin = tempfile::tempdir().unwrap();
+        write_fake_createrepo_c(bin.path());
+        stub_missing_path_feeds_with(&missing, Some(bin.path().as_os_str())).unwrap();
+
+        assert!(dir.is_dir());
+        assert!(dir.join("repodata/repomd.xml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial] // see missing_path_feed_directories_are_stubbed_with_warning above
+    fn failed_indexing_removes_the_stub_directory_so_a_retry_can_stub_it_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "missing-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        let dir = missing[0].mount.clone().unwrap();
+
+        // An empty PATH resolves no createrepo_c, so indexing fails.
+        let empty_bin = tempfile::tempdir().unwrap();
+        stub_missing_path_feeds_with(&missing, Some(empty_bin.path().as_os_str()))
+            .expect_err("indexing should fail with no createrepo_c on PATH");
+        assert!(
+            !dir.is_dir(),
+            "a failed stub must not leave the directory behind, or a retry's \
+             missing_path_feed_dirs would treat it as already present"
+        );
+
+        // A retry with a working createrepo_c on PATH succeeds, proving the
+        // directory is still eligible to be stubbed after the failure above.
+        let bin = tempfile::tempdir().unwrap();
+        write_fake_createrepo_c(bin.path());
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert_eq!(
+            missing.len(),
+            1,
+            "retry should still see the feed as missing"
+        );
+        stub_missing_path_feeds_with(&missing, Some(bin.path().as_os_str())).unwrap();
+        assert!(dir.is_dir());
+        assert!(dir.join("repodata/repomd.xml").is_file());
+    }
+
+    #[test]
+    fn existing_path_feed_directory_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("present-feed")).unwrap();
+        std::fs::write(tmp.path().join("present-feed").join("marker"), "untouched").unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "present-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert!(missing.is_empty(), "{feed_set:?}");
+        stub_missing_path_feeds(&missing).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("present-feed").join("marker")).unwrap(),
+            "untouched"
+        );
+        assert!(
+            !tmp.path()
+                .join("present-feed")
+                .join("repodata/repomd.xml")
+                .exists(),
+            "nothing indexed an already-present directory"
+        );
+    }
+
+    /// Regression test: a non-replay caller (`materialize`, unmodified by this
+    /// change) over a missing `path:` feed directory still hard-fails exactly
+    /// as before - the stub is additive logic fully contained in
+    /// `provision_bundle.rs`, never reached from `feeds.rs`'s own path.
+    #[test]
+    fn non_replay_commands_still_hard_fail_on_missing_path_feed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "never-indexed");
+        let err = feed_set
+            .materialize(crate::utils::feeds::FeedStage::Rootfs)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("has no repodata/repomd.xml"),
+            "{err:#}"
+        );
     }
 }

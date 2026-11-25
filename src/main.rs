@@ -5859,8 +5859,17 @@ enum HitlCommands {
 }
 
 /// Set the process-wide offline mode from `--offline` or `AVOCADO_OFFLINE`.
+///
+/// When resolved offline, also sets `AVOCADO_OFFLINE` in this process's own
+/// environment so that every child process spawned afterward (which inherits
+/// the full environment by default) sees offline mode too. Never unset when
+/// not offline - the user may have set the env var for an unrelated reason.
 fn apply_offline(cli: &Cli) {
-    utils::offline::set_offline(utils::offline::resolve(cli.offline));
+    let offline = utils::offline::resolve(cli.offline);
+    utils::offline::set_offline(offline);
+    if offline {
+        std::env::set_var("AVOCADO_OFFLINE", "1");
+    }
 }
 
 /// Whether to spawn the background GitHub release check. `--offline` must not
@@ -5908,6 +5917,30 @@ mod tests {
         std::env::remove_var("AVOCADO_OFFLINE");
         utils::offline::set_offline(false);
         assert_eq!(seen, cases.map(|(_, _, want)| Some(want)).to_vec());
+    }
+
+    #[test]
+    #[serial_test::serial(offline)]
+    fn offline_flag_sets_avocado_offline_env() {
+        std::env::remove_var("AVOCADO_OFFLINE");
+        let parsed =
+            on_big_stack(|| Cli::try_parse_from(["avocado", "--offline", "feed", "index", "d"]));
+        let cli = parsed.expect("parses");
+        apply_offline(&cli);
+        assert_eq!(std::env::var("AVOCADO_OFFLINE").as_deref(), Ok("1"));
+        std::env::remove_var("AVOCADO_OFFLINE");
+        utils::offline::set_offline(false);
+    }
+
+    #[test]
+    #[serial_test::serial(offline)]
+    fn no_offline_flag_leaves_avocado_offline_unset() {
+        std::env::remove_var("AVOCADO_OFFLINE");
+        let parsed = on_big_stack(|| Cli::try_parse_from(["avocado", "feed", "index", "d"]));
+        let cli = parsed.expect("parses");
+        apply_offline(&cli);
+        assert!(std::env::var("AVOCADO_OFFLINE").is_err());
+        utils::offline::set_offline(false);
     }
 
     #[test]
