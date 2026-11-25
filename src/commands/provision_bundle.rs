@@ -935,6 +935,63 @@ fn sdk_install_env(meta: &BundleMeta) -> HashMap<String, String> {
     env
 }
 
+/// `path:` feed directories a bundle replay's machine does not have: every
+/// resolved feed whose `kind` is [`crate::utils::feeds::FeedKind::Path`] and
+/// whose `mount` is not currently a directory on disk. `mount` is already an
+/// absolute host path by construction (`resolve_relative()` in `feeds.rs`),
+/// so no further path resolution happens here.
+///
+/// A path occupied by something other than a directory (a plain file, a
+/// broken symlink) matches `!dir.is_dir()` too and is included here - it is
+/// not a true "missing feed", and [`stub_missing_path_feeds`] fails loudly on
+/// it rather than papering over the obstruction.
+fn missing_path_feed_dirs(
+    feeds: &[crate::utils::feeds::ResolvedFeed],
+) -> Vec<&crate::utils::feeds::ResolvedFeed> {
+    feeds
+        .iter()
+        .filter(|f| {
+            f.kind == crate::utils::feeds::FeedKind::Path
+                && f.mount.as_deref().is_some_and(|d| !d.is_dir())
+        })
+        .collect()
+}
+
+/// Stub an empty, indexed feed at each of `missing`'s directories, so
+/// `sdk install`'s dnf run sees a valid (if empty) repo instead of hard-
+/// failing on a `path:` feed directory this replaying machine never had. A
+/// package genuinely needed from it still fails loudly later, through dnf's
+/// own resolution - `feeds.rs`'s own materialization check is untouched for
+/// every other caller.
+///
+/// A directory that already exists is left completely untouched: no
+/// re-index, no warning. That is also the correct behavior on a hub reusing
+/// one work directory across repeated replays of the same project - only
+/// the first replay stubs and warns, later ones stay silent.
+fn stub_missing_path_feeds(missing: &[&crate::utils::feeds::ResolvedFeed]) -> Result<()> {
+    for f in missing {
+        let Some(dir) = &f.mount else { continue };
+        std::fs::create_dir_all(dir).with_context(|| {
+            format!(
+                "repos.{}: {} exists but is not a directory",
+                f.name,
+                dir.display()
+            )
+        })?;
+        crate::commands::feed::index::run(dir)?;
+        crate::utils::output::print_warning(
+            &format!(
+                "repos.{}: {} not found on this machine - stubbing an empty feed; \
+                 replay fails separately if a package was actually needed from it",
+                f.name,
+                dir.display()
+            ),
+            OutputLevel::Normal,
+        );
+    }
+    Ok(())
+}
+
 /// A replay writes the bundle's avocado.yaml and avocado.lock into the
 /// directory it runs in. Refuse one holding a project a replay didn't write
 /// (no `.avocado-bundle/files.tsv`, which every replay writes before them);
@@ -1178,6 +1235,21 @@ impl BundleProvision {
         std::fs::write(cwd.join("avocado.yaml"), &meta.avocado_yaml)?;
         std::fs::write(cwd.join("avocado.lock"), &meta.avocado_lock)?;
 
+        let composed =
+            crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
+        let config = &composed.config;
+        // A `path:` feed directory the replaying machine never had (built on
+        // the packing host, not carried in the bundle) would otherwise hard-
+        // fail `sdk install`'s dnf run through `feeds.rs`'s own materialization
+        // check; stub an empty, indexed feed there instead, same as a hub
+        // reusing one work directory across repeated replays leaves an
+        // already-present directory untouched.
+        if let Some(feed_set) =
+            crate::utils::feeds::ResolvedFeedSet::resolve(config, &meta.target, &cwd, None)?
+        {
+            stub_missing_path_feeds(&missing_path_feed_dirs(&feed_set.feeds))?;
+        }
+
         // The SDK matching the bundled lock. Reuses this directory's volume,
         // so later bundles for the same target skip the download.
         let exe = std::env::current_exe()?;
@@ -1190,9 +1262,6 @@ impl BundleProvision {
             bail!("avocado sdk install failed ({st})");
         }
 
-        let composed =
-            crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
-        let config = &composed.config;
         check_unsigned(config, &meta.runtime)?;
         let image = config
             .get_sdk_image()
@@ -2043,5 +2112,108 @@ provision:
             "t\nt/sub\nt/sub/small\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `createrepo_c` for tests that must not assume the real tool is
+    /// on `$PATH`: writes `repodata/repomd.xml` under its last argument (the
+    /// directory `index_argv` passes), which is all a caller here checks for.
+    #[cfg(unix)]
+    fn write_fake_createrepo_c(bin_dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = bin_dir.join("createrepo_c");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nfor a; do d=\"$a\"; done\nmkdir -p \"$d/repodata\" && printf '<repomd/>' > \"$d/repodata/repomd.xml\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A minimal composed config resolving to one `path:` feed named `local`,
+    /// pointed at `dir` (relative to `config_dir`, as `path:` is written).
+    fn resolve_one_path_feed(
+        config_dir: &Path,
+        dir_name: &str,
+    ) -> crate::utils::feeds::ResolvedFeedSet {
+        let cfg: Config = serde_yaml::from_str(&format!(
+            "distro:\n  release: 2026\n  channel: next\n  feeds: [local]\nrepos:\n  local:\n    path: ./{dir_name}\n"
+        ))
+        .unwrap();
+        crate::utils::feeds::ResolvedFeedSet::resolve(&cfg, "t", config_dir, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial] // mutates the process PATH
+    fn missing_path_feed_directories_are_stubbed_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "missing-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert_eq!(missing.len(), 1, "{feed_set:?}");
+        let dir = missing[0].mount.clone().unwrap();
+        assert!(!dir.is_dir());
+
+        let bin = tempfile::tempdir().unwrap();
+        write_fake_createrepo_c(bin.path());
+        let old_path = std::env::var_os("PATH");
+        let new_path = match &old_path {
+            Some(p) => std::env::join_paths(
+                std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(p)),
+            )
+            .unwrap(),
+            None => bin.path().as_os_str().to_os_string(),
+        };
+        std::env::set_var("PATH", new_path);
+        let result = stub_missing_path_feeds(&missing);
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        result.unwrap();
+
+        assert!(dir.is_dir());
+        assert!(dir.join("repodata/repomd.xml").is_file());
+    }
+
+    #[test]
+    fn existing_path_feed_directory_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("present-feed")).unwrap();
+        std::fs::write(tmp.path().join("present-feed").join("marker"), "untouched").unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "present-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert!(missing.is_empty(), "{feed_set:?}");
+        stub_missing_path_feeds(&missing).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("present-feed").join("marker")).unwrap(),
+            "untouched"
+        );
+        assert!(
+            !tmp.path()
+                .join("present-feed")
+                .join("repodata/repomd.xml")
+                .exists(),
+            "nothing indexed an already-present directory"
+        );
+    }
+
+    /// Regression test: a non-replay caller (`materialize`, unmodified by this
+    /// change) over a missing `path:` feed directory still hard-fails exactly
+    /// as before - the stub is additive logic fully contained in
+    /// `provision_bundle.rs`, never reached from `feeds.rs`'s own path.
+    #[test]
+    fn non_replay_commands_still_hard_fail_on_missing_path_feed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "never-indexed");
+        let err = feed_set
+            .materialize(crate::utils::feeds::FeedStage::Rootfs)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("has no repodata/repomd.xml"),
+            "{err:#}"
+        );
     }
 }
