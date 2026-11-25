@@ -401,6 +401,10 @@
           "type": "boolean",
           "description": "Run the container privileged."
         },
+        "live_devices": {
+          "type": "boolean",
+          "description": "Bind the host's /dev live into the container, so a device that appears or changes identity after the container starts (a board re-enumerating out of USB recovery, its later mass-storage export) is still visible. Off by default. false removes a '/dev:/dev' mount set in 'container_args'. Ignored under hub USB scoping."
+        },
         "network_mode": {
           "type": "string",
           "description": "Network the container joins.",

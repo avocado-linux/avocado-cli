@@ -1418,7 +1418,7 @@ fn host_burn_applies(docker_desktop: bool, dry_run: bool) -> bool {
 /// path, so a later `-e` would win: a profile other than the one the dry-run
 /// gate checked, a dry run switched off, or a host mount table the CLI did not
 /// bind.
-fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String>> {
+pub(crate) fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String>> {
     const KEYS: [&str; 3] = [
         "AVOCADO_PROVISION_PROFILE",
         "AVOCADO_PROVISION_DRY_RUN",
@@ -1478,7 +1478,11 @@ fn provision_completion_message(runtime_name: &str, dry_run: bool) -> String {
 /// disk being written. Docker Desktop (macOS) and the avocado-vm run the
 /// container in a VM, and `--runs-on` runs it on another machine, so the local
 /// table would describe the wrong host.
-fn host_mounts_export_applies(docker_desktop: bool, runs_on: bool, vm_routing: bool) -> bool {
+pub(crate) fn host_mounts_export_applies(
+    docker_desktop: bool,
+    runs_on: bool,
+    vm_routing: bool,
+) -> bool {
     !docker_desktop && !runs_on && !vm_routing
 }
 
@@ -1487,7 +1491,10 @@ fn host_mounts_export_applies(docker_desktop: bool, runs_on: bool, vm_routing: b
 /// Removes any `--env` value first so a caller cannot redirect the check at a
 /// file of their choosing, or keep it set when no table was bound. Inserted
 /// after the user's env, like the force export.
-fn insert_provision_host_mounts_env(env_vars: &mut HashMap<String, String>, bound: bool) {
+pub(crate) fn insert_provision_host_mounts_env(
+    env_vars: &mut HashMap<String, String>,
+    bound: bool,
+) {
     env_vars.remove(crate::utils::host_mounts::ENV_VAR);
     if bound {
         env_vars.insert(
@@ -1590,6 +1597,40 @@ provision_profiles:
             provision_container_args(&config, Some("safe"), None, true).unwrap(),
             ["--privileged=false"]
         );
+    }
+
+    const LIVE_DEVICES_CONFIG: &str = r#"
+sdk:
+  container_args: ["--network=host"]
+provision_profiles:
+  usb-flash:
+    container:
+      live_devices: true
+  plain:
+    container_args: ["--rm"]
+"#;
+
+    /// A bundle carries the config text `pack_ext_sources` re-serializes;
+    /// replay loads it with `Config::load_composed`. `live_devices` must
+    /// survive that round trip.
+    #[test]
+    fn live_devices_survives_a_bundle_pack_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("avocado.yaml");
+        std::fs::write(&src, LIVE_DEVICES_CONFIG).unwrap();
+        let (_, packed) = crate::commands::provision_bundle::pack_ext_sources(
+            &src,
+            "t",
+            &std::collections::HashSet::new(),
+            &tmp.path().join("blobs"),
+        )
+        .unwrap();
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(hub.join("avocado.yaml"), packed).unwrap();
+        let reloaded = Config::load_composed(hub.join("avocado.yaml"), Some("t")).unwrap();
+        let profile = reloaded.config.get_provision_profile("usb-flash").unwrap();
+        assert_eq!(profile.container.as_ref().unwrap().live_devices, Some(true));
     }
 
     #[test]

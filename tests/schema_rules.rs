@@ -90,6 +90,9 @@ fn the_container_block_is_accepted_where_container_args_is() {
     assert!(accepts(
         "provision_profiles:\n  usb:\n    container:\n      network_mode: host\n"
     ));
+    assert!(accepts(
+        "provision_profiles:\n  usb:\n    container:\n      live_devices: true\n"
+    ));
     assert!(!accepts("sdk:\n  container:\n    priviledged: true\n"));
 }
 
