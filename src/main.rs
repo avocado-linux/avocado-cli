@@ -5921,7 +5921,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(offline)]
-    fn offline_flag_sets_env_var_for_children() {
+    fn offline_flag_sets_avocado_offline_env() {
         std::env::remove_var("AVOCADO_OFFLINE");
         let parsed =
             on_big_stack(|| Cli::try_parse_from(["avocado", "--offline", "feed", "index", "d"]));
@@ -5929,13 +5929,17 @@ mod tests {
         apply_offline(&cli);
         assert_eq!(std::env::var("AVOCADO_OFFLINE").as_deref(), Ok("1"));
         std::env::remove_var("AVOCADO_OFFLINE");
+        utils::offline::set_offline(false);
+    }
 
+    #[test]
+    #[serial_test::serial(offline)]
+    fn no_offline_flag_leaves_avocado_offline_unset() {
+        std::env::remove_var("AVOCADO_OFFLINE");
         let parsed = on_big_stack(|| Cli::try_parse_from(["avocado", "feed", "index", "d"]));
         let cli = parsed.expect("parses");
         apply_offline(&cli);
         assert!(std::env::var("AVOCADO_OFFLINE").is_err());
-
-        std::env::remove_var("AVOCADO_OFFLINE");
         utils::offline::set_offline(false);
     }
 

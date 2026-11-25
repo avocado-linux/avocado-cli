@@ -1027,7 +1027,7 @@ fn stub_missing_path_feeds(missing: &[&crate::utils::feeds::ResolvedFeed]) -> Re
         let Some(dir) = &f.mount else { continue };
         std::fs::create_dir_all(dir).with_context(|| {
             format!(
-                "repos.{}: {} exists but is not a directory",
+                "repos.{}: could not create stub feed directory {}",
                 f.name,
                 dir.display()
             )
@@ -1316,6 +1316,16 @@ impl BundleProvision {
             bail!("avocado sdk install failed ({st})");
         }
 
+        // Re-load composed config: `sdk install` just fetched and merged in
+        // any remote (non-`path:`) extensions under `includes/`, which the
+        // earlier load above (taken before `sdk install` ran, for the feed-
+        // stub check) cannot see. `replay_container_args` below needs this
+        // fresh view - a Docker-priming extension sourced remotely, like this
+        // project's own `docker`/`nvidia-container-toolkit`, would otherwise
+        // never be found and `--privileged` would silently never be injected.
+        let composed =
+            crate::utils::config::Config::load_composed("avocado.yaml", Some(&meta.target))?;
+        let config = &composed.config;
         check_unsigned(config, &meta.runtime)?;
         let image = config
             .get_sdk_image()
