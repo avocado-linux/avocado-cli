@@ -376,6 +376,60 @@ set +f
     )
 }
 
+/// The provisioning-script container's args for a bundle replay.
+///
+/// Derived the same way the live `runtime provision` call site derives
+/// `primes_docker`: resolve the bundled runtime's own merged entry, collect
+/// its extension names, then check whether any of them declare a
+/// `docker_images` to prime. A missing runtime entry is an inconsistent
+/// bundle (this is the bundle's own avocado.yaml, naming the runtime it was
+/// packed for), so it is an error naming the runtime, not a silent "primes
+/// no Docker" default - unlike the live path's `unwrap_or_default()`, which
+/// is fine there because the live path already has a valid, loaded project.
+///
+/// `provision_container_args` also runs `strip_cli_owned_provision_env`,
+/// which strips three specific CLI-generated `-e AVOCADO_PROVISION_*`
+/// container-arg forms the live CLI's own flag handling produces. A bundle's
+/// merged `container_args` comes from its carried avocado.yaml profile, and
+/// the same `HOST_ONLY_ENV` stripping that keeps those keys out of
+/// `meta.env` at pack time means they never legitimately land in a profile's
+/// `container.args` either, so this call is a no-op for replay.
+fn replay_container_args(
+    composed: &ComposedConfig,
+    meta: &BundleMeta,
+    profile: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let merged_runtime = composed
+        .config
+        .get_merged_runtime_config(&meta.runtime, &meta.target, &composed.config_path)?
+        .with_context(|| {
+            format!(
+                "bundle's own avocado.yaml has no runtime '{}' - the bundle is inconsistent",
+                meta.runtime
+            )
+        })?;
+    let ext_names = crate::commands::runtime::var_image::runtime_extension_names(
+        composed,
+        &merged_runtime,
+        &meta.target,
+    )?;
+    let primes_docker = !crate::commands::runtime::var_image::docker_images(
+        &composed.config,
+        &composed.merged_value,
+        &ext_names,
+        &meta.target,
+    )
+    .is_empty();
+    Ok(
+        crate::commands::runtime::provision::provision_container_args(
+            &composed.config,
+            profile,
+            None,
+            primes_docker,
+        ),
+    )
+}
+
 /// A replay runs no signing service (the key stays on the packing host), so
 /// a hook calling `avocado-sign-request` would fail mid-provision: refuse a
 /// runtime that signs, at pack time and again at replay.
@@ -1344,8 +1398,7 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
                 source_environment: true,
                 interactive: false,
                 env_vars: Some(env),
-                container_args: config
-                    .merge_provision_container_args(self.profile.as_deref(), None),
+                container_args: replay_container_args(&composed, &meta, self.profile.as_deref())?,
                 // The restored includes are what the hook runs on: no live
                 // extension sources mounted over them, read-write.
                 ext_path_mounts: Some(HashMap::new()),
@@ -1503,6 +1556,140 @@ mod tests {
         assert_eq!(a[0].name, "bsp-b1");
         assert!(yaml.contains(".avocado-bundle/ext/bsp-b1"), "{yaml}");
         assert!(!yaml.contains("../extensions"), "{yaml}");
+    }
+
+    /// A bundle replay's own fixture: an avocado.yaml with one runtime and a
+    /// `BundleMeta` naming it, so `replay_container_args` resolves the
+    /// runtime's merged entry the same way a real replay would.
+    fn composed_and_meta(
+        content: &str,
+        runtime: &str,
+        target: &str,
+    ) -> (tempfile::TempDir, ComposedConfig, BundleMeta) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("avocado.yaml");
+        std::fs::write(&cfg, content).unwrap();
+        let composed = Config::load_composed(&cfg, Some(target)).unwrap();
+        let meta = BundleMeta {
+            format: FORMAT,
+            target: target.to_string(),
+            runtime: runtime.to_string(),
+            sdk_host_arch: "x86_64".to_string(),
+            env: HashMap::new(),
+            avocado_yaml: String::new(),
+            avocado_lock: String::new(),
+            provision_script: String::new(),
+            clear: vec![],
+            files: vec![],
+            small_files: vec![],
+            created_at: String::new(),
+            cli_version: String::new(),
+            rubicon: None,
+            ext_sources: vec![],
+            src_includes: vec![],
+            stone_manifest: None,
+        };
+        (tmp, composed, meta)
+    }
+
+    #[test]
+    fn replay_container_args_gets_privileged_when_runtime_primes_docker() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - { image: redis, tag: "7" }
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, None)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(args.contains(&"--privileged".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn replay_container_args_unaffected_when_runtime_does_not_prime_docker() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, None)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !args.contains(&"--privileged".to_string()),
+            "today's behavior: no priming, no injected flag - {args:?}"
+        );
+    }
+
+    #[test]
+    fn replay_container_args_respects_explicit_privileged_false() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - { image: redis, tag: "7" }
+
+provision_profiles:
+  safe:
+    container:
+      privileged: false
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args = replay_container_args(&composed, &meta, Some("safe"))
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            args,
+            ["--privileged=false"],
+            "the profile's explicit setting must survive the automatic injection: {args:?}"
+        );
     }
 
     #[test]

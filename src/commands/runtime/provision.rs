@@ -1430,7 +1430,7 @@ fn strip_cli_owned_provision_env(args: Option<Vec<String>>) -> Option<Vec<String
 /// The provision container's args. Priming Docker images runs dockerd in the
 /// container, which needs `--privileged`; an explicit `--privileged=<bool>`
 /// (e.g. a profile's `container.privileged: false`) is left as set.
-fn provision_container_args(
+pub(crate) fn provision_container_args(
     config: &crate::utils::config::Config,
     profile: Option<&str>,
     cli_args: Option<&Vec<String>>,
