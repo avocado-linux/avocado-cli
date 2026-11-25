@@ -875,6 +875,15 @@ impl KernelConfig {
     }
 }
 
+/// Result of [`Config::runtime_kernel_selection`].
+#[derive(Debug, Clone)]
+pub struct KernelSelection {
+    /// The runtime's kernel block, `None` when it declares none.
+    pub config: Option<KernelConfig>,
+    /// A non-fatal note for the caller to print once.
+    pub warning: Option<String>,
+}
+
 /// A kernel reference on a runtime: either a name pointing at a top-level
 /// `kernel.<name>` definition, or an inline anonymous override.
 ///
@@ -4438,6 +4447,36 @@ impl Config {
             .validate()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Some(kernel_config))
+    }
+
+    /// [`Self::get_kernel_config_from_runtime`] for a named runtime: every
+    /// error carries the runtime name so a failure reads the same wherever
+    /// the lookup runs. Callers propagate it rather than treating an invalid
+    /// kernel block as an absent one.
+    pub fn runtime_kernel_selection(
+        runtime_name: &str,
+        merged_runtime: &serde_yaml::Value,
+        top_level_kernels: Option<&HashMap<String, KernelConfig>>,
+    ) -> Result<KernelSelection> {
+        let config = Self::get_kernel_config_from_runtime(merged_runtime, top_level_kernels)
+            .map_err(|e| {
+                let msg = e.to_string();
+                // A block with neither `package` nor `compile` installs no
+                // kernel image, so say how to fix it. Matched on the
+                // validate() text, which is kept stable for this purpose.
+                if msg.contains("either 'package' or 'compile' must be set") {
+                    anyhow::anyhow!(
+                        "runtime '{runtime_name}': {msg}; add `package:` (for example \
+                         `package: kernel-image`) or `compile:`"
+                    )
+                } else {
+                    anyhow::anyhow!("runtime '{runtime_name}': {msg}")
+                }
+            })?;
+        Ok(KernelSelection {
+            config,
+            warning: None,
+        })
     }
 
     /// Get all runtime names defined in the configuration
@@ -14054,6 +14093,66 @@ kernel:
         );
     }
 
+    fn runtime_with_kernel(kernel_yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!("kernel:\n{kernel_yaml}")).unwrap()
+    }
+
+    #[test]
+    fn runtime_kernel_selection_package_and_compile_is_an_error_naming_the_runtime() {
+        let rt = runtime_with_kernel("  package: kernel-image\n  compile: k\n  install: i.sh\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "runtime 'dev': Validation error: kernel config: 'package' and 'compile' are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn runtime_kernel_selection_compile_without_install_is_an_error() {
+        let rt = runtime_with_kernel("  compile: k\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "runtime 'dev': Validation error: kernel config: 'compile' requires 'install' to be set"
+        );
+    }
+
+    #[test]
+    fn runtime_kernel_selection_package_block_is_selected() {
+        let rt = runtime_with_kernel("  package: kernel-image\n  version: '6.8.*'\n");
+        let sel = Config::runtime_kernel_selection("dev", &rt, None).unwrap();
+        let kc = sel.config.unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("6.8.*"));
+        assert!(sel.warning.is_none());
+    }
+
+    #[test]
+    fn runtime_kernel_selection_absent_block_is_none() {
+        let rt: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        let sel = Config::runtime_kernel_selection("dev", &rt, None).unwrap();
+        assert!(sel.config.is_none());
+        assert!(sel.warning.is_none());
+    }
+
+    #[test]
+    fn runtime_kernel_selection_version_only_block_is_an_error_naming_package() {
+        let rt = runtime_with_kernel("  version: '6.8.*'\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("runtime 'dev': "),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("either 'package' or 'compile' must be set"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("add `package:` (for example `package: kernel-image`) or `compile:`"),
+            "unexpected error: {msg}"
+        );
+    }
     #[test]
     fn characterize_kernel_version_only_block_still_pins() {
         let yaml = r#"

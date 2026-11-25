@@ -540,11 +540,13 @@ impl RuntimeBuildCommand {
         // Check for kernel configuration in the merged runtime config
         let merged_runtime =
             config.get_merged_runtime_config(&self.runtime_name, target_arch, &self.config_path)?;
-        let kernel_config = merged_runtime.as_ref().and_then(|v| {
-            Config::get_kernel_config_from_runtime(v, config.kernel.as_ref())
-                .ok()
-                .flatten()
-        });
+        let kernel_config = match merged_runtime.as_ref() {
+            Some(v) => {
+                Config::runtime_kernel_selection(&self.runtime_name, v, config.kernel.as_ref())?
+                    .config
+            }
+            None => None,
+        };
 
         // Handle kernel cross-compilation if kernel.compile is configured
         if let Some(ref kc) = kernel_config {

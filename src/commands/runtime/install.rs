@@ -12,7 +12,9 @@ use crate::utils::kernel_resolver::{
 };
 use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
-use crate::utils::output::{print_debug, print_error, print_info, print_success, OutputLevel};
+use crate::utils::output::{
+    print_debug, print_error, print_info, print_success, print_warning, OutputLevel,
+};
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
     compute_runtime_install_input_hash, generate_write_stamp_script, Stamp, StampOutputs,
@@ -388,12 +390,12 @@ impl RuntimeInstallCommand {
         runtime: &str,
         target_arch: &str,
         lock_file: &mut LockFile,
-    ) -> bool {
+    ) -> Result<bool> {
         let sysroot = SysrootType::Runtime(runtime.to_string());
         let locked_names = lock_file.get_locked_package_names(target_arch, &sysroot);
 
         if locked_names.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         let merged_runtime = config
@@ -416,8 +418,9 @@ impl RuntimeInstallCommand {
 
         // Also include kernel package if specified
         if let Some(ref merged_val) = merged_runtime {
-            if let Ok(Some(kernel_config)) =
-                Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
+            if let Some(kernel_config) =
+                Config::runtime_kernel_selection(runtime, merged_val, config.kernel.as_ref())?
+                    .config
             {
                 if let Some(ref kernel_package) = kernel_config.package {
                     config_names.insert(kernel_package.clone());
@@ -428,7 +431,7 @@ impl RuntimeInstallCommand {
         let removed: Vec<String> = locked_names.difference(&config_names).cloned().collect();
 
         if removed.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         print_info(
@@ -442,7 +445,7 @@ impl RuntimeInstallCommand {
 
         lock_file.remove_packages_from_sysroot(target_arch, &sysroot, &removed);
 
-        true
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -478,7 +481,7 @@ impl RuntimeInstallCommand {
         // Detect package removals: if packages were removed from the config since the last
         // install, clean the installroot so DNF reinstalls from a clean state.
         let needs_clean_reinstall =
-            self.detect_runtime_package_removals(config, runtime, &target_arch, lock_file);
+            self.detect_runtime_package_removals(config, runtime, &target_arch, lock_file)?;
 
         let installroot_path = format!("$AVOCADO_PREFIX/runtimes/{runtime}");
 
@@ -679,9 +682,12 @@ impl RuntimeInstallCommand {
 
             // Add kernel package if specified in the runtime kernel config
             if let Some(ref merged_val) = merged_runtime {
-                if let Ok(Some(kernel_config)) =
-                    Config::get_kernel_config_from_runtime(merged_val, config.kernel.as_ref())
-                {
+                let selection =
+                    Config::runtime_kernel_selection(runtime, merged_val, config.kernel.as_ref())?;
+                if let Some(warning) = &selection.warning {
+                    print_warning(warning, OutputLevel::Normal);
+                }
+                if let Some(kernel_config) = selection.config {
                     if let Some(ref kernel_package) = kernel_config.package {
                         let kernel_version = kernel_config.version.as_deref().unwrap_or("*");
                         let resolved_name = match resolved_kver.as_deref() {
