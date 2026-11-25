@@ -267,11 +267,13 @@ impl ConnectAuthLoginCommand {
         };
 
         let mut config = client::load_stored_config()?;
-        let is_new_config = config.is_none();
         let existed = config
             .as_ref()
             .map(|c| c.profiles.contains_key(profile_name))
             .unwrap_or(false);
+        let was_default = config
+            .as_ref()
+            .is_some_and(|c| c.default_profile == profile_name);
 
         let cfg = match config.as_mut() {
             Some(cfg) => {
@@ -283,13 +285,14 @@ impl ConnectAuthLoginCommand {
 
         client::save_config(&cfg)?;
 
-        let action = if is_new_config {
-            format!("Created new profile '{profile_name}' (set as default)")
-        } else if existed {
+        let mut action = if existed {
             format!("Updated profile '{profile_name}'")
         } else {
             format!("Created new profile '{profile_name}'")
         };
+        if cfg.default_profile == profile_name && !was_default {
+            action.push_str(" (set as default)");
+        }
 
         if self.output.is_json() {
             emit_json_event(&serde_json::json!({

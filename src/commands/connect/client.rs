@@ -171,14 +171,25 @@ impl ConnectConfig {
             .map(|(name, p)| (name.as_str(), p))
     }
 
-    /// Insert or update a profile.
+    /// Insert or update a profile. It becomes the default when the default
+    /// names no profile (logged out, or a file an older CLI left that way).
     pub fn upsert_profile(&mut self, name: &str, profile: Profile) {
         self.profiles.insert(name.to_string(), profile);
+        if !self.profiles.contains_key(&self.default_profile) {
+            self.default_profile = name.to_string();
+        }
     }
 
-    /// Remove a profile. Returns true if it existed.
+    /// Remove a profile. Returns true if it existed. Removing the default
+    /// hands it to the first remaining profile by name.
     pub fn remove_profile(&mut self, name: &str) -> bool {
-        self.profiles.remove(name).is_some()
+        let removed = self.profiles.remove(name).is_some();
+        if removed && self.default_profile == name {
+            if let Some(next) = self.profiles.keys().min() {
+                self.default_profile = next.clone();
+            }
+        }
+        removed
     }
 }
 
@@ -2206,6 +2217,28 @@ mod tests {
             created_at: String::new(),
             organization_id: None,
         }
+    }
+
+    /// Logging out of the default profile and back in leaves a default that
+    /// exists, as the desktop's Sign out / Sign in do.
+    #[test]
+    fn logout_then_login_keeps_a_live_default() {
+        let mut cfg = ConnectConfig::new_with_profile("dev", profile_at("https://onprem", "d"));
+        cfg.upsert_profile("bethlehem", profile_at("https://onprem", "b"));
+        assert_eq!(
+            cfg.default_profile, "dev",
+            "a second login keeps the default"
+        );
+        assert!(cfg.remove_profile("dev"));
+        assert_eq!(cfg.default_profile, "bethlehem");
+        assert!(cfg.remove_profile("bethlehem"));
+        cfg.upsert_profile("default", profile_at("https://connect.example", "p"));
+        assert_eq!(cfg.default_profile, "default");
+        assert_eq!(cfg.resolve_profile(None, None).unwrap().0, "default");
+        // A file left pointing at a removed profile heals on the next login.
+        cfg.default_profile = "gone".into();
+        cfg.upsert_profile("default", profile_at("https://connect.example", "p2"));
+        assert_eq!(cfg.default_profile, "default");
     }
 
     /// The saved credentials are owner-only, including a file an older CLI
