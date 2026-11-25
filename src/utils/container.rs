@@ -684,6 +684,136 @@ fn usb_view_args_for(dir: Option<&str>) -> Result<Vec<String>> {
     ])
 }
 
+/// Takes any mount onto the container's `/dev` (a profile's live device view,
+/// or a hand-written bind) out of a hub-scoped run's container args: beside
+/// the job's USB view it would hand the job every board on the hub. Returns
+/// the args and, when something was taken, the warning to print. `profile` is
+/// `None` when the run names no provision profile. `tokenized` says each entry
+/// is already one argv token; otherwise entries are raw `container_args`
+/// strings.
+fn suppress_live_device_view(
+    args: Vec<String>,
+    hub_scoped: bool,
+    tokenized: bool,
+    profile: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    if !hub_scoped {
+        return (args, None);
+    }
+    // Entries may hold several arguments, or one flag's value may sit in the
+    // next entry, so walk the tokens as docker gets them. Splitting an
+    // already-split token would read a value containing spaces as flags.
+    let tokens: Vec<(usize, String)> = args
+        .iter()
+        .enumerate()
+        .flat_map(|(i, entry)| {
+            let split = if tokenized {
+                vec![entry.clone()]
+            } else {
+                SdkContainer::parse_container_arg(entry)
+            };
+            split.into_iter().map(move |token| (i, token))
+        })
+        .collect();
+    // Any mount onto the container's /dev covers the hub's narrower view,
+    // whatever it mounts there. Docker cleans the target path, so compare it
+    // cleaned: `/dev/`, `//dev`, `/./dev` and `/x/../dev` are all `/dev`.
+    let onto_dev = |target: &str| {
+        let mut parts = Vec::new();
+        for c in target.split('/') {
+            match c {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                c => parts.push(c),
+            }
+        }
+        parts == ["dev"]
+    };
+    let volume_onto_dev = |v: &str| v.split(':').nth(1).is_some_and(onto_dev);
+    // Docker reads `--mount` as CSV with case-insensitive keys.
+    let mount_onto_dev = |v: &str| {
+        v.split(',').any(|field| {
+            let field = field.trim_matches('"');
+            field.split_once('=').is_some_and(|(key, t)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "target" | "dst" | "destination"
+                ) && onto_dev(t)
+            })
+        })
+    };
+    let mut gone = vec![false; tokens.len()];
+    let mut k = 0;
+    while k < tokens.len() {
+        let token = tokens[k].1.as_str();
+        // `Some(true)` for a `--mount` spec, `Some(false)` for a volume.
+        let (mount, inline) = match token {
+            "-v" | "--volume" => (Some(false), None),
+            "--mount" => (Some(true), None),
+            _ => {
+                if let Some(v) = token.strip_prefix("--volume=") {
+                    (Some(false), Some(v))
+                } else if let Some(v) = token.strip_prefix("--mount=") {
+                    (Some(true), Some(v))
+                } else {
+                    match token.strip_prefix("-v") {
+                        Some(v) if !v.is_empty() => {
+                            (Some(false), Some(v.strip_prefix('=').unwrap_or(v)))
+                        }
+                        _ => (None, None),
+                    }
+                }
+            }
+        };
+        let width = if inline.is_some() { 1 } else { 2 };
+        let value = inline.or(tokens.get(k + 1).map(|(_, t)| t.as_str()));
+        let hit = match mount {
+            Some(true) => value.is_some_and(mount_onto_dev),
+            Some(false) => value.is_some_and(volume_onto_dev),
+            None => false,
+        };
+        if hit {
+            let end = (k + width).min(tokens.len());
+            gone[k..end].fill(true);
+            k = end;
+        } else {
+            k += 1;
+        }
+    }
+    if !gone.contains(&true) {
+        return (args, None);
+    }
+    let mut kept = Vec::new();
+    for (i, entry) in args.into_iter().enumerate() {
+        let mine: Vec<_> = tokens
+            .iter()
+            .zip(&gone)
+            .filter(|((at, _), _)| *at == i)
+            .collect();
+        if mine.iter().all(|(_, g)| !**g) {
+            kept.push(entry);
+            continue;
+        }
+        let rest: Vec<String> = mine
+            .iter()
+            .filter(|(_, g)| !**g)
+            .map(|((_, t), _)| crate::utils::config::atom(t))
+            .collect();
+        if !rest.is_empty() {
+            kept.push(rest.join(" "));
+        }
+    }
+    let warning = match profile {
+        Some(name) => format!(
+            "live-device-view suppressed for profile '{name}': running under hub USB scoping"
+        ),
+        None => "live-device-view suppressed: running under hub USB scoping".to_string(),
+    };
+    (kept, Some(warning))
+}
+
 /// Add security options to container command based on host security module.
 /// - SELinux (Fedora/RHEL): adds --security-opt label=disable
 /// - AppArmor (Ubuntu/Debian): adds --security-opt apparmor=unconfined
@@ -3048,8 +3178,20 @@ impl SdkContainer {
         }
 
         // Add additional container arguments if provided
+        let usb_view = usb_view_args()?;
+        let (extra_args, suppressed) = suppress_live_device_view(
+            extra_args,
+            !usb_view.is_empty(),
+            true,
+            env_vars
+                .get("AVOCADO_PROVISION_PROFILE")
+                .map(String::as_str),
+        );
+        if let Some(warning) = suppressed {
+            crate::utils::output::print_warning(&warning, OutputLevel::Normal);
+        }
         container_cmd.extend(extra_args);
-        container_cmd.extend(usb_view_args()?);
+        container_cmd.extend(usb_view);
 
         // Add the container image
         container_cmd.push(config.container_image.to_string());
@@ -3599,7 +3741,19 @@ impl SdkContainer {
         if let Some(ref args) = config.container_args {
             extra_args.extend(args.clone());
         }
-        extra_args.extend(usb_view_args()?);
+        let usb_view = usb_view_args()?;
+        let (mut extra_args, suppressed) = suppress_live_device_view(
+            extra_args,
+            !usb_view.is_empty(),
+            false,
+            env_vars
+                .get("AVOCADO_PROVISION_PROFILE")
+                .map(String::as_str),
+        );
+        if let Some(warning) = suppressed {
+            crate::utils::output::print_warning(&warning, OutputLevel::Normal);
+        }
+        extra_args.extend(usb_view);
 
         Ok((full_command, env_vars, extra_args))
     }
@@ -5067,6 +5221,130 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    fn strs(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_hub_scoped_run_drops_the_host_dev_bind_and_names_the_profile() {
+        let (args, warning) = suppress_live_device_view(
+            strs(&["--privileged", "-v", "/dev:/dev", "-e", "X=1"]),
+            true,
+            true,
+            Some("usb-flash"),
+        );
+        assert_eq!(args, strs(&["--privileged", "-e", "X=1"]));
+        assert_eq!(
+            warning.as_deref(),
+            Some("live-device-view suppressed for profile 'usb-flash': running under hub USB scoping")
+        );
+    }
+
+    #[test]
+    fn a_hub_scoped_run_drops_every_spelling_of_the_host_dev_bind() {
+        for spelling in [
+            strs(&["--volume", "/dev:/dev"]),
+            strs(&["--volume=/dev:/dev"]),
+            strs(&["-v/dev:/dev"]),
+            strs(&["-v=/dev:/dev"]),
+            strs(&["-v /dev:/dev"]),
+            strs(&["-v", "/dev:/dev:rw"]),
+        ] {
+            let (args, warning) =
+                suppress_live_device_view(spelling.clone(), true, false, Some("p"));
+            assert!(args.is_empty(), "{spelling:?} left {args:?}");
+            assert!(warning.is_some(), "{spelling:?} gave no warning");
+        }
+    }
+
+    #[test]
+    fn a_hub_scoped_run_keeps_the_rest_of_an_entry_holding_the_dev_bind() {
+        let (args, _) =
+            suppress_live_device_view(strs(&["-v /dev:/dev -e \"X=a b\""]), true, false, Some("p"));
+        assert_eq!(args, strs(&["-e \"X=a b\""]));
+    }
+
+    #[test]
+    fn a_hub_scoped_run_without_the_dev_bind_is_left_alone() {
+        let input = strs(&[
+            "--privileged",
+            "-v",
+            "/dev/bus/usb:/dev/bus/usb",
+            "-v",
+            "/srv/dev:/dev2",
+            "-e X=\"a b\"",
+        ]);
+        let (args, warning) = suppress_live_device_view(input.clone(), true, false, Some("p"));
+        assert_eq!(args, input);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn an_unscoped_run_keeps_the_dev_bind() {
+        let input = strs(&["-v", "/dev:/dev", "--volume=/dev:/dev"]);
+        let (args, warning) = suppress_live_device_view(input.clone(), false, false, Some("p"));
+        assert_eq!(args, input);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_hub_scoped_local_run_does_not_resplit_a_token_holding_spaces() {
+        // The local path hands over argv tokens already split, so a value that
+        // merely mentions a /dev bind is one argument, not a bind.
+        let input = strs(&["-e", "DOCKER_OPTS=--rm -v /dev:/dev"]);
+        let (args, warning) = suppress_live_device_view(input.clone(), true, true, Some("p"));
+        assert_eq!(args, input);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_hub_scoped_run_drops_any_bind_onto_the_container_dev() {
+        for spelling in [
+            strs(&["-v", "/dev/:/dev"]),
+            strs(&["-v", "/dev:/dev/"]),
+            strs(&["-v", "/host/dev:/dev"]),
+            strs(&["-v", "/dev:/./dev"]),
+            strs(&["-v", "/dev://dev"]),
+            strs(&["-v", "/dev:/dev/."]),
+            strs(&["--mount", "type=bind,source=/dev,target=/dev"]),
+            strs(&["--mount=type=bind,src=/dev,dst=/dev,readonly"]),
+            strs(&["--mount", "destination=/dev/,source=/dev,type=bind"]),
+            strs(&["-v", "/dev:/dev/bus/.."]),
+            strs(&["-v", "/dev:/x/../dev"]),
+            strs(&["--mount", "type=bind,source=/dev,Target=/tmp/../dev"]),
+            strs(&["--mount", "type=bind,source=/dev,\"dst=/dev\""]),
+        ] {
+            let (args, warning) =
+                suppress_live_device_view(spelling.clone(), true, true, Some("p"));
+            assert!(args.is_empty(), "{spelling:?} left {args:?}");
+            assert!(warning.is_some(), "{spelling:?} gave no warning");
+        }
+    }
+
+    #[test]
+    fn a_hub_scoped_run_keeps_a_mount_below_the_container_dev() {
+        let input = strs(&[
+            "--mount",
+            "type=bind,source=/dev/bus/usb,target=/dev/bus/usb",
+            "-v",
+            "/dev/dri:/dev/dri",
+        ]);
+        let (args, warning) = suppress_live_device_view(input.clone(), true, true, Some("p"));
+        assert_eq!(args, input);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_hub_scoped_run_with_no_profile_name_still_warns() {
+        let (args, warning) =
+            suppress_live_device_view(strs(&["-v", "/dev:/dev"]), true, false, None);
+        assert!(args.is_empty());
+        assert_eq!(
+            warning.as_deref(),
+            Some("live-device-view suppressed: running under hub USB scoping")
+        );
     }
 
     /// Regression: `source_date_epoch` was plumbed into extension images only.

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`live_devices` in a provision profile's `container` block.** Set to
+  `true`, it bind-mounts the host's `/dev` into the provisioning container,
+  so the container sees devices that appear or re-enumerate after it starts,
+  such as a board leaving USB recovery mode and coming back as a
+  mass-storage device. It applies the same way to `avocado provision` and to
+  `avocado provision --bundle` replay. It is off by default. Set to `false`,
+  it strips a hand-written `/dev:/dev` bind from the profile's or the SDK's
+  `container_args`. Under hub USB scoping (`AVOCADO_USB_VIEW` set) any mount
+  onto the container's `/dev`, from `live_devices` or written by hand, is
+  dropped with a warning. A `--privileged` container still sees the host's
+  devices as they were when it started.
+
 ## [1.2.0] - 2026-11-19
 
 ### Added

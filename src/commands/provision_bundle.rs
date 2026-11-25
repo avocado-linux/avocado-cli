@@ -44,8 +44,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::commands::runtime::provision::{
+    host_mounts_export_applies, insert_provision_host_mounts_env,
+};
 use crate::utils::config::{ComposedConfig, Config, ProvisionRubicon, RubiconStep};
-use crate::utils::container::{RunConfig, SdkContainer};
+use crate::utils::container::{is_docker_desktop, is_vm_routing_active, RunConfig, SdkContainer};
 use crate::utils::output::{print_info, print_success, OutputLevel};
 
 pub const FORMAT: u32 = 2;
@@ -387,17 +390,16 @@ set +f
 /// no Docker" default - unlike the live path's `unwrap_or_default()`, which
 /// is fine there because the live path already has a valid, loaded project.
 ///
-/// `provision_container_args` also runs `strip_cli_owned_provision_env`,
-/// which strips three specific CLI-generated `-e AVOCADO_PROVISION_*`
-/// container-arg forms the live CLI's own flag handling produces. A bundle's
-/// merged `container_args` comes from its carried avocado.yaml profile, and
-/// the same `HOST_ONLY_ENV` stripping that keeps those keys out of
-/// `meta.env` at pack time means they never legitimately land in a profile's
-/// `container.args` either, so this call is a no-op for replay.
+/// `provision_container_args` also runs `strip_cli_owned_provision_env`, as
+/// `runtime provision` does: container args come after the generated `-e`
+/// flags and would win, so a bundled profile setting a CLI-owned env var
+/// (such as `AVOCADO_PROVISION_HOST_MOUNTS`) must not reach the container.
+/// Then the read-only bind of the host mount table copy, when one was taken.
 fn replay_container_args(
     composed: &ComposedConfig,
     meta: &BundleMeta,
     profile: Option<&str>,
+    host_mounts_bind: Option<String>,
 ) -> Result<Option<Vec<String>>> {
     let merged_runtime = composed
         .config
@@ -420,14 +422,17 @@ fn replay_container_args(
         &meta.target,
     )
     .is_empty();
-    Ok(
-        crate::commands::runtime::provision::provision_container_args(
-            &composed.config,
-            profile,
-            None,
-            primes_docker,
-        ),
-    )
+    let mut args = crate::commands::runtime::provision::provision_container_args(
+        &composed.config,
+        profile,
+        None,
+        primes_docker,
+    );
+    if let Some(bind) = host_mounts_bind {
+        args.get_or_insert_with(Vec::new)
+            .extend(["-v".to_string(), bind]);
+    }
+    Ok(args)
 }
 
 /// A replay runs no signing service (the key stays on the packing host), so
@@ -1361,15 +1366,22 @@ impl BundleProvision {
             .get_sdk_image()
             .context("No SDK container image specified in the bundled configuration")?;
 
-        let mut env = localize_env(&meta);
-        env.extend(self.env_vars.clone().unwrap_or_default());
-        env.insert("AVOCADO_USB_PASSTHROUGH".into(), "1".into());
-        if Path::new("/run/avocado-agent.sock").exists() {
-            env.insert(
-                "AVOCADO_AGENT_SOCK".into(),
-                "/run/avocado-agent.sock".into(),
-            );
-        }
+        let docker_desktop = is_docker_desktop();
+        let vm_routing = is_vm_routing_active();
+        // Held until the container exits: dropping it deletes the private copy.
+        let host_mounts = if replay_takes_host_mounts(docker_desktop, vm_routing) {
+            crate::utils::host_mounts::HostMountsCopy::take()
+        } else {
+            None
+        };
+        let mut env = replay_env(
+            localize_env(&meta),
+            self.env_vars.clone().unwrap_or_default(),
+            docker_desktop,
+            vm_routing,
+            Path::new("/run/avocado-agent.sock").exists(),
+            host_mounts.is_some(),
+        );
         if self.verbose {
             env.insert("AVOCADO_VERBOSE".into(), "1".into());
         }
@@ -1438,7 +1450,12 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
                 source_environment: true,
                 interactive: false,
                 env_vars: Some(env),
-                container_args: replay_container_args(&composed, &meta, self.profile.as_deref())?,
+                container_args: replay_container_args(
+                    &composed,
+                    &meta,
+                    self.profile.as_deref(),
+                    host_mounts.as_ref().map(|copy| copy.bind_arg()),
+                )?,
                 // The restored includes are what the hook runs on: no live
                 // extension sources mounted over them, read-write.
                 ext_path_mounts: Some(HashMap::new()),
@@ -1464,6 +1481,60 @@ echo "[INFO] Restored the bundle into $AVOCADO_PREFIX"
         );
         Ok(())
     }
+}
+
+/// Whether a replay takes the host mount table. Replay has no remote dispatch,
+/// hence the explicit `false` for live's `runs_on`.
+fn replay_takes_host_mounts(docker_desktop: bool, vm_routing: bool) -> bool {
+    host_mounts_export_applies(docker_desktop, false, vm_routing)
+}
+
+/// A replay's container env: the bundle's, then the caller's `--env`, then
+/// the device env and the host-mount export, so a caller cannot redirect the
+/// disk-safety check but can set the passthrough.
+fn replay_env(
+    bundle: HashMap<String, String>,
+    caller: HashMap<String, String>,
+    docker_desktop: bool,
+    vm_routing: bool,
+    agent_sock_exists: bool,
+    host_mounts_bound: bool,
+) -> HashMap<String, String> {
+    let mut env = bundle;
+    env.extend(caller);
+    let device_env = replay_device_env(docker_desktop, vm_routing, agent_sock_exists, &env);
+    env.extend(device_env);
+    insert_provision_host_mounts_env(&mut env, host_mounts_bound);
+    env
+}
+
+/// The device env a replay adds after the caller's `--env`, decided as
+/// `runtime provision` decides it.
+///
+/// `AVOCADO_AGENT_SOCK` is set when the VM hosting the agent socket is routed
+/// to, or the socket is local (already inside the avocado-vm).
+/// `AVOCADO_USB_PASSTHROUGH` defaults to `0` under Docker Desktop, `1`
+/// elsewhere, and a caller's value wins: under the avocado-vm a device imported
+/// over USB/IP does reach the container, and only the caller knows.
+fn replay_device_env(
+    docker_desktop: bool,
+    vm_routing: bool,
+    agent_sock_exists: bool,
+    caller: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let passthrough = caller
+        .get("AVOCADO_USB_PASSTHROUGH")
+        .cloned()
+        .unwrap_or_else(|| if docker_desktop { "0" } else { "1" }.to_string());
+    env.insert("AVOCADO_USB_PASSTHROUGH".to_string(), passthrough);
+    if vm_routing || agent_sock_exists {
+        env.insert(
+            "AVOCADO_AGENT_SOCK".to_string(),
+            "/run/avocado-agent.sock".to_string(),
+        );
+    }
+    env
 }
 
 #[cfg(test)]
@@ -1656,7 +1727,7 @@ extensions:
             "test-runtime",
             "x86_64",
         );
-        let args = replay_container_args(&composed, &meta, None)
+        let args = replay_container_args(&composed, &meta, None, None)
             .unwrap()
             .unwrap_or_default();
         assert!(args.contains(&"--privileged".to_string()), "{args:?}");
@@ -1684,7 +1755,7 @@ extensions:
             "test-runtime",
             "x86_64",
         );
-        let args = replay_container_args(&composed, &meta, None)
+        let args = replay_container_args(&composed, &meta, None, None)
             .unwrap()
             .unwrap_or_default();
         assert!(
@@ -1722,7 +1793,7 @@ provision_profiles:
             "test-runtime",
             "x86_64",
         );
-        let args = replay_container_args(&composed, &meta, Some("safe"))
+        let args = replay_container_args(&composed, &meta, Some("safe"), None)
             .unwrap()
             .unwrap_or_default();
         assert_eq!(
@@ -2468,6 +2539,177 @@ provision:
         assert!(
             format!("{err:#}").contains("has no repodata/repomd.xml"),
             "{err:#}"
+        );
+    }
+
+    fn caller_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_replay_on_a_local_docker_daemon_exports_the_host_mounts() {
+        assert!(replay_takes_host_mounts(false, false));
+        let env = replay_env(HashMap::new(), HashMap::new(), false, false, false, true);
+        assert_eq!(
+            env.get(crate::utils::host_mounts::ENV_VAR)
+                .map(String::as_str),
+            Some(crate::utils::host_mounts::CONTAINER_PATH)
+        );
+    }
+
+    #[test]
+    fn a_replay_takes_no_host_mounts_under_docker_desktop_or_vm_routing() {
+        assert!(!replay_takes_host_mounts(true, false));
+        assert!(!replay_takes_host_mounts(false, true));
+        let env = replay_env(HashMap::new(), HashMap::new(), true, false, false, false);
+        assert_eq!(env.get(crate::utils::host_mounts::ENV_VAR), None);
+    }
+
+    #[test]
+    fn a_replay_replaces_a_caller_host_mounts_value_with_the_bound_copy() {
+        let caller = caller_env(&[(crate::utils::host_mounts::ENV_VAR, "/tmp/attacker-mounts")]);
+        let env = replay_env(HashMap::new(), caller.clone(), false, false, false, true);
+        assert_eq!(
+            env.get(crate::utils::host_mounts::ENV_VAR)
+                .map(String::as_str),
+            Some(crate::utils::host_mounts::CONTAINER_PATH)
+        );
+        let unbound = replay_env(HashMap::new(), caller, false, false, false, false);
+        assert_eq!(unbound.get(crate::utils::host_mounts::ENV_VAR), None);
+    }
+
+    const LIVE_DEVICES_YAML: &str = r#"
+sdk:
+  image: "test-image"
+  container_args: ["--network=host"]
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    packages:
+      avocado-runtime: "*"
+provision_profiles:
+  usb-flash:
+    container:
+      live_devices: true
+  plain:
+    container_args: ["--rm"]
+"#;
+
+    /// Live and `--bundle` replay assemble a profile's container args through
+    /// the same path, so `live_devices` reaches both identically. The replay
+    /// side is replay's own assembly over a real composed config.
+    #[test]
+    fn live_devices_reaches_live_and_replay_container_args_identically() {
+        let (_tmp, composed, meta) = composed_and_meta(LIVE_DEVICES_YAML, "test-runtime", "x86_64");
+        let live = crate::commands::runtime::provision::provision_container_args(
+            &composed.config,
+            Some("usb-flash"),
+            None,
+            false,
+        );
+        let replay = replay_container_args(&composed, &meta, Some("usb-flash"), None).unwrap();
+        assert_eq!(live, replay);
+        assert_eq!(live.unwrap(), ["--network=host", "-v", "/dev:/dev"]);
+    }
+
+    #[test]
+    fn a_profile_without_live_devices_keeps_the_same_args_live_and_replay() {
+        let (_tmp, composed, meta) = composed_and_meta(LIVE_DEVICES_YAML, "test-runtime", "x86_64");
+        let live = crate::commands::runtime::provision::provision_container_args(
+            &composed.config,
+            Some("plain"),
+            None,
+            false,
+        );
+        let replay = replay_container_args(&composed, &meta, Some("plain"), None).unwrap();
+        assert_eq!(live, replay);
+        assert_eq!(live.unwrap(), ["--network=host", "--rm"]);
+    }
+
+    #[test]
+    fn a_replay_drops_a_container_args_host_mounts_export_and_binds_the_copy() {
+        let (_tmp, composed, meta) = composed_and_meta(
+            r#"
+sdk:
+  image: "test-image"
+  container_args: ["-e AVOCADO_PROVISION_HOST_MOUNTS=/tmp/attacker", "--rm"]
+
+runtimes:
+  test-runtime:
+    target: "x86_64"
+    packages:
+      avocado-runtime: "*"
+"#,
+            "test-runtime",
+            "x86_64",
+        );
+        let args =
+            replay_container_args(&composed, &meta, None, Some("/tmp/copy:/x:ro".to_string()))
+                .unwrap();
+        assert_eq!(args.unwrap(), ["--rm", "-v", "/tmp/copy:/x:ro"]);
+        let unbound = replay_container_args(&composed, &meta, None, None).unwrap();
+        assert_eq!(unbound.unwrap(), ["--rm"]);
+    }
+
+    #[test]
+    fn a_replay_keeps_the_caller_passthrough_over_the_bundle_env() {
+        let base = caller_env(&[("AVOCADO_USB_PASSTHROUGH", "1")]);
+        let caller = caller_env(&[("AVOCADO_USB_PASSTHROUGH", "0")]);
+        let env = replay_env(base, caller, false, false, false, false);
+        assert_eq!(
+            env.get("AVOCADO_USB_PASSTHROUGH").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn replay_exports_the_agent_socket_under_vm_routing_without_a_local_socket() {
+        let env = replay_device_env(false, true, false, &HashMap::new());
+        assert_eq!(
+            env.get("AVOCADO_AGENT_SOCK").map(String::as_str),
+            Some("/run/avocado-agent.sock")
+        );
+    }
+
+    #[test]
+    fn replay_exports_the_agent_socket_when_the_local_socket_exists() {
+        let env = replay_device_env(false, false, true, &HashMap::new());
+        assert_eq!(
+            env.get("AVOCADO_AGENT_SOCK").map(String::as_str),
+            Some("/run/avocado-agent.sock")
+        );
+    }
+
+    #[test]
+    fn replay_omits_the_agent_socket_with_no_vm_routing_and_no_local_socket() {
+        let env = replay_device_env(false, false, false, &HashMap::new());
+        assert_eq!(env.get("AVOCADO_AGENT_SOCK"), None);
+    }
+
+    #[test]
+    fn replay_defaults_usb_passthrough_by_docker_desktop_when_the_caller_sets_none() {
+        let native = replay_device_env(false, false, false, &HashMap::new());
+        assert_eq!(
+            native.get("AVOCADO_USB_PASSTHROUGH").map(String::as_str),
+            Some("1")
+        );
+        let desktop = replay_device_env(true, false, false, &HashMap::new());
+        assert_eq!(
+            desktop.get("AVOCADO_USB_PASSTHROUGH").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn replay_keeps_a_caller_supplied_usb_passthrough() {
+        let caller = HashMap::from([("AVOCADO_USB_PASSTHROUGH".to_string(), "0".to_string())]);
+        let env = replay_device_env(false, false, false, &caller);
+        assert_eq!(
+            env.get("AVOCADO_USB_PASSTHROUGH").map(String::as_str),
+            Some("0")
         );
     }
 }

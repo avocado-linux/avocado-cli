@@ -968,6 +968,11 @@ pub struct RuntimeConfig {
 #[serde(deny_unknown_fields)]
 pub struct ContainerConfig {
     pub privileged: Option<bool>,
+    /// Bind the host's `/dev` live, so a device that appears or changes
+    /// identity after the container starts (a board re-enumerating out of
+    /// USB recovery, its later mass-storage export) is still visible.
+    /// `--privileged` alone only copies `/dev` as it was at container start.
+    pub live_devices: Option<bool>,
     pub network_mode: Option<String>,
     pub volumes: Option<Vec<String>>,
     pub devices: Option<Vec<String>>,
@@ -985,6 +990,9 @@ impl ContainerConfig {
             // Spelled out, so it overrides an earlier `--privileged` in a merge.
             Some(false) => args.push("--privileged=false".to_string()),
             None => {}
+        }
+        if self.live_devices == Some(true) {
+            args.extend(["-v".to_string(), "/dev:/dev".to_string()]);
         }
         if let Some(network) = &self.network_mode {
             args.push(format!("--network={network}"));
@@ -1076,14 +1084,19 @@ impl ContainerConfig {
         Some(kept)
     }
 
-    /// Whether one of the block's volumes mounts where `volume` does.
+    /// Whether one of the block's volumes, or its `live_devices`, mounts
+    /// where `volume` does.
     fn mounts_on(&self, volume: &str) -> bool {
         let target = |v: &str| v.split(':').nth(1).map(str::to_string);
         target(volume).is_some_and(|t| {
-            self.volumes
-                .iter()
-                .flatten()
-                .any(|v| target(v).as_ref() == Some(&t))
+            // Either setting of `live_devices` owns the `/dev` mount, so
+            // `false` can strip a hand-written one without adding its own.
+            (self.live_devices.is_some() && t == "/dev")
+                || self
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .any(|v| target(v).as_ref() == Some(&t))
         })
     }
 }
@@ -1091,7 +1104,7 @@ impl ContainerConfig {
 /// One argument as a `container_args` entry. The entries are split on spaces
 /// outside double quotes, and a bare `"` toggles quoting, so a value with
 /// either is quoted, its quotes and backslashes escaped as in a shell.
-fn atom(value: &str) -> String {
+pub(crate) fn atom(value: &str) -> String {
     if !value.contains(|c: char| c.is_whitespace() || c == '"') {
         return value.to_string();
     }
@@ -9462,6 +9475,73 @@ provision_profiles:
             .merge_provision_container_args(Some("safe"), None)
             .unwrap();
         assert_eq!(merged, ["--privileged=false"]);
+    }
+
+    fn merged_profile_args(yaml: &str) -> Option<Vec<String>> {
+        Config::load_from_str(yaml)
+            .unwrap()
+            .merge_provision_container_args(Some("flash"), None)
+    }
+
+    #[test]
+    fn a_profile_without_live_devices_gains_no_dev_mount() {
+        let merged = merged_profile_args(
+            r#"
+provision_profiles:
+  flash:
+    container:
+      network_mode: host
+"#,
+        );
+        assert_eq!(merged.unwrap(), ["--network=host"]);
+    }
+
+    #[test]
+    fn live_devices_true_binds_the_host_dev_directory() {
+        let merged = merged_profile_args(
+            r#"
+provision_profiles:
+  flash:
+    container:
+      live_devices: true
+"#,
+        );
+        assert_eq!(merged.unwrap(), ["-v", "/dev:/dev"]);
+    }
+
+    #[test]
+    fn live_devices_true_beside_a_container_args_dev_mount_leaves_one_mount() {
+        let merged = merged_profile_args(
+            r#"
+sdk:
+  container_args: ["-v /dev:/dev"]
+provision_profiles:
+  flash:
+    container_args: ["--volume", "/dev:/dev"]
+    container:
+      live_devices: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(merged, ["-v", "/dev:/dev"]);
+    }
+
+    #[test]
+    fn live_devices_false_strips_a_container_args_dev_mount_and_emits_nothing() {
+        let merged = merged_profile_args(
+            r#"
+sdk:
+  container_args: ["--init", "-v /dev:/dev", "-v /dev/bus/usb:/dev/bus/usb"]
+provision_profiles:
+  flash:
+    container_args: ["--volume=/dev:/dev"]
+    container:
+      live_devices: false
+"#,
+        )
+        .unwrap();
+        // Only the whole-/dev mount goes; a narrower mount under it stays.
+        assert_eq!(merged, ["--init", "-v /dev/bus/usb:/dev/bus/usb"]);
     }
 
     #[test]
