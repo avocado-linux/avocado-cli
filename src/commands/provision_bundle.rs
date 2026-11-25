@@ -1022,7 +1022,22 @@ fn missing_path_feed_dirs(
 /// re-index, no warning. That is also the correct behavior on a hub reusing
 /// one work directory across repeated replays of the same project - only
 /// the first replay stubs and warns, later ones stay silent.
+///
+/// A directory this call creates is removed again if indexing fails (a
+/// missing or broken `createrepo_c`): leaving an unindexed directory behind
+/// would make a retry see it as "already there" via `missing_path_feed_dirs`'s
+/// `is_dir()` check, skip stubbing it a second time, and hard-fail later with
+/// `feeds.rs`'s generic no-repodata message instead of a retry ever getting
+/// another chance to stub it. Cleanup is best-effort: a failure to remove it
+/// is folded into the original indexing error rather than replacing it.
 fn stub_missing_path_feeds(missing: &[&crate::utils::feeds::ResolvedFeed]) -> Result<()> {
+    stub_missing_path_feeds_with(missing, std::env::var_os("PATH").as_deref())
+}
+
+fn stub_missing_path_feeds_with(
+    missing: &[&crate::utils::feeds::ResolvedFeed],
+    path: Option<&std::ffi::OsStr>,
+) -> Result<()> {
     for f in missing {
         let Some(dir) = &f.mount else { continue };
         std::fs::create_dir_all(dir).with_context(|| {
@@ -1032,7 +1047,22 @@ fn stub_missing_path_feeds(missing: &[&crate::utils::feeds::ResolvedFeed]) -> Re
                 dir.display()
             )
         })?;
-        crate::commands::feed::index::run(dir)?;
+        if let Err(e) = crate::commands::feed::index::run_with(dir, path, |tool, argv| {
+            std::process::Command::new(tool)
+                .args(argv)
+                .status()
+                .map(|s| s.success())
+        }) {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(dir) {
+                return Err(e.context(format!(
+                    "repos.{}: also failed to remove the stub directory {} after the indexing \
+                     failure above ({cleanup_err}); remove it by hand before retrying",
+                    f.name,
+                    dir.display()
+                )));
+            }
+            return Err(e);
+        }
         crate::utils::output::print_warning(
             &format!(
                 "repos.{}: {} not found on this machine - stubbing an empty feed; \
@@ -2343,7 +2373,14 @@ provision:
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial] // mutates the process PATH
+    // Not the PATH-mutation hazard the earlier version of this test carried -
+    // stub_missing_path_feeds_with now takes its search path as an argument,
+    // so no process-global env var is touched. Serialized instead against a
+    // reproduced flake in this environment: two tests concurrently writing,
+    // chmod'ing and exec'ing a freshly created script (write_fake_createrepo_c)
+    // can hit a transient ETXTBSY ("Text file busy") on the exec, even though
+    // each writes to its own unique tempdir.
+    #[serial_test::serial]
     fn missing_path_feed_directories_are_stubbed_with_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let feed_set = resolve_one_path_feed(tmp.path(), "missing-feed");
@@ -2354,22 +2391,42 @@ provision:
 
         let bin = tempfile::tempdir().unwrap();
         write_fake_createrepo_c(bin.path());
-        let old_path = std::env::var_os("PATH");
-        let new_path = match &old_path {
-            Some(p) => std::env::join_paths(
-                std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(p)),
-            )
-            .unwrap(),
-            None => bin.path().as_os_str().to_os_string(),
-        };
-        std::env::set_var("PATH", new_path);
-        let result = stub_missing_path_feeds(&missing);
-        match old_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        result.unwrap();
+        stub_missing_path_feeds_with(&missing, Some(bin.path().as_os_str())).unwrap();
 
+        assert!(dir.is_dir());
+        assert!(dir.join("repodata/repomd.xml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial] // see missing_path_feed_directories_are_stubbed_with_warning above
+    fn failed_indexing_removes_the_stub_directory_so_a_retry_can_stub_it_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let feed_set = resolve_one_path_feed(tmp.path(), "missing-feed");
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        let dir = missing[0].mount.clone().unwrap();
+
+        // An empty PATH resolves no createrepo_c, so indexing fails.
+        let empty_bin = tempfile::tempdir().unwrap();
+        stub_missing_path_feeds_with(&missing, Some(empty_bin.path().as_os_str()))
+            .expect_err("indexing should fail with no createrepo_c on PATH");
+        assert!(
+            !dir.is_dir(),
+            "a failed stub must not leave the directory behind, or a retry's \
+             missing_path_feed_dirs would treat it as already present"
+        );
+
+        // A retry with a working createrepo_c on PATH succeeds, proving the
+        // directory is still eligible to be stubbed after the failure above.
+        let bin = tempfile::tempdir().unwrap();
+        write_fake_createrepo_c(bin.path());
+        let missing = missing_path_feed_dirs(&feed_set.feeds);
+        assert_eq!(
+            missing.len(),
+            1,
+            "retry should still see the feed as missing"
+        );
+        stub_missing_path_feeds_with(&missing, Some(bin.path().as_os_str())).unwrap();
         assert!(dir.is_dir());
         assert!(dir.join("repodata/repomd.xml").is_file());
     }

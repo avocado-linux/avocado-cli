@@ -151,7 +151,12 @@ fn which_on_path(bin: &str, path: Option<&OsStr>) -> Option<PathBuf> {
 /// Core of `run` with PATH and the spawner injected. The directory and cycle
 /// checks come first so a bad path fails before the tool is resolved or
 /// anything is spawned. `spawn` returns whether the tool exited successfully.
-fn run_with<F>(dir: &Path, path: Option<&OsStr>, spawn: F) -> Result<()>
+///
+/// `pub(crate)` so a caller that needs to stub indexing in a test (e.g.
+/// `provision_bundle`'s replay tests) can inject a PATH without mutating the
+/// process-global environment variable, which `#[serial_test::serial]` alone
+/// does not make safe against tests that aren't also marked `#[serial]`.
+pub(crate) fn run_with<F>(dir: &Path, path: Option<&OsStr>, spawn: F) -> Result<()>
 where
     F: FnOnce(&Path, &[OsString]) -> std::io::Result<bool>,
 {
