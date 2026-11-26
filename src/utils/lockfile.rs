@@ -5,6 +5,7 @@
 
 use crate::commands::rootfs::install::is_explicit_version;
 use crate::utils::output::{print_info, OutputLevel};
+use crate::utils::shell::shell_escape;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -296,6 +297,44 @@ impl RpmQueryConfig {
              dnf --installroot=\"{root}\" --disablerepo=\"*\" repoquery --installed \
              --qf '%{{name}}|%{{from_repo}}' 2>/dev/null) || true"
         ))
+    }
+
+    /// Build a command that asks, for each name, which installed package
+    /// provides it. Each answer is preceded by an `@@ <name>` marker line so
+    /// [`parse_provides_output`] can attribute provider lines to names; `rpm`
+    /// prints nothing attributable for a miss.
+    ///
+    /// Unlike `build_query_command`, every name is single-quoted: this command
+    /// runs in a container shell and a config-supplied name must not become
+    /// code. The environment handling and `--root` match that function.
+    pub fn build_provides_query_command(&self, names: &[String]) -> String {
+        let mut queries = String::new();
+        for name in names {
+            let marker = shell_escape(&format!("@@ {name}"));
+            let name = shell_escape(name);
+            let root = match self.root_path {
+                Some(ref root_path) => format!(" --root=\"{root_path}\""),
+                None => String::new(),
+            };
+            queries.push_str(&format!(
+                "printf '%s\\n' {marker}; rpm -q --whatprovides{root} \
+                 --qf '%{{NAME}} %{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' {name} || true; "
+            ));
+        }
+
+        // An installroot query must not inherit the SDK's rpm config from the
+        // container entrypoint; the native SDK query keeps it.
+        let mut env_setup = String::new();
+        if self.root_path.is_some() {
+            env_setup.push_str("unset RPM_ETCCONFIGDIR RPM_CONFIGDIR; ");
+        }
+        if let Some(ref etcconfigdir) = self.rpm_etcconfigdir {
+            env_setup.push_str(&format!("export RPM_ETCCONFIGDIR=\"{etcconfigdir}\"; "));
+        }
+        if let Some(ref configdir) = self.rpm_configdir {
+            env_setup.push_str(&format!("export RPM_CONFIGDIR=\"{configdir}\"; "));
+        }
+        format!("({env_setup}{queries}) || true")
     }
 
     /// Build the rpm -q command with proper environment and flags
@@ -691,6 +730,14 @@ pub struct TargetLocks {
     /// disk value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feeds: Option<Vec<LockedFeed>>,
+
+    /// Per sysroot (keyed by [`SysrootType::lock_key`]), the packages that
+    /// provide each requested name: requested name -> `NAME VERSION-RELEASE.ARCH`
+    /// strings. A name declared as a virtual provide has no package of that name
+    /// in the version map, so this is where the lock records what satisfied it.
+    /// Never mixed into the version maps, whose keys are the declared package set.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub providers: HashMap<String, HashMap<String, Vec<String>>>,
 
     /// In-memory only: sysroot sections explicitly cleared during this process
     /// run (e.g., "rootfs" / "initramfs" after a kernel-pin-change clean).
@@ -1327,6 +1374,24 @@ impl LockFile {
                 &base_target.repo_snapshot,
                 other_target.repo_snapshot,
             );
+            // Providers per sysroot key. A cleared section keeps this
+            // writer's entry and drops the disk one: a lock that was never
+            // loaded has an empty base, so removal-by-absence cannot fire and
+            // the stale disk providers would come back.
+            let mut mine = std::mem::take(&mut self_target.providers);
+            let mut disk = other_target.providers;
+            let mut kept = Vec::new();
+            for key in ["rootfs", "initramfs", "target-sysroot"] {
+                if self_target.cleared_sections.contains(key) {
+                    disk.remove(key);
+                    if let Some(entry) = mine.remove(key) {
+                        kept.push((key.to_string(), entry));
+                    }
+                }
+            }
+            let mut merged = merge_entries(mine, &base_target.providers, disk, keep_mine);
+            merged.extend(kept);
+            self_target.providers = merged;
         }
 
         self
@@ -1487,6 +1552,9 @@ impl LockFile {
     /// rolling feed may no longer carry.
     pub fn clear_sysroot_packages(&mut self, target: &str, sysroot: &SysrootType) {
         self.sysroot_packages_mut(target, sysroot).clear();
+        if let Some(target_locks) = self.targets.get_mut(target) {
+            target_locks.providers.remove(&sysroot.lock_key());
+        }
     }
 
     /// The kernel pin recorded for an extension under whichever scope holds
@@ -1823,6 +1891,7 @@ impl LockFile {
                     && runtimes_are_empty(&target_locks.runtimes)
                     && target_locks.kernels.is_empty()
                     && target_locks.boot.is_empty()
+                    && target_locks.providers.is_empty()
             })
     }
 
@@ -1830,6 +1899,7 @@ impl LockFile {
     pub fn clear_sdk(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.sdk.clear();
+            target_locks.providers.retain(|k, _| !k.starts_with("sdk/"));
         }
     }
 
@@ -1838,6 +1908,7 @@ impl LockFile {
     pub fn clear_rootfs(&mut self, target: &str) {
         let entry = self.targets.entry(target.to_string()).or_default();
         entry.rootfs.clear();
+        entry.providers.remove("rootfs");
         entry.cleared_sections.insert("rootfs".to_string());
     }
 
@@ -1846,6 +1917,7 @@ impl LockFile {
     pub fn clear_initramfs(&mut self, target: &str) {
         let entry = self.targets.entry(target.to_string()).or_default();
         entry.initramfs.clear();
+        entry.providers.remove("initramfs");
         entry.cleared_sections.insert("initramfs".to_string());
     }
 
@@ -1866,6 +1938,9 @@ impl LockFile {
         let entry = self.targets.entry(target.to_string()).or_default();
         entry.target_sysroot.clear();
         entry
+            .providers
+            .remove(&SysrootType::TargetSysroot.lock_key());
+        entry
             .cleared_sections
             .insert(SysrootType::TargetSysroot.lock_key());
     }
@@ -1878,6 +1953,11 @@ impl LockFile {
             for runtime in target_locks.runtimes.values_mut() {
                 runtime.extensions.remove(extension_name);
             }
+            let global = format!("extensions/{extension_name}");
+            let scoped = format!("/extensions/{extension_name}");
+            target_locks.providers.retain(|k, _| {
+                *k != global && !(k.starts_with("runtimes/") && k.ends_with(&scoped))
+            });
         }
     }
 
@@ -1886,6 +1966,10 @@ impl LockFile {
     pub fn clear_all_extensions(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.extensions.clear();
+            target_locks.providers.retain(|k, _| {
+                !(k.starts_with("extensions/")
+                    || (k.starts_with("runtimes/") && k.contains("/extensions/")))
+            });
         }
     }
 
@@ -1893,6 +1977,11 @@ impl LockFile {
     pub fn clear_runtime(&mut self, target: &str, runtime_name: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.runtimes.remove(runtime_name);
+            let own = format!("runtimes/{runtime_name}");
+            let nested = format!("{own}/extensions/");
+            target_locks
+                .providers
+                .retain(|k, _| *k != own && !k.starts_with(&nested));
         }
     }
 
@@ -1901,7 +1990,98 @@ impl LockFile {
     pub fn clear_all_runtimes(&mut self, target: &str) {
         if let Some(target_locks) = self.targets.get_mut(target) {
             target_locks.runtimes.clear();
+            target_locks
+                .providers
+                .retain(|k, _| !k.starts_with("runtimes/"));
         }
+    }
+
+    /// Record which installed packages provide each requested name in a
+    /// sysroot, replacing the sysroot's whole entry. An empty map removes it.
+    ///
+    /// Kept apart from the version map on purpose: the removal checks read that
+    /// map's keys as the declared package set, so a provider key there would
+    /// wipe the sysroot on the next install.
+    pub fn set_sysroot_providers(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+        providers: HashMap<String, Vec<String>>,
+    ) {
+        if providers.is_empty() {
+            if let Some(target_locks) = self.targets.get_mut(target) {
+                target_locks.providers.remove(&sysroot.lock_key());
+            }
+            return;
+        }
+        self.targets
+            .entry(target.to_string())
+            .or_default()
+            .providers
+            .insert(sysroot.lock_key(), providers);
+    }
+
+    /// Fold the outcome of a providers query into the lock for one sysroot.
+    ///
+    /// `unresolved` is the declared names the version query did not return and
+    /// `queried` is the providers query result, `None` when that query could
+    /// not run. Nothing unresolved clears the entry, so one from an earlier
+    /// install cannot outlive the names it described. A failed query leaves the
+    /// entry alone: "could not ask" is not "nothing provides it". A provider
+    /// whose package name equals the requested name is the package itself and
+    /// not a Provides, so it is not recorded; without that, a failed version
+    /// query would copy every plain package into this map.
+    pub fn apply_providers_query(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+        unresolved: &[String],
+        queried: Option<HashMap<String, Vec<String>>>,
+    ) {
+        if unresolved.is_empty() {
+            self.set_sysroot_providers(target, sysroot, HashMap::new());
+            return;
+        }
+        let Some(queried) = queried else {
+            return;
+        };
+        let providers = queried
+            .into_iter()
+            .filter_map(|(name, provs)| {
+                let others: Vec<String> = provs
+                    .into_iter()
+                    .filter(|p| p.split_whitespace().next() != Some(name.as_str()))
+                    .collect();
+                (!others.is_empty()).then_some((name, others))
+            })
+            .collect();
+        self.set_sysroot_providers(target, sysroot, providers);
+    }
+
+    /// The providers recorded for a sysroot, requested name -> providers.
+    pub fn get_sysroot_providers(
+        &self,
+        target: &str,
+        sysroot: &SysrootType,
+    ) -> Option<&HashMap<String, Vec<String>>> {
+        self.targets.get(target)?.providers.get(&sysroot.lock_key())
+    }
+
+    /// Copy one sysroot's providers entry from another lock, removing ours when
+    /// `other` has none. `avocado sdk install` installs the rootfs and initramfs
+    /// on separate lock clones and merges field by field, so without this a
+    /// providers entry written on a clone is dropped at the merge.
+    pub fn copy_sysroot_providers_from(
+        &mut self,
+        other: &LockFile,
+        target: &str,
+        sysroot: &SysrootType,
+    ) {
+        let providers = other
+            .get_sysroot_providers(target, sysroot)
+            .cloned()
+            .unwrap_or_default();
+        self.set_sysroot_providers(target, sysroot, providers);
     }
 
     /// Get the set of package names previously locked for a target and sysroot.
@@ -1970,6 +2150,18 @@ impl LockFile {
         // by save time the in-memory section *is* the complete intended state.
         if removed_any {
             target_locks.cleared_sections.insert(sysroot.lock_key());
+        }
+
+        // A provider entry is keyed by the requested name, so it goes with
+        // that name; one left behind would outlive its package.
+        let key = sysroot.lock_key();
+        if let Some(entries) = target_locks.providers.get_mut(&key) {
+            for pkg in packages_to_remove {
+                entries.remove(pkg);
+            }
+            if entries.is_empty() {
+                target_locks.providers.remove(&key);
+            }
         }
     }
 
@@ -2192,6 +2384,7 @@ impl LockFile {
             target_locks.runtimes.clear();
             target_locks.kernel_versions.clear();
             target_locks.kernels.clear();
+            target_locks.providers.clear();
             // Drop the snapshot pin too: unlock means "re-pick latest snapshot
             // on the next fetch", mirroring the kernel-pin reset above.
             target_locks.repo_snapshot = None;
@@ -2363,6 +2556,60 @@ pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
             }
 
             result.insert(name.to_string(), version.to_string());
+        }
+    }
+
+    result
+}
+
+/// The declared package names the `rpm -q` version map did not resolve: the
+/// ones a provider, rather than a package of that name, satisfied.
+pub fn unresolved_declared_names(
+    declared: &[String],
+    versions: &HashMap<String, String>,
+) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|name| !versions.contains_key(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Parse the output of [`RpmQueryConfig::build_provides_query_command`] into
+/// requested name -> `NAME VERSION-RELEASE.ARCH` providers.
+///
+/// A provider line belongs to the nearest preceding `@@ <name>` marker. It must
+/// be exactly two whitespace-separated tokens: `rpm` prints `no package
+/// provides x` (four tokens) for a miss, and container output or a warning must
+/// never turn into a key or a provider. A name with no provider is omitted.
+pub fn parse_provides_output(output: &str) -> HashMap<String, Vec<String>> {
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current: Option<&str> = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('[') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("@@ ") {
+            current = Some(name.trim());
+            continue;
+        }
+        let Some(name) = current else {
+            continue;
+        };
+        let mut tokens = line.split_whitespace();
+        let (Some(pkg), Some(version), None) = (tokens.next(), tokens.next(), tokens.next()) else {
+            continue;
+        };
+        // `warning: foo` is two tokens too.
+        if pkg.ends_with(':') {
+            continue;
+        }
+        let provider = format!("{pkg} {version}");
+        let providers = result.entry(name.to_string()).or_default();
+        if !providers.contains(&provider) {
+            providers.push(provider);
         }
     }
 
@@ -5471,5 +5718,527 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             on_disk.get_kernel_version(target, &ext_b),
             Some(&"6.6.2".to_string())
         );
+    }
+
+    fn providers_of(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(name, provs)| {
+                (
+                    name.to_string(),
+                    provs.iter().map(|p| p.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn whatprovides_query_marks_each_name_and_uses_whatprovides() {
+        let cfg = SysrootType::Sdk("x86_64".to_string()).get_rpm_query_config();
+        let cmd = cfg.build_provides_query_command(&["foo".to_string(), "bar".to_string()]);
+        assert_eq!(cmd.matches("--whatprovides").count(), 2, "{cmd}");
+        assert!(cmd.contains("printf '%s\\n' '@@ foo'"), "{cmd}");
+        assert!(cmd.contains("printf '%s\\n' '@@ bar'"), "{cmd}");
+        assert!(cmd.contains("'foo' || true"), "{cmd}");
+        assert!(cmd.contains("'bar' || true"), "{cmd}");
+        assert!(
+            cmd.contains("--qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\\n'"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("--root"), "{cmd}");
+    }
+
+    #[test]
+    fn whatprovides_installroot_query_sets_root() {
+        let cfg = SysrootType::Rootfs.get_rpm_query_config();
+        let cmd = cfg.build_provides_query_command(&["foo".to_string()]);
+        assert!(
+            cmd.contains("unset RPM_ETCCONFIGDIR RPM_CONFIGDIR; "),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("rpm -q --whatprovides --root=\"$AVOCADO_PREFIX/rootfs\""),
+            "{cmd}"
+        );
+        assert!(cmd.ends_with(") || true"), "{cmd}");
+    }
+
+    #[test]
+    fn whatprovides_query_single_quotes_names() {
+        let cfg = SysrootType::Rootfs.get_rpm_query_config();
+        let cmd = cfg.build_provides_query_command(&["a'b; touch /pwned".to_string()]);
+        // The embedded quote is closed, escaped and reopened in both the
+        // marker and the rpm argument, so the name never leaves the string.
+        assert!(
+            cmd.contains("printf '%s\\n' '@@ a'\\''b; touch /pwned'"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("'a'\\''b; touch /pwned' || true"), "{cmd}");
+    }
+
+    /// Runs the generated command under `sh` against a stand-in `rpm` that
+    /// answers each query with one provider named after its last argument, then
+    /// parses what it printed. A name carrying shell syntax must reach rpm as
+    /// one literal argument and come back attributed to itself.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn whatprovides_query_runs_each_name_as_one_literal_argument() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        let rpm = dir.path().join("rpm");
+        std::fs::write(
+            &rpm,
+            "#!/bin/sh\nfor last; do :; done\n\
+             echo \"provider-of-$(echo \"$last\" | tr -c 'A-Za-z0-9\\n' _) 1.0-r0.noarch\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&rpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tricky = format!("a'b; touch {}", marker.display());
+        let cmd = SysrootType::Sdk("x86_64".to_string())
+            .get_rpm_query_config()
+            .build_provides_query_command(&[tricky.clone(), "plain".to_string()]);
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(!marker.exists(), "the name ran as shell: {stdout}");
+        let parsed = parse_provides_output(&stdout);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(
+            parsed.get("plain"),
+            Some(&vec!["provider-of-plain 1.0-r0.noarch".to_string()])
+        );
+        assert_eq!(parsed.get(&tricky).map(Vec::len), Some(1), "{parsed:?}");
+    }
+
+    #[test]
+    fn whatprovides_parse_attributes_providers_to_names() {
+        let out =
+            "[INFO] Running\n@@ libfoo\nlibfoo-impl 1.0-r0.x86_64\n@@ bar\nbar 2.0-r1.noarch\n";
+        let parsed = parse_provides_output(out);
+        assert_eq!(
+            parsed,
+            providers_of(&[
+                ("libfoo", &["libfoo-impl 1.0-r0.x86_64"]),
+                ("bar", &["bar 2.0-r1.noarch"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn whatprovides_no_provider_line_is_not_recorded() {
+        let out =
+            "@@ ghost\nno package provides ghost\n@@ real\nreal 1.0-r0.x86_64\nwarning: odd\n";
+        let parsed = parse_provides_output(out);
+        assert!(!parsed.contains_key("no"));
+        assert!(!parsed.contains_key("ghost"));
+        assert_eq!(parsed, providers_of(&[("real", &["real 1.0-r0.x86_64"])]));
+    }
+
+    #[test]
+    fn whatprovides_two_providers_are_both_recorded() {
+        let out = "@@ virt\na 1.0-r0.x86_64\nb 2.0-r0.x86_64\n";
+        assert_eq!(
+            parse_provides_output(out),
+            providers_of(&[("virt", &["a 1.0-r0.x86_64", "b 2.0-r0.x86_64"])])
+        );
+    }
+
+    #[test]
+    fn whatprovides_provider_line_before_any_marker_is_ignored() {
+        assert!(parse_provides_output("stray 1.0-r0.x86_64\n").is_empty());
+    }
+
+    #[test]
+    fn whatprovides_provider_is_not_a_locked_package_name() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Rootfs;
+        lock.update_sysroot_versions(
+            "t",
+            &sysroot,
+            HashMap::from([("real".to_string(), "1.0-r0.x86_64".to_string())]),
+        );
+        lock.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("virt", &["real 1.0-r0.x86_64"])]),
+        );
+        assert_eq!(
+            lock.get_locked_package_names("t", &sysroot),
+            HashSet::from(["real".to_string()])
+        );
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_unresolved_names_are_the_declared_ones_missing_from_versions() {
+        let declared = vec![
+            "real".to_string(),
+            "kernel-module-*".to_string(),
+            "virt".to_string(),
+        ];
+        let versions = HashMap::from([("real".to_string(), "1.0-r0.x86_64".to_string())]);
+        assert_eq!(
+            unresolved_declared_names(&declared, &versions),
+            vec!["kernel-module-*".to_string(), "virt".to_string()]
+        );
+        assert!(unresolved_declared_names(&declared[..1], &versions).is_empty());
+        assert_eq!(
+            unresolved_declared_names(&declared[..2], &HashMap::new()),
+            declared[..2].to_vec()
+        );
+    }
+
+    #[test]
+    fn whatprovides_apply_clears_the_entry_when_nothing_is_unresolved() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("virt", &["real 1.0-r0.x86_64"])]),
+        );
+        // Every declared name now resolves under its own name, so the entry
+        // describes names that are no longer asked for.
+        lock.apply_providers_query("t", &sysroot, &[], Some(HashMap::new()));
+        assert_eq!(lock.get_sysroot_providers("t", &sysroot), None);
+    }
+
+    #[test]
+    fn whatprovides_apply_keeps_the_entry_when_the_query_failed() {
+        let sysroot = SysrootType::Rootfs;
+        let recorded = providers_of(&[("virt", &["real 1.0-r0.x86_64"])]);
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers("t", &sysroot, recorded.clone());
+        // `None` is "could not ask", which says nothing about what provides
+        // the name, so the recorded answer stays.
+        lock.apply_providers_query("t", &sysroot, &["virt".to_string()], None);
+        assert_eq!(lock.get_sysroot_providers("t", &sysroot), Some(&recorded));
+    }
+
+    #[test]
+    fn whatprovides_apply_replaces_the_entry_with_the_query_result() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers("t", &sysroot, providers_of(&[("old", &["x 1-r0.noarch"])]));
+        lock.apply_providers_query(
+            "t",
+            &sysroot,
+            &["virt".to_string()],
+            Some(providers_of(&[("virt", &["real 1.0-r0.x86_64"])])),
+        );
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_apply_records_only_names_another_package_provides() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        // A version query that failed leaves every declared name unresolved,
+        // and rpm then answers a plain package with itself. That is not a
+        // Provides, so it must not land in the map.
+        lock.apply_providers_query(
+            "t",
+            &sysroot,
+            &["busybox".to_string(), "virt".to_string()],
+            Some(providers_of(&[
+                ("busybox", &["busybox 1.36-r0.x86_64"]),
+                ("virt", &["busybox 1.36-r0.x86_64", "virt 2.0-r0.noarch"]),
+            ])),
+        );
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["busybox 1.36-r0.x86_64"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_copied_across_lock_clones() {
+        let sysroot = SysrootType::Rootfs;
+        let mut clone = LockFile::new();
+        clone.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("virt", &["real 1.0-r0.x86_64"])]),
+        );
+        let mut final_lock = LockFile::new();
+        final_lock.copy_sysroot_providers_from(&clone, "t", &sysroot);
+        assert_eq!(
+            final_lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
+        );
+
+        // A clone with no entry clears a stale one rather than leaving it.
+        let empty_clone = LockFile::new();
+        final_lock.copy_sysroot_providers_from(&empty_clone, "t", &sysroot);
+        assert_eq!(final_lock.get_sysroot_providers("t", &sysroot), None);
+
+        // Another sysroot's entry is untouched.
+        let other = SysrootType::Initramfs;
+        final_lock.set_sysroot_providers("t", &other, providers_of(&[("v", &["p 1-r0.x86_64"])]));
+        final_lock.copy_sysroot_providers_from(&empty_clone, "t", &sysroot);
+        assert!(final_lock.get_sysroot_providers("t", &other).is_some());
+    }
+
+    #[test]
+    fn whatprovides_lock_without_providers_round_trips_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = LockFile::new();
+        lock.update_sysroot_versions(
+            "t",
+            &SysrootType::Rootfs,
+            HashMap::from([("real".to_string(), "1.0-r0.x86_64".to_string())]),
+        );
+        lock.save(dir.path()).unwrap();
+        let path = LockFile::get_path(dir.path());
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(!first.contains("providers"), "{first}");
+
+        let mut loaded = LockFile::load(dir.path()).unwrap();
+        assert_eq!(loaded.version, LOCKFILE_VERSION);
+        loaded.save(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn whatprovides_empty_map_removes_the_entry() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Rootfs;
+        lock.set_sysroot_providers("t", &sysroot, providers_of(&[("v", &["a 1-r0.x"])]));
+        lock.set_sysroot_providers("t", &sysroot, HashMap::new());
+        assert!(lock.get_sysroot_providers("t", &sysroot).is_none());
+        assert!(lock.targets["t"].providers.is_empty());
+    }
+
+    #[test]
+    fn whatprovides_cleared_with_the_sysroot_packages() {
+        let mut lock = LockFile::new();
+        let rt_ext = runtime_ext("dev", "foo");
+        lock.set_sysroot_providers("t", &rt_ext, providers_of(&[("v", &["a 1-r0.x"])]));
+        lock.set_sysroot_providers(
+            "t",
+            &SysrootType::Rootfs,
+            providers_of(&[("v", &["b 1-r0.x"])]),
+        );
+
+        lock.clear_sysroot_packages("t", &rt_ext);
+
+        assert!(lock.get_sysroot_providers("t", &rt_ext).is_none());
+        assert!(lock
+            .get_sysroot_providers("t", &SysrootType::Rootfs)
+            .is_some());
+    }
+
+    #[test]
+    fn whatprovides_cleared_with_the_extension_and_runtime() {
+        let p = || providers_of(&[("v", &["a 1-r0.x"])]);
+        let mut lock = LockFile::new();
+        let global_ext = SysrootType::Extension("foo".to_string());
+        let other_ext = SysrootType::Extension("bar".to_string());
+        let rt_foo = runtime_ext("dev", "foo");
+        let rt_bar = runtime_ext("dev", "bar");
+        let rt = SysrootType::Runtime("dev".to_string());
+        let other_rt = SysrootType::Runtime("prod".to_string());
+        let sdk = SysrootType::Sdk("x86_64".to_string());
+        for s in [
+            &global_ext,
+            &other_ext,
+            &rt_foo,
+            &rt_bar,
+            &rt,
+            &other_rt,
+            &sdk,
+            &SysrootType::Rootfs,
+            &SysrootType::Initramfs,
+            &SysrootType::TargetSysroot,
+        ] {
+            lock.set_sysroot_providers("t", s, p());
+        }
+
+        lock.clear_extension("t", "foo");
+        assert!(lock.get_sysroot_providers("t", &global_ext).is_none());
+        assert!(lock.get_sysroot_providers("t", &rt_foo).is_none());
+        assert!(lock.get_sysroot_providers("t", &other_ext).is_some());
+        assert!(lock.get_sysroot_providers("t", &rt_bar).is_some());
+
+        lock.clear_runtime("t", "dev");
+        assert!(lock.get_sysroot_providers("t", &rt).is_none());
+        assert!(lock.get_sysroot_providers("t", &rt_bar).is_none());
+        assert!(lock.get_sysroot_providers("t", &other_rt).is_some());
+        assert!(lock.get_sysroot_providers("t", &other_ext).is_some());
+
+        lock.clear_all_runtimes("t");
+        assert!(lock.get_sysroot_providers("t", &other_rt).is_none());
+        assert!(lock.get_sysroot_providers("t", &other_ext).is_some());
+
+        lock.clear_all_extensions("t");
+        assert!(lock.get_sysroot_providers("t", &other_ext).is_none());
+        assert!(lock.get_sysroot_providers("t", &sdk).is_some());
+
+        lock.clear_sdk("t");
+        assert!(lock.get_sysroot_providers("t", &sdk).is_none());
+        for s in [
+            &SysrootType::Rootfs,
+            &SysrootType::Initramfs,
+            &SysrootType::TargetSysroot,
+        ] {
+            assert!(lock.get_sysroot_providers("t", s).is_some());
+        }
+
+        lock.clear_rootfs("t");
+        lock.clear_initramfs("t");
+        lock.clear_target_sysroot("t");
+        assert!(lock.targets["t"].providers.is_empty());
+    }
+
+    #[test]
+    fn whatprovides_cleared_by_unlock() {
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers(
+            "t",
+            &SysrootType::Rootfs,
+            providers_of(&[("v", &["a 1-r0.x"])]),
+        );
+        lock.set_sysroot_providers(
+            "u",
+            &SysrootType::Rootfs,
+            providers_of(&[("v", &["a 1-r0.x"])]),
+        );
+
+        lock.clear_all("t");
+
+        assert!(lock.targets["t"].providers.is_empty());
+        assert!(lock
+            .get_sysroot_providers("u", &SysrootType::Rootfs)
+            .is_some());
+    }
+
+    #[test]
+    fn whatprovides_dropped_with_a_removed_package() {
+        let mut lock = LockFile::new();
+        let sysroot = SysrootType::Rootfs;
+        lock.update_sysroot_versions(
+            "t",
+            &sysroot,
+            HashMap::from([("real".to_string(), "1-r0.x".to_string())]),
+        );
+        lock.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("v", &["real 1-r0.x"]), ("w", &["real 1-r0.x"])]),
+        );
+
+        lock.remove_packages_from_sysroot("t", &sysroot, &["v".to_string()]);
+
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("w", &["real 1-r0.x"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_lock_with_only_providers_is_not_empty() {
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers(
+            "t",
+            &runtime_ext("dev", "foo"),
+            providers_of(&[("v", &["a 1-r0.x"])]),
+        );
+        assert!(!lock.is_empty());
+        lock.clear_extension("t", "foo");
+        assert!(lock.is_empty());
+    }
+
+    #[test]
+    fn whatprovides_survives_merge_with_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = SysrootType::Rootfs;
+        let mut initial = LockFile::new();
+        initial.update_sysroot_versions(
+            "t",
+            &sysroot,
+            HashMap::from([("real".to_string(), "1-r0.x".to_string())]),
+        );
+        initial.save(dir.path()).unwrap();
+
+        let mut writer_a = LockFile::load(dir.path()).unwrap();
+        let mut writer_b = LockFile::load(dir.path()).unwrap();
+        writer_a.set_sysroot_providers("t", &sysroot, providers_of(&[("v", &["real 1-r0.x"])]));
+        writer_a.save(dir.path()).unwrap();
+        writer_b.set_locked_version("t", &sysroot, "real", "2-r0.x");
+        writer_b.save(dir.path()).unwrap();
+
+        let on_disk = LockFile::load(dir.path()).unwrap();
+        assert_eq!(
+            on_disk.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("v", &["real 1-r0.x"])]))
+        );
+        assert_eq!(
+            on_disk.get_locked_version("t", &sysroot, "real"),
+            Some(&"2-r0.x".to_string())
+        );
+    }
+
+    #[test]
+    fn whatprovides_cleared_section_ignores_disk_providers() {
+        let mut on_disk = LockFile::new();
+        for s in [
+            SysrootType::Rootfs,
+            SysrootType::Initramfs,
+            SysrootType::TargetSysroot,
+        ] {
+            on_disk.set_sysroot_providers("t", &s, providers_of(&[("stale", &["old 1-r0.x"])]));
+        }
+        on_disk.set_sysroot_providers(
+            "t",
+            &SysrootType::Extension("e".to_string()),
+            providers_of(&[("keep", &["k 1-r0.x"])]),
+        );
+
+        // A lock that was never loaded has no base, so removal-by-absence
+        // cannot drop the disk entries; only the cleared flag can.
+        let mut mine = LockFile::new();
+        mine.clear_rootfs("t");
+        mine.clear_initramfs("t");
+        mine.clear_target_sysroot("t");
+        mine.set_sysroot_providers(
+            "t",
+            &SysrootType::Initramfs,
+            providers_of(&[("fresh", &["new 1-r0.x"])]),
+        );
+
+        let merged = mine.merge_with(on_disk);
+
+        assert!(merged
+            .get_sysroot_providers("t", &SysrootType::Rootfs)
+            .is_none());
+        assert!(merged
+            .get_sysroot_providers("t", &SysrootType::TargetSysroot)
+            .is_none());
+        assert_eq!(
+            merged.get_sysroot_providers("t", &SysrootType::Initramfs),
+            Some(&providers_of(&[("fresh", &["new 1-r0.x"])]))
+        );
+        assert!(merged
+            .get_sysroot_providers("t", &SysrootType::Extension("e".to_string()))
+            .is_some());
     }
 }

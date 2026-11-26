@@ -2181,7 +2181,7 @@
         "enable_services": {
           "title": "Enable services",
           "$ref": "#/definitions/stringList",
-          "description": "List of systemd services to enable when the extension is active. Services must be available in the extension or base system.",
+          "description": "Systemd units to enable when the extension is active. Each unit must ship in the extension itself (its packages or its overlay) with an [Install] section naming WantedBy= or RequiredBy=. A template instance (name@instance.service) is enabled through its template when the extension ships the template. To enable a unit that ships in the rootfs, or one without an [Install] section, drop it from this list and ship the symlink in the overlay instead: overlay/etc/systemd/system/<target>.wants/<unit>.",
           "examples": [
             [
               "sshd.socket",

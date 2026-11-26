@@ -880,6 +880,7 @@ impl StampValidationResult {
             unreadable: self.unreadable,
             runs_on: runs_on.map(|s| s.to_string()),
             search_root: None,
+            single_fix: None,
         }
     }
 }
@@ -968,6 +969,42 @@ pub struct StampValidationError {
     pub runs_on: Option<String>,
     /// Where the read looked, when the caller knows.
     pub search_root: Option<StampSearchRoot>,
+    /// One command that fixes every listed layer, shown instead of the
+    /// per-layer fixes.
+    single_fix: Option<String>,
+}
+
+/// Position of a requirement in the order its fix has to run. Extension
+/// install follows rootfs and initramfs install because it seeds each
+/// extension's rpm database from the rootfs.
+fn layer_rank(req: &StampRequirement) -> u8 {
+    match (req.component, req.command) {
+        (StampComponent::Sdk, StampCommand::Compile) => 1,
+        (StampComponent::Sdk, _) => 0,
+        (StampComponent::Rootfs, StampCommand::Install) => 2,
+        (StampComponent::Initramfs, StampCommand::Install) => 3,
+        (StampComponent::Extension, StampCommand::Install) => 4,
+        (StampComponent::Extension, StampCommand::Build) => 5,
+        (StampComponent::Extension, _) => 6,
+        (StampComponent::Runtime, StampCommand::Install) => 7,
+        (StampComponent::Rootfs | StampComponent::Initramfs, _) => 8,
+        (StampComponent::Runtime, StampCommand::Build) => 9,
+        (StampComponent::Runtime, StampCommand::Sign) => 10,
+        (StampComponent::Runtime, _) => 11,
+    }
+}
+
+/// `items` in layer-rank order, ties broken by component name. The sort is
+/// stable, so equal requirements keep their input order.
+fn by_layer_rank<T>(items: &[T], req: impl Fn(&T) -> &StampRequirement) -> Vec<&T> {
+    let mut sorted: Vec<&T> = items.iter().collect();
+    sorted.sort_by(|a, b| {
+        let (a, b) = (req(a), req(b));
+        layer_rank(a)
+            .cmp(&layer_rank(b))
+            .then_with(|| a.component_name.cmp(&b.component_name))
+    });
+    sorted
 }
 
 impl std::error::Error for StampValidationError {}
@@ -1001,16 +1038,63 @@ impl StampValidationError {
         ]
     }
 
-    /// Collect unique fix commands, using runs_on hint for SDK install commands
+    /// Replace the per-layer fix commands with one command that fixes them
+    /// all. The layers are still listed; only the "To fix" section changes.
+    pub fn with_single_fix(mut self, command: String) -> Self {
+        self.single_fix = Some(command);
+        self
+    }
+
+    /// Every missing, stale and unreadable layer as one list in the order their
+    /// fixes have to run. With a single command covering them all, separate
+    /// sections would print a missing extension above a stale rootfs even though
+    /// the rootfs is refreshed first.
+    fn layers_in_fix_order(&self) -> Vec<String> {
+        let mut rows: Vec<(&StampRequirement, String)> = self
+            .missing
+            .iter()
+            .map(|req| (req, "missing".to_string()))
+            .chain(
+                self.stale
+                    .iter()
+                    .map(|(req, reason)| (req, format!("stale: {reason}"))),
+            )
+            .chain(
+                self.unreadable
+                    .iter()
+                    .map(|(req, reason)| (req, format!("unreadable: {reason}"))),
+            )
+            .collect();
+        rows.sort_by(|(a, _), (b, _)| {
+            layer_rank(a)
+                .cmp(&layer_rank(b))
+                .then_with(|| a.component_name.cmp(&b.component_name))
+        });
+        rows.into_iter()
+            .map(|(req, state)| {
+                format!("{} ({}: {})", req.description(), req.relative_path(), state)
+            })
+            .collect()
+    }
+
+    /// Collect unique fix commands in dependency order, using runs_on hint
+    /// for SDK install commands
     fn fix_commands(&self) -> Vec<String> {
+        if let Some(command) = &self.single_fix {
+            return vec![command.clone()];
+        }
         let runs_on_ref = self.runs_on.as_deref();
         let local_arch = get_local_arch();
 
-        let mut fixes: Vec<String> = self
+        let all: Vec<&StampRequirement> = self
             .missing
             .iter()
             .chain(self.stale.iter().map(|(req, _)| req))
             .chain(self.unreadable.iter().map(|(req, _)| req))
+            .collect();
+
+        let fixes: Vec<String> = by_layer_rank(&all, |req| *req)
+            .into_iter()
             .flat_map(|req| {
                 // For SDK install stamps with a different architecture than local,
                 // offer both --runs-on and --sdk-arch alternatives
@@ -1029,9 +1113,13 @@ impl StampValidationError {
                 vec![req.fix_command_with_remote(runs_on_ref)]
             })
             .collect();
-        fixes.sort();
-        fixes.dedup();
+        // A sort by rank leaves duplicates apart (two SDK alternatives
+        // interleave), so keep the first occurrence instead of `dedup`.
+        let mut seen = std::collections::HashSet::new();
         fixes
+            .into_iter()
+            .filter(|fix| seen.insert(fix.clone()))
+            .collect()
     }
 
     /// The record [`Self::print_and_exit`] emits under `--output json`, where
@@ -1071,9 +1159,19 @@ impl StampValidationError {
             OutputLevel::Normal,
         );
 
-        if !self.missing.is_empty() {
+        if self.single_fix.is_some() {
+            print_info(
+                "Steps to refresh, in the order to run them:",
+                OutputLevel::Normal,
+            );
+            for row in self.layers_in_fix_order() {
+                print_info(&format!("  - {row}"), OutputLevel::Normal);
+            }
+        }
+
+        if self.single_fix.is_none() && !self.missing.is_empty() {
             print_info("Missing steps:", OutputLevel::Normal);
-            for req in &self.missing {
+            for req in by_layer_rank(&self.missing, |req| req) {
                 print_info(
                     &format!("  - {} ({})", req.description(), req.relative_path()),
                     OutputLevel::Normal,
@@ -1081,9 +1179,9 @@ impl StampValidationError {
             }
         }
 
-        if !self.stale.is_empty() {
+        if self.single_fix.is_none() && !self.stale.is_empty() {
             print_warning("Stale steps:", OutputLevel::Normal);
-            for (req, reason) in &self.stale {
+            for (req, reason) in by_layer_rank(&self.stale, |(req, _)| req) {
                 print_warning(
                     &format!(
                         "  - {} ({}: {})",
@@ -1096,12 +1194,12 @@ impl StampValidationError {
             }
         }
 
-        if !self.unreadable.is_empty() {
+        if self.single_fix.is_none() && !self.unreadable.is_empty() {
             print_warning(
                 "Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):",
                 OutputLevel::Normal,
             );
-            for (req, reason) in &self.unreadable {
+            for (req, reason) in by_layer_rank(&self.unreadable, |(req, _)| req) {
                 print_warning(
                     &format!(
                         "  - {} ({}: {})",
@@ -1131,17 +1229,25 @@ impl fmt::Display for StampValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{} - dependencies not satisfied\n", self.context)?;
 
-        if !self.missing.is_empty() {
+        if self.single_fix.is_some() {
+            writeln!(f, "  Steps to refresh, in the order to run them:")?;
+            for row in self.layers_in_fix_order() {
+                writeln!(f, "    - {row}")?;
+            }
+            writeln!(f)?;
+        }
+
+        if self.single_fix.is_none() && !self.missing.is_empty() {
             writeln!(f, "  Missing steps:")?;
-            for req in &self.missing {
+            for req in by_layer_rank(&self.missing, |req| req) {
                 writeln!(f, "    - {} ({})", req.description(), req.relative_path())?;
             }
             writeln!(f)?;
         }
 
-        if !self.stale.is_empty() {
+        if self.single_fix.is_none() && !self.stale.is_empty() {
             writeln!(f, "  Stale steps:")?;
-            for (req, reason) in &self.stale {
+            for (req, reason) in by_layer_rank(&self.stale, |(req, _)| req) {
                 writeln!(
                     f,
                     "    - {} ({}: {})",
@@ -1153,12 +1259,12 @@ impl fmt::Display for StampValidationError {
             writeln!(f)?;
         }
 
-        if !self.unreadable.is_empty() {
+        if self.single_fix.is_none() && !self.unreadable.is_empty() {
             writeln!(
                 f,
                 "  Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):"
             )?;
-            for (req, reason) in &self.unreadable {
+            for (req, reason) in by_layer_rank(&self.unreadable, |(req, _)| req) {
                 writeln!(
                     f,
                     "    - {} ({}: {})",
@@ -5113,6 +5219,144 @@ runtime/my-runtime/build.stamp:::null"#,
         assert!(msg.contains("avocado sdk install"));
         assert!(msg.contains("avocado ext install app"));
         assert!(msg.contains("avocado ext build app"));
+    }
+
+    fn three_layer_error() -> StampValidationError {
+        let mut result = StampValidationResult::new();
+        // Added in the order that used to sort wrongly: ext before sdk.
+        result.add_stale(
+            StampRequirement::ext_install("app"),
+            "config hash mismatch".to_string(),
+        );
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        result.add_missing(StampRequirement::sdk_install());
+        result.into_error("Cannot build")
+    }
+
+    #[test]
+    fn stamp_fix_order_sdk_then_rootfs_then_extension() {
+        let fixes = three_layer_error().fix_commands();
+        assert_eq!(
+            fixes,
+            vec![
+                "avocado sdk install".to_string(),
+                "avocado rootfs install".to_string(),
+                "avocado ext install app".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stamp_fix_order_duplicates_keep_first_position() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::ext_install("zed"));
+        result.add_missing(StampRequirement::compile_deps_install());
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_missing(StampRequirement::sdk_install());
+        let fixes = result.into_error("Cannot build").fix_commands();
+        assert_eq!(
+            fixes,
+            vec![
+                "avocado sdk install".to_string(),
+                "avocado ext install app".to_string(),
+                "avocado ext install zed".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_lists_every_layer_and_one_command() {
+        let msg = three_layer_error()
+            .with_single_fix("avocado install -r dev".to_string())
+            .to_string();
+
+        let sdk = msg.find("SDK install").expect("names the SDK layer");
+        let rootfs = msg.find("rootfs install").expect("names the rootfs layer");
+        let ext = msg
+            .find("extension 'app' install")
+            .expect("names the extension layer");
+        assert!(sdk < rootfs && rootfs < ext, "{msg}");
+        assert_eq!(msg.matches("avocado install -r dev").count(), 1, "{msg}");
+        assert!(!msg.contains("avocado ext install"), "{msg}");
+        assert!(!msg.contains("avocado rootfs install"), "{msg}");
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_orders_missing_and_stale_layers_together() {
+        // A missing extension and a stale rootfs: printed as separate Missing
+        // and Stale sections, the extension would come first.
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        let msg = result
+            .into_error("Cannot build")
+            .with_single_fix("avocado install".to_string())
+            .to_string();
+
+        let rootfs = msg.find("rootfs install").expect("names the rootfs layer");
+        let ext = msg
+            .find("extension 'app' install")
+            .expect("names the extension layer");
+        assert!(rootfs < ext, "{msg}");
+        assert!(!msg.contains("Missing steps:"), "{msg}");
+        assert!(!msg.contains("Stale steps:"), "{msg}");
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_rows_name_each_layer_and_its_state() {
+        let missing = StampRequirement::ext_install("app");
+        let stale = StampRequirement::rootfs_install();
+        let unreadable = StampRequirement::sdk_install();
+        let mut result = StampValidationResult::new();
+        result.add_missing(missing.clone());
+        result.add_stale(stale.clone(), "config hash mismatch".to_string());
+        result.add_unreadable(unreadable.clone(), "bad json".to_string());
+        let error = result
+            .into_error("Cannot build")
+            .with_single_fix("avocado install".to_string());
+
+        let row = |req: &StampRequirement, state: &str| {
+            format!("{} ({}: {state})", req.description(), req.relative_path())
+        };
+        assert_eq!(
+            error.layers_in_fix_order(),
+            vec![
+                row(&unreadable, "unreadable: bad json"),
+                row(&stale, "stale: config hash mismatch"),
+                row(&missing, "missing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stamp_fix_order_without_single_fix_keeps_the_separate_sections() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        let msg = result.into_error("Cannot build").to_string();
+        assert!(msg.contains("Missing steps:"), "{msg}");
+        assert!(msg.contains("Stale steps:"), "{msg}");
+        assert!(!msg.contains("Steps to refresh"), "{msg}");
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_applies_to_json_record() {
+        let event = three_layer_error()
+            .with_single_fix("avocado install -r dev".to_string())
+            .json_error_event();
+        let msg = event["message"].as_str().expect("message is a string");
+        assert_eq!(msg.matches("avocado install -r dev").count(), 1, "{msg}");
+        assert!(!msg.contains("avocado ext install"), "{msg}");
+        assert!(msg.contains("extension 'app' install"), "{msg}");
     }
 
     #[test]

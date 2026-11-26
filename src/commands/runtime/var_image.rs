@@ -50,6 +50,7 @@ struct Rendered {
     subvol_mkdir_section: String,
     mkfs_flags: String,
     global_compress_flag: String,
+    compression_probe: String,
     post_creation_section: String,
     device_tree_overlay_section: String,
     var_luks_room: &'static str,
@@ -185,9 +186,41 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
             .and_then(|v| v.get("compression"))
             .and_then(|v| v.as_str());
         match var_compression {
-            Some(c) if c != "no" => format!("    --compress {c}"),
+            Some(c) if c != "no" => {
+                format!("    --compress {}", crate::utils::shell::shell_escape(c))
+            }
             _ => String::new(),
         }
+    };
+
+    // The SDK's mkfs.btrfs may lack an algorithm the config names (zstd needs
+    // build-time support), and the real run fails only after docker priming.
+    // Probing a throwaway image first makes that failure cost nothing.
+    let compression_probe = match merged_runtime
+        .get("var")
+        .and_then(|v| v.get("compression"))
+        .and_then(|v| v.as_str())
+    {
+        Some(c) if c != "no" => {
+            // The value is project config, so it is quoted for both places it
+            // lands: one argument to mkfs, and text inside a double-quoted echo.
+            let arg = crate::utils::shell::shell_escape(c);
+            let shown = crate::utils::shell::shell_escape_double_quoted(c);
+            format!(
+                r#"
+_COMPRESS_PROBE_DIR=$(mktemp -d)
+mkdir "$_COMPRESS_PROBE_DIR/src"
+: > "$_COMPRESS_PROBE_DIR/probe.img"
+if ! _COMPRESS_PROBE_OUT=$(mkfs.btrfs -r "$_COMPRESS_PROBE_DIR/src" --compress {arg} -f "$_COMPRESS_PROBE_DIR/probe.img" 2>&1); then
+    echo "ERROR: var.compression '{shown}' for runtime '$RUNTIME_NAME' is not supported by this SDK's mkfs.btrfs: $_COMPRESS_PROBE_OUT. Set var.compression to an algorithm this SDK's mkfs.btrfs supports, or to 'no'." >&2
+    rm -r "$_COMPRESS_PROBE_DIR"
+    exit 1
+fi
+rm -r "$_COMPRESS_PROBE_DIR"
+"#
+            )
+        }
+        _ => String::new(),
     };
 
     let needs_post_creation = has_ro_subvolumes
@@ -221,11 +254,18 @@ fn prepare(ctx: &VarImageContext) -> Result<Rendered> {
             }
             if let Some(ref comp) = s.compression {
                 if comp != "no" {
+                    // The value can be the runtime's `var.compression`, which
+                    // is project config: quote it for the argument and the echo.
                     commands.push(format!(
                         "btrfs property set /tmp/btrfs-var-setup/{} compression {}",
-                        s.path, comp
+                        s.path,
+                        crate::utils::shell::shell_escape(comp)
                     ));
-                    commands.push(format!("echo \"  {}: compression={}\"", s.path, comp));
+                    commands.push(format!(
+                        "echo \"  {}: compression={}\"",
+                        s.path,
+                        crate::utils::shell::shell_escape_double_quoted(comp)
+                    ));
                 }
             }
         }
@@ -398,6 +438,7 @@ echo "Docker image priming complete.""#,
         } else {
             format!("{global_compress_flag} \\\n")
         },
+        compression_probe,
         post_creation_section,
         device_tree_overlay_section,
         var_luks_room: if var_encrypt(target_arch) { "1" } else { "0" },
@@ -701,6 +742,7 @@ export OUTPUT_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME"
 VAR_DIR="$AVOCADO_PREFIX/runtimes/$RUNTIME_NAME/var-staging"
 export AVOCADO_IMAGES_DIR="$VAR_DIR/lib/avocado/images"
 export AVOCADO_NS_UUID="{namespace_uuid}"
+{compression_probe}
 
 # Resolve the manifest this build produced. `provision` does not know the
 # BUILD_ID that names its directory, so it resolves it the way the hash
@@ -816,6 +858,7 @@ echo "Built var image: ${{FINAL_MB}}MB"
         subvol_mkdir_section = r.subvol_mkdir_section,
         mkfs_flags = r.mkfs_flags,
         global_compress_flag = r.global_compress_flag,
+        compression_probe = r.compression_probe,
         post_creation_section = r.post_creation_section,
         var_luks_room = r.var_luks_room,
         keep_initial_os_rollback = r.keep_initial_os_rollback,
@@ -1556,5 +1599,180 @@ extensions:
             images.iter().map(|i| i.image.as_str()).collect::<Vec<_>>(),
             ["redis"]
         );
+    }
+
+    fn with_compression(value: &str) -> String {
+        format!("{BASE}    var:\n      compression: '{value}'\n")
+    }
+
+    /// Runs the var half under `set -e` against a `mkfs.btrfs` that refuses
+    /// zstd, with TMPDIR confined so leftover scratch directories show.
+    /// Returns (succeeded, stderr, var image length, scratch entries left).
+    #[cfg(unix)]
+    fn run_var_half_without_zstd(script: &str) -> (bool, String, u64, usize) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let prefix = dir.path();
+        let lib = prefix.join("runtimes/test-runtime/var-staging/lib/avocado");
+        std::fs::create_dir_all(lib.join("images")).unwrap();
+        std::fs::create_dir_all(lib.join("runtimes/b1")).unwrap();
+        std::os::unix::fs::symlink("runtimes/b1", lib.join("active")).unwrap();
+        std::fs::write(
+            lib.join("runtimes/b1/manifest.json"),
+            r#"{"os_bundle": {"image_id": "aos1", "sha256": "x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(lib.join("images/aos1.raw"), "bundle").unwrap();
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mkfs = bin.join("mkfs.btrfs");
+        std::fs::write(
+            &mkfs,
+            "#!/bin/sh\nprev=\n\
+             for a in \"$@\"; do\n\
+             if [ \"$prev\" = --compress ]; then\n\
+             case \"$a\" in zstd|zstd:*) echo 'ERROR: zstd support not compiled in'; exit 1 ;; esac\n\
+             fi\n\
+             prev=$a\n\
+             done\n\
+             for a in \"$@\"; do last=$a; done\n\
+             echo img >> \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&mkfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A var.compression always adds the loop-mount post-creation step.
+        for tool in ["losetup", "mount", "umount", "btrfs"] {
+            let path = bin.join(tool);
+            std::fs::write(&path, "#!/bin/sh\necho /dev/loop0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tmp = prefix.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let image = prefix.join("runtimes/test-runtime/avocado-image-var-x86_64.btrfs");
+        std::fs::write(&image, vec![0u8; 4096]).unwrap();
+        let script_path = prefix.join("var.sh");
+        std::fs::write(&script_path, script).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script_path)
+            .env("AVOCADO_PREFIX", prefix)
+            .env("TMPDIR", &tmp)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            std::fs::metadata(&image).unwrap().len(),
+            std::fs::read_dir(&tmp).unwrap().count(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn var_compression_probe_unsupported_value_fails_before_docker_and_image() {
+        let (ok, stderr, image_len, _) =
+            run_var_half_without_zstd(&var_half(&with_compression("zstd:3")));
+        assert!(!ok, "script must fail");
+        assert!(stderr.contains("var.compression 'zstd:3'"), "{stderr}");
+        assert!(
+            stderr.contains("ERROR: zstd support not compiled in"),
+            "{stderr}"
+        );
+        assert_eq!(image_len, 4096, "the var image was rewritten");
+
+        let (_, var) = var_from_declaration(&format!(
+            r#"{BASE}    var:
+      compression: 'zstd:3'
+    extensions:
+      - app
+    packages:
+      avocado-runtime: "*"
+
+extensions:
+  app:
+    version: "1.0.0"
+    docker_images:
+      - {{ image: redis, tag: "7" }}
+"#
+        ));
+        let check = var.find("var.compression '").expect("check rendered");
+        let docker = var.find("dockerd").expect("docker section rendered");
+        assert!(check < docker, "check must precede the docker section");
+    }
+
+    /// The value comes from the project's config, which a user may have taken
+    /// from someone else. It reaches mkfs as one argument and is echoed as text;
+    /// a command substitution inside it must run in neither place.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn var_compression_probe_never_runs_the_configured_value_as_shell() {
+        let marker_dir = TempDir::new().unwrap();
+        let marker = marker_dir.path().join("ran");
+        let value = format!("zstd:3$(touch {})", marker.display());
+        let (ok, stderr, _, _) = run_var_half_without_zstd(&var_half(&with_compression(&value)));
+        assert!(!ok, "the stand-in mkfs refuses a zstd value");
+        assert!(!marker.exists(), "the config value ran as shell: {stderr}");
+        assert!(
+            stderr.contains(&format!("var.compression '{value}'")),
+            "the error must show the value as written: {stderr}"
+        );
+    }
+
+    /// The probe passes a value the stand-in accepts, so this reaches the real
+    /// image step: the same command substitution must not run there either.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn var_compression_image_step_never_runs_the_configured_value_as_shell() {
+        let marker_dir = TempDir::new().unwrap();
+        let marker = marker_dir.path().join("ran");
+        let value = format!("lzo$(touch {})", marker.display());
+        let (ok, stderr, image_len, _) =
+            run_var_half_without_zstd(&var_half(&with_compression(&value)));
+        assert!(ok, "{stderr}");
+        assert_eq!(image_len, 4, "the real var image step did not run");
+        assert!(!marker.exists(), "the config value ran as shell");
+    }
+
+    #[test]
+    fn var_compression_probe_off_renders_no_check() {
+        for content in [BASE.to_string(), with_compression("no")] {
+            assert!(!var_half(&content).contains("var.compression '"));
+        }
+        assert!(var_half(&with_compression("zstd")).contains("var.compression 'zstd'"));
+    }
+
+    #[test]
+    fn var_compression_probe_covers_the_from_staging_render() {
+        let content = with_compression("zstd");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("avocado.yaml");
+        std::fs::write(&path, &content).unwrap();
+        let config = Config::load(path.to_str().unwrap()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let merged = config
+            .get_merged_runtime_config("test-runtime", "x86_64", path.to_str().unwrap())
+            .unwrap()
+            .unwrap_or_default();
+        let script =
+            render_var_image_from_staging(&ctx_for(&config, &parsed, &merged, &[])).unwrap();
+        assert!(script.contains("var.compression 'zstd'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn var_compression_probe_supported_value_continues_and_cleans_up() {
+        let (ok, stderr, image_len, scratch_left) =
+            run_var_half_without_zstd(&var_half(&with_compression("lzo")));
+        assert!(ok, "{stderr}");
+        assert_eq!(image_len, 4, "the real var image step did not run");
+        assert_eq!(scratch_left, 0, "scratch directory left behind");
     }
 }

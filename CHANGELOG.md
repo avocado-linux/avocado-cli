@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped with a warning. A `--privileged` container still sees the host's
   devices as they were when it started.
 
+### Changed
+- **`avocado.lock` records providers.** A package requested by a Provides name, such as `kernel-module-*`, now has an entry in a new per-sysroot `providers` map naming the package that satisfied it; the existing version map is unchanged.
+- **Off-kernel exclusion covers any package named for another kernel version.** A package whose name ends in `-<version>` of an off-kernel version is now excluded, which can surface a dnf resolution error where an off-kernel package used to install silently.
+- **A kernel block with only `version` is now an error.** It did not select that kernel family, so `runtime build` and `runtime install` now fail naming the runtime and asking for `package:` or `compile:`.
+- **Invalid runtime `kernel:` blocks fail instead of installing the default kernel.** `package` with `compile`, or `compile` without `install`, used to exit 0 with the platform default; the validation error is now reported.
+- **`avocado build` lists every stale install layer in one run.** It checks the SDK, each extension and each runtime and prints one fix command, and stamp fix commands are listed in dependency order.
+- **`enable_services` errors name the overlay `.wants` alternative.** Both errors point to `overlay/etc/systemd/system/<target>.wants/<unit>`, and the schema text no longer claims services can come from the base system.
+
+### Fixed
+- **Unsupported `var.compression` fails before provisioning does any work.** The value is probed with `mkfs.btrfs` first, so it errors before Docker is primed or the var image is touched.
+- **`avocado build` names compile sections it will not run.** It warns once per `sdk.compile` section that no extension, runtime kernel or runtime package references.
+- **A build volume still used by another tree is refused.** A copied project tree no longer silently shares the original's volume, and a moved tree gets a warning.
+- **`runtime install` warns when a top-level `kernel.package` is ignored.** It applies to a runtime with no `kernel:` entry, where the package was silently not installed.
+
 ## [1.2.0] - 2026-11-19
 
 ### Added

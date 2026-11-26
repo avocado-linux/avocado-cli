@@ -3596,6 +3596,72 @@ impl SdkContainer {
             .unwrap_or_default()
     }
 
+    /// Which installed packages provide each requested name, best effort.
+    ///
+    /// A request such as `kernel-module-foo` can be satisfied by a package with
+    /// a different name, so `rpm -q <name>` finds nothing and the version map
+    /// never holds it. This resolves those names with `--whatprovides` so the
+    /// lock can record what satisfied them. The query never fails the install:
+    /// an empty list runs no container and answers an empty map, and a failed
+    /// run answers `None` with a warning. `None` and an empty map differ on
+    /// purpose: the first means the question was not answered, so the lock
+    /// keeps what it has, and the second means nothing provides the names.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_installed_providers(
+        &self,
+        sysroot: &crate::utils::lockfile::SysrootType,
+        names: &[String],
+        container_image: &str,
+        target: &str,
+        repo_url: Option<String>,
+        repo_release: Option<String>,
+        container_args: Option<Vec<String>>,
+        runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
+        sdk_arch: Option<&String>,
+        env_vars: Option<std::collections::HashMap<String, String>>,
+    ) -> Option<std::collections::HashMap<String, Vec<String>>> {
+        if names.is_empty() {
+            return Some(std::collections::HashMap::new());
+        }
+        let run_config = RunConfig {
+            container_image: container_image.to_string(),
+            target: target.to_string(),
+            command: sysroot
+                .get_rpm_query_config()
+                .build_provides_query_command(names),
+            verbose: self.verbose,
+            source_environment: false,
+            use_entrypoint: true,
+            interactive: false,
+            repo_url,
+            repo_release,
+            container_args,
+            sdk_arch: sdk_arch.cloned(),
+            env_vars,
+            ..Default::default()
+        };
+        let output = match runs_on_context {
+            Some(ctx) => {
+                self.run_in_container_with_output_remote(&run_config, ctx)
+                    .await
+            }
+            None => self.run_in_container_with_output(run_config).await,
+        };
+        match output {
+            Ok(Some(output)) => Some(crate::utils::lockfile::parse_provides_output(&output)),
+            _ => {
+                print_info(
+                    &format!(
+                        "Warning: providers query for lock file failed for: {}",
+                        names.join(", ")
+                    ),
+                    OutputLevel::Normal,
+                );
+                None
+            }
+        }
+    }
+
     /// Run a command in a remote container and capture its output
     ///
     /// This is similar to `run_in_container_with_output` but uses the provided
@@ -8018,5 +8084,80 @@ extensions:
         let cli = vec!["--network=host".to_string()];
         let effective = composed.config.merge_sdk_container_args(Some(&cli));
         assert_loopback_decision(effective, true);
+    }
+    /// A container tool that records each invocation in `marker` and fails, so
+    /// a test can tell "no container was started" from "a container was started
+    /// and the command failed".
+    fn recording_failing_tool(dir: &Path, marker: &Path) -> SdkContainer {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = dir.join("fake-container-tool");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SdkContainer {
+            container_tool: tool.display().to_string(),
+            cwd: dir.to_path_buf(),
+            ..SdkContainer::new()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn query_installed_providers_empty_names_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked");
+        let container = recording_failing_tool(dir.path(), &marker);
+        let providers = container
+            .query_installed_providers(
+                &crate::utils::lockfile::SysrootType::Rootfs,
+                &[],
+                "test-image",
+                "qemuarm64",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(
+            providers,
+            Some(std::collections::HashMap::new()),
+            "no names is answered, with nothing providing them"
+        );
+        assert!(!marker.exists(), "no container tool may be invoked");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn query_installed_providers_failed_run_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked");
+        let container = recording_failing_tool(dir.path(), &marker);
+        let providers = container
+            .query_installed_providers(
+                &crate::utils::lockfile::SysrootType::Rootfs,
+                &["kernel-module-foo".to_string()],
+                "test-image",
+                "qemuarm64",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        // `None`, not an empty map: the caller keeps the lock's recorded
+        // providers for a question that was never answered.
+        assert_eq!(providers, None, "a failed query must not read as an answer");
+        assert!(
+            marker.exists(),
+            "a non-empty name list must start a container tool run"
+        );
     }
 }

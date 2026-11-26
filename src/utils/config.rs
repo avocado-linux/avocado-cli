@@ -875,6 +875,15 @@ impl KernelConfig {
     }
 }
 
+/// Result of [`Config::runtime_kernel_selection`].
+#[derive(Debug, Clone)]
+pub struct KernelSelection {
+    /// The runtime's kernel block, `None` when it declares none.
+    pub config: Option<KernelConfig>,
+    /// A non-fatal note for the caller to print once.
+    pub warning: Option<String>,
+}
+
 /// A kernel reference on a runtime: either a name pointing at a top-level
 /// `kernel.<name>` definition, or an inline anonymous override.
 ///
@@ -4438,6 +4447,58 @@ impl Config {
             .validate()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Some(kernel_config))
+    }
+
+    /// [`Self::get_kernel_config_from_runtime`] for a named runtime: every
+    /// error carries the runtime name so a failure reads the same wherever
+    /// the lookup runs. Callers propagate it rather than treating an invalid
+    /// kernel block as an absent one.
+    pub fn runtime_kernel_selection(
+        runtime_name: &str,
+        merged_runtime: &serde_yaml::Value,
+        top_level_kernels: Option<&HashMap<String, KernelConfig>>,
+    ) -> Result<KernelSelection> {
+        let config = Self::get_kernel_config_from_runtime(merged_runtime, top_level_kernels)
+            .map_err(|e| {
+                // `{e:#}` keeps the cause chain: a parse failure is wrapped in
+                // a context, and `to_string` would print only the context.
+                let msg = format!("{e:#}");
+                // A block with neither `package` nor `compile` installs no
+                // kernel image, so say how to fix it. Matched on the
+                // validate() text, which is kept stable for this purpose.
+                if msg.contains("either 'package' or 'compile' must be set") {
+                    anyhow::anyhow!(
+                        "runtime '{runtime_name}': {msg}; add `package:` (for example \
+                         `package: kernel-image`) or `compile:`"
+                    )
+                } else {
+                    anyhow::anyhow!("runtime '{runtime_name}': {msg}")
+                }
+            })?;
+        Ok(KernelSelection {
+            config,
+            warning: None,
+        })
+    }
+
+    /// The top-level `kernel.package` that `merged_runtime` leaves uninstalled.
+    ///
+    /// A runtime installs a kernel image only through its own `kernel:` entry;
+    /// the top-level block is reached by reference, never inherited. A runtime
+    /// with no entry silently skips the package while the top-level version
+    /// still pins kernel-versioned packages, so callers warn with this name.
+    /// `merged_runtime` is the target-merged value, so a `kernel:` inside a
+    /// `target-<t>:` block counts as set.
+    pub fn ignored_top_level_kernel_package(
+        &self,
+        merged_runtime: &serde_yaml::Value,
+    ) -> Option<String> {
+        let package = self.kernel_default()?.package.as_ref()?;
+        match merged_runtime.get("kernel") {
+            None => Some(package.clone()),
+            Some(v) if v.is_null() => Some(package.clone()),
+            Some(_) => None,
+        }
     }
 
     /// Get all runtime names defined in the configuration
@@ -8160,6 +8221,70 @@ pub fn find_active_compile_sections(
     Ok(active_sections)
 }
 
+/// Find the `sdk.compile` section names that `find_active_compile_sections`
+/// does not select for the same arguments, and that no active extension's
+/// target-merged `packages` names either, sorted.
+///
+/// `avocado build` only runs the active sections, so these are the ones a user
+/// may have written expecting them to run.
+pub fn find_unreferenced_compile_sections(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    active_extensions: &std::collections::HashSet<String>,
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(declared) = parsed
+        .get("sdk")
+        .and_then(|s| s.get("compile"))
+        .and_then(|c| c.as_mapping())
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut active: std::collections::HashSet<String> = find_active_compile_sections(
+        config,
+        parsed,
+        active_extensions,
+        target,
+        config_path,
+        requested_runtime,
+    )?
+    .into_iter()
+    .collect();
+
+    // `find_active_compile_sections` reads each extension's raw `packages`,
+    // but ext build runs the compile sections of the target-merged extension.
+    // A reference only a target override carries would be reported as unused
+    // and then run, so count what the merged extension names too. A failed
+    // merge adds nothing: this helper only warns.
+    for ext_name in active_extensions {
+        let merged = config
+            .get_merged_ext_config(ext_name, target, config_path)
+            .ok()
+            .flatten();
+        let packages = merged
+            .as_ref()
+            .and_then(|m| m.get("packages"))
+            .and_then(|p| p.as_mapping());
+        for (_name, spec) in packages.into_iter().flatten() {
+            if let Some(section) = spec.get("compile").and_then(|c| c.as_str()) {
+                active.insert(section.to_string());
+            }
+        }
+    }
+
+    let mut unreferenced: Vec<String> = declared
+        .keys()
+        .filter_map(|k| k.as_str())
+        .filter(|name| !active.contains(*name))
+        .map(String::from)
+        .collect();
+    unreferenced.sort();
+    Ok(unreferenced)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -8853,6 +8978,140 @@ extensions:
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         find_active_compile_sections(&config, &parsed, active_extensions, target, &path, None)
             .unwrap()
+    }
+
+    fn unreferenced_compile_sections_for(
+        config_content: &str,
+        active_extensions: &[&str],
+    ) -> Vec<String> {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let exts = active_extensions.iter().map(|e| e.to_string()).collect();
+        find_unreferenced_compile_sections(&config, &parsed, &exts, "qemux86-64", &path, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_an_active_extension_is_not_listed() {
+        let config = r#"
+extensions:
+  app:
+    version: "1.0.0"
+    packages:
+      app-lib:
+        compile: app-lib
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    app-lib:
+      compile: app-lib.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &["app"]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_an_extension_target_override_is_not_listed() {
+        // Ext build reads the target-merged extension, so a compile reference
+        // that only the target override carries still runs.
+        let config = r#"
+extensions:
+  app:
+    version: "1.0.0"
+    qemux86-64:
+      packages:
+        app-lib:
+          compile: app-lib
+          install: app-lib-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    app-lib:
+      compile: app-lib.sh
+    unused:
+      compile: unused.sh
+"#;
+        assert_eq!(
+            unreferenced_compile_sections_for(config, &["app"]),
+            vec!["unused".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_a_runtime_kernel_compile_is_not_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+      install: kernel-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    kernel:
+      compile: kernel-compile.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &[]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_a_runtime_package_compile_is_not_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    packages:
+      uboot:
+        compile: uboot
+        install: uboot-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot:
+      compile: uboot-compile.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &[]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_unused_section_is_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+      install: kernel-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    zeta:
+      compile: zeta.sh
+    kernel:
+      compile: kernel-compile.sh
+    alpha:
+      compile: alpha.sh
+"#;
+        assert_eq!(
+            unreferenced_compile_sections_for(config, &[]),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_no_sdk_compile_is_empty() {
+        let config = r#"
+runtimes:
+  dev:
+    extensions: [app]
+extensions:
+  app:
+    version: "1.0.0"
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+"#;
+        assert!(unreferenced_compile_sections_for(config, &["app"]).is_empty());
     }
 
     /// `install -r prod -t qemux86-64`, where only `dev` builds for that
@@ -14034,6 +14293,220 @@ packages:
 
         let result = Config::get_kernel_config_from_runtime(&yaml, None).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn characterize_kernel_version_only_block_fails_validation() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+kernel:
+  version: '6.8.*'
+"#,
+        )
+        .unwrap();
+
+        let err = Config::get_kernel_config_from_runtime(&yaml, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("either 'package' or 'compile' must be set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn runtime_with_kernel(kernel_yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!("kernel:\n{kernel_yaml}")).unwrap()
+    }
+
+    fn config_with_top_level_kernel(extra: &str) -> Config {
+        Config::load_from_yaml_str(&format!(
+            "kernel:\n  package: kernel-image\n  version: '6.8.*'\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_runtime_without_kernel_returns_the_package() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        assert_eq!(
+            config.ignored_top_level_kernel_package(&merged).as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_null_kernel_returns_the_package() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("kernel: null").unwrap();
+        assert_eq!(
+            config.ignored_top_level_kernel_package(&merged).as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_named_reference_returns_none() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev:\n    kernel: default\n");
+        let merged: serde_yaml::Value = serde_yaml::from_str("kernel: default").unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_inline_block_returns_none() {
+        let config = config_with_top_level_kernel("runtimes:\n  dev: {}\n");
+        let merged = runtime_with_kernel("  package: other-kernel\n");
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_kernel_in_a_target_block_returns_none() {
+        let yaml = "kernel:\n  package: kernel-image\nruntimes:\n  dev:\n    packages:\n      avocado-runtime: '*'\n    target-qemux86-64:\n      kernel:\n        package: other-kernel\n";
+        let config = Config::load_from_yaml_str(yaml).unwrap();
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(file.path(), yaml).unwrap();
+        let path = file.path().to_str().unwrap();
+
+        let on_target = config
+            .get_merged_runtime_config("dev", "qemux86-64", path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&on_target), None);
+
+        // Another target has no kernel entry, so the package is ignored there.
+        let off_target = config
+            .get_merged_runtime_config("dev", "qemuarm64", path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config
+                .ignored_top_level_kernel_package(&off_target)
+                .as_deref(),
+            Some("kernel-image")
+        );
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_no_top_level_package_returns_none() {
+        let config =
+            Config::load_from_yaml_str("kernel:\n  version: '6.8.*'\nruntimes:\n  dev: {}\n")
+                .unwrap();
+        let merged: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+
+        let no_kernel = Config::load_from_yaml_str("runtimes:\n  dev: {}\n").unwrap();
+        assert_eq!(no_kernel.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn ignored_top_level_kernel_package_implicit_default_runtime_returns_none() {
+        let config = config_with_top_level_kernel("default_target: qemux86-64\n");
+        let synthesized = config
+            .runtimes
+            .as_ref()
+            .and_then(|m| m.get("default"))
+            .expect("implicit default runtime");
+        let merged = serde_yaml::to_value(synthesized).unwrap();
+        assert_eq!(config.ignored_top_level_kernel_package(&merged), None);
+    }
+
+    #[test]
+    fn runtime_kernel_selection_package_and_compile_is_an_error_naming_the_runtime() {
+        let rt = runtime_with_kernel("  package: kernel-image\n  compile: k\n  install: i.sh\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "runtime 'dev': Validation error: kernel config: 'package' and 'compile' are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn runtime_kernel_selection_compile_without_install_is_an_error() {
+        let rt = runtime_with_kernel("  compile: k\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "runtime 'dev': Validation error: kernel config: 'compile' requires 'install' to be set"
+        );
+    }
+
+    #[test]
+    fn runtime_kernel_selection_package_block_is_selected() {
+        let rt = runtime_with_kernel("  package: kernel-image\n  version: '6.8.*'\n");
+        let sel = Config::runtime_kernel_selection("dev", &rt, None).unwrap();
+        let kc = sel.config.unwrap();
+        assert_eq!(kc.package.as_deref(), Some("kernel-image"));
+        assert_eq!(kc.version.as_deref(), Some("6.8.*"));
+        assert!(sel.warning.is_none());
+    }
+
+    #[test]
+    fn runtime_kernel_selection_absent_block_is_none() {
+        let rt: serde_yaml::Value = serde_yaml::from_str("packages: {}").unwrap();
+        let sel = Config::runtime_kernel_selection("dev", &rt, None).unwrap();
+        assert!(sel.config.is_none());
+        assert!(sel.warning.is_none());
+    }
+
+    #[test]
+    fn runtime_kernel_selection_version_only_block_is_an_error_naming_package() {
+        let rt = runtime_with_kernel("  version: '6.8.*'\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("runtime 'dev': "),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("either 'package' or 'compile' must be set"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("add `package:` (for example `package: kernel-image`) or `compile:`"),
+            "unexpected error: {msg}"
+        );
+    }
+    #[test]
+    fn runtime_kernel_selection_parse_error_keeps_the_serde_reason() {
+        let rt = runtime_with_kernel("  package: [kernel-image, other]\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("runtime 'dev': "),
+            "unexpected error: {msg}"
+        );
+        let cause = msg
+            .split_once("Failed to parse kernel configuration: ")
+            .map(|(_, cause)| cause)
+            .unwrap_or_default();
+        assert!(!cause.is_empty(), "the parse cause is missing: {msg}");
+    }
+
+    #[test]
+    fn characterize_kernel_version_only_block_still_pins() {
+        let yaml = r#"
+runtimes:
+  dev:
+    kernel:
+      version: '6.8.*'
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let spec = config.effective_kernel_spec(Some("dev")).unwrap().unwrap();
+        assert!(spec.matches("6.8.12"));
+        assert!(!spec.matches("6.18.35"));
+    }
+
+    #[test]
+    fn characterize_kernel_top_level_package_ignored_by_explicit_runtime() {
+        let yaml = r#"
+kernel:
+  package: kernel-image
+  version: '6.8.*'
+runtimes:
+  dev: {}
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.resolve_runtime_kernel("dev").is_none());
+        assert!(config.effective_kernel_spec(Some("dev")).unwrap().is_some());
     }
 
     #[test]
