@@ -1040,11 +1040,41 @@ impl StampValidationError {
 
     /// Replace the per-layer fix commands with one command that fixes them
     /// all. The layers are still listed; only the "To fix" section changes.
-    // The build pre-flight is the only caller; drop this attribute there.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_single_fix(mut self, command: String) -> Self {
         self.single_fix = Some(command);
         self
+    }
+
+    /// Every missing, stale and unreadable layer as one list in the order their
+    /// fixes have to run. With a single command covering them all, separate
+    /// sections would print a missing extension above a stale rootfs even though
+    /// the rootfs is refreshed first.
+    fn layers_in_fix_order(&self) -> Vec<String> {
+        let mut rows: Vec<(&StampRequirement, String)> = self
+            .missing
+            .iter()
+            .map(|req| (req, "missing".to_string()))
+            .chain(
+                self.stale
+                    .iter()
+                    .map(|(req, reason)| (req, format!("stale: {reason}"))),
+            )
+            .chain(
+                self.unreadable
+                    .iter()
+                    .map(|(req, reason)| (req, format!("unreadable: {reason}"))),
+            )
+            .collect();
+        rows.sort_by(|(a, _), (b, _)| {
+            layer_rank(a)
+                .cmp(&layer_rank(b))
+                .then_with(|| a.component_name.cmp(&b.component_name))
+        });
+        rows.into_iter()
+            .map(|(req, state)| {
+                format!("{} ({}: {})", req.description(), req.relative_path(), state)
+            })
+            .collect()
     }
 
     /// Collect unique fix commands in dependency order, using runs_on hint
@@ -1129,7 +1159,17 @@ impl StampValidationError {
             OutputLevel::Normal,
         );
 
-        if !self.missing.is_empty() {
+        if self.single_fix.is_some() {
+            print_info(
+                "Steps to refresh, in the order to run them:",
+                OutputLevel::Normal,
+            );
+            for row in self.layers_in_fix_order() {
+                print_info(&format!("  - {row}"), OutputLevel::Normal);
+            }
+        }
+
+        if self.single_fix.is_none() && !self.missing.is_empty() {
             print_info("Missing steps:", OutputLevel::Normal);
             for req in by_layer_rank(&self.missing, |req| req) {
                 print_info(
@@ -1139,7 +1179,7 @@ impl StampValidationError {
             }
         }
 
-        if !self.stale.is_empty() {
+        if self.single_fix.is_none() && !self.stale.is_empty() {
             print_warning("Stale steps:", OutputLevel::Normal);
             for (req, reason) in by_layer_rank(&self.stale, |(req, _)| req) {
                 print_warning(
@@ -1154,7 +1194,7 @@ impl StampValidationError {
             }
         }
 
-        if !self.unreadable.is_empty() {
+        if self.single_fix.is_none() && !self.unreadable.is_empty() {
             print_warning(
                 "Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):",
                 OutputLevel::Normal,
@@ -1189,7 +1229,15 @@ impl fmt::Display for StampValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{} - dependencies not satisfied\n", self.context)?;
 
-        if !self.missing.is_empty() {
+        if self.single_fix.is_some() {
+            writeln!(f, "  Steps to refresh, in the order to run them:")?;
+            for row in self.layers_in_fix_order() {
+                writeln!(f, "    - {row}")?;
+            }
+            writeln!(f)?;
+        }
+
+        if self.single_fix.is_none() && !self.missing.is_empty() {
             writeln!(f, "  Missing steps:")?;
             for req in by_layer_rank(&self.missing, |req| req) {
                 writeln!(f, "    - {} ({})", req.description(), req.relative_path())?;
@@ -1197,7 +1245,7 @@ impl fmt::Display for StampValidationError {
             writeln!(f)?;
         }
 
-        if !self.stale.is_empty() {
+        if self.single_fix.is_none() && !self.stale.is_empty() {
             writeln!(f, "  Stale steps:")?;
             for (req, reason) in by_layer_rank(&self.stale, |(req, _)| req) {
                 writeln!(
@@ -1211,7 +1259,7 @@ impl fmt::Display for StampValidationError {
             writeln!(f)?;
         }
 
-        if !self.unreadable.is_empty() {
+        if self.single_fix.is_none() && !self.unreadable.is_empty() {
             writeln!(
                 f,
                 "  Unreadable steps (stamp exists but could not be parsed; rerunning the step rewrites it):"
@@ -5234,6 +5282,70 @@ runtime/my-runtime/build.stamp:::null"#,
         assert_eq!(msg.matches("avocado install -r dev").count(), 1, "{msg}");
         assert!(!msg.contains("avocado ext install"), "{msg}");
         assert!(!msg.contains("avocado rootfs install"), "{msg}");
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_orders_missing_and_stale_layers_together() {
+        // A missing extension and a stale rootfs: printed as separate Missing
+        // and Stale sections, the extension would come first.
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        let msg = result
+            .into_error("Cannot build")
+            .with_single_fix("avocado install".to_string())
+            .to_string();
+
+        let rootfs = msg.find("rootfs install").expect("names the rootfs layer");
+        let ext = msg
+            .find("extension 'app' install")
+            .expect("names the extension layer");
+        assert!(rootfs < ext, "{msg}");
+        assert!(!msg.contains("Missing steps:"), "{msg}");
+        assert!(!msg.contains("Stale steps:"), "{msg}");
+    }
+
+    #[test]
+    fn stamp_fix_order_single_fix_rows_name_each_layer_and_its_state() {
+        let missing = StampRequirement::ext_install("app");
+        let stale = StampRequirement::rootfs_install();
+        let unreadable = StampRequirement::sdk_install();
+        let mut result = StampValidationResult::new();
+        result.add_missing(missing.clone());
+        result.add_stale(stale.clone(), "config hash mismatch".to_string());
+        result.add_unreadable(unreadable.clone(), "bad json".to_string());
+        let error = result
+            .into_error("Cannot build")
+            .with_single_fix("avocado install".to_string());
+
+        let row = |req: &StampRequirement, state: &str| {
+            format!("{} ({}: {state})", req.description(), req.relative_path())
+        };
+        assert_eq!(
+            error.layers_in_fix_order(),
+            vec![
+                row(&unreadable, "unreadable: bad json"),
+                row(&stale, "stale: config hash mismatch"),
+                row(&missing, "missing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stamp_fix_order_without_single_fix_keeps_the_separate_sections() {
+        let mut result = StampValidationResult::new();
+        result.add_missing(StampRequirement::ext_install("app"));
+        result.add_stale(
+            StampRequirement::rootfs_install(),
+            "config hash mismatch".to_string(),
+        );
+        let msg = result.into_error("Cannot build").to_string();
+        assert!(msg.contains("Missing steps:"), "{msg}");
+        assert!(msg.contains("Stale steps:"), "{msg}");
+        assert!(!msg.contains("Steps to refresh"), "{msg}");
     }
 
     #[test]

@@ -78,6 +78,58 @@ pub struct RuntimeBuildCommand {
     pub tui_context: Option<TuiContext>,
 }
 
+/// Free-function body of [`RuntimeBuildCommand::sysroot_install_inputs`], so
+/// `avocado build`'s pre-flight compares the same hashes this build does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sysroot_install_inputs(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    config_path: &str,
+    target_board: Option<&str>,
+    dnf_args: Option<&[String]>,
+    target_arch: &str,
+    repo_url: Option<&String>,
+    repo_release: Option<&String>,
+) -> Result<Vec<(StampComponent, StampInputs)>> {
+    let src_dir = config.project_root(config_path);
+    let lock_file = LockFile::load(&src_dir)?;
+
+    // An install exports the pin through AVOCADO_RELEASEVER before
+    // reading `repo_release`; build resolves nothing, so it reads the pin
+    // from the lock. The pin must win over the live value.
+    let pinned = pinned_releasever(config, &lock_file, target_arch);
+    let repo_release = pinned.as_deref().or(repo_release.map(String::as_str));
+
+    let mut inputs = Vec::new();
+    for (component, sysroot_type) in [
+        (StampComponent::Rootfs, SysrootType::Rootfs),
+        (StampComponent::Initramfs, SysrootType::Initramfs),
+    ] {
+        let Some(packages) = sysroot_packages(config, &sysroot_type, target_arch, Some(parsed))?
+        else {
+            continue;
+        };
+        if let Some(computed) = compute_sysroot_install_inputs(
+            &SysrootStampContext {
+                sysroot_type: &sysroot_type,
+                config,
+                parsed,
+                src_dir: &src_dir,
+                target: target_arch,
+                target_board,
+                repo_url: repo_url.map(String::as_str),
+                repo_release,
+                dnf_args,
+                lock_file: &lock_file,
+            },
+            &packages,
+        )? {
+            inputs.push((component, computed));
+        }
+    }
+    Ok(inputs)
+}
+
 impl RuntimeBuildCommand {
     pub fn new(
         runtime_name: String,
@@ -282,44 +334,16 @@ impl RuntimeBuildCommand {
         repo_url: Option<&String>,
         repo_release: Option<&String>,
     ) -> Result<Vec<(StampComponent, StampInputs)>> {
-        let src_dir = config.project_root(&self.config_path);
-        let lock_file = LockFile::load(&src_dir)?;
-
-        // An install exports the pin through AVOCADO_RELEASEVER before
-        // reading `repo_release`; build resolves nothing, so it reads the pin
-        // from the lock. The pin must win over the live value.
-        let pinned = pinned_releasever(config, &lock_file, target_arch);
-        let repo_release = pinned.as_deref().or(repo_release.map(String::as_str));
-
-        let mut inputs = Vec::new();
-        for (component, sysroot_type) in [
-            (StampComponent::Rootfs, SysrootType::Rootfs),
-            (StampComponent::Initramfs, SysrootType::Initramfs),
-        ] {
-            let Some(packages) =
-                sysroot_packages(config, &sysroot_type, target_arch, Some(parsed))?
-            else {
-                continue;
-            };
-            if let Some(computed) = compute_sysroot_install_inputs(
-                &SysrootStampContext {
-                    sysroot_type: &sysroot_type,
-                    config,
-                    parsed,
-                    src_dir: &src_dir,
-                    target: target_arch,
-                    target_board: self.target_board.as_deref(),
-                    repo_url: repo_url.map(String::as_str),
-                    repo_release,
-                    dnf_args: self.dnf_args.as_deref(),
-                    lock_file: &lock_file,
-                },
-                &packages,
-            )? {
-                inputs.push((component, computed));
-            }
-        }
-        Ok(inputs)
+        sysroot_install_inputs(
+            config,
+            parsed,
+            &self.config_path,
+            self.target_board.as_deref(),
+            self.dnf_args.as_deref(),
+            target_arch,
+            repo_url,
+            repo_release,
+        )
     }
 
     /// What the runtime build hash reads: extension boot settings resolved

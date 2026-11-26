@@ -11,9 +11,14 @@ use crate::commands::{
 };
 use crate::utils::{
     config::{ComposedConfig, Config, ExtensionSource},
-    container::{SdkContainer, TuiContext},
+    container::{RunConfig, SdkContainer, TuiContext},
     output::{print_error, print_info, print_success, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
+    stamps::{
+        compute_ext_install_input_hash_current, compute_runtime_install_input_hash,
+        generate_batch_read_stamps_script, validate_stamps_batch, CurrentInput, StampCommand,
+        StampComponent, StampInputs, StampRequirement, StampValidationResult,
+    },
     tui::{TaskId, TaskRenderer, TaskStatus},
 };
 
@@ -27,6 +32,77 @@ pub enum ExtensionDependency {
         name: String,
         source: ExtensionSource,
     },
+}
+
+/// Every install stamp `avocado build` depends on, in layer order: the SDK,
+/// the target sysroots, one per extension, one per runtime.
+pub(crate) fn build_preflight_requirements(
+    extensions: &[String],
+    runtimes: &[String],
+) -> Vec<StampRequirement> {
+    let mut reqs = build_preflight_base_requirements();
+    reqs.extend(extensions.iter().map(|e| StampRequirement::ext_install(e)));
+    reqs.extend(
+        runtimes
+            .iter()
+            .map(|r| StampRequirement::runtime_install(r)),
+    );
+    reqs
+}
+
+fn build_preflight_base_requirements() -> Vec<StampRequirement> {
+    vec![
+        StampRequirement::sdk_install(),
+        StampRequirement::compile_deps_install(),
+        StampRequirement::rootfs_install(),
+        StampRequirement::initramfs_install(),
+    ]
+}
+
+/// Check the pre-flight stamps against one batch read.
+///
+/// `validate_stamps_batch` matches an input on (component, command) and takes
+/// the first hit, so a call carrying inputs for two extensions would compare
+/// the second against the first's hash. Each extension and runtime therefore
+/// gets its own call with a one-entry input slice.
+pub(crate) fn build_preflight_validate(
+    batch: &str,
+    sdk_and_sysroot: &[(StampComponent, StampInputs)],
+    per_extension: &[(StampRequirement, Option<StampInputs>)],
+    per_runtime: &[(StampRequirement, Option<StampInputs>)],
+) -> StampValidationResult {
+    let base_inputs: Vec<CurrentInput<'_>> = sdk_and_sysroot
+        .iter()
+        .map(|(component, inputs)| (*component, StampCommand::Install, inputs))
+        .collect();
+    let mut merged =
+        validate_stamps_batch(&build_preflight_base_requirements(), batch, &base_inputs);
+
+    for (req, inputs) in per_extension.iter().chain(per_runtime) {
+        let current: Vec<CurrentInput<'_>> = inputs
+            .as_ref()
+            .map(|i| (req.component, req.command, i))
+            .into_iter()
+            .collect();
+        let one = validate_stamps_batch(std::slice::from_ref(req), batch, &current);
+        merged.satisfied.extend(one.satisfied);
+        merged.missing.extend(one.missing);
+        merged.stale.extend(one.stale);
+        merged.unreadable.extend(one.unreadable);
+    }
+    merged
+}
+
+/// The one command that repairs every layer the pre-flight can report.
+pub(crate) fn build_preflight_fix_command(runtime: Option<&str>, runs_on: Option<&str>) -> String {
+    let mut command = "avocado install".to_string();
+    if let Some(runtime) = runtime {
+        command.push_str(&format!(" -r {runtime}"));
+    }
+    if let Some(host) = runs_on {
+        command.push_str(&format!(" --runs-on {host}"));
+    }
+    command
 }
 
 /// Implementation of the 'build' command that runs all build subcommands.
@@ -175,8 +251,6 @@ impl BuildCommand {
         // task list.  This gives the user a clear "run avocado install" message
         // instead of failing mid-build inside a TUI.
         if !self.no_stamps {
-            use crate::utils::stamps::{resolve_required_stamps, StampCommand, StampComponent};
-
             let container_image = config.get_sdk_image().ok_or_else(|| {
                 anyhow::anyhow!("No container image specified in config under 'sdk.image'")
             })?;
@@ -184,17 +258,24 @@ impl BuildCommand {
                 .verbose(false)
                 .with_cli_target_board(self.target_board.clone());
 
-            // Check that SDK install stamp exists (required for all builds).
-            // Use Runtime/Install which just requires sdk_install().
-            let required =
-                resolve_required_stamps(StampCommand::Install, StampComponent::Runtime, None, &[]);
+            // Every install layer, so a stale one surfaces here with one fix
+            // instead of at the first step that happens to read it.
+            let ext_names: Vec<String> = required_extensions
+                .iter()
+                .map(|dep| match dep {
+                    ExtensionDependency::Local(n) => n.clone(),
+                    ExtensionDependency::Remote { name, .. } => name.clone(),
+                })
+                .collect();
+            let required = build_preflight_requirements(&ext_names, &runtimes_to_build);
 
-            let validation = crate::utils::prerequisites::read_stamps_batch(
-                &required,
-                &container_helper,
-                crate::utils::container::RunConfig {
+            let output = container_helper
+                .run_in_container_with_output(RunConfig {
                     container_image: container_image.clone(),
                     target: target.clone(),
+                    command: generate_batch_read_stamps_script(&required),
+                    source_environment: true,
+                    interactive: false,
                     repo_url: config.get_sdk_repo_url(),
                     repo_release: config.get_sdk_repo_release(),
                     container_args: self.container_args.clone(),
@@ -202,11 +283,59 @@ impl BuildCommand {
                     runs_on: self.runs_on.clone(),
                     nfs_port: self.nfs_port,
                     ..Default::default()
-                },
-                None,
-            )
-            .await?
-            .validate(&required, &[]);
+                })
+                .await?
+                .unwrap_or_default();
+
+            let sysroot_inputs = crate::commands::runtime::build::sysroot_install_inputs(
+                config,
+                parsed,
+                &self.config_path,
+                self.target_board.as_deref(),
+                self.dnf_args.as_deref(),
+                &target,
+                config.get_sdk_repo_url().as_ref(),
+                config.get_sdk_repo_release().as_ref(),
+            )?;
+
+            // Resolved as ext build resolves it, so both hash the same lock.
+            let lock_src_dir = config
+                .get_resolved_src_dir(&self.config_path)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&self.config_path)
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf()
+                });
+            let per_extension: Vec<(StampRequirement, Option<StampInputs>)> = ext_names
+                .iter()
+                .map(|name| {
+                    (
+                        StampRequirement::ext_install(name),
+                        compute_ext_install_input_hash_current(
+                            &composed,
+                            name,
+                            &target,
+                            &lock_src_dir,
+                        )
+                        .ok(),
+                    )
+                })
+                .collect();
+            let per_runtime: Vec<(StampRequirement, Option<StampInputs>)> = runtimes_to_build
+                .iter()
+                .map(|name| {
+                    let inputs = config
+                        .get_merged_runtime_config(name, &target, &self.config_path)
+                        .ok()
+                        .flatten()
+                        .and_then(|mr| compute_runtime_install_input_hash(&mr, name).ok());
+                    (StampRequirement::runtime_install(name), inputs)
+                })
+                .collect();
+
+            let validation =
+                build_preflight_validate(&output, &sysroot_inputs, &per_extension, &per_runtime);
 
             if !validation.is_satisfied() {
                 let error = validation
@@ -214,8 +343,11 @@ impl BuildCommand {
                     .with_search_root(crate::utils::stamps::StampSearchRoot::for_container(
                         &container_helper,
                         &target,
+                    ))
+                    .with_single_fix(build_preflight_fix_command(
+                        self.runtime.as_deref(),
+                        self.runs_on.as_deref(),
                     ));
-                // Print the error with fix commands (includes "avocado install")
                 error.print_and_exit();
             }
         }
@@ -872,6 +1004,165 @@ impl BuildCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::stamps::{Stamp, StampComponent, StampInputs, StampRequirement};
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn stamp_line(req: &StampRequirement, hash: &str) -> String {
+        let stamp = Stamp::new(
+            req.command,
+            req.component,
+            req.component_name.clone(),
+            "qemux86-64".to_string(),
+            StampInputs::new(hash.to_string()),
+            Default::default(),
+        );
+        // The batch script strips newlines from each stamp file.
+        let json = stamp.to_json().unwrap().replace('\n', "");
+        format!("{}:::{json}\n", req.relative_path())
+    }
+
+    /// A batch in which every pre-flight requirement is present and current.
+    fn full_batch(hashes: &[(&StampRequirement, &str)]) -> String {
+        hashes.iter().map(|(r, h)| stamp_line(r, h)).collect()
+    }
+
+    #[test]
+    fn build_preflight_requirements_order_and_membership() {
+        let reqs = build_preflight_requirements(&names(&["app", "base"]), &names(&["dev"]));
+        let got: Vec<String> = reqs.iter().map(|r| r.relative_path()).collect();
+        let want: Vec<String> = [
+            StampRequirement::sdk_install(),
+            StampRequirement::compile_deps_install(),
+            StampRequirement::rootfs_install(),
+            StampRequirement::initramfs_install(),
+            StampRequirement::ext_install("app"),
+            StampRequirement::ext_install("base"),
+            StampRequirement::runtime_install("dev"),
+        ]
+        .iter()
+        .map(|r| r.relative_path())
+        .collect();
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 7);
+    }
+
+    #[test]
+    fn build_preflight_requirements_without_extensions() {
+        let reqs = build_preflight_requirements(&[], &names(&["dev"]));
+        assert_eq!(reqs.len(), 5);
+        assert_eq!(
+            reqs.last().unwrap().relative_path(),
+            StampRequirement::runtime_install("dev").relative_path()
+        );
+        assert!(reqs
+            .iter()
+            .all(|r| r.component != StampComponent::Extension));
+    }
+
+    #[test]
+    fn build_preflight_fix_command_plain() {
+        assert_eq!(build_preflight_fix_command(None, None), "avocado install");
+    }
+
+    #[test]
+    fn build_preflight_fix_command_with_runtime() {
+        assert_eq!(
+            build_preflight_fix_command(Some("dev"), None),
+            "avocado install -r dev"
+        );
+    }
+
+    #[test]
+    fn build_preflight_fix_command_with_runs_on() {
+        assert_eq!(
+            build_preflight_fix_command(Some("dev"), Some("user@host")),
+            "avocado install -r dev --runs-on user@host"
+        );
+        assert_eq!(
+            build_preflight_fix_command(None, Some("user@host")),
+            "avocado install --runs-on user@host"
+        );
+    }
+
+    #[test]
+    fn build_preflight_reports_every_stale_layer() {
+        let app = StampRequirement::ext_install("app");
+        let rt = StampRequirement::runtime_install("dev");
+        let batch = full_batch(&[
+            (&StampRequirement::sdk_install(), "x"),
+            (&StampRequirement::compile_deps_install(), "x"),
+            (&StampRequirement::rootfs_install(), "old-rootfs"),
+            (&StampRequirement::initramfs_install(), "initramfs"),
+            (&app, "old-app"),
+            (&rt, "rt"),
+        ]);
+        let result = build_preflight_validate(
+            &batch,
+            &[
+                (
+                    StampComponent::Rootfs,
+                    StampInputs::new("new-rootfs".into()),
+                ),
+                (
+                    StampComponent::Initramfs,
+                    StampInputs::new("initramfs".into()),
+                ),
+            ],
+            &[(app, Some(StampInputs::new("new-app".into())))],
+            &[(rt, Some(StampInputs::new("rt".into())))],
+        );
+        let stale: Vec<String> = result
+            .stale
+            .iter()
+            .map(|(r, _)| r.relative_path())
+            .collect();
+        assert_eq!(
+            stale,
+            vec![
+                StampRequirement::rootfs_install().relative_path(),
+                StampRequirement::ext_install("app").relative_path(),
+            ]
+        );
+        assert!(result.missing.is_empty());
+    }
+
+    #[test]
+    fn build_preflight_two_extensions_reports_only_the_stale_one() {
+        let app = StampRequirement::ext_install("app");
+        let base = StampRequirement::ext_install("base");
+        let rt = StampRequirement::runtime_install("dev");
+        let batch = full_batch(&[
+            (&StampRequirement::sdk_install(), "x"),
+            (&StampRequirement::compile_deps_install(), "x"),
+            (&StampRequirement::rootfs_install(), "r"),
+            (&StampRequirement::initramfs_install(), "i"),
+            (&app, "app-hash"),
+            (&base, "old-base"),
+            (&rt, "rt"),
+        ]);
+        let result = build_preflight_validate(
+            &batch,
+            &[],
+            &[
+                (app, Some(StampInputs::new("app-hash".into()))),
+                (base, Some(StampInputs::new("new-base".into()))),
+            ],
+            &[(rt, Some(StampInputs::new("rt".into())))],
+        );
+        let stale: Vec<String> = result
+            .stale
+            .iter()
+            .map(|(r, _)| r.relative_path())
+            .collect();
+        assert_eq!(
+            stale,
+            vec![StampRequirement::ext_install("base").relative_path()]
+        );
+        assert!(result.missing.is_empty());
+    }
 
     #[test]
     fn test_new() {
