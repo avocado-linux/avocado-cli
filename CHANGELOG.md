@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Signing out of the default Connect profile no longer leaves you signed
+  out after signing in again.** `connect auth logout` of the default profile
+  makes the first remaining profile the default, and `connect auth login`
+  makes the profile it saves the default whenever the default names no
+  profile. A credentials file an older CLI left pointing at a removed profile
+  heals on the next login.
+
 ## [1.2.0] - 2026-11-19
 
 ### Added
