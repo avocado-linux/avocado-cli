@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::utils::output::{print_info, OutputLevel};
+use crate::utils::output::{print_info, print_warning_above, OutputLevel};
 
 /// Volume state configuration stored in .avocado-state file
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -19,6 +19,40 @@ pub struct VolumeState {
     pub source_path: String,
     /// Container tool being used (docker/podman)
     pub container_tool: String,
+}
+
+/// Whether the directory recorded in a `.avocado-state` is the directory using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourcePathVerdict {
+    Same,
+    /// The recorded directory still names this volume, so two trees share it.
+    Shared {
+        recorded: PathBuf,
+    },
+    /// The recorded directory no longer uses this volume (moved, deleted or reassigned).
+    Moved {
+        recorded: PathBuf,
+    },
+}
+
+/// Compare the path a volume was recorded for with the directory running now.
+/// Canonicalizes when the path exists so a symlinked checkout counts as the same one.
+pub fn source_path_verdict(recorded: &Path, here: &Path, volume_name: &str) -> SourcePathVerdict {
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(recorded) == canon(here) {
+        return SourcePathVerdict::Same;
+    }
+    let recorded = recorded.to_path_buf();
+    let still_uses_volume = recorded.exists()
+        && matches!(
+            VolumeState::load_from_dir(&recorded),
+            Ok(Some(state)) if state.volume_name == volume_name
+        );
+    if still_uses_volume {
+        SourcePathVerdict::Shared { recorded }
+    } else {
+        SourcePathVerdict::Moved { recorded }
+    }
 }
 
 /// What `volume rm` or `volume inspect` says about a volume that does not exist. Docker prints
@@ -209,6 +243,31 @@ impl VolumeManager {
         if let Some(existing_state) = VolumeState::load_from_dir(source_dir)? {
             // Verify the volume still exists
             if self.volume_exists(&existing_state.volume_name).await? {
+                let recorded = Path::new(&existing_state.source_path);
+                let volume = &existing_state.volume_name;
+                match source_path_verdict(recorded, source_dir, volume) {
+                    SourcePathVerdict::Same => {}
+                    SourcePathVerdict::Shared { recorded } => {
+                        let here = source_dir.display();
+                        let recorded = recorded.display();
+                        anyhow::bail!(
+                            "Build volume '{volume}' recorded in {here}/.avocado-state is still used by the project at {recorded}. Two trees sharing one volume overwrite each other's SDK and stamps. Delete {here}/.avocado-state to give this tree its own volume, or run avocado from {recorded}."
+                        );
+                    }
+                    SourcePathVerdict::Moved { recorded } => {
+                        // Every container step of a command lands here, so the
+                        // notice prints once per process. `print_warning_above`
+                        // because the plain one is silent under the renderer
+                        // and `--json`, which is where these steps run.
+                        static WARNED: std::sync::Once = std::sync::Once::new();
+                        WARNED.call_once(|| {
+                            print_warning_above(&format!(
+                                "Build volume '{volume}' was created for {}, which no longer uses it; continuing here. The volume is still labelled with the old path, so the abandoned-volume reaper can remove it. Run 'avocado clean' then 'avocado install' here to give this tree its own volume.",
+                                recorded.display()
+                            ));
+                        });
+                    }
+                }
                 if self.verbose {
                     print_info(
                         &format!("Using existing volume: {}", existing_state.volume_name),
@@ -1507,5 +1566,92 @@ exit 0
 
         assert!(from_config_dir.unwrap().is_none());
         assert!(from_src_dir.unwrap().is_some());
+    }
+
+    fn state_json(volume_name: &str, source_path: &Path) -> String {
+        serde_json::json!({
+            "volume_name": volume_name,
+            "source_path": source_path.to_string_lossy(),
+            "container_tool": "docker",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn source_path_verdict_same_dir() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            source_path_verdict(dir.path(), dir.path(), "avo-a"),
+            SourcePathVerdict::Same
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_path_verdict_same_dir_through_symlink() {
+        let dir = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert_eq!(
+            source_path_verdict(dir.path(), &link, "avo-a"),
+            SourcePathVerdict::Same
+        );
+    }
+
+    #[test]
+    fn source_path_verdict_copied_tree_still_in_use_is_shared() {
+        let original = TempDir::new().unwrap();
+        let copy = TempDir::new().unwrap();
+        fs::write(
+            original.path().join(".avocado-state"),
+            state_json("avo-a", original.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            source_path_verdict(original.path(), copy.path(), "avo-a"),
+            SourcePathVerdict::Shared {
+                recorded: original.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn source_path_verdict_missing_recorded_dir_is_moved() {
+        let here = TempDir::new().unwrap();
+        let gone = here.path().join("does-not-exist");
+        assert_eq!(
+            source_path_verdict(&gone, here.path(), "avo-a"),
+            SourcePathVerdict::Moved { recorded: gone }
+        );
+    }
+
+    #[test]
+    fn source_path_verdict_recorded_dir_with_other_volume_is_moved() {
+        let recorded = TempDir::new().unwrap();
+        let here = TempDir::new().unwrap();
+        fs::write(
+            recorded.path().join(".avocado-state"),
+            state_json("avo-other", recorded.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            source_path_verdict(recorded.path(), here.path(), "avo-a"),
+            SourcePathVerdict::Moved {
+                recorded: recorded.path().to_path_buf()
+            }
+        );
+    }
+
+    #[test]
+    fn source_path_verdict_recorded_dir_without_state_is_moved() {
+        let recorded = TempDir::new().unwrap();
+        let here = TempDir::new().unwrap();
+        assert_eq!(
+            source_path_verdict(recorded.path(), here.path(), "avo-a"),
+            SourcePathVerdict::Moved {
+                recorded: recorded.path().to_path_buf()
+            }
+        );
     }
 }
