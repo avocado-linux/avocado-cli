@@ -168,8 +168,9 @@ fn kernel_version_cache() -> &'static KernelVersionCache {
 /// tie-breaks among providers in ways that aren't always EVR-monotonic, so a
 /// 5.15-only candidate can win even when the lockfile pins 6.6.
 ///
-/// Adding `--exclude='kernel-*-${other_kver}*'` (and the `nv-kernel-module-*`
-/// variant) for every other-kernel kver in the feed makes those candidates
+/// Adding `--exclude='kernel-*${other_kver}'` (plus the `nv-kernel-module-*`
+/// and any-package `*-${other_kver}` variants) for every other-kernel kver in
+/// the feed makes those candidates
 /// invisible to the solver — leaving the on-kernel package as the only viable
 /// provider, or the recommend as unsatisfiable (which is the right outcome for
 /// a feature that isn't shipped on the chosen kernel).
@@ -209,10 +210,16 @@ pub async fn off_kernel_dnf_excludes(
 /// (L4T `6.8.12-l4t-r39.2.0-1021.21` and its PREEMPT_RT sibling
 /// `...-1021.21-rt`). A trailing `*` excluded the RT kernel's own packages
 /// whenever the RT kernel was the one selected, so it could never install.
-fn off_kernel_exclude_globs(kver: &str) -> [String; 2] {
+///
+/// The third glob, `*-${kver}`, covers per-kernel packages outside the
+/// `kernel-*` and `nv-kernel-module-*` families, such as the out-of-tree
+/// modules packagegroup `packagegroup-avocado-rootfs-modules-oot-${kver}`.
+/// Its dash keeps unversioned names like `packagegroup-avocado-rootfs` out.
+fn off_kernel_exclude_globs(kver: &str) -> [String; 3] {
     [
         format!("kernel-*{kver}"),
         format!("nv-kernel-module-*{kver}"),
+        format!("*-{kver}"),
     ]
 }
 
@@ -399,6 +406,35 @@ mod tests {
             "kernel-image-6.8.12-l4t-r39.2.0-1021.21-rt",
             "kernel-module-zram-6.8.12-l4t-r39.2.0-1021.21-rt",
             "nv-kernel-module-nvgpu-6.8.12-l4t-r39.2.0-1021.21-rt",
+        ] {
+            assert!(!set.is_match(kept), "{kept} must not be excluded");
+        }
+    }
+
+    fn glob_set(globs: &[String]) -> globset::GlobSet {
+        globs
+            .iter()
+            .fold(globset::GlobSetBuilder::new(), |mut b, g| {
+                b.add(globset::Glob::new(g).unwrap());
+                b
+            })
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn off_kernel_excludes_cover_an_oot_packagegroup() {
+        let set = glob_set(&off_kernel_exclude_globs("6.18.35-yocto-standard"));
+        let pkg = "packagegroup-avocado-rootfs-modules-oot-6.18.35-yocto-standard";
+        assert!(set.is_match(pkg), "{pkg} must be excluded");
+    }
+
+    #[test]
+    fn off_kernel_excludes_skip_unversioned_and_on_kernel_packagegroups() {
+        let set = glob_set(&off_kernel_exclude_globs("6.18.35-yocto-standard"));
+        for kept in [
+            "packagegroup-avocado-rootfs",
+            "packagegroup-avocado-rootfs-modules-oot-6.8.12-l4t-r39.2.0-1021.21",
         ] {
             assert!(!set.is_match(kept), "{kept} must not be excluded");
         }
