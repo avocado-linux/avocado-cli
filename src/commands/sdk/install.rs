@@ -1345,6 +1345,7 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                     entry.kernels.insert(kver.clone(), pkgs.clone());
                 }
             }
+            final_lock.copy_sysroot_providers_from(&rootfs_lock, target, &SysrootType::Rootfs);
         }
         // Merge initramfs lock.
         if initramfs_landed {
@@ -1365,6 +1366,11 @@ $DNF_SDK_HOST $DNF_NO_SCRIPTS $DNF_SDK_TARGET_REPO_CONF \
                         .insert(SysrootType::Initramfs.lock_key(), kver.clone());
                 }
             }
+            final_lock.copy_sysroot_providers_from(
+                &initramfs_lock,
+                target,
+                &SysrootType::Initramfs,
+            );
         }
         // Merge target-dev lock
         let target_dev_installed = need_target_dev && target_dev_result.is_ok();

@@ -307,7 +307,6 @@ impl RpmQueryConfig {
     /// Unlike `build_query_command`, every name is single-quoted: this command
     /// runs in a container shell and a config-supplied name must not become
     /// code. The environment handling and `--root` match that function.
-    #[allow(dead_code)] // Called by the providers query in the container module (next task).
     pub fn build_provides_query_command(&self, names: &[String]) -> String {
         let mut queries = String::new();
         for name in names {
@@ -2003,7 +2002,6 @@ impl LockFile {
     /// Kept apart from the version map on purpose: the removal checks read that
     /// map's keys as the declared package set, so a provider key there would
     /// wipe the sysroot on the next install.
-    #[allow(dead_code)] // Called by the providers query in the container module (next task).
     pub fn set_sysroot_providers(
         &mut self,
         target: &str,
@@ -2023,14 +2021,67 @@ impl LockFile {
             .insert(sysroot.lock_key(), providers);
     }
 
+    /// Fold the outcome of a providers query into the lock for one sysroot.
+    ///
+    /// `unresolved` is the declared names the version query did not return and
+    /// `queried` is the providers query result, `None` when that query could
+    /// not run. Nothing unresolved clears the entry, so one from an earlier
+    /// install cannot outlive the names it described. A failed query leaves the
+    /// entry alone: "could not ask" is not "nothing provides it". A provider
+    /// whose package name equals the requested name is the package itself and
+    /// not a Provides, so it is not recorded; without that, a failed version
+    /// query would copy every plain package into this map.
+    pub fn apply_providers_query(
+        &mut self,
+        target: &str,
+        sysroot: &SysrootType,
+        unresolved: &[String],
+        queried: Option<HashMap<String, Vec<String>>>,
+    ) {
+        if unresolved.is_empty() {
+            self.set_sysroot_providers(target, sysroot, HashMap::new());
+            return;
+        }
+        let Some(queried) = queried else {
+            return;
+        };
+        let providers = queried
+            .into_iter()
+            .filter_map(|(name, provs)| {
+                let others: Vec<String> = provs
+                    .into_iter()
+                    .filter(|p| p.split_whitespace().next() != Some(name.as_str()))
+                    .collect();
+                (!others.is_empty()).then_some((name, others))
+            })
+            .collect();
+        self.set_sysroot_providers(target, sysroot, providers);
+    }
+
     /// The providers recorded for a sysroot, requested name -> providers.
-    #[allow(dead_code)] // Called by the providers query in the container module (next task).
     pub fn get_sysroot_providers(
         &self,
         target: &str,
         sysroot: &SysrootType,
     ) -> Option<&HashMap<String, Vec<String>>> {
         self.targets.get(target)?.providers.get(&sysroot.lock_key())
+    }
+
+    /// Copy one sysroot's providers entry from another lock, removing ours when
+    /// `other` has none. `avocado sdk install` installs the rootfs and initramfs
+    /// on separate lock clones and merges field by field, so without this a
+    /// providers entry written on a clone is dropped at the merge.
+    pub fn copy_sysroot_providers_from(
+        &mut self,
+        other: &LockFile,
+        target: &str,
+        sysroot: &SysrootType,
+    ) {
+        let providers = other
+            .get_sysroot_providers(target, sysroot)
+            .cloned()
+            .unwrap_or_default();
+        self.set_sysroot_providers(target, sysroot, providers);
     }
 
     /// Get the set of package names previously locked for a target and sysroot.
@@ -2511,6 +2562,19 @@ pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
     result
 }
 
+/// The declared package names the `rpm -q` version map did not resolve: the
+/// ones a provider, rather than a package of that name, satisfied.
+pub fn unresolved_declared_names(
+    declared: &[String],
+    versions: &HashMap<String, String>,
+) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|name| !versions.contains_key(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Parse the output of [`RpmQueryConfig::build_provides_query_command`] into
 /// requested name -> `NAME VERSION-RELEASE.ARCH` providers.
 ///
@@ -2518,7 +2582,6 @@ pub fn parse_rpm_query_output(output: &str) -> HashMap<String, String> {
 /// be exactly two whitespace-separated tokens: `rpm` prints `no package
 /// provides x` (four tokens) for a miss, and container output or a warning must
 /// never turn into a key or a provider. A name with no provider is omitted.
-#[allow(dead_code)] // Called by the providers query in the container module (next task).
 pub fn parse_provides_output(output: &str) -> HashMap<String, Vec<String>> {
     let mut result: HashMap<String, Vec<String>> = HashMap::new();
     let mut current: Option<&str> = None;
@@ -5713,6 +5776,53 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
         assert!(cmd.contains("'a'\\''b; touch /pwned' || true"), "{cmd}");
     }
 
+    /// Runs the generated command under `sh` against a stand-in `rpm` that
+    /// answers each query with one provider named after its last argument, then
+    /// parses what it printed. A name carrying shell syntax must reach rpm as
+    /// one literal argument and come back attributed to itself.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn whatprovides_query_runs_each_name_as_one_literal_argument() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        let rpm = dir.path().join("rpm");
+        std::fs::write(
+            &rpm,
+            "#!/bin/sh\nfor last; do :; done\n\
+             echo \"provider-of-$(echo \"$last\" | tr -c 'A-Za-z0-9\\n' _) 1.0-r0.noarch\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&rpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tricky = format!("a'b; touch {}", marker.display());
+        let cmd = SysrootType::Sdk("x86_64".to_string())
+            .get_rpm_query_config()
+            .build_provides_query_command(&[tricky.clone(), "plain".to_string()]);
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(!marker.exists(), "the name ran as shell: {stdout}");
+        let parsed = parse_provides_output(&stdout);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(
+            parsed.get("plain"),
+            Some(&vec!["provider-of-plain 1.0-r0.noarch".to_string()])
+        );
+        assert_eq!(parsed.get(&tricky).map(Vec::len), Some(1), "{parsed:?}");
+    }
+
     #[test]
     fn whatprovides_parse_attributes_providers_to_names() {
         let out =
@@ -5773,6 +5883,119 @@ avocado-sdk-toolchain 0.1.0-r0.x86_64_avocadosdk
             lock.get_sysroot_providers("t", &sysroot),
             Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
         );
+    }
+
+    #[test]
+    fn whatprovides_unresolved_names_are_the_declared_ones_missing_from_versions() {
+        let declared = vec![
+            "real".to_string(),
+            "kernel-module-*".to_string(),
+            "virt".to_string(),
+        ];
+        let versions = HashMap::from([("real".to_string(), "1.0-r0.x86_64".to_string())]);
+        assert_eq!(
+            unresolved_declared_names(&declared, &versions),
+            vec!["kernel-module-*".to_string(), "virt".to_string()]
+        );
+        assert!(unresolved_declared_names(&declared[..1], &versions).is_empty());
+        assert_eq!(
+            unresolved_declared_names(&declared[..2], &HashMap::new()),
+            declared[..2].to_vec()
+        );
+    }
+
+    #[test]
+    fn whatprovides_apply_clears_the_entry_when_nothing_is_unresolved() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("virt", &["real 1.0-r0.x86_64"])]),
+        );
+        // Every declared name now resolves under its own name, so the entry
+        // describes names that are no longer asked for.
+        lock.apply_providers_query("t", &sysroot, &[], Some(HashMap::new()));
+        assert_eq!(lock.get_sysroot_providers("t", &sysroot), None);
+    }
+
+    #[test]
+    fn whatprovides_apply_keeps_the_entry_when_the_query_failed() {
+        let sysroot = SysrootType::Rootfs;
+        let recorded = providers_of(&[("virt", &["real 1.0-r0.x86_64"])]);
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers("t", &sysroot, recorded.clone());
+        // `None` is "could not ask", which says nothing about what provides
+        // the name, so the recorded answer stays.
+        lock.apply_providers_query("t", &sysroot, &["virt".to_string()], None);
+        assert_eq!(lock.get_sysroot_providers("t", &sysroot), Some(&recorded));
+    }
+
+    #[test]
+    fn whatprovides_apply_replaces_the_entry_with_the_query_result() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        lock.set_sysroot_providers("t", &sysroot, providers_of(&[("old", &["x 1-r0.noarch"])]));
+        lock.apply_providers_query(
+            "t",
+            &sysroot,
+            &["virt".to_string()],
+            Some(providers_of(&[("virt", &["real 1.0-r0.x86_64"])])),
+        );
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_apply_records_only_names_another_package_provides() {
+        let sysroot = SysrootType::Rootfs;
+        let mut lock = LockFile::new();
+        // A version query that failed leaves every declared name unresolved,
+        // and rpm then answers a plain package with itself. That is not a
+        // Provides, so it must not land in the map.
+        lock.apply_providers_query(
+            "t",
+            &sysroot,
+            &["busybox".to_string(), "virt".to_string()],
+            Some(providers_of(&[
+                ("busybox", &["busybox 1.36-r0.x86_64"]),
+                ("virt", &["busybox 1.36-r0.x86_64", "virt 2.0-r0.noarch"]),
+            ])),
+        );
+        assert_eq!(
+            lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["busybox 1.36-r0.x86_64"])]))
+        );
+    }
+
+    #[test]
+    fn whatprovides_copied_across_lock_clones() {
+        let sysroot = SysrootType::Rootfs;
+        let mut clone = LockFile::new();
+        clone.set_sysroot_providers(
+            "t",
+            &sysroot,
+            providers_of(&[("virt", &["real 1.0-r0.x86_64"])]),
+        );
+        let mut final_lock = LockFile::new();
+        final_lock.copy_sysroot_providers_from(&clone, "t", &sysroot);
+        assert_eq!(
+            final_lock.get_sysroot_providers("t", &sysroot),
+            Some(&providers_of(&[("virt", &["real 1.0-r0.x86_64"])]))
+        );
+
+        // A clone with no entry clears a stale one rather than leaving it.
+        let empty_clone = LockFile::new();
+        final_lock.copy_sysroot_providers_from(&empty_clone, "t", &sysroot);
+        assert_eq!(final_lock.get_sysroot_providers("t", &sysroot), None);
+
+        // Another sysroot's entry is untouched.
+        let other = SysrootType::Initramfs;
+        final_lock.set_sysroot_providers("t", &other, providers_of(&[("v", &["p 1-r0.x86_64"])]));
+        final_lock.copy_sysroot_providers_from(&empty_clone, "t", &sysroot);
+        assert!(final_lock.get_sysroot_providers("t", &other).is_some());
     }
 
     #[test]

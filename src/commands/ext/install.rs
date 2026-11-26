@@ -2114,6 +2114,10 @@ $DNF_SDK_HOST \
                             self.runtime_env_vars(),
                         )
                         .await?;
+                    let unresolved = crate::utils::lockfile::unresolved_declared_names(
+                        &package_names,
+                        &installed_versions,
+                    );
 
                     if !installed_versions.is_empty() {
                         // Single-write to the sysroot computed by
@@ -2147,6 +2151,25 @@ $DNF_SDK_HOST \
                             );
                         }
                     }
+
+                    // A name a provider satisfied has no `rpm -q` version, so it
+                    // sits outside the gate above. The entry is replaced on
+                    // every install, and kept when the query could not run.
+                    let providers = container_helper
+                        .query_installed_providers(
+                            &sysroot,
+                            &unresolved,
+                            container_image,
+                            target,
+                            repo_url.cloned(),
+                            repo_release.cloned(),
+                            merged_container_args.clone(),
+                            runs_on_context,
+                            self.sdk_arch.as_ref(),
+                            self.runtime_env_vars(),
+                        )
+                        .await;
+                    lock_file.apply_providers_query(target, &sysroot, &unresolved, providers);
                 }
             } else if self.verbose {
                 print_debug(
@@ -2329,7 +2352,6 @@ async fn run_container_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// The pin gate must sit inside the fast-path skip decision, not beside it:
     /// with the sysroot seeded, pins present and the stamp current, a lock entry
     /// that no longer matches the exact yaml pin still has to block the skip.

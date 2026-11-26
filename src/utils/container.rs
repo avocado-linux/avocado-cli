@@ -3602,10 +3602,11 @@ impl SdkContainer {
     /// a different name, so `rpm -q <name>` finds nothing and the version map
     /// never holds it. This resolves those names with `--whatprovides` so the
     /// lock can record what satisfied them. The query never fails the install:
-    /// an empty list runs no container, and a failed run returns an empty map
-    /// with a warning.
+    /// an empty list runs no container and answers an empty map, and a failed
+    /// run answers `None` with a warning. `None` and an empty map differ on
+    /// purpose: the first means the question was not answered, so the lock
+    /// keeps what it has, and the second means nothing provides the names.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // Called by the install paths when providers are recorded (next phase).
     pub async fn query_installed_providers(
         &self,
         sysroot: &crate::utils::lockfile::SysrootType,
@@ -3618,9 +3619,9 @@ impl SdkContainer {
         runs_on_context: Option<&crate::utils::runs_on::RunsOnContext>,
         sdk_arch: Option<&String>,
         env_vars: Option<std::collections::HashMap<String, String>>,
-    ) -> std::collections::HashMap<String, Vec<String>> {
+    ) -> Option<std::collections::HashMap<String, Vec<String>>> {
         if names.is_empty() {
-            return std::collections::HashMap::new();
+            return Some(std::collections::HashMap::new());
         }
         let run_config = RunConfig {
             container_image: container_image.to_string(),
@@ -3647,7 +3648,7 @@ impl SdkContainer {
             None => self.run_in_container_with_output(run_config).await,
         };
         match output {
-            Ok(Some(output)) => crate::utils::lockfile::parse_provides_output(&output),
+            Ok(Some(output)) => Some(crate::utils::lockfile::parse_provides_output(&output)),
             _ => {
                 print_info(
                     &format!(
@@ -3656,7 +3657,7 @@ impl SdkContainer {
                     ),
                     OutputLevel::Normal,
                 );
-                std::collections::HashMap::new()
+                None
             }
         }
     }
@@ -8123,13 +8124,17 @@ extensions:
                 None,
             )
             .await;
-        assert!(providers.is_empty());
+        assert_eq!(
+            providers,
+            Some(std::collections::HashMap::new()),
+            "no names is answered, with nothing providing them"
+        );
         assert!(!marker.exists(), "no container tool may be invoked");
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn query_installed_providers_failed_run_returns_empty_map() {
+    async fn query_installed_providers_failed_run_is_not_an_answer() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("invoked");
         let container = recording_failing_tool(dir.path(), &marker);
@@ -8147,13 +8152,12 @@ extensions:
                 None,
             )
             .await;
-        assert!(
-            providers.is_empty(),
-            "a failed query must not fail the install"
-        );
+        // `None`, not an empty map: the caller keeps the lock's recorded
+        // providers for a question that was never answered.
+        assert_eq!(providers, None, "a failed query must not read as an answer");
         assert!(
             marker.exists(),
-            "the non-empty query must reach the container tool"
+            "a non-empty name list must start a container tool run"
         );
     }
 }

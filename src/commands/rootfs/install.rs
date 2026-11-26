@@ -1448,6 +1448,10 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
         // stamp anyway latches the broken state: every later run reports "up to
         // date" and the user is wedged until they guess --no-stamps.
         let versions_recorded = !installed_versions.is_empty();
+        let unresolved = crate::utils::lockfile::unresolved_declared_names(
+            &effective_names,
+            &installed_versions,
+        );
         let mut kernel_staging_error: Option<String> = None;
         let install_is_clean = clean_ok;
 
@@ -1490,6 +1494,32 @@ $DNF_SDK_HOST $DNF_SDK_TARGET_REPO_CONF \
             // here is last-writer-wins against the sibling task; the caller
             // merges both and saves once.
         }
+
+        // A name a provider satisfied has no `rpm -q` version, so a sysroot of
+        // only such names leaves `versions_recorded` false; the providers step
+        // stays outside that gate. The entry is replaced on every install, and
+        // kept when the query could not run.
+        let providers = params
+            .container_helper
+            .query_installed_providers(
+                &params.sysroot_type,
+                &unresolved,
+                params.container_image,
+                params.target,
+                params.repo_url.map(|s| s.to_string()),
+                params.repo_release.map(|s| s.to_string()),
+                params.merged_container_args.clone(),
+                params.runs_on_context,
+                params.sdk_arch,
+                None,
+            )
+            .await;
+        params.lock_file.apply_providers_query(
+            params.target,
+            &params.sysroot_type,
+            &unresolved,
+            providers,
+        );
 
         // Stage the kernel sysroot from the rootfs (Phase 2c). Only when:
         // - sysroot is rootfs (initramfs doesn't carry the kernel Image),

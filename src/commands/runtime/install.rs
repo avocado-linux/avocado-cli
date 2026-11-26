@@ -13,7 +13,7 @@ use crate::utils::kernel_resolver::{
 use crate::utils::kernel_version::substitute_kernel_version;
 use crate::utils::lockfile::{build_package_spec_with_lock, LockFile, SysrootType};
 use crate::utils::output::{
-    print_debug, print_error, print_info, print_success, print_warning, OutputLevel,
+    print_debug, print_error, print_info, print_success, print_warning_above, OutputLevel,
 };
 use crate::utils::runs_on::RunsOnContext;
 use crate::utils::stamps::{
@@ -478,6 +478,15 @@ impl RuntimeInstallCommand {
 
         let sysroot = SysrootType::Runtime(runtime.to_string());
 
+        // Validate the kernel block first: the later lookups are conditional
+        // (the removal check, the `packages:` branch), so a runtime that reaches
+        // neither would otherwise never have its block checked.
+        if let Some(merged) =
+            config.get_merged_runtime_config(runtime, &target_arch, &self.config_path)?
+        {
+            Config::runtime_kernel_selection(runtime, &merged, config.kernel.as_ref())?;
+        }
+
         // Detect package removals: if packages were removed from the config since the last
         // install, clean the installroot so DNF reinstalls from a clean state.
         let needs_clean_reinstall =
@@ -586,14 +595,13 @@ impl RuntimeInstallCommand {
             .as_ref()
             .and_then(|merged| config.ignored_top_level_kernel_package(merged))
         {
-            print_warning(
-                &format!(
-                    "runtime '{runtime}' has no kernel: entry, so the top-level kernel.package \
-                     '{package}' is not installed into it; the top-level version still pins \
-                     kernel-versioned packages. Add 'kernel: <name>' to the runtime to install it."
-                ),
-                OutputLevel::Normal,
-            );
+            // `print_warning_above`: the plain `print_warning` prints nothing
+            // under the install renderer or `--json`, which is where this runs.
+            print_warning_above(&format!(
+                "runtime '{runtime}' has no kernel: entry, so the top-level kernel.package \
+                 '{package}' is not installed into it; the top-level version still pins \
+                 kernel-versioned packages. Add 'kernel: <name>' to the runtime to install it."
+            ));
         }
         let dependencies = merged_runtime
             .as_ref()
@@ -698,7 +706,7 @@ impl RuntimeInstallCommand {
                 let selection =
                     Config::runtime_kernel_selection(runtime, merged_val, config.kernel.as_ref())?;
                 if let Some(warning) = &selection.warning {
-                    print_warning(warning, OutputLevel::Normal);
+                    print_warning_above(warning);
                 }
                 if let Some(kernel_config) = selection.config {
                     if let Some(ref kernel_package) = kernel_config.package {
@@ -854,6 +862,10 @@ $DNF_SDK_HOST \
                             Some(runtime_env_vars.clone()),
                         )
                         .await?;
+                    let unresolved = crate::utils::lockfile::unresolved_declared_names(
+                        &package_names,
+                        &installed_versions,
+                    );
 
                     if !installed_versions.is_empty() {
                         lock_file.update_sysroot_versions(
@@ -890,6 +902,26 @@ $DNF_SDK_HOST \
                         // Save lock file immediately after runtime install
                         lock_file.save(src_dir)?;
                     }
+
+                    // A name a provider satisfied has no `rpm -q` version, so it
+                    // sits outside the gate above. The entry is replaced on
+                    // every install, and kept when the query could not run.
+                    let providers = container_helper
+                        .query_installed_providers(
+                            &sysroot,
+                            &unresolved,
+                            container_image,
+                            &target_arch,
+                            repo_url.cloned(),
+                            repo_release.cloned(),
+                            merged_container_args.clone(),
+                            runs_on_context,
+                            self.sdk_arch.as_ref(),
+                            Some(runtime_env_vars),
+                        )
+                        .await;
+                    lock_file.apply_providers_query(&target_arch, &sysroot, &unresolved, providers);
+                    lock_file.save(src_dir)?;
                 }
             } else {
                 print_info(
@@ -1063,6 +1095,61 @@ $DNF_SDK_HOST \
 
 #[cfg(test)]
 mod tests {
+    /// A runtime with no `packages:` reaches none of the later kernel lookups,
+    /// so the check at the top of the install is the only one its block gets.
+    /// The tool below fails every run, so a missing check cannot reach a real
+    /// container daemon either.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn invalid_kernel_block_fails_a_runtime_that_has_no_packages() {
+        use std::os::unix::fs::PermissionsExt;
+        let yaml = "default_target: qemux86-64\nsdk:\n  image: test-image\nruntimes:\n  dev:\n    kernel:\n      package: kernel-image\n      compile: k\n      install: i.sh\n";
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("avocado.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let tool = dir.path().join("fake-container-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let container = crate::utils::container::SdkContainer {
+            container_tool: tool.display().to_string(),
+            cwd: dir.path().to_path_buf(),
+            ..crate::utils::container::SdkContainer::new()
+        };
+        let config = crate::utils::config::Config::load_from_yaml_str(yaml).unwrap();
+        let config_toml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let mut lock = crate::utils::lockfile::LockFile::new();
+        let cmd = super::RuntimeInstallCommand::new(
+            Some("dev".to_string()),
+            config_path.display().to_string(),
+            false,
+            Some("qemux86-64".to_string()),
+            None,
+            None,
+        );
+        let err = cmd
+            .install_single_runtime(
+                &config_toml,
+                &config,
+                "dev",
+                &container,
+                "test-image",
+                None,
+                None,
+                None,
+                &None,
+                &mut lock,
+                dir.path(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime 'dev'") && msg.contains("mutually exclusive"),
+            "unexpected error: {msg}"
+        );
+    }
+
     /// A failed pre-reinstall clean must abort before dnf. Before ENG-2352 the
     /// clean result was ignored, so a failed `rm -rf` fell through to dnf against
     /// a dirty installroot. This drives the clean step with a fake runner so the
