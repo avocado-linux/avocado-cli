@@ -4460,7 +4460,9 @@ impl Config {
     ) -> Result<KernelSelection> {
         let config = Self::get_kernel_config_from_runtime(merged_runtime, top_level_kernels)
             .map_err(|e| {
-                let msg = e.to_string();
+                // `{e:#}` keeps the cause chain: a parse failure is wrapped in
+                // a context, and `to_string` would print only the context.
+                let msg = format!("{e:#}");
                 // A block with neither `package` nor `compile` installs no
                 // kernel image, so say how to fix it. Matched on the
                 // validate() text, which is kept stable for this purpose.
@@ -8219,6 +8221,70 @@ pub fn find_active_compile_sections(
     Ok(active_sections)
 }
 
+/// Find the `sdk.compile` section names that `find_active_compile_sections`
+/// does not select for the same arguments, and that no active extension's
+/// target-merged `packages` names either, sorted.
+///
+/// `avocado build` only runs the active sections, so these are the ones a user
+/// may have written expecting them to run.
+pub fn find_unreferenced_compile_sections(
+    config: &Config,
+    parsed: &serde_yaml::Value,
+    active_extensions: &std::collections::HashSet<String>,
+    target: &str,
+    config_path: &str,
+    requested_runtime: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(declared) = parsed
+        .get("sdk")
+        .and_then(|s| s.get("compile"))
+        .and_then(|c| c.as_mapping())
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut active: std::collections::HashSet<String> = find_active_compile_sections(
+        config,
+        parsed,
+        active_extensions,
+        target,
+        config_path,
+        requested_runtime,
+    )?
+    .into_iter()
+    .collect();
+
+    // `find_active_compile_sections` reads each extension's raw `packages`,
+    // but ext build runs the compile sections of the target-merged extension.
+    // A reference only a target override carries would be reported as unused
+    // and then run, so count what the merged extension names too. A failed
+    // merge adds nothing: this helper only warns.
+    for ext_name in active_extensions {
+        let merged = config
+            .get_merged_ext_config(ext_name, target, config_path)
+            .ok()
+            .flatten();
+        let packages = merged
+            .as_ref()
+            .and_then(|m| m.get("packages"))
+            .and_then(|p| p.as_mapping());
+        for (_name, spec) in packages.into_iter().flatten() {
+            if let Some(section) = spec.get("compile").and_then(|c| c.as_str()) {
+                active.insert(section.to_string());
+            }
+        }
+    }
+
+    let mut unreferenced: Vec<String> = declared
+        .keys()
+        .filter_map(|k| k.as_str())
+        .filter(|name| !active.contains(*name))
+        .map(String::from)
+        .collect();
+    unreferenced.sort();
+    Ok(unreferenced)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -8912,6 +8978,140 @@ extensions:
         let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
         find_active_compile_sections(&config, &parsed, active_extensions, target, &path, None)
             .unwrap()
+    }
+
+    fn unreferenced_compile_sections_for(
+        config_content: &str,
+        active_extensions: &[&str],
+    ) -> Vec<String> {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = Config::load(temp_file.path()).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(config_content).unwrap();
+        let exts = active_extensions.iter().map(|e| e.to_string()).collect();
+        find_unreferenced_compile_sections(&config, &parsed, &exts, "qemux86-64", &path, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_an_active_extension_is_not_listed() {
+        let config = r#"
+extensions:
+  app:
+    version: "1.0.0"
+    packages:
+      app-lib:
+        compile: app-lib
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    app-lib:
+      compile: app-lib.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &["app"]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_an_extension_target_override_is_not_listed() {
+        // Ext build reads the target-merged extension, so a compile reference
+        // that only the target override carries still runs.
+        let config = r#"
+extensions:
+  app:
+    version: "1.0.0"
+    qemux86-64:
+      packages:
+        app-lib:
+          compile: app-lib
+          install: app-lib-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    app-lib:
+      compile: app-lib.sh
+    unused:
+      compile: unused.sh
+"#;
+        assert_eq!(
+            unreferenced_compile_sections_for(config, &["app"]),
+            vec!["unused".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_a_runtime_kernel_compile_is_not_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+      install: kernel-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    kernel:
+      compile: kernel-compile.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &[]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_section_used_by_a_runtime_package_compile_is_not_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    packages:
+      uboot:
+        compile: uboot
+        install: uboot-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    uboot:
+      compile: uboot-compile.sh
+"#;
+        assert!(unreferenced_compile_sections_for(config, &[]).is_empty());
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_unused_section_is_listed() {
+        let config = r#"
+runtimes:
+  dev:
+    kernel:
+      compile: kernel
+      install: kernel-install.sh
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+  compile:
+    zeta:
+      compile: zeta.sh
+    kernel:
+      compile: kernel-compile.sh
+    alpha:
+      compile: alpha.sh
+"#;
+        assert_eq!(
+            unreferenced_compile_sections_for(config, &[]),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreferenced_compile_sections_no_sdk_compile_is_empty() {
+        let config = r#"
+runtimes:
+  dev:
+    extensions: [app]
+extensions:
+  app:
+    version: "1.0.0"
+sdk:
+  image: "docker.io/avocadolinux/sdk:edge"
+"#;
+        assert!(unreferenced_compile_sections_for(config, &["app"]).is_empty());
     }
 
     /// `install -r prod -t qemux86-64`, where only `dev` builds for that
@@ -14265,6 +14465,22 @@ kernel:
             "unexpected error: {msg}"
         );
     }
+    #[test]
+    fn runtime_kernel_selection_parse_error_keeps_the_serde_reason() {
+        let rt = runtime_with_kernel("  package: [kernel-image, other]\n");
+        let err = Config::runtime_kernel_selection("dev", &rt, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("runtime 'dev': "),
+            "unexpected error: {msg}"
+        );
+        let cause = msg
+            .split_once("Failed to parse kernel configuration: ")
+            .map(|(_, cause)| cause)
+            .unwrap_or_default();
+        assert!(!cause.is_empty(), "the parse cause is missing: {msg}");
+    }
+
     #[test]
     fn characterize_kernel_version_only_block_still_pins() {
         let yaml = r#"

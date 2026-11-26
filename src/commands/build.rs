@@ -10,9 +10,9 @@ use crate::commands::{
     runtime::RuntimeBuildCommand,
 };
 use crate::utils::{
-    config::{ComposedConfig, Config, ExtensionSource},
+    config::{find_unreferenced_compile_sections, ComposedConfig, Config, ExtensionSource},
     container::{RunConfig, SdkContainer, TuiContext},
-    output::{print_error, print_info, print_success, OutputLevel},
+    output::{print_error, print_info, print_success, print_warning_above, OutputLevel},
     scheduler::{TaskGraph, TaskScheduler},
     stamps::{
         compute_ext_install_input_hash_current, compute_runtime_install_input_hash,
@@ -247,6 +247,32 @@ impl BuildCommand {
         let required_extensions =
             self.find_required_extensions(parsed, &composed, &runtimes_to_build, &target)?;
 
+        let ext_names: Vec<String> = required_extensions
+            .iter()
+            .map(|dep| match dep {
+                ExtensionDependency::Local(n) => n.clone(),
+                ExtensionDependency::Remote { name, .. } => name.clone(),
+            })
+            .collect();
+
+        // A section nothing references is silently skipped by this command;
+        // naming it here is the only signal the user gets.
+        let active_ext_names: HashSet<String> = ext_names.iter().cloned().collect();
+        for section in find_unreferenced_compile_sections(
+            config,
+            parsed,
+            &active_ext_names,
+            &target,
+            &self.config_path,
+            self.runtime.as_deref(),
+        )? {
+            // `print_warning_above` so the notice survives `--json`, which
+            // silences the plain `print_warning`.
+            print_warning_above(&format!(
+                "sdk.compile.{section} is not referenced by any extension, runtime kernel or runtime package in this build, so avocado build will not run it (avocado sdk compile {section} still does)"
+            ));
+        }
+
         // Pre-flight: verify dependencies are installed before drawing the
         // task list.  This gives the user a clear "run avocado install" message
         // instead of failing mid-build inside a TUI.
@@ -260,13 +286,6 @@ impl BuildCommand {
 
             // Every install layer, so a stale one surfaces here with one fix
             // instead of at the first step that happens to read it.
-            let ext_names: Vec<String> = required_extensions
-                .iter()
-                .map(|dep| match dep {
-                    ExtensionDependency::Local(n) => n.clone(),
-                    ExtensionDependency::Remote { name, .. } => name.clone(),
-                })
-                .collect();
             let required = build_preflight_requirements(&ext_names, &runtimes_to_build);
 
             let output = container_helper
@@ -284,7 +303,8 @@ impl BuildCommand {
                     nfs_port: self.nfs_port,
                     ..Default::default()
                 })
-                .await?
+                .await
+                .context("Failed to read stamps in SDK container")?
                 .unwrap_or_default();
 
             let sysroot_inputs = crate::commands::runtime::build::sysroot_install_inputs(
