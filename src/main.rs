@@ -2306,11 +2306,16 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
         cmd,
         // These compose the project, reading installed BSPs' run profiles,
         // wiring and console out of the SDK volume. The rest only talk to
-        // hubs, and routing may auto-start the VM.
+        // hubs, and routing may auto-start the VM. `show --output json` has
+        // no wiring, so never composes the project: it reads at most
+        // `rubicon.default`, which needs no SDK volume.
         Commands::Rubicon(args) if matches!(
             args.command,
             RubiconCommands::Run { .. }
-                | RubiconCommands::Show { .. }
+                | RubiconCommands::Show {
+                    output: OutputFormat::Human,
+                    ..
+                }
                 | RubiconCommands::Console { .. }
                 | RubiconCommands::Logs { .. }
         )
@@ -6355,6 +6360,9 @@ mod tests {
         }
         for c in [
             &["list"][..],
+            &["list", "--output", "json"],
+            &["show", "--output", "json"],
+            &["show", "thor", "--output", "json"],
             &["add", "10.0.0.1"],
             &["claim"],
             &["cancel", "j"],

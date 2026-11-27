@@ -13,7 +13,7 @@ use crate::commands::provision_remote::{self as remote, Board, Hub, Scope, Via};
 use crate::commands::vm::rubicon::{RubiconAction as VmAction, RubiconCommand as VmRubicon};
 use crate::utils::config::Config;
 use crate::utils::output::{print_success, OutputLevel};
-use crate::utils::output_format::{emit_json_object, OutputFormat};
+use crate::utils::output_format::{emit_json_object, JsonOutputGuard, OutputFormat};
 use crate::utils::vm::lifecycle;
 
 pub enum RubiconAction {
@@ -107,8 +107,15 @@ impl RubiconCommand {
 
     pub async fn execute(self) -> Result<()> {
         match &self.action {
-            RubiconAction::List { output } => self.list(*output).await,
+            RubiconAction::List { output } => {
+                // Under JSON, stdout is the payload alone: no `print_*`
+                // prose (an unset `{{ env.* }}` warns while the config
+                // interpolates) may land ahead of it.
+                let _json = output.is_json().then(JsonOutputGuard::enable);
+                self.list(*output).await
+            }
             RubiconAction::Show { board, output } => {
+                let _json = output.is_json().then(JsonOutputGuard::enable);
                 let b = self.board(board).await?;
                 if output.is_json() {
                     emit_json_object(&board_json(&b));
@@ -349,11 +356,12 @@ impl RubiconCommand {
     }
 
     async fn list(&self, output: OutputFormat) -> Result<()> {
-        let boards = self.all_boards().await?;
         if output.is_json() {
-            emit_json_object(&Value::Array(boards.iter().map(board_json).collect()));
+            let (boards, connect_error) = self.boards().await?;
+            emit_json_object(&list_json(&boards, connect_error.as_deref()));
             return Ok(());
         }
+        let boards = self.all_boards().await?;
         if boards.is_empty() {
             println!(
                 "No Rubicons. Add one to this machine's VM with `avocado rubicon add <address>`."
@@ -389,8 +397,20 @@ impl RubiconCommand {
 
     /// Every board reachable from here, once per hub that drives it (this
     /// machine's VM, also one of the org's VMs in Connect, counts once).
+    /// When `--via auto` could not reach Connect, says so on stderr.
     async fn all_boards(&self) -> Result<Vec<Board>> {
+        let (boards, connect_error) = self.boards().await?;
+        if let Some(e) = connect_error {
+            eprintln!("(Connect not consulted: {e})");
+        }
+        Ok(boards)
+    }
+
+    /// [`Self::all_boards`], with why Connect was not consulted under
+    /// `--via auto` (any other `--via` fails instead).
+    async fn boards(&self) -> Result<(Vec<Board>, Option<String>)> {
         let mut boards = Vec::new();
+        let mut connect_error = None;
         if self.via != Via::Connect {
             boards.extend(remote::local_boards().await?);
         }
@@ -398,9 +418,7 @@ impl RubiconCommand {
             match remote::connect_boards(self.connect_profile.as_deref(), self.vm.as_deref()).await
             {
                 Ok(c) => boards.extend(c),
-                Err(e) if self.via == Via::Auto => {
-                    eprintln!("(Connect not consulted: {e:#})");
-                }
+                Err(e) if self.via == Via::Auto => connect_error = Some(format!("{e:#}")),
                 Err(e) => return Err(e),
             }
         }
@@ -411,7 +429,7 @@ impl RubiconCommand {
                 boards.retain(|b| b.vm_instance.as_deref() != Some(me.as_str()));
             }
         }
-        Ok(boards)
+        Ok((boards, connect_error))
     }
 
     async fn run(&self, board: &Option<String>, profile: &str) -> Result<()> {
@@ -882,8 +900,18 @@ fn level(v: &Value) -> String {
     }
 }
 
-/// A board for `--output json`: what `list` prints, field by field, with the
-/// hub's record (`info`) as it came.
+/// `list --output json`: the boards, and why Connect was not consulted
+/// (`null` when it was, or when `--via local` left it out).
+fn list_json(boards: &[Board], connect_error: Option<&str>) -> Value {
+    json!({
+        "rubicons": boards.iter().map(board_json).collect::<Vec<_>>(),
+        "connect_error": connect_error,
+    })
+}
+
+/// A board for `--output json`. `status` is the one word to parse
+/// (`online`, `busy`, `offline` or `unknown`); `state` is a one-line human
+/// summary for display only; `info` is the hub's record as it came.
 fn board_json(b: &Board) -> Value {
     let hub = match &b.hub {
         Hub::Local => json!({"kind": "local"}),
@@ -1162,7 +1190,7 @@ mod tests {
             label: Some("thor".into()),
             hub: Hub::Connect {
                 vm: "vm-1".into(),
-                vm_name: "molcajete".into(),
+                vm_name: "bench-1".into(),
             },
             vm_instance: Some("i-1".into()),
             ..local
@@ -1170,11 +1198,33 @@ mod tests {
         assert_eq!(
             board_json(&connect),
             json!({"name": "rubicon-a", "label": "thor", "address": "10.0.0.5",
-                   "hub": {"kind": "connect", "vm": "vm-1", "vm_name": "molcajete"},
+                   "hub": {"kind": "connect", "vm": "vm-1", "vm_name": "bench-1"},
                    "vm_instance": "i-1",
                    "state": "online  fw 0.1  power on  recovery off", "status": "online",
                    "info": info})
         );
+    }
+
+    /// `list --output json` wraps the boards in an object, like the CLI's
+    /// other lists, with room for why Connect was not consulted.
+    #[test]
+    fn list_json_wraps_the_boards_and_says_why_connect_was_skipped() {
+        let b = Board {
+            address: "10.0.0.5".into(),
+            name: Some("rubicon-a".into()),
+            label: None,
+            hub: Hub::Local,
+            info: json!({"online": true, "fw": "0.1"}),
+            vm_instance: None,
+        };
+        let v = list_json(std::slice::from_ref(&b), None);
+        assert_eq!(v["rubicons"], json!([board_json(&b)]));
+        assert_eq!(v["connect_error"], Value::Null);
+        assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+
+        let v = list_json(&[], Some("not logged in"));
+        assert_eq!(v["rubicons"], json!([]));
+        assert_eq!(v["connect_error"], "not logged in");
     }
 
     /// `list` stays one short line per board: the status word, with the

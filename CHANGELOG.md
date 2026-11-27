@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`avocado rubicon list` and `show` take `--output json`.** `list` prints one
-  array of boards, `show` one board: `name`, `label`, `address`, `hub`
-  (`{"kind": "local"}` or `{"kind": "connect", "vm", "vm_name"}`),
-  `vm_instance`, `state` (the same text as the table) and the hub's `info`
-  record, plus a one-word `status`. Errors and the "Connect not consulted"
-  note stay on stderr.
+- **`avocado rubicon list` and `show` take `--output json`.** `show` prints one
+  board: `name`, `label`, `address`, `hub` (`{"kind": "local"}` or
+  `{"kind": "connect", "vm", "vm_name"}`), `vm_instance`, `status`, `state` and
+  the hub's `info` record. `status` is the one word to parse (`online`, `busy`,
+  `offline` or `unknown`); `state` is a one-line human summary for display.
+  `list` prints `{"rubicons": [...], "connect_error": ...}`, where
+  `connect_error` says why `--via auto` could not reach Connect, else `null`.
+  stdout carries the JSON alone; errors go to stderr. `show --output json`
+  never starts the avocado-vm.
 
 ### Changed
 - **`avocado rubicon list` is one short line per board.** Columns are NAME,
