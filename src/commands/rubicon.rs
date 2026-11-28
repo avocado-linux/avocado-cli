@@ -13,12 +13,16 @@ use crate::commands::provision_remote::{self as remote, Board, Hub, Scope, Via};
 use crate::commands::vm::rubicon::{RubiconAction as VmAction, RubiconCommand as VmRubicon};
 use crate::utils::config::Config;
 use crate::utils::output::{print_success, OutputLevel};
+use crate::utils::output_format::{emit_json_object, JsonOutputGuard, OutputFormat};
 use crate::utils::vm::lifecycle;
 
 pub enum RubiconAction {
-    List,
+    List {
+        output: OutputFormat,
+    },
     Show {
         board: Option<String>,
+        output: OutputFormat,
     },
     Add {
         address: String,
@@ -103,9 +107,20 @@ impl RubiconCommand {
 
     pub async fn execute(self) -> Result<()> {
         match &self.action {
-            RubiconAction::List => self.list().await,
-            RubiconAction::Show { board } => {
+            RubiconAction::List { output } => {
+                // Under JSON, stdout is the payload alone: no `print_*`
+                // prose (an unset `{{ env.* }}` warns while the config
+                // interpolates) may land ahead of it.
+                let _json = output.is_json().then(JsonOutputGuard::enable);
+                self.list(*output).await
+            }
+            RubiconAction::Show { board, output } => {
+                let _json = output.is_json().then(JsonOutputGuard::enable);
                 let b = self.board(board).await?;
+                if output.is_json() {
+                    emit_json_object(&board_json(&b));
+                    return Ok(());
+                }
                 let wiring = self.project()?.and_then(|c| Some(c.rubicon?.wiring));
                 show(&b, &wiring.unwrap_or_default());
                 Ok(())
@@ -340,7 +355,12 @@ impl RubiconCommand {
         })
     }
 
-    async fn list(&self) -> Result<()> {
+    async fn list(&self, output: OutputFormat) -> Result<()> {
+        if output.is_json() {
+            let (boards, connect_error) = self.boards().await?;
+            emit_json_object(&list_json(&boards, connect_error.as_deref()));
+            return Ok(());
+        }
         let boards = self.all_boards().await?;
         if boards.is_empty() {
             println!(
@@ -348,31 +368,49 @@ impl RubiconCommand {
             );
             return Ok(());
         }
-        println!(
-            "{:<18} {:<16} {:<16} {:<20} STATE",
-            "NAME", "LABEL", "ADDRESS", "HUB"
+        let rows: Vec<[String; 6]> = boards
+            .iter()
+            .map(|b| {
+                [
+                    b.name.clone().unwrap_or_else(|| "-".into()),
+                    b.label.clone().unwrap_or_else(|| "-".into()),
+                    b.address.clone(),
+                    match &b.hub {
+                        Hub::Local => "this machine".to_string(),
+                        Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
+                    },
+                    status(b),
+                    b.info["fw"]
+                        .as_str()
+                        .filter(|f| !f.is_empty())
+                        .unwrap_or("-")
+                        .to_string(),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            table(["NAME", "LABEL", "ADDRESS", "HUB", "STATUS", "FW"], &rows)
         );
-        for b in &boards {
-            println!(
-                "{:<18} {:<16} {:<16} {:<20} {}",
-                b.name.as_deref().unwrap_or("-"),
-                b.label.as_deref().unwrap_or("-"),
-                b.address,
-                match &b.hub {
-                    Hub::Local => "this machine".to_string(),
-                    Hub::Connect { vm_name, .. } => format!("VM {vm_name}"),
-                },
-                state(b)
-            );
-            print_queue(b, "  ");
-        }
         Ok(())
     }
 
     /// Every board reachable from here, once per hub that drives it (this
     /// machine's VM, also one of the org's VMs in Connect, counts once).
+    /// When `--via auto` could not reach Connect, says so on stderr.
     async fn all_boards(&self) -> Result<Vec<Board>> {
+        let (boards, connect_error) = self.boards().await?;
+        if let Some(e) = connect_error {
+            eprintln!("(Connect not consulted: {e})");
+        }
+        Ok(boards)
+    }
+
+    /// [`Self::all_boards`], with why Connect was not consulted under
+    /// `--via auto` (any other `--via` fails instead).
+    async fn boards(&self) -> Result<(Vec<Board>, Option<String>)> {
         let mut boards = Vec::new();
+        let mut connect_error = None;
         if self.via != Via::Connect {
             boards.extend(remote::local_boards().await?);
         }
@@ -380,9 +418,7 @@ impl RubiconCommand {
             match remote::connect_boards(self.connect_profile.as_deref(), self.vm.as_deref()).await
             {
                 Ok(c) => boards.extend(c),
-                Err(e) if self.via == Via::Auto => {
-                    eprintln!("(Connect not consulted: {e:#})");
-                }
+                Err(e) if self.via == Via::Auto => connect_error = Some(format!("{e:#}")),
                 Err(e) => return Err(e),
             }
         }
@@ -393,7 +429,7 @@ impl RubiconCommand {
                 boards.retain(|b| b.vm_instance.as_deref() != Some(me.as_str()));
             }
         }
-        Ok(boards)
+        Ok((boards, connect_error))
     }
 
     async fn run(&self, board: &Option<String>, profile: &str) -> Result<()> {
@@ -762,20 +798,11 @@ fn state(b: &Board) -> String {
         );
     }
     let dut = |k: &str| {
-        let v = if i["dut"].is_object() {
+        level(if i["dut"].is_object() {
             &i["dut"][k]
         } else {
             &i["state"]["dut"][k]
-        };
-        match v {
-            Value::Bool(true) => "on".to_string(),
-            Value::Bool(false) => "off".to_string(),
-            Value::Null => "?".to_string(),
-            v => v
-                .as_str()
-                .map(String::from)
-                .unwrap_or_else(|| v.to_string()),
-        }
+        })
     };
     format!(
         "online  fw {}  power {}  recovery {}",
@@ -783,6 +810,43 @@ fn state(b: &Board) -> String {
         dut("power"),
         dut("recovery")
     )
+}
+
+/// One word for `list`: `unknown`, `offline`, `online`, or `busy` while a
+/// job holds the board. `show` has the rest.
+fn status(b: &Board) -> String {
+    let i = &b.info;
+    if i.is_null() || i["unknown"].is_string() {
+        "unknown".into()
+    } else if i["online"] != true {
+        "offline".into()
+    } else if !remote::queue_of(b).is_empty() {
+        "busy".into()
+    } else {
+        "online".into()
+    }
+}
+
+/// Left-aligned columns, each as wide as its widest cell.
+fn table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
+    let mut width = header.map(str::len);
+    for r in rows {
+        for (w, c) in width.iter_mut().zip(r) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| {
+        let mut l = String::new();
+        for (c, w) in cells.iter().zip(width) {
+            l.push_str(&format!("{c:<w$}  "));
+        }
+        format!("{}\n", l.trim_end())
+    };
+    let mut out = line(header.to_vec());
+    for r in rows {
+        out.push_str(&line(r.iter().map(String::as_str).collect()));
+    }
+    out
 }
 
 /// The board's holder, then whoever waits for it.
@@ -797,13 +861,101 @@ fn print_queue(b: &Board, indent: &str) {
     }
 }
 
+/// Output levels by pin: a protocol 2 board's generic outputs, else the
+/// DUT's power and recovery. Empty while the board is offline.
+fn outputs(b: &Board) -> std::collections::BTreeMap<String, String> {
+    let i = &b.info;
+    if i["online"] != true {
+        return Default::default();
+    }
+    let io = if i["io"].is_object() {
+        &i["io"]
+    } else {
+        &i["state"]["io"]
+    };
+    if let Some(io) = io.as_object().filter(|o| !o.is_empty()) {
+        return io.iter().map(|(k, v)| (k.clone(), level(v))).collect();
+    }
+    let dut = if i["dut"].is_object() {
+        &i["dut"]
+    } else {
+        &i["state"]["dut"]
+    };
+    ["power", "recovery"]
+        .into_iter()
+        .map(|k| (k.to_string(), level(&dut[k])))
+        .collect()
+}
+
+/// An output's level as a hub reports it: a bool, or already a word.
+fn level(v: &Value) -> String {
+    match v {
+        Value::Bool(true) => "on".to_string(),
+        Value::Bool(false) => "off".to_string(),
+        Value::Null => "?".to_string(),
+        v => v
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string()),
+    }
+}
+
+/// `list --output json`: the boards, and why Connect was not consulted
+/// (`null` when it was, or when `--via local` left it out).
+fn list_json(boards: &[Board], connect_error: Option<&str>) -> Value {
+    json!({
+        "rubicons": boards.iter().map(board_json).collect::<Vec<_>>(),
+        "connect_error": connect_error,
+    })
+}
+
+/// A board for `--output json`. `status` is the one word to parse
+/// (`online`, `busy`, `offline` or `unknown`); `state` is a one-line human
+/// summary for display only; `info` is the hub's record as it came.
+fn board_json(b: &Board) -> Value {
+    let hub = match &b.hub {
+        Hub::Local => json!({"kind": "local"}),
+        Hub::Connect { vm, vm_name } => json!({"kind": "connect", "vm": vm, "vm_name": vm_name}),
+    };
+    json!({
+        "name": b.name,
+        "label": b.label,
+        "address": b.address,
+        "hub": hub,
+        "vm_instance": b.vm_instance,
+        "state": state(b),
+        "status": status(b),
+        "info": b.info,
+    })
+}
+
 fn show(b: &Board, wiring: &std::collections::BTreeMap<String, String>) {
+    let i = &b.info;
     println!("{}", b.describe());
-    println!("  state:    {}", state(b));
+    let mut status = status(b);
+    if let Some(why) = i["unknown"].as_str().or(i["error"].as_str()) {
+        status.push_str(&format!(" ({why})"));
+    } else if i["online"] == true {
+        status.push_str(if i["claimed"] == true {
+            " (claimed)"
+        } else {
+            " (dev mode)"
+        });
+    }
+    println!("  status:   {status}");
+    if let Some(fw) = i["fw"].as_str().filter(|f| !f.is_empty()) {
+        println!("  firmware: {fw}");
+    }
     print_queue(b, "  ");
-    // The project's wiring, by pin: what this board drives on its DUT.
-    for (pin, what) in wiring {
-        println!("  {:<9} {what}", format!("{pin}:"));
+    // Each output, its level, and what the project wires it to.
+    let outputs = outputs(b);
+    for (pin, level) in &outputs {
+        let what = wiring.get(pin).map(String::as_str).unwrap_or("");
+        let line = format!("  {:<9} {level:<4}{what}", format!("{pin}:"));
+        println!("{}", line.trim_end());
+    }
+    for (pin, what) in wiring.iter().filter(|(p, _)| !outputs.contains_key(*p)) {
+        println!("  {:<9} ?   {what}", format!("{pin}:"));
     }
     if let Some(m) = b.info["model"].as_str().filter(|m| !m.is_empty()) {
         println!("  model:    {m}");
@@ -909,7 +1061,9 @@ mod tests {
 
     fn command(config_path: &str, target: Option<&str>) -> RubiconCommand {
         RubiconCommand {
-            action: RubiconAction::List,
+            action: RubiconAction::List {
+                output: OutputFormat::Human,
+            },
             config_path: config_path.into(),
             target: target.map(String::from),
             via: Via::Auto,
@@ -1011,6 +1165,100 @@ mod tests {
             ..local
         };
         assert_eq!(state(&off), "offline (no route)");
+    }
+
+    /// The desktop parses this: keep the shape stable.
+    #[test]
+    fn board_json_shape_is_stable() {
+        let info = json!({"online": true, "fw": "0.1", "dut": {"power": true, "recovery": false}});
+        let local = Board {
+            address: "10.0.0.5".into(),
+            name: Some("rubicon-a".into()),
+            label: None,
+            hub: Hub::Local,
+            info: info.clone(),
+            vm_instance: None,
+        };
+        assert_eq!(
+            board_json(&local),
+            json!({"name": "rubicon-a", "label": null, "address": "10.0.0.5",
+                   "hub": {"kind": "local"}, "vm_instance": null,
+                   "state": "online  fw 0.1  power on  recovery off", "status": "online",
+                   "info": info})
+        );
+        let connect = Board {
+            label: Some("thor".into()),
+            hub: Hub::Connect {
+                vm: "vm-1".into(),
+                vm_name: "bench-1".into(),
+            },
+            vm_instance: Some("i-1".into()),
+            ..local
+        };
+        assert_eq!(
+            board_json(&connect),
+            json!({"name": "rubicon-a", "label": "thor", "address": "10.0.0.5",
+                   "hub": {"kind": "connect", "vm": "vm-1", "vm_name": "bench-1"},
+                   "vm_instance": "i-1",
+                   "state": "online  fw 0.1  power on  recovery off", "status": "online",
+                   "info": info})
+        );
+    }
+
+    /// `list --output json` wraps the boards in an object, like the CLI's
+    /// other lists, with room for why Connect was not consulted.
+    #[test]
+    fn list_json_wraps_the_boards_and_says_why_connect_was_skipped() {
+        let b = Board {
+            address: "10.0.0.5".into(),
+            name: Some("rubicon-a".into()),
+            label: None,
+            hub: Hub::Local,
+            info: json!({"online": true, "fw": "0.1"}),
+            vm_instance: None,
+        };
+        let v = list_json(std::slice::from_ref(&b), None);
+        assert_eq!(v["rubicons"], json!([board_json(&b)]));
+        assert_eq!(v["connect_error"], Value::Null);
+        assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+
+        let v = list_json(&[], Some("not logged in"));
+        assert_eq!(v["rubicons"], json!([]));
+        assert_eq!(v["connect_error"], "not logged in");
+    }
+
+    /// `list` stays one short line per board: the status word, with the
+    /// outputs and queue left to `show`; columns fit the widest cell.
+    #[test]
+    fn list_is_one_short_line_per_board() {
+        let b = Board {
+            address: "10.0.0.5".into(),
+            name: None,
+            label: Some("iot-gate-imx8plus".into()),
+            hub: Hub::Local,
+            info: json!({"online": true, "fw": "0.2", "io": {"power": true, "ssr1": false},
+                         "queue": [{"id": "j1"}]}),
+            vm_instance: None,
+        };
+        assert_eq!(status(&b), "busy");
+        let off = Board {
+            info: json!({"online": false, "error": "no route"}),
+            ..b.clone()
+        };
+        assert_eq!(status(&off), "offline");
+        let t = table(
+            ["NAME", "LABEL"],
+            &[
+                ["-".into(), "iot-gate-imx8plus".into()],
+                ["rubicon-a".into(), "x".into()],
+            ],
+        );
+        assert_eq!(
+            t,
+            "NAME       LABEL\n-          iot-gate-imx8plus\nrubicon-a  x\n"
+        );
+        assert_eq!(outputs(&b)["ssr1"], "off");
+        assert!(outputs(&off).is_empty());
     }
 
     #[test]

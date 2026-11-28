@@ -2306,11 +2306,16 @@ fn needs_vm_routing(cmd: &Commands) -> bool {
         cmd,
         // These compose the project, reading installed BSPs' run profiles,
         // wiring and console out of the SDK volume. The rest only talk to
-        // hubs, and routing may auto-start the VM.
+        // hubs, and routing may auto-start the VM. `show --output json` has
+        // no wiring, so never composes the project: it reads at most
+        // `rubicon.default`, which needs no SDK volume.
         Commands::Rubicon(args) if matches!(
             args.command,
             RubiconCommands::Run { .. }
-                | RubiconCommands::Show { .. }
+                | RubiconCommands::Show {
+                    output: OutputFormat::Human,
+                    ..
+                }
                 | RubiconCommands::Console { .. }
                 | RubiconCommands::Logs { .. }
         )
@@ -3650,8 +3655,8 @@ async fn main() -> Result<()> {
                 connect_profile,
             } = *args;
             let action = match command {
-                RubiconCommands::List => A::List,
-                RubiconCommands::Show { board } => A::Show { board },
+                RubiconCommands::List { output } => A::List { output },
+                RubiconCommands::Show { board, output } => A::Show { board, output },
                 RubiconCommands::Add { address, label } => A::Add { address, label },
                 RubiconCommands::Remove { board } => A::Remove { board },
                 RubiconCommands::Label { board, label } => A::Label { board, label },
@@ -5555,9 +5560,18 @@ struct RubiconArgs {
 #[derive(Subcommand)]
 enum RubiconCommands {
     /// Boards reachable from here, with their state.
-    List,
+    List {
+        /// `json`: one array of boards on stdout.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
     /// One board in detail.
-    Show { board: Option<String> },
+    Show {
+        board: Option<String>,
+        /// `json`: the board as one object on stdout.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+        output: OutputFormat,
+    },
     /// Add a board to this machine's VM by address.
     Add {
         address: String,
@@ -6346,6 +6360,9 @@ mod tests {
         }
         for c in [
             &["list"][..],
+            &["list", "--output", "json"],
+            &["show", "--output", "json"],
+            &["show", "thor", "--output", "json"],
             &["add", "10.0.0.1"],
             &["claim"],
             &["cancel", "j"],
